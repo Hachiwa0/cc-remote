@@ -43,8 +43,9 @@ class WorkRegistryTests(unittest.TestCase):
                 connection.execute("SELECT 1")
 
     def test_legacy_schema_migration_is_safe_under_concurrent_initialize(self):
+        store = WorkRegistry(self.root, "codex")
         self.root.mkdir(parents=True)
-        with sqlite3.connect(self.store.db_path) as db:
+        with sqlite3.connect(store.db_path) as db:
             db.execute(
                 """CREATE TABLE work_sessions (
                     work_id TEXT PRIMARY KEY,
@@ -64,16 +65,82 @@ class WorkRegistryTests(unittest.TestCase):
 
         def initialize() -> None:
             barrier.wait(timeout=5)
-            self.store.initialize()
+            store.initialize()
 
         with ThreadPoolExecutor(max_workers=workers) as pool:
             list(pool.map(lambda _index: initialize(), range(workers)))
 
-        with sqlite3.connect(self.store.db_path) as db:
+        with sqlite3.connect(store.db_path) as db:
             columns = [row[1] for row in db.execute(
                 "PRAGMA table_info(work_sessions)"
             )]
+            table_sql = db.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'work_sessions'"
+            ).fetchone()[0]
+            indexes = {
+                row[1] for row in db.execute("PRAGMA index_list(work_sessions)")
+            }
         self.assertEqual(columns.count("context_baseline_tokens"), 1)
+        self.assertEqual(columns.count("codex_profile_id"), 1)
+        self.assertNotRegex(table_sql, r"session_id\s+TEXT\s+UNIQUE")
+        self.assertIn("work_sessions_updated", indexes)
+        self.assertIn("work_sessions_project", indexes)
+        self.assertIn("work_sessions_identity", indexes)
+
+        primary = store.create_session(codex_profile_id="primary")
+        stack = store.create_session(codex_profile_id="stack")
+        store.bind_session(
+            primary.work_id, "same-native-id", codex_profile_id="primary",
+        )
+        store.bind_session(
+            stack.work_id, "same-native-id", codex_profile_id="stack",
+        )
+        records = store.records_by_profile_session()
+        self.assertEqual(records[("primary", "same-native-id")].work_id,
+                         primary.work_id)
+        self.assertEqual(records[("stack", "same-native-id")].work_id,
+                         stack.work_id)
+
+    def test_codex_work_records_keep_their_profile_identity(self):
+        store = WorkRegistry(self.root, "codex")
+        record = store.create_session(codex_profile_id="primary")
+        sibling = store.create_session(codex_profile_id="stack")
+        store.bind_session(
+            record.work_id, "same-native-id", codex_profile_id="primary",
+        )
+        store.bind_session(
+            sibling.work_id, "same-native-id", codex_profile_id="stack",
+        )
+
+        primary = store.get_by_session(
+            "same-native-id", codex_profile_id="primary",
+        )
+        assert primary is not None
+        self.assertEqual(primary.codex_profile_id, "primary")
+        stack = store.get_by_session(
+            "same-native-id", codex_profile_id="stack",
+        )
+        assert stack is not None
+        self.assertEqual(stack.work_id, sibling.work_id)
+        records = store.records_by_profile_session()
+        self.assertEqual(records[("primary", "same-native-id")].work_id,
+                         record.work_id)
+        self.assertEqual(records[("stack", "same-native-id")].work_id,
+                         sibling.work_id)
+
+    def test_legacy_codex_work_profile_is_assigned_only_once(self):
+        store = WorkRegistry(self.root, "codex")
+        record = store.create_session()
+        store.bind_session(record.work_id, "native-id")
+
+        self.assertEqual(store.assign_legacy_codex_profile("primary"), 1)
+        self.assertEqual(store.assign_legacy_codex_profile("stack"), 0)
+        migrated = store.get_by_session(
+            "native-id", codex_profile_id="primary",
+        )
+        assert migrated is not None
+        self.assertEqual(migrated.codex_profile_id, "primary")
 
     def test_project_sources_plugins_are_materialized_into_private_session(self):
         project_id = self.store.create_project("季度复盘", "整理业务结果")

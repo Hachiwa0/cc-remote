@@ -15,7 +15,7 @@ import type {
   QueryImg, QueryFile, DirEntry, AssistantChannel, ProcessStatus,
   CollaborationModeName, Notice, RateLimitUpdate,
   StatusRateLimit, StatusRateWindow, SessionControl, PermissionProfileInfo,
-  PreviewAuthorizationOperation,
+  PreviewAuthorizationOperation, CodexProfileInfo,
 } from "./protocol";
 import type { SendMode } from "./composer-submit";
 import {
@@ -70,6 +70,7 @@ import {
 import type { HistoryDetailRequestContext } from "./history-requests";
 import { boundRuntimeTurns, pruneRuntimeMap } from "./runtime-bounds";
 import { bumpSessionActivity, setSessionPinned } from "./session-order";
+import { normalizeSessionList } from "./session-list";
 import { presentCommandProblem, presentTurnProblem } from "./problem-presentation";
 import {
   matchQueryAcceptanceHistory,
@@ -107,6 +108,23 @@ const MAX_LIVE_SPILL_ARCHIVE_CHARS = 16 * 1024 * 1024;
 // simultaneous startup/config/security warnings available without allowing a
 // noisy app-server to grow every resident session indefinitely.
 export const MAX_SESSION_NOTICES = 8;
+
+/** Account-sensitive model/default cache key. Claude remains byte-for-byte
+ * compatible with its historical engine key; every Codex CODEX_HOME gets an
+ * isolated lane so a late response can only update its own account. */
+export function modelCatalogScopeKey(
+  engine: string,
+  codexProfileId?: string | null,
+): string {
+  return engine === "codex"
+    ? `codex\u0000${codexProfileId || "__default__"}`
+    : engine;
+}
+
+function nativeCodexSessionId(sessionId: string): string {
+  const separator = sessionId.indexOf("@");
+  return separator >= 0 ? sessionId.slice(separator + 1) : sessionId;
+}
 
 export interface PendingQuery {
   msg_id?: string;
@@ -318,7 +336,13 @@ export interface AppState {
     cwdSource: "default" | "inherited" | "explicit";
     model: string | null;
     effort: string | null;
+    codexProfileId: string | null;
   } | null;
+  // Public labels/errors only; CODEX_HOME never crosses the wire. Selection is
+  // scoped like cwd so Code accounts cannot leak across devices or surfaces.
+  codexProfiles: CodexProfileInfo[];
+  defaultCodexProfileId: string | null;
+  codexProfileByScope: Record<string, string>;
   // sessions + multi-session runtimes
   sessions: SessionInfo[];
   focusedSid: string | null;
@@ -443,8 +467,9 @@ export type Action =
   | { type: "prune_runtimes"; protectedSids: string[] }
   | { type: "answer_question"; sid: string; ask_id: string }
   | { type: "dismiss_notice"; sid: string; noticeId: string }
-  | { type: "enter_new_chat"; cwd: string; cwdSource?: "default" | "inherited" | "explicit"; model?: string | null; effort?: string | null }
+  | { type: "enter_new_chat"; cwd: string; cwdSource?: "default" | "inherited" | "explicit"; model?: string | null; effort?: string | null; codexProfileId?: string | null }
   | { type: "set_new_chat_cwd"; cwd: string; cwdSource?: "default" | "inherited" | "explicit" }
+  | { type: "set_new_chat_codex_profile"; scopeKey: string; profileId: string }
   | { type: "clear_scope_cwd"; scopeKey: string }
   | { type: "set_new_chat_model"; model: string | null }
   | { type: "set_new_chat_effort"; effort: string | null }
@@ -460,6 +485,9 @@ export const initialState: AppState = {
   dirPicker: null,
   cwdByScope: {},
   newChat: null,
+  codexProfiles: [],
+  defaultCodexProfileId: null,
+  codexProfileByScope: {},
   sessions: [],
   focusedSid: null,
   runtimes: {},
@@ -1466,7 +1494,8 @@ export function reduce(state: AppState, action: Action): AppState {
         ...initialState,
         sessions: [], runtimes: {}, artifact: null, dirPicker: null,
         newChat: null, btwByParentSid: {}, catalog: {}, catalogDefault: {},
-        catalogDefaultEffort: {}, catalogDefaultCwd: {},
+        catalogDefaultEffort: {}, catalogDefaultCwd: {}, codexProfiles: [],
+        defaultCodexProfileId: null, codexProfileByScope: {},
         retainedHistoryBrowse: null,
       };
     case "conn": {
@@ -2233,6 +2262,7 @@ export function reduce(state: AppState, action: Action): AppState {
           cwdSource: action.cwdSource ?? "default",
           model: action.model ?? null,
           effort: action.effort ?? null,
+          codexProfileId: action.codexProfileId ?? null,
         },
       };
     case "set_new_chat_cwd":
@@ -2241,6 +2271,27 @@ export function reduce(state: AppState, action: Action): AppState {
         cwd: action.cwd,
         cwdSource: action.cwdSource ?? "explicit",
       } } : state;
+    case "set_new_chat_codex_profile": {
+      if (!state.newChat
+          || !state.codexProfiles.some((profile) => profile.id === action.profileId)) {
+        return state;
+      }
+      return {
+        ...state,
+        codexProfileByScope: {
+          ...state.codexProfileByScope,
+          [action.scopeKey]: action.profileId,
+        },
+        newChat: {
+          ...state.newChat,
+          codexProfileId: action.profileId,
+          // Catalog and execution controls are account-owned. Never carry an
+          // explicit choice into another CODEX_HOME before its catalog arrives.
+          model: null,
+          effort: null,
+        },
+      };
+    }
     case "clear_scope_cwd": {
       if (!(action.scopeKey in state.cwdByScope)) return state;
       const cwdByScope = { ...state.cwdByScope };
@@ -2341,6 +2392,12 @@ function reduceEvent(
           state: base.state,
           engine: ownership.engine,
           space: ownership.space,
+          codex_profile_id: ownership.engine === "codex"
+            ? ownership.codexProfileId ?? undefined
+            : undefined,
+          native_session_id: ownership.engine === "codex" && newF.includes("@")
+            ? nativeCodexSessionId(newF)
+            : undefined,
         } satisfies SessionInfo, ...state.sessions]
         : state.sessions;
       return {
@@ -2551,6 +2608,10 @@ function reduceEvent(
             ...sourceSession,
             ...targetSession,
             session_id,
+            native_session_id: ownership?.engine === "codex"
+              ? nativeCodexSessionId(session_id)
+              : targetSession?.native_session_id
+                ?? sourceSession.native_session_id,
             cwd: e.cwd ?? targetSession?.cwd ?? sourceSession.cwd,
           },
         ]
@@ -2618,11 +2679,44 @@ function reduceEvent(
       return { ...state, sessions, cwdByScope, artifact };
     }
     case "session_list": {
+      const normalized = normalizeSessionList(
+        state.sessions,
+        state.codexProfiles,
+        state.defaultCodexProfileId,
+        e,
+      );
+      const {
+        sessions,
+        codexProfiles,
+        defaultCodexProfileId,
+      } = normalized;
+      let codexProfileByScope = state.codexProfileByScope;
+      let selectedCodexProfileId: string | null = null;
+      if (e.engine === "codex" && ownership && codexProfiles.length > 0) {
+        const known = new Set(codexProfiles.map((profile) => profile.id));
+        const preferred = ownership.space === "work"
+          ? defaultCodexProfileId
+          : state.newChat?.codexProfileId
+            ?? state.codexProfileByScope[ownership.scopeKey]
+            ?? defaultCodexProfileId;
+        selectedCodexProfileId = preferred && known.has(preferred)
+          ? preferred
+          : defaultCodexProfileId && known.has(defaultCodexProfileId)
+            ? defaultCodexProfileId
+            : codexProfiles[0].id;
+        if (state.codexProfileByScope[ownership.scopeKey]
+            !== selectedCodexProfileId) {
+          codexProfileByScope = {
+            ...state.codexProfileByScope,
+            [ownership.scopeKey]: selectedCodexProfileId,
+          };
+        }
+      }
       const focusedMissing = !!state.focusedSid
         && !state.focusedSid.startsWith("tmp-")
-        && !e.sessions.some((session) => session.session_id === state.focusedSid);
+        && !sessions.some((session) => session.session_id === state.focusedSid);
       const focusedSession = ownership && state.focusedSid
-        ? e.sessions.find(
+        ? sessions.find(
           (session) => session.session_id === state.focusedSid)
         : undefined;
       // Another client may migrate the focused session while this tab is
@@ -2632,26 +2726,39 @@ function reduceEvent(
           && state.cwdByScope[ownership.scopeKey] !== focusedSession.cwd
         ? { ...state.cwdByScope, [ownership.scopeKey]: focusedSession.cwd }
         : state.cwdByScope;
+      const replacementNewChat = focusedMissing
+        ? {
+          cwd: (ownership
+            ? state.cwdByScope[ownership.scopeKey] : "") || "~",
+          cwdSource: (ownership
+            && !!state.cwdByScope[ownership.scopeKey]
+              ? "inherited" : "default") as "inherited" | "default",
+          model: null,
+          effort: null,
+          codexProfileId: selectedCodexProfileId,
+        }
+        : state.newChat && e.engine === "codex" && selectedCodexProfileId
+          && state.newChat.codexProfileId !== selectedCodexProfileId
+          ? {
+            ...state.newChat,
+            codexProfileId: selectedCodexProfileId,
+            model: null,
+            effort: null,
+          }
+          : state.newChat;
       return {
         ...state,
-        sessions: e.sessions,
+        sessions,
         cwdByScope,
+        codexProfiles,
+        defaultCodexProfileId,
+        codexProfileByScope,
         focusedSid: focusedMissing ? null : state.focusedSid,
         historyRecovery: focusedMissing ? null : state.historyRecovery,
         historyBrowse: focusedMissing ? null : state.historyBrowse,
         retainedHistoryBrowse: focusedMissing
           ? null : state.retainedHistoryBrowse,
-        newChat: focusedMissing
-          ? {
-            cwd: (ownership
-              ? state.cwdByScope[ownership.scopeKey] : "") || "~",
-            cwdSource: ownership
-              && !!state.cwdByScope[ownership.scopeKey]
-              ? "inherited" : "default",
-            model: null,
-            effort: null,
-          }
-          : state.newChat,
+        newChat: replacementNewChat,
       };
     }
     case "session_activity": {
@@ -3387,8 +3494,14 @@ function reduceEvent(
     // The engine's real model catalog. Empty => the wrapper couldn't read it; keep
     // what we have (data.ts's static table) rather than blanking the pickers.
     case "models": {
+      const cacheKey = modelCatalogScopeKey(
+        e.engine,
+        e.engine === "codex"
+          ? (e.codex_profile_id ?? state.defaultCodexProfileId)
+          : null,
+      );
       const catalog = e.models.length
-        ? { ...state.catalog, [e.engine]: e.models }
+        ? { ...state.catalog, [cacheKey]: e.models }
         : state.catalog;
       if (e.cwd && e.cwd !== state.newChat?.cwd) {
         // Cwd-aware reads run concurrently. Never let a late response for a
@@ -3404,26 +3517,26 @@ function reduceEvent(
         catalogDefault = { ...catalogDefault };
         catalogDefaultEffort = { ...catalogDefaultEffort };
         if (e.default_model) {
-          catalogDefault[e.engine] = matchModelId(e.default_model, e.engine);
+          catalogDefault[cacheKey] = matchModelId(e.default_model, e.engine);
         } else {
-          delete catalogDefault[e.engine];
+          delete catalogDefault[cacheKey];
         }
         if (e.default_effort) {
-          catalogDefaultEffort[e.engine] = e.default_effort;
+          catalogDefaultEffort[cacheKey] = e.default_effort;
         } else {
-          delete catalogDefaultEffort[e.engine];
+          delete catalogDefaultEffort[cacheKey];
         }
         catalogDefaultCwd = {
-          ...catalogDefaultCwd, [e.engine]: e.cwd,
+          ...catalogDefaultCwd, [cacheKey]: e.cwd,
         };
       } else {
         if (e.default_model) {
           catalogDefault = { ...catalogDefault,
-            [e.engine]: matchModelId(e.default_model, e.engine) };
+            [cacheKey]: matchModelId(e.default_model, e.engine) };
         }
         if (e.default_effort) {
           catalogDefaultEffort = {
-            ...catalogDefaultEffort, [e.engine]: e.default_effort,
+            ...catalogDefaultEffort, [cacheKey]: e.default_effort,
           };
         }
       }

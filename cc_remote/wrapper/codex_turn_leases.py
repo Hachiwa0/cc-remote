@@ -14,7 +14,7 @@ from pathlib import Path
 import string
 import tempfile
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 
 _SCHEMA_VERSION = 1
@@ -54,18 +54,25 @@ class CodexTurnLeaseStore:
             and all(char in string.hexdigits for char in value)
         )
 
-    def _read(self) -> dict[str, CodexTurnLease]:
+    def _read_state(self) -> tuple[dict[str, CodexTurnLease], int]:
         try:
             if self.path.stat().st_size > _MAX_BYTES:
-                return {}
+                return {}, 0
             raw = json.loads(self.path.read_text(encoding="utf-8"))
         except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
-            return {}
+            return {}, 0
         if not isinstance(raw, dict) or raw.get("version") != _SCHEMA_VERSION:
-            return {}
+            return {}, 0
+        profile_revision = raw.get("profile_revision", 0)
+        if (
+            isinstance(profile_revision, bool)
+            or not isinstance(profile_revision, int)
+            or profile_revision < 0
+        ):
+            return {}, 0
         records = raw.get("leases")
         if not isinstance(records, dict) or len(records) > _MAX_LEASES:
-            return {}
+            return {}, 0
         leases: dict[str, CodexTurnLease] = {}
         for session_id, record in records.items():
             if (
@@ -90,12 +97,23 @@ class CodexTurnLeaseStore:
                 automatic=record.get("automatic", False),
                 updated_at=float(record["updated_at"]),
             )
-        return leases
+        return leases, profile_revision
 
-    def _write(self, leases: dict[str, CodexTurnLease]) -> None:
+    def _read(self) -> dict[str, CodexTurnLease]:
+        return self._read_state()[0]
+
+    def _write(
+        self,
+        leases: dict[str, CodexTurnLease],
+        *,
+        profile_revision: int | None = None,
+    ) -> None:
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if profile_revision is None:
+            profile_revision = self._read_state()[1]
         payload = json.dumps({
             "version": _SCHEMA_VERSION,
+            "profile_revision": profile_revision,
             "leases": {
                 session_id: {
                     "turn_id": lease.turn_id,
@@ -117,6 +135,11 @@ class CodexTurnLeaseStore:
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, self.path)
+            directory_fd = os.open(self.path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
         finally:
             if fd >= 0:
                 os.close(fd)
@@ -134,6 +157,133 @@ class CodexTurnLeaseStore:
             key=lambda lease: lease.updated_at,
             reverse=True,
         ))
+
+    def namespace_legacy_sessions(self, profile_id: str) -> int:
+        """Move pre-multi-account leases into the default wire namespace."""
+        if not self._valid_text(profile_id) or "@" in profile_id:
+            raise ValueError("invalid Codex profile id")
+        leases = self._read()
+        updated = dict(leases)
+        migrated = 0
+        for session_id, lease in tuple(leases.items()):
+            if "@" in session_id:
+                continue
+            target = f"{profile_id}@{session_id}"
+            if not self._valid_text(target):
+                continue
+            if target not in updated:
+                updated[target] = CodexTurnLease(
+                    session_id=target,
+                    turn_id=lease.turn_id,
+                    msg_id=lease.msg_id,
+                    daemon_epoch=lease.daemon_epoch,
+                    automatic=lease.automatic,
+                    updated_at=lease.updated_at,
+                )
+            updated.pop(session_id, None)
+            migrated += 1
+        if migrated:
+            self._write(updated)
+        return migrated
+
+    def denamespace_profile_sessions(self, profile_id: str) -> int:
+        """Activate one profile in single-account mode without dropping siblings."""
+        if not self._valid_text(profile_id) or "@" in profile_id:
+            raise ValueError("invalid Codex profile id")
+        prefix = f"{profile_id}@"
+        leases = self._read()
+        updated = dict(leases)
+        migrated = 0
+        for session_id, lease in tuple(leases.items()):
+            if not session_id.startswith(prefix):
+                continue
+            native_id = session_id[len(prefix):]
+            if not self._valid_text(native_id) or "@" in native_id:
+                continue
+            updated[native_id] = CodexTurnLease(
+                session_id=native_id,
+                turn_id=lease.turn_id,
+                msg_id=lease.msg_id,
+                daemon_epoch=lease.daemon_epoch,
+                automatic=lease.automatic,
+                updated_at=lease.updated_at,
+            )
+            updated.pop(session_id, None)
+            migrated += 1
+        if migrated:
+            self._write(updated)
+        return migrated
+
+    def remap_profile_sessions(self, remaps: dict[str, str]) -> int:
+        leases = self._read()
+        updated = dict(leases)
+        moves: list[tuple[str, str, CodexTurnLease]] = []
+        for session_id, lease in tuple(leases.items()):
+            if "@" not in session_id:
+                continue
+            old_id, native_id = session_id.split("@", 1)
+            new_id = remaps.get(old_id)
+            if not new_id or new_id == old_id:
+                continue
+            target = f"{new_id}@{native_id}"
+            if not self._valid_text(target):
+                continue
+            moves.append((session_id, target, CodexTurnLease(
+                session_id=target,
+                turn_id=lease.turn_id,
+                msg_id=lease.msg_id,
+                daemon_epoch=lease.daemon_epoch,
+                automatic=lease.automatic,
+                updated_at=lease.updated_at,
+            )))
+        sources = {source for source, _target, _lease in moves}
+        for source in sources:
+            updated.pop(source, None)
+        for _source, target, lease in moves:
+            if target not in updated or target in sources:
+                updated[target] = lease
+        migrated = len(moves)
+        if migrated:
+            self._write(updated)
+        return migrated
+
+    def migrate_profile_sessions(
+        self,
+        transform: Callable[[str], str],
+        *,
+        profile_revision: int,
+    ) -> int:
+        """Atomically translate lease identities once per topology revision."""
+        if (
+            isinstance(profile_revision, bool)
+            or not isinstance(profile_revision, int)
+            or profile_revision < 1
+        ):
+            raise ValueError("invalid Codex profile revision")
+        leases, durable_revision = self._read_state()
+        if durable_revision >= profile_revision:
+            return 0
+        updated: dict[str, CodexTurnLease] = {}
+        migrated = 0
+        for session_id, lease in leases.items():
+            target = transform(session_id)
+            if not self._valid_text(target):
+                raise ValueError("invalid migrated Codex session id")
+            candidate = CodexTurnLease(
+                session_id=target,
+                turn_id=lease.turn_id,
+                msg_id=lease.msg_id,
+                daemon_epoch=lease.daemon_epoch,
+                automatic=lease.automatic,
+                updated_at=lease.updated_at,
+            )
+            existing = updated.get(target)
+            if existing is not None and existing != candidate:
+                raise ValueError("Codex profile migration collides")
+            updated[target] = candidate
+            migrated += target != session_id
+        self._write(updated, profile_revision=profile_revision)
+        return migrated
 
     def claim(
         self,

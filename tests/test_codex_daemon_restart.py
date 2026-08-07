@@ -184,6 +184,62 @@ def test_detached_restart_publishes_barrier_before_spawning(
     assert float(observed["argv"][grace_index]) == _DEFAULT_DRAIN_GRACE
 
 
+def test_profile_restart_uses_its_marker_and_codex_home(
+    tmp_path, monkeypatch,
+):
+    observed = {}
+
+    class FakeProcess:
+        def __init__(self, argv, **kwargs):
+            observed["argv"] = argv
+            observed["kwargs"] = kwargs
+
+    monkeypatch.setattr(restart_module.subprocess, "Popen", FakeProcess)
+    codex_home = tmp_path / "codex-stack"
+    epoch = schedule_managed_daemon_restart(
+        codex_bin="/opt/codex",
+        codex_home=codex_home,
+        profile_id="stack",
+        state_dir=tmp_path,
+    )
+
+    path = restart_state_path(tmp_path, profile_id="stack")
+    assert path.name == "codex-daemon-restart-stack.json"
+    state = read_restart_state(path)
+    assert state is not None and state.epoch == epoch
+    argv = observed["argv"]
+    assert argv[argv.index("--profile-id") + 1] == "stack"
+    assert argv[argv.index("--codex-home") + 1] == str(codex_home)
+
+
+def test_profile_restart_passes_codex_home_only_to_official_command(
+    tmp_path, monkeypatch,
+):
+    observed = {}
+
+    def run(argv, **kwargs):
+        observed["argv"] = argv
+        observed["env"] = kwargs.get("env")
+        return subprocess.CompletedProcess(
+            argv, 0, stdout='{"status":"restarted"}\n', stderr="")
+
+    monkeypatch.setattr(restart_module.subprocess, "run", run)
+    codex_home = tmp_path / "codex-stack"
+    restart_managed_daemon(
+        codex_bin="/opt/codex",
+        codex_home=codex_home,
+        profile_id="stack",
+        state_dir=tmp_path,
+    )
+
+    assert observed["argv"] == [
+        "/opt/codex", "app-server", "daemon", "restart"]
+    assert observed["env"]["CODEX_HOME"] == str(codex_home.resolve())
+    assert read_restart_state(
+        restart_state_path(tmp_path, profile_id="stack")
+    ).phase == "ready"
+
+
 def test_scheduled_worker_waits_for_turn_and_publishes_ready(
     tmp_path, monkeypatch,
 ):

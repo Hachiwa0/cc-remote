@@ -10,9 +10,11 @@ from pathlib import Path
 from cc_remote.protocol import History, Query, SessionActivity, Takeover
 from cc_remote.wrapper import machine as machine_module
 from cc_remote.wrapper.codex_external import (
-    CodexTuiLogTracker, HolderScan, ProcessIdentity, parse_turn_markers,
+    CodexTuiLogTracker, HolderScan, ProcessIdentity,
+    codex_app_server_proxy_socket, parse_turn_markers,
     writable_rollout_holders,
 )
+from cc_remote.wrapper.process_scan import process_command
 from tests.test_multisession import _mk_ctx, _mk_machine
 
 
@@ -76,6 +78,58 @@ def _watch(path: Path) -> dict:
         "takeover_interactive_holders": set(),
         "partial": b"",
     }
+
+
+def test_codex_app_server_proxy_socket_requires_one_absolute_socket(
+    monkeypatch,
+):
+    identity = ProcessIdentity(99, 123)
+
+    def socket_for(args: tuple[bytes, ...] | None) -> str | None:
+        monkeypatch.setattr(
+            "cc_remote.wrapper.codex_external.process_command",
+            lambda exact_identity: args if exact_identity == identity else None,
+        )
+        return codex_app_server_proxy_socket(identity)
+
+    expected = str(Path("/tmp/codex-stack.sock").resolve())
+    assert socket_for((
+        b"/usr/local/bin/codex", b"app-server", b"proxy",
+        b"--sock", b"/tmp/codex-stack.sock",
+    )) == expected
+    assert socket_for((
+        b"codex", b"app-server", b"proxy",
+        b"--sock=/tmp/codex-stack.sock",
+    )) == expected
+    for args in (
+        None,
+        (b"codex", b"app-server", b"daemon"),
+        (b"codex", b"app-server", b"proxy"),
+        (b"codex", b"app-server", b"proxy", b"--sock"),
+        (b"codex", b"app-server", b"proxy", b"--sock", b"relative.sock"),
+        (
+            b"codex", b"app-server", b"proxy",
+            b"--sock=/tmp/one.sock", b"--sock=/tmp/two.sock",
+        ),
+    ):
+        assert socket_for(args) is None
+
+
+def test_process_command_is_bound_to_exact_process_identity(tmp_path):
+    proc_root = tmp_path / "proc"
+    _fake_process(
+        proc_root,
+        100,
+        456,
+        cmdline=("codex", "app-server", "proxy", "--sock", "/tmp/x.sock"),
+    )
+
+    assert process_command(
+        ProcessIdentity(100, 456), proc_root=str(proc_root),
+    ) == (b"codex", b"app-server", b"proxy", b"--sock", b"/tmp/x.sock")
+    assert process_command(
+        ProcessIdentity(100, 455), proc_root=str(proc_root),
+    ) is None
 
 
 class _CodexSdk:

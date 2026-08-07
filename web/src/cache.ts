@@ -30,10 +30,11 @@ const SCHEMA = 1;
 // assistant blocks after switching away from and back to a running session.
 // v10 separates the instant timeline skeleton from heavyweight detail so one
 // image or tool output can no longer evict an otherwise valid completed turn.
-// v11 discards rows written before Claude transcript promptId was retained as
-// clientMsgId. Those rows can otherwise paint beside the live optimistic row
-// after switching engines until authoritative History replaces both.
-const CACHE_VER = 11;
+// v11 attempted to retain Claude's transcript promptId as clientMsgId. Claude
+// Code generates promptId internally, so it is not the browser Query.msg_id.
+// v12 discards both older shapes; only wrapper-observed native UUID aliases may
+// reconcile a canonical History turn with its optimistic browser row.
+const CACHE_VER = 12;
 const MAX_CACHE_SESSIONS = 64;
 const MAX_CACHE_TURNS = 100;
 const MAX_CACHE_BYTES = 2 * 1024 * 1024;

@@ -11,6 +11,37 @@
   delimiters split across deltas, paused Goal resumes retain one bounded
   objective anchor, and compact continuation no longer renders a live spinner
   beside a real interrupted terminal.
+- Upgrade the coordinated Wrapper/Relay/Web wire gate to protocol v32 and add
+  concurrent Codex account profiles. Each configured `CODEX_HOME` owns its own
+  official daemon, catalog, controls, and history namespace; Code combines the
+  sessions with account labels and filters, while Work remains on the default
+  profile only. Single-account installs retain native ids and their old UI;
+  multi-account cards use stable colored `default`/celestial ribbons. Local
+  profile-key migrations are crash-resumable and include aliases, fork recovery,
+  turn leases, controls, pins, Work ownership, and rollback checkpoints.
+  Headless profiles now bootstrap their own official remote-control daemon
+  instead of silently degrading to a private stdio process. OAuth-only sibling
+  homes safely reuse the verified managed standalone CLI entry while retaining
+  independent auth, rollout, socket, and daemon state; existing custom layouts
+  are never replaced. An unavailable account control plane fails clearly, while
+  single-account fallback semantics remain unchanged. An authenticated account
+  whose quota read temporarily
+  returns no windows is also shown as a refreshable read failure rather than a
+  missing account.
+- Keep Claude prompts stable across refreshes and Claude/Codex surface switches.
+  Claude Code's internal `promptId` is no longer mistaken for the browser
+  message id; the wrapper persists only exact native-user aliases observed
+  after a generation-bound Agent SDK transcript boundary (with SDK replay as
+  fallback) or a broker-owned append boundary. Learning this Claude metadata
+  no longer invalidates Codex account caches. Derived Claude pages from the old
+  identity model are invalidated without discarding Codex history pages. While
+  an Agent SDK turn is live, transcript EOF now remains an open projection and
+  the first ownership scan no longer mirrors a duplicate partial page; the real
+  `ResultMessage` is the sole completion boundary. A
+  narrowly-proved delayed `request_retry` branch no longer hides the already
+  completed sibling tail, and entering or retrying a resident-session switch
+  publishes the current lifecycle state with a fresh sequence instead of
+  replaying a stale `running` frame.
 - Add protocol v28 Codex account activity. The existing one-shot status read
   carries a validated, bounded 53-week daily token series, and Web exposes a
   Codex-only Desktop-style activity calendar without storing it in live replay.

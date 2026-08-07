@@ -26,6 +26,7 @@ import hashlib
 import hmac
 import json
 import os
+from pathlib import Path
 import re
 import signal
 import time
@@ -806,7 +807,7 @@ def _codex_version(path: str) -> tuple[int, ...]:
 
 
 def _newer_private_core_for_oversized_resume(
-    managed_bin: str, resume_id: Optional[str],
+    managed_bin: str, resume_id: Optional[str], codex_home: Optional[str] = None,
 ) -> Optional[str]:
     """Select a newer official desktop app-server for one oversized thread.
 
@@ -823,7 +824,11 @@ def _newer_private_core_for_oversized_resume(
     if (not resume_id or os.environ.get("CODEX_BIN")
             or managed_bin in _CODEX_DESKTOP_BIN_CANDIDATES):
         return None
-    rollout_path = codex_rollout_path(resume_id)
+    rollout_path = (
+        codex_rollout_path(resume_id)
+        if codex_home is None
+        else codex_rollout_path(resume_id, codex_home=codex_home)
+    )
     if not rollout_path:
         return None
     try:
@@ -856,7 +861,7 @@ def _newer_private_core_for_oversized_resume(
 
 
 def _oversized_desktop_openai_resume_requires_http(
-    resume_id: Optional[str],
+    resume_id: Optional[str], codex_home: Optional[str] = None,
 ) -> bool:
     """Use Codex's official Responses HTTP path for one pathological resume.
 
@@ -874,7 +879,11 @@ def _oversized_desktop_openai_resume_requires_http(
     """
     if not resume_id:
         return False
-    rollout_path = codex_rollout_path(resume_id)
+    rollout_path = (
+        codex_rollout_path(resume_id)
+        if codex_home is None
+        else codex_rollout_path(resume_id, codex_home=codex_home)
+    )
     if not rollout_path:
         return False
     try:
@@ -933,21 +942,45 @@ def _resolve_codex_bin() -> str:
     return _runtime_resolve_codex_bin()
 
 
-def _codex_env(bin_path: str) -> dict[str, str]:
+def _codex_env(
+    bin_path: str, codex_home: Optional[str] = None,
+) -> dict[str, str]:
     """Compatibility seam for wrapper-owned Codex child environments."""
-    return _runtime_codex_env(bin_path)
+    if codex_home is None:
+        return _runtime_codex_env(bin_path)
+    return _runtime_codex_env(bin_path, codex_home)
 
 
-def _codex_runtime_tmp() -> str:
+def _profile_codex_env(
+    bin_path: str, codex_home: Optional[str],
+) -> dict[str, str]:
+    return (_codex_env(bin_path) if codex_home is None
+            else _codex_env(bin_path, codex_home))
+
+
+def _profile_rollout_path(
+    session_id: str, codex_home: Optional[str],
+) -> Optional[str]:
+    return (
+        codex_rollout_path(session_id)
+        if codex_home is None
+        else codex_rollout_path(session_id, codex_home=codex_home)
+    )
+
+
+def _codex_runtime_tmp(codex_home: Optional[str] = None) -> str:
     """Return the private runtime directory Codex uses for sandbox launchers.
 
     Work leaves unspecified paths ungranted and opens only its own workspace.
     Codex stages ``codex-linux-sandbox`` below ``$CODEX_HOME/tmp`` before every
     tool call, so that narrow runtime path must remain readable as well.
     """
-    codex_home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
-    codex_home = os.path.abspath(os.path.expanduser(codex_home))
-    return os.path.join(codex_home, "tmp")
+    selected_home = (
+        codex_home or os.environ.get("CODEX_HOME")
+        or os.path.expanduser("~/.codex")
+    )
+    selected_home = os.path.abspath(os.path.expanduser(selected_home))
+    return os.path.join(selected_home, "tmp")
 
 
 def _initialize_params() -> dict[str, Any]:
@@ -1043,8 +1076,13 @@ class CodexHandle:
                  turn_lifecycle_callback: Optional[TurnLifecycleCallback] = None,
                  runtime_event_callback: Optional[RuntimeEventCallback] = None,
                  daemon_mode: Optional[str] = None,
-                 daemon_manager: Optional[CodexDaemonManager] = None):
+                 daemon_manager: Optional[CodexDaemonManager] = None,
+                 codex_home: Optional[str] = None):
         self.cfg = cfg
+        self.codex_home = (
+            os.path.realpath(os.path.expanduser(codex_home))
+            if codex_home else None
+        )
         self.proc: Optional[asyncio.subprocess.Process] = None
         self.thread_id: Optional[str] = None
         # A shared daemon can publish every subscribed thread immediately after
@@ -1088,7 +1126,8 @@ class CodexHandle:
         self.daemon_manager = (
             daemon_manager
             if daemon_manager is not None
-            else default_codex_daemon_manager(self.daemon_mode)
+            else default_codex_daemon_manager(
+                self.daemon_mode, codex_home=self.codex_home)
         )
         self._using_daemon_proxy = False
         # Once a Code session has joined the official shared app-server, a
@@ -1180,14 +1219,23 @@ class CodexHandle:
         # turn. Config.toml is read-only here and supplies fresh-thread defaults.
         # Codex equivalents of cc's model / effort / permission-mode. Defaults come
         # from ~/.codex/config.toml; the client overrides them via set_* .
-        self.model: Optional[str] = codex_model()
-        self.effort: Optional[str] = codex_effort()         # low | medium | high | xhigh
+        self.model: Optional[str] = (
+            codex_model() if self.codex_home is None
+            else codex_model(codex_home=self.codex_home)
+        )
+        self.effort: Optional[str] = (
+            codex_effort() if self.codex_home is None
+            else codex_effort(codex_home=self.codex_home)
+        )         # low | medium | high | xhigh
         self.applied_effort = self.effort                   # keep machine's spawn-time check a no-op
         # Work is governed by its per-process named permission profile. It must
         # never fall back to interactive escalation outside that profile, even
         # when a resumed native thread persisted a Code-time approval policy.
         self.approval: str = (
-            "never" if self.work_mode else codex_approval())  # UI/callback projection
+            "never" if self.work_mode else (
+                codex_approval() if self.codex_home is None
+                else codex_approval(codex_home=self.codex_home)
+            ))  # UI/callback projection
         # Official named profile id (for example ``:workspace`` or
         # ``:danger-full-access``).  It is independent from approvalPolicy:
         # the profile says what the sandbox may access; approvalPolicy says
@@ -1200,11 +1248,17 @@ class CodexHandle:
         # locally so controlled reconnects preserve it.
         self.web_search_override: Optional[str] = None
         self.web_search: str = (
-            "cached" if self.work_mode else codex_web_search()
+            "cached" if self.work_mode else (
+                codex_web_search() if self.codex_home is None
+                else codex_web_search(codex_home=self.codex_home)
+            )
         )
         self.collaboration_mode: str = "default"            # default | plan; independent of approval
         self.service_tier: Optional[str] = (
-            "fast" if codex_fast_enabled() else None
+            "fast" if (
+                codex_fast_enabled() if self.codex_home is None
+                else codex_fast_enabled(codex_home=self.codex_home)
+            ) else None
         )                                                    # thread-scoped; None = standard
 
     async def activate_runtime_events(self) -> None:
@@ -1389,7 +1443,7 @@ class CodexHandle:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=self._cwd,
-            env=_codex_env(codex_bin),
+            env=_profile_codex_env(codex_bin, self.codex_home),
             # JSONL and reassembled WebSocket messages share this hard ceiling.
             limit=_PROXY_MESSAGE_MAX,
             start_new_session=(os.name == "posix"),
@@ -1455,18 +1509,25 @@ class CodexHandle:
             http_only_resume = await asyncio.to_thread(
                 _oversized_desktop_openai_resume_requires_http,
                 resume_id,
+            ) if self.codex_home is None else await asyncio.to_thread(
+                _oversized_desktop_openai_resume_requires_http,
+                resume_id, self.codex_home,
             )
             private_core = await asyncio.to_thread(
                 _newer_private_core_for_oversized_resume,
                 codex_bin,
                 resume_id,
+            ) if self.codex_home is None else await asyncio.to_thread(
+                _newer_private_core_for_oversized_resume,
+                codex_bin,
+                resume_id, self.codex_home,
             )
             if private_core is not None:
                 codex_bin = private_core
         self._http_provider_root_id = resume_id if http_only_resume else None
         if http_only_resume:
             self._http_provider_repair_stop.clear()
-        child_env = _codex_env(codex_bin)
+        child_env = _profile_codex_env(codex_bin, self.codex_home)
         stdio_argv = [codex_bin, "app-server", "--stdio"]
         if http_only_resume:
             _append_openai_http_resume_provider(stdio_argv)
@@ -1483,7 +1544,7 @@ class CodexHandle:
             # bwrap and every tool fails with ENOENT before its command starts.
             filesystem_entries = [
                 '":minimal" = "read"',
-                f'{json.dumps(_codex_runtime_tmp())} = "read"',
+                f'{json.dumps(_codex_runtime_tmp() if self.codex_home is None else _codex_runtime_tmp(self.codex_home))} = "read"',
                 f'{json.dumps(os.path.realpath(codex_bin))} = "read"',
                 f'{json.dumps(self._cwd)} = "write"',
             ]
@@ -1667,7 +1728,7 @@ class CodexHandle:
                     # transport ceiling; otherwise fail before the stdout reader
                     # is destroyed by an oversized thread/resume response.
                     rollout_path = await asyncio.to_thread(
-                        codex_rollout_path, resume_id)
+                        _profile_rollout_path, resume_id, self.codex_home)
                     try:
                         rollout_size = (
                             await asyncio.to_thread(os.path.getsize, rollout_path)
@@ -1791,7 +1852,10 @@ class CodexHandle:
         # Codex Plan mode is a collaboration-mode override, not an approval
         # policy. The app-server schema requires settings.model. Code selects the
         # built-in mode instructions with null; Work repeats its isolated policy.
-        collaboration_model = self.model or codex_model()
+        collaboration_model = self.model or (
+            codex_model() if self.codex_home is None
+            else codex_model(codex_home=self.codex_home)
+        )
         if collaboration_model:
             params["collaborationMode"] = self._collaboration_setting(
                 self.collaboration_mode)
@@ -2859,7 +2923,10 @@ class CodexHandle:
         return False
 
     def _collaboration_setting(self, mode: str) -> dict[str, Any]:
-        model = self.model or codex_model()
+        model = self.model or (
+            codex_model() if self.codex_home is None
+            else codex_model(codex_home=self.codex_home)
+        )
         if not model:
             raise RuntimeError("Codex collaboration mode requires an active model")
         settings: dict[str, Any] = {
@@ -3618,7 +3685,10 @@ class CodexHandle:
         if used is None:
             used = total.get("totalTokens")
         # server value (captured in _dispatch) wins; else the config-declared window.
-        win = self.context_window or u.get("modelContextWindow") or codex_context_window()
+        win = self.context_window or u.get("modelContextWindow") or (
+            codex_context_window() if self.codex_home is None
+            else codex_context_window(codex_home=self.codex_home)
+        )
         return {"used_tokens": used, "context_window": win, "raw": u}
 
     async def recover_owned_turn(self, turn_id: str) -> bool:
@@ -3945,15 +4015,28 @@ class CodexHandle:
         roots = {root_id} if include_descendants else set()
         async with self._http_provider_repair_lock:
             try:
+                repair_kwargs: dict[str, Any] = {}
+                restored_kwargs: dict[str, Any] = {}
+                if self.codex_home is not None:
+                    repair_kwargs = {
+                        "codex_home": self.codex_home,
+                        "journal_dir": str(
+                            Path(self.codex_home)
+                            / ".cc-remote-provider-repair-journal"
+                        ),
+                    }
+                    restored_kwargs = {"codex_home": self.codex_home}
                 report = await asyncio.to_thread(
                     repair_http_provider_records,
                     apply=True,
                     roots=roots,
                     include_thread_ids=include_ids,
+                    **repair_kwargs,
                 )
                 restored = await asyncio.to_thread(
                     canonical_thread_provider_is_restored,
                     root_id,
+                    **restored_kwargs,
                 )
                 if strict and not restored:
                     raise RuntimeError(

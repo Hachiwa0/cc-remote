@@ -38,7 +38,10 @@ def initial_work_context_baseline(engine: str, usage: dict[str, Any]) -> int:
 
 
 def recover_work_context_baseline(
-    engine: str, session_id: str,
+    engine: str,
+    session_id: str,
+    *,
+    codex_home: str | None = None,
 ) -> int | None:
     """Recover a migrated Work session's first authoritative input depth.
 
@@ -46,8 +49,14 @@ def recover_work_context_baseline(
     same startup zero point used for new Codex Work sessions and avoids treating
     an old conversation's *current* depth as engine overhead after an upgrade.
     """
-    path = (codex_rollout_path(session_id) if engine == "codex"
-            else transcript_path(session_id))
+    if engine == "codex":
+        path = (
+            codex_rollout_path(session_id)
+            if codex_home is None
+            else codex_rollout_path(session_id, codex_home=codex_home)
+        )
+    else:
+        path = transcript_path(session_id)
     if not path:
         return None
     try:

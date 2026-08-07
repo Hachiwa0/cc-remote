@@ -40,6 +40,7 @@ _MAX_CATALOG_TEXT = 4096
 
 _cache: Optional[list[dict]] = None
 _cache_ts: float = 0.0
+_profile_cache: dict[str, tuple[list[dict], float]] = {}
 _lock = asyncio.Lock()
 
 # Cost/latency order, low -> high. Used only to clamp an unsupported request DOWN
@@ -51,7 +52,12 @@ def _rank(effort: str) -> int:
     return EFFORT_ORDER.index(effort) if effort in EFFORT_ORDER else len(EFFORT_ORDER)
 
 
-async def _rpc_model_list() -> list[dict]:
+def _profile_cache_key(codex_home: str | None) -> str:
+    return (os.path.realpath(os.path.expanduser(codex_home))
+            if codex_home else "")
+
+
+async def _rpc_model_list(codex_home: str | None = None) -> list[dict]:
     """One-shot `codex app-server --stdio` -> initialize -> model/list -> die.
     No thread, no turn, no tokens."""
     binp = await asyncio.to_thread(_resolve_codex_bin)
@@ -61,7 +67,8 @@ async def _rpc_model_list() -> list[dict]:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
         cwd=os.path.expanduser("~"),
-        env=_codex_env(binp),
+        env=(_codex_env(binp) if codex_home is None
+             else _codex_env(binp, codex_home)),
         limit=16 * 1024 * 1024,
     )
 
@@ -139,36 +146,57 @@ def _normalize(raw: list[dict]) -> list[dict]:
     return out
 
 
-async def codex_catalog(force: bool = False) -> list[dict]:
+async def codex_catalog(
+    force: bool = False,
+    *,
+    codex_home: str | None = None,
+) -> list[dict]:
     """Normalized model list, cached. Never raises: on failure we serve the last
     good catalog (or []), and the web falls back to its static table."""
     global _cache, _cache_ts
+    cache_key = _profile_cache_key(codex_home)
     async with _lock:
-        if not force and _cache is not None and (time.time() - _cache_ts) < _TTL:
-            return _cache
+        cached, cached_ts = (
+            (_cache, _cache_ts) if not cache_key
+            else _profile_cache.get(cache_key, (None, 0.0))
+        )
+        if not force and cached is not None and (time.time() - cached_ts) < _TTL:
+            return cached
         try:
-            data = _normalize(await _rpc_model_list())
+            data = _normalize(await _rpc_model_list(codex_home))
         except Exception as e:
             log.warning("codex model/list failed", error=str(e))
-            return _cache or []
+            return cached or []
         if not data:
             log.warning("codex model/list returned nothing")
-            return _cache or []
-        _cache, _cache_ts = data, time.time()
+            return cached or []
+        now = time.time()
+        if cache_key:
+            _profile_cache[cache_key] = (data, now)
+        else:
+            _cache, _cache_ts = data, now
         log.info("codex catalog", count=len(data), ids=[m["id"] for m in data])
         return data
 
 
-async def efforts_for(model: Optional[str]) -> list[str]:
+async def efforts_for(
+    model: Optional[str],
+    *,
+    codex_home: str | None = None,
+) -> list[str]:
     if not model:
         return []
-    for m in await codex_catalog():
+    for m in await codex_catalog(codex_home=codex_home):
         if m["id"] == model:
             return m["efforts"]
     return []
 
 
-async def clamp_effort(model: Optional[str], effort: Optional[str]) -> Optional[str]:
+async def clamp_effort(
+    model: Optional[str], effort: Optional[str],
+    *,
+    codex_home: str | None = None,
+) -> Optional[str]:
     """Coerce `effort` to something `model` actually supports.
 
     Clamps DOWN — the highest supported level at or below the request — so we never
@@ -178,7 +206,7 @@ async def clamp_effort(model: Optional[str], effort: Optional[str]) -> Optional[
     """
     if not effort:
         return effort
-    supported = await efforts_for(model)
+    supported = await efforts_for(model, codex_home=codex_home)
     if not supported or effort in supported:
         return effort
     want = _rank(effort)

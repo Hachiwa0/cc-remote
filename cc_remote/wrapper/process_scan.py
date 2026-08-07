@@ -150,6 +150,31 @@ def process_identity(pid: int, *, proc_root: str = "/proc",
     return None
 
 
+def process_command(
+    identity: ProcessIdentity,
+    *,
+    proc_root: str = "/proc",
+) -> tuple[bytes, ...] | None:
+    """Read argv only while the exact cross-platform process identity lives."""
+    proc_dir = Path(proc_root) / str(identity.pid)
+    stat = _process_stat(proc_dir)
+    if stat is not None:
+        if stat[1] != identity.start_ticks:
+            return None
+        args = _process_cmdline(proc_dir)
+        return (
+            args
+            if _process_start_ticks(proc_dir) == identity.start_ticks
+            else None
+        )
+    if sys.platform == "darwin" and proc_root == "/proc":
+        info = _darwin_process_info(identity.pid)
+        if info is None or info[0] != identity:
+            return None
+        return info[3]
+    return None
+
+
 def process_owner_uid(pid: int, *, proc_root: str = "/proc") -> int | None:
     """Return the process owner without weakening the caller's identity check."""
     try:

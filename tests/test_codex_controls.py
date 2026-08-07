@@ -2791,6 +2791,56 @@ def test_http_provider_guard_runs_after_every_persisting_request(monkeypatch):
     asyncio.run(run())
 
 
+def test_http_provider_guard_isolated_to_explicit_codex_home(
+    tmp_path, monkeypatch,
+):
+    async def run():
+        codex_home = tmp_path / "codex-stack"
+        handle = CodexHandle(_Cfg(), codex_home=str(codex_home))
+        handle._http_provider_root_id = "root-thread"
+        handle.thread_id = "child-thread"
+        repair_calls = []
+        restored_calls = []
+
+        def repair(**kwargs):
+            repair_calls.append(kwargs)
+            return SimpleNamespace(
+                changed_db_thread_ids=(),
+                changed_rollout_thread_ids=(),
+                deferred_thread_ids=(),
+            )
+
+        def restored(thread_id, **kwargs):
+            restored_calls.append((thread_id, kwargs))
+            return True
+
+        monkeypatch.setattr(
+            codex_handle_module, "repair_http_provider_records", repair)
+        monkeypatch.setattr(
+            codex_handle_module,
+            "canonical_thread_provider_is_restored",
+            restored,
+        )
+
+        await handle._restore_http_provider_state(
+            include_descendants=True, strict=True)
+
+        resolved_home = str(codex_home.resolve())
+        assert repair_calls == [{
+            "apply": True,
+            "roots": {"root-thread"},
+            "include_thread_ids": {"root-thread", "child-thread"},
+            "codex_home": resolved_home,
+            "journal_dir": str(
+                codex_home.resolve()
+                / ".cc-remote-provider-repair-journal"),
+        }]
+        assert restored_calls == [(
+            "root-thread", {"codex_home": resolved_home})]
+
+    asyncio.run(run())
+
+
 def test_http_provider_guard_runs_for_late_persisting_notification(monkeypatch):
     async def run():
         handle = CodexHandle(_Cfg())

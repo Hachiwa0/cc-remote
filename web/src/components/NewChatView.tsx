@@ -8,25 +8,34 @@ import {
   effortsFor, modelsFor, type Catalog, type Effort, type Model,
 } from "../data";
 import { attachmentBytes, pickFiles } from "../img";
-import type { CodexPermissionMode, CodexServiceTier, CodexWebSearchMode, CollaborationModeName, PermissionProfileInfo, QueryImg, QueryFile, Space, WorkDashboard } from "../protocol";
+import type { CodexPermissionMode, CodexProfileInfo, CodexServiceTier, CodexWebSearchMode, CollaborationModeName, PermissionProfileInfo, QueryImg, QueryFile, Space, WorkDashboard } from "../protocol";
 import { ImeSubmitGuard } from "../ime-submit";
 import { PendingImageAttachments } from "./PendingImageAttachments";
 import { CommandSheet } from "./CommandSheet";
 import { permissionProfileLabel } from "../data";
+import { codexProfilePresentation } from "../codex-profile-presentation";
 
 type Engine = "claude" | "codex";
 
 export interface NewChatCatalogRequest {
   engine: Engine;
   cwd?: string;
+  codexProfileId?: string;
 }
 
 /** Catalog reads are scoped like the session they describe. Work owns its own
  * private cwd, so it must never probe Claude settings through the Code cwd. */
 export function newChatCatalogRequest(
   engine: Engine, space: Space, cwd: string,
+  codexProfileId?: string | null,
 ): NewChatCatalogRequest | null {
-  if (engine === "codex") return { engine };
+  if (engine === "codex") {
+    return {
+      engine,
+      ...(space === "code" && codexProfileId
+        ? { codexProfileId } : {}),
+    };
+  }
   return space === "code" ? { engine, cwd } : null;
 }
 
@@ -45,14 +54,15 @@ export function resolveNewChatLocalDefaults(
   modelDefaults: Record<string, string>,
   effortDefaults: Record<string, string>,
   defaultCwds: Record<string, string>,
+  catalogScopeKey: string = engine,
 ): NewChatLocalDefaults {
   if (engine === "claude"
-      && (space !== "code" || defaultCwds.claude !== cwd)) {
+      && (space !== "code" || defaultCwds[catalogScopeKey] !== cwd)) {
     return { model: null, effort: null };
   }
   return {
-    model: modelDefaults[engine] ?? null,
-    effort: effortDefaults[engine] ?? null,
+    model: modelDefaults[catalogScopeKey] ?? null,
+    effort: effortDefaults[catalogScopeKey] ?? null,
   };
 }
 
@@ -121,6 +131,9 @@ interface Props {
   effort?: string | null;
   defaultModel?: string | null;
   defaultEffort?: string | null;
+  codexProfiles?: CodexProfileInfo[];
+  defaultCodexProfileId?: string | null;
+  codexProfileId?: string | null;
   autoFocus?: boolean;
   createError?: string | null;
   workDashboard?: WorkDashboard | null;
@@ -130,6 +143,7 @@ interface Props {
   onPickCwd: () => void;  // open the directory picker
   onPickModel?: (model: string | null) => void;
   onPickEffort?: (effort: string | null) => void;
+  onPickCodexProfile?: (profileId: string) => void;
   permissionProfiles?: PermissionProfileInfo[] | null;
   onGetPermissionProfiles?: (cwd: string) => void;
   onSend: (prompt: string, images?: QueryImg[], files?: QueryFile[],
@@ -220,8 +234,10 @@ export function NewChatView({ cwd, controlScopeKey,
   space = "code", engine = "claude",
   catalog = {}, model = null, effort = null,
   defaultModel = null, defaultEffort = null, autoFocus = true, createError,
+  codexProfiles = [], defaultCodexProfileId = null, codexProfileId = null,
   workDashboard, selectedProjectId, onSelectProject, onManageWork, onPickCwd,
-  onPickModel, onPickEffort, permissionProfiles, onGetPermissionProfiles,
+  onPickModel, onPickEffort, onPickCodexProfile,
+  permissionProfiles, onGetPermissionProfiles,
   onSend }: Props) {
   const [text, setText] = useState("");
   const [images, setImages] = useState<QueryImg[]>([]);
@@ -293,7 +309,12 @@ export function NewChatView({ cwd, controlScopeKey,
       ...patch,
     }));
   };
-  const canSend = (text.trim().length > 0 || hasAttachments) && !creating && !importing;
+  const selectedCodexProfile = engine === "codex" && space === "code"
+    ? codexProfiles.find((profile) => profile.id === codexProfileId) ?? null
+    : null;
+  const selectedProfileError = selectedCodexProfile?.error ?? null;
+  const canSend = (text.trim().length > 0 || hasAttachments)
+    && !creating && !importing && !selectedProfileError;
   const modelList = modelsFor(engine, catalog);
   const effectiveModel = model ?? defaultModel;
   const effortList = newChatEfforts(engine, effectiveModel, catalog);
@@ -385,6 +406,18 @@ export function NewChatView({ cwd, controlScopeKey,
       send();
     }, 0);
   };
+  const cwdButton = (
+    <button className="newchat-cwd" onClick={onPickCwd}
+      title="更改工作目录" disabled={creating}>
+      <Icon name="folder" size={16} />
+      <span className="newchat-cwd-path">
+        {cwd === "~" ? "~ · 主目录" : (cwd || "未指定目录")}
+      </span>
+      <Icon name="edit" size={13} />
+    </button>
+  );
+  const showCodexProfileSelector =
+    engine === "codex" && space === "code" && codexProfiles.length > 1;
 
   return (
     <div className={"newchat " + (space === "work" ? "work-newchat" : "code-newchat")}>
@@ -415,12 +448,44 @@ export function NewChatView({ cwd, controlScopeKey,
               <span>{workDashboard.plugins.length} 个工作模板</span>
             </div>}
           </>
+        ) : showCodexProfileSelector ? (
+          <div className="newchat-context">
+            <label className="newchat-profile">
+              <span>账号</span>
+              <select value={codexProfileId ?? ""}
+                onChange={(event) => onPickCodexProfile?.(event.target.value)}
+                disabled={creating || importing || !onPickCodexProfile}
+                aria-label="选择 Codex 账号">
+                {codexProfiles.map((profile) => (
+                  <option key={profile.id} value={profile.id}>
+                    {codexProfilePresentation(
+                      codexProfiles,
+                      defaultCodexProfileId,
+                      profile.id,
+                    )?.fullLabel ?? profile.label}
+                    {profile.error ? " · 不可用" : ""}
+                  </option>
+                ))}
+              </select>
+            </label>
+            {cwdButton}
+            {selectedProfileError && (
+              <div className="newchat-profile-error" role="status">
+                <Icon name="warning" size={14} />
+                <span>{selectedProfileError}</span>
+              </div>
+            )}
+          </div>
         ) : (
-          <button className="newchat-cwd" onClick={onPickCwd} title="更改工作目录" disabled={creating}>
-            <Icon name="folder" size={16} />
-            <span className="newchat-cwd-path">{cwd === "~" ? "~ · 主目录" : (cwd || "未指定目录")}</span>
-            <Icon name="edit" size={13} />
-          </button>
+          <>
+            {cwdButton}
+            {selectedProfileError && (
+              <div className="newchat-profile-error" role="status">
+                <Icon name="warning" size={14} />
+                <span>{selectedProfileError}</span>
+              </div>
+            )}
+          </>
         )}
 
         {space === "work" && !text && !hasAttachments && (

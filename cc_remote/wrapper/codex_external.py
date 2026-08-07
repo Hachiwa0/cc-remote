@@ -26,6 +26,7 @@ from cc_remote.wrapper.process_scan import (
     _process_cmdline,
     _process_start_ticks,
     _process_stat,
+    process_command,
 )
 
 MAX_FDS_PER_PROCESS = 8192
@@ -238,6 +239,42 @@ def _is_app_server_proxy(
         tty_nr == 0 and args
         and b"app-server" in args and b"proxy" in args
     )
+
+
+def codex_app_server_proxy_socket(
+    identity: ProcessIdentity,
+) -> str | None:
+    """Return the exact proxy socket without weakening process identity.
+
+    Multiple CODEX_HOME profiles run independent app-server daemons. A proxy
+    whose socket is missing or ambiguous cannot be assigned to any account's
+    TUI log tracker; doing so would make one account appear to own a sibling
+    account's thread.
+    """
+    args = process_command(identity)
+    if not args or b"app-server" not in args or b"proxy" not in args:
+        return None
+    sockets: list[bytes] = []
+    for index, arg in enumerate(args):
+        if arg == b"--sock":
+            if index + 1 >= len(args):
+                return None
+            sockets.append(args[index + 1])
+        elif arg.startswith(b"--sock="):
+            sockets.append(arg.removeprefix(b"--sock="))
+    if len(sockets) != 1:
+        return None
+    try:
+        socket_path = os.fsdecode(sockets[0])
+    except (TypeError, ValueError):
+        return None
+    if (
+        not os.path.isabs(socket_path)
+        or "\x00" in socket_path
+        or len(os.fsencode(socket_path)) > 4096
+    ):
+        return None
+    return os.path.realpath(socket_path)
 
 
 def _codex_resume_sids(

@@ -31,9 +31,10 @@ from cc_remote.protocol import (
     GetHistory, GetHistoryImage, GetTurnDetail, History, HistoryImage,
     TurnDetail, HistoryInvalidated,
     UserMsg, AssistantMsgStart, AssistantMsgEnd, Delta, ProcessEvent,
-    TurnEnd, TurnResult, Error, is_downstream,
+    TurnBinding, TurnEnd, TurnResult, Error, is_downstream,
 )
 from cc_remote.wrapper import machine as mm
+from cc_remote.wrapper import stream as stream_module
 from cc_remote.wrapper.codex_history import (
     CodexHistoryPage,
     CodexHistoryUnsupported,
@@ -63,23 +64,320 @@ from cc_remote.wrapper.stream import (
 from tests.test_multisession import _mk_machine, _mk_ctx
 
 
-def test_claude_sdk_prompt_id_survives_history_as_exact_client_alias(
+def _delayed_retry_transcript_rows() -> list[dict]:
+    """Minimal anonymized shape of Claude's delayed request-retry fork."""
+    return [
+        {
+            "type": "user",
+            "uuid": "11111111-1111-4111-8111-111111111111",
+            "parentUuid": None,
+            "isSidechain": False,
+            "timestamp": "2026-08-07T03:42:31.117Z",
+            "message": {"role": "user", "content": "first prompt"},
+        },
+        {
+            "type": "assistant",
+            "uuid": "22222222-2222-4222-8222-222222222222",
+            "parentUuid": "11111111-1111-4111-8111-111111111111",
+            "isSidechain": False,
+            "timestamp": "2026-08-07T03:47:00.000Z",
+            "message": {
+                "role": "assistant",
+                "stop_reason": "tool_use",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_delayed_retry",
+                    "name": "Bash",
+                    "input": {"command": "true"},
+                }],
+            },
+        },
+        {
+            "type": "user",
+            "uuid": "33333333-3333-4333-8333-333333333333",
+            "parentUuid": "22222222-2222-4222-8222-222222222222",
+            "isSidechain": False,
+            "timestamp": "2026-08-07T03:48:40.000Z",
+            "message": {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_delayed_retry",
+                    "content": "ok",
+                    "is_error": False,
+                }],
+            },
+        },
+        {
+            "type": "assistant",
+            "uuid": "44444444-4444-4444-8444-444444444444",
+            "parentUuid": "33333333-3333-4333-8333-333333333333",
+            "isSidechain": False,
+            "timestamp": "2026-08-07T03:58:01.136Z",
+            "message": {
+                "role": "assistant",
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "first answer"}],
+            },
+        },
+        # Claude appends this old retry record only when the later prompt is
+        # submitted. Its file offset is after the completed answer while its
+        # engine timestamp is earlier, and the new prompt follows this branch.
+        {
+            "type": "system",
+            "subtype": "api_error",
+            "uuid": "55555555-5555-4555-8555-555555555555",
+            "parentUuid": "33333333-3333-4333-8333-333333333333",
+            "isSidechain": False,
+            "timestamp": "2026-08-07T03:48:50.436Z",
+            "source": "request_retry",
+            "retryAttempt": 1,
+            "maxRetries": 10,
+            "error": {"message": "Connection error"},
+        },
+        {
+            "type": "user",
+            "uuid": "66666666-6666-4666-8666-666666666666",
+            "parentUuid": "55555555-5555-4555-8555-555555555555",
+            "isSidechain": False,
+            "timestamp": "2026-08-07T05:57:37.880Z",
+            "message": {"role": "user", "content": "second prompt"},
+        },
+        {
+            "type": "assistant",
+            "uuid": "77777777-7777-4777-8777-777777777777",
+            "parentUuid": "66666666-6666-4666-8666-666666666666",
+            "isSidechain": False,
+            "timestamp": "2026-08-07T06:15:34.621Z",
+            "message": {
+                "role": "assistant",
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "second answer"}],
+            },
+        },
+    ]
+
+
+def _write_transcript(path, rows: list[dict]) -> None:
+    path.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+
+def _session_message(row: dict) -> SimpleNamespace:
+    return SimpleNamespace(
+        type=row["type"],
+        uuid=row["uuid"],
+        session_id="claude-delayed-retry",
+        message=row["message"],
+        parent_tool_use_id=(
+            row.get("parentToolUseID") or row.get("parent_tool_use_id")
+        ),
+    )
+
+
+def _delayed_retry_sdk_projection(rows: list[dict]) -> list[SimpleNamespace]:
+    by_id = {row["uuid"]: row for row in rows}
+    # The SDK follows the newest parentUuid chain and therefore omits the
+    # successful assistant tail on the sibling branch.
+    canonical_ids = (
+        "11111111-1111-4111-8111-111111111111",
+        "22222222-2222-4222-8222-222222222222",
+        "33333333-3333-4333-8333-333333333333",
+        "66666666-6666-4666-8666-666666666666",
+        "77777777-7777-4777-8777-777777777777",
+    )
+    return [_session_message(by_id[uid]) for uid in canonical_ids]
+
+
+def test_claude_delayed_retry_recovers_one_completed_sibling_tail(tmp_path):
+    rows = _delayed_retry_transcript_rows()
+    transcript = tmp_path / "claude-delayed-retry.jsonl"
+    _write_transcript(transcript, rows)
+    canonical = _delayed_retry_sdk_projection(rows)
+    store = HistoryIndexStore(tmp_path / "state")
+    timestamps: dict[str, float] = {}
+
+    recovered = stream_module.recover_claude_delayed_retry_tail(
+        "claude-delayed-retry",
+        canonical,
+        path=str(transcript),
+        index_store=store,
+        snapshot_size=transcript.stat().st_size,
+        timestamps=timestamps,
+    )
+
+    assert [message.uuid for message in recovered] == [
+        "11111111-1111-4111-8111-111111111111",
+        "22222222-2222-4222-8222-222222222222",
+        "33333333-3333-4333-8333-333333333333",
+        "44444444-4444-4444-8444-444444444444",
+        "66666666-6666-4666-8666-666666666666",
+        "77777777-7777-4777-8777-777777777777",
+    ]
+    assert timestamps["44444444-4444-4444-8444-444444444444"] == pytest.approx(
+        1786075081.136
+    )
+    assert [
+        message.uuid
+        for message in stream_module.recover_claude_delayed_retry_tail(
+            "claude-delayed-retry",
+            recovered,
+            path=str(transcript),
+            index_store=store,
+            snapshot_size=transcript.stat().st_size,
+        )
+    ] == [message.uuid for message in recovered]
+
+
+@pytest.mark.parametrize("mutation", [
+    "not_retry",
+    "ordered_time",
+    "ambiguous",
+    "sidechain_tail",
+    "failed_tail",
+    "no_later_prompt",
+])
+def test_claude_delayed_retry_recovery_fails_closed(
+    tmp_path, mutation,
+):
+    rows = _delayed_retry_transcript_rows()
+    canonical = None
+    if mutation == "not_retry":
+        rows[4]["source"] = "other"
+    elif mutation == "ordered_time":
+        rows[4]["timestamp"] = "2026-08-07T04:00:00.000Z"
+    elif mutation == "ambiguous":
+        competing = dict(rows[3])
+        competing["uuid"] = "88888888-8888-4888-8888-888888888888"
+        competing["message"] = {
+            "role": "assistant",
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "competing answer"}],
+        }
+        rows.insert(4, competing)
+    elif mutation == "sidechain_tail":
+        rows[3]["isSidechain"] = True
+    elif mutation == "failed_tail":
+        rows[3]["message"]["stop_reason"] = "error"
+    else:
+        rows = rows[:5]
+        canonical = [_session_message(row) for row in rows[:3]]
+    transcript = tmp_path / f"claude-delayed-retry-{mutation}.jsonl"
+    _write_transcript(transcript, rows)
+    canonical = canonical or _delayed_retry_sdk_projection(rows)
+    store = HistoryIndexStore(tmp_path / f"state-{mutation}")
+
+    recovered = stream_module.recover_claude_delayed_retry_tail(
+        "claude-delayed-retry",
+        canonical,
+        path=str(transcript),
+        index_store=store,
+        snapshot_size=transcript.stat().st_size,
+    )
+
+    assert [message.uuid for message in recovered] == [
+        message.uuid for message in canonical
+    ]
+
+
+def test_claude_history_materializes_recovered_answer_once(
     monkeypatch, tmp_path,
 ):
-    """Switch-back History must reconcile one SDK prompt with its live row.
+    rows = _delayed_retry_transcript_rows()
+    transcript = tmp_path / "claude-delayed-retry.jsonl"
+    _write_transcript(transcript, rows)
+    canonical = _delayed_retry_sdk_projection(rows)
+    monkeypatch.setattr(mm, "transcript_path", lambda _sid: str(transcript))
+    monkeypatch.setattr(
+        "cc_remote.wrapper.stream.transcript_path",
+        lambda _sid: str(transcript),
+    )
+    monkeypatch.setattr(mm, "get_session_info", lambda _sid: None)
+    monkeypatch.setattr(
+        mm, "get_session_messages", lambda *_args, **_kwargs: canonical)
+    monkeypatch.setattr(mm, "translate_subagent_history", lambda *_args: [])
 
-    Claude stores the transcript UUID as ``uuid`` and the browser query id as
-    ``promptId``.  The SDK's SessionMessage projection drops promptId, so the
-    timestamp side read is also the source of this exact, non-textual alias.
+    async def go():
+        machine, _ = _mk_machine()
+        machine._history_index = HistoryIndexStore(tmp_path / "history-state")
+        history = await machine._build_history(
+            "claude-delayed-retry", limit=4, detail="summary")
+
+        assert [turn.prompt for turn in history.turns] == [
+            "first prompt", "second prompt"]
+        assert [
+            block["text"]
+            for turn in history.turns
+            for block in turn.blocks
+            if block["kind"] == "text" and block["channel"] == "final"
+        ] == ["first answer", "second answer"]
+        assert all(turn.done for turn in history.turns)
+
+    asyncio.run(go())
+
+
+def test_claude_resident_preload_keeps_recovered_answer_once(
+    monkeypatch, tmp_path,
+):
+    rows = _delayed_retry_transcript_rows()
+    transcript = tmp_path / "claude-delayed-retry.jsonl"
+    _write_transcript(transcript, rows)
+    canonical = _delayed_retry_sdk_projection(rows)
+    monkeypatch.setattr(mm, "transcript_path", lambda _sid: str(transcript))
+    monkeypatch.setattr(
+        "cc_remote.wrapper.stream.transcript_path",
+        lambda _sid: str(transcript),
+    )
+    monkeypatch.setattr(
+        mm, "get_session_messages", lambda *_args, **_kwargs: canonical)
+    monkeypatch.setattr(mm, "translate_subagent_history", lambda *_args: [])
+
+    async def go():
+        machine, _ = _mk_machine()
+        machine._history_index = HistoryIndexStore(tmp_path / "history-state")
+        ctx = _mk_ctx("claude-delayed-retry", "claude-delayed-retry")
+        ctx.cwd = str(tmp_path)
+
+        await machine._load_history(ctx, "claude-delayed-retry")
+
+        frames = ctx.buffer.replay_from(
+            0,
+            cc_session_id=ctx.key,
+            state=ctx.state,
+            cwd=ctx.cwd,
+            generation=machine.instance_id,
+        )
+        assert [
+            frame.prompt for frame in frames if isinstance(frame, UserMsg)
+        ] == ["first prompt", "second prompt"]
+        assert [
+            frame.text
+            for frame in frames
+            if isinstance(frame, Delta) and frame.channel == "final"
+        ] == ["first answer", "second answer"]
+
+    asyncio.run(go())
+
+
+def test_claude_sdk_prompt_id_is_not_treated_as_browser_client_alias(
+    monkeypatch, tmp_path,
+):
+    """Claude's native per-query promptId is not cc-remote's browser id.
+
+    Claude Code generates promptId inside the child and copies it to every row
+    in one native turn.  Treating that UUID as a browser client alias leaves the
+    optimistic row and canonical History row side by side after a switch.
     """
     session_id = "fa800ca3-18e3-4391-b401-a33fe52e2f56"
     transcript_id = "2259073b-7676-455f-b7b0-b9b3892dbe93"
-    client_id = "6b09ee37-f861-4422-b98a-21f509c951b0"
+    native_prompt_id = "ad59b20c-1894-4eda-98f5-9e7d7cfc17a7"
     transcript = tmp_path / f"{session_id}.jsonl"
     transcript.write_text(json.dumps({
         "type": "user",
         "uuid": transcript_id,
-        "promptId": client_id,
+        "promptId": native_prompt_id,
         "promptSource": "sdk",
         "timestamp": "2026-08-02T09:09:16.263Z",
         "message": {
@@ -108,10 +406,10 @@ def test_claude_sdk_prompt_id_survives_history_as_exact_client_alias(
 
     user = next(event for event in events if isinstance(event, UserMsg))
     assert user.msg_id == transcript_id
-    assert user.client_msg_id == client_id
+    assert user.client_msg_id is None
 
 
-def test_claude_repeated_prompt_text_keeps_distinct_prompt_identities(
+def test_claude_repeated_prompt_text_uses_explicit_wrapper_client_aliases(
     monkeypatch, tmp_path,
 ):
     session_id = "fa800ca3-18e3-4391-b401-a33fe52e2f56"
@@ -119,7 +417,11 @@ def test_claude_repeated_prompt_text_keeps_distinct_prompt_identities(
         "2259073b-7676-455f-b7b0-b9b3892dbe93",
         "3259073b-7676-455f-b7b0-b9b3892dbe93",
     ]
-    client_ids = [
+    native_prompt_ids = [
+        "ad59b20c-1894-4eda-98f5-9e7d7cfc17a7",
+        "bd59b20c-1894-4eda-98f5-9e7d7cfc17a7",
+    ]
+    browser_client_ids = [
         "6b09ee37-f861-4422-b98a-21f509c951b0",
         "7b09ee37-f861-4422-b98a-21f509c951b0",
     ]
@@ -128,13 +430,13 @@ def test_claude_repeated_prompt_text_keeps_distinct_prompt_identities(
         json.dumps({
             "type": "user",
             "uuid": transcript_id,
-            "promptId": client_id,
+            "promptId": native_prompt_id,
             "promptSource": "sdk",
             "timestamp": f"2026-08-02T09:09:{16 + index:02d}.263Z",
             "message": {"role": "user", "content": "继续"},
         }) + "\n"
-        for index, (transcript_id, client_id) in enumerate(zip(
-            transcript_ids, client_ids, strict=True))
+        for index, (transcript_id, native_prompt_id) in enumerate(zip(
+            transcript_ids, native_prompt_ids, strict=True))
     ), encoding="utf-8")
     monkeypatch.setattr(
         "cc_remote.wrapper.stream.transcript_path",
@@ -153,11 +455,316 @@ def test_claude_repeated_prompt_text_keeps_distinct_prompt_identities(
 
     users = [
         event for event in translate_history(
-            messages, 10_000, timestamps=transcript_timestamps(session_id))
+            messages,
+            10_000,
+            timestamps=transcript_timestamps(session_id),
+            client_message_ids=dict(zip(
+                transcript_ids, browser_client_ids, strict=True)),
+        )
         if isinstance(event, UserMsg)
     ]
     assert [(user.msg_id, user.client_msg_id) for user in users] == list(zip(
-        transcript_ids, client_ids, strict=True))
+        transcript_ids, browser_client_ids, strict=True))
+
+
+def test_claude_history_loads_durable_wrapper_alias_after_restart(
+    monkeypatch, tmp_path,
+):
+    session_id = "fa800ca3-18e3-4391-b401-a33fe52e2f56"
+    native_id = "2259073b-7676-455f-b7b0-b9b3892dbe93"
+    client_id = "6b09ee37-f861-4422-b98a-21f509c951b0"
+    transcript = tmp_path / f"{session_id}.jsonl"
+    transcript.write_text(json.dumps({
+        "type": "user",
+        "uuid": native_id,
+        "promptId": "ad59b20c-1894-4eda-98f5-9e7d7cfc17a7",
+        "promptSource": "sdk",
+        "timestamp": "2026-08-02T09:09:16.263Z",
+        "message": {"role": "user", "content": "继续"},
+    }) + "\n", encoding="utf-8")
+    monkeypatch.setattr(mm, "transcript_path", lambda _sid: str(transcript))
+    monkeypatch.setattr(
+        "cc_remote.wrapper.stream.transcript_path",
+        lambda _sid: str(transcript),
+    )
+    monkeypatch.setattr(mm, "get_session_info", lambda _sid: None)
+    monkeypatch.setattr(mm, "get_session_messages", lambda *_args, **_kwargs: [
+        SimpleNamespace(
+            type="user",
+            uuid=native_id,
+            session_id=session_id,
+            message={"role": "user", "content": "继续"},
+            parent_tool_use_id=None,
+        ),
+    ])
+    monkeypatch.setattr(mm, "translate_subagent_history", lambda *_args: [])
+
+    async def go():
+        first_machine, _ = _mk_machine()
+        first_machine._claude_client_messages.put(
+            session_id, transcript, native_id, client_id)
+
+        # A new WrapperMachine must recover the private identity journal rather
+        # than relying on resident state from the turn that wrote it.
+        restarted_machine, _ = _mk_machine()
+        restarted_machine.cfg.state_dir = first_machine.cfg.state_dir
+        restarted_machine._claude_client_messages = type(
+            first_machine._claude_client_messages,
+        )(first_machine.cfg.state_dir)
+        history = await restarted_machine._build_history(
+            session_id, limit=4, detail="summary")
+
+        assert len(history.turns) == 1
+        assert history.turns[0].id == native_id
+        assert history.turns[0].clientMsgId == client_id
+
+    asyncio.run(go())
+
+
+def test_claude_history_retries_when_alias_lands_during_source_scan(
+    monkeypatch, tmp_path,
+):
+    session_id = "fa800ca3-18e3-4391-b401-a33fe52e2f56"
+    native_id = "2259073b-7676-455f-b7b0-b9b3892dbe93"
+    client_id = "6b09ee37-f861-4422-b98a-21f509c951b0"
+    transcript = tmp_path / f"{session_id}.jsonl"
+    transcript.write_text(json.dumps({
+        "type": "user",
+        "uuid": native_id,
+        "parentUuid": None,
+        "isSidechain": False,
+        "timestamp": "2026-08-02T09:09:16.263Z",
+        "message": {"role": "user", "content": "继续"},
+    }) + "\n", encoding="utf-8")
+    monkeypatch.setattr(mm, "transcript_path", lambda _sid: str(transcript))
+    monkeypatch.setattr(
+        "cc_remote.wrapper.stream.transcript_path",
+        lambda _sid: str(transcript),
+    )
+    monkeypatch.setattr(mm, "get_session_info", lambda _sid: None)
+    monkeypatch.setattr(mm, "get_session_messages", lambda *_args, **_kwargs: [
+        SimpleNamespace(
+            type="user",
+            uuid=native_id,
+            session_id=session_id,
+            message={"role": "user", "content": "继续"},
+            parent_tool_use_id=None,
+        ),
+    ])
+    monkeypatch.setattr(mm, "translate_subagent_history", lambda *_args: [])
+
+    alias_read_started = threading.Event()
+    release_alias_read = threading.Event()
+    real_translate = mm.translate_history
+    calls: list[dict[str, str]] = []
+
+    def racing_translate(messages, tool_result_max, timestamps=None,
+                         internal_user_events=None, **kwargs):
+        calls.append(dict(kwargs.get("client_message_ids") or {}))
+        return real_translate(
+            messages,
+            tool_result_max,
+            timestamps=timestamps,
+            internal_user_events=internal_user_events,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(mm, "translate_history", racing_translate)
+
+    async def go():
+        machine, _ = _mk_machine()
+        machine._history_index = None
+        real_alias_read = machine._claude_history_client_message_ids
+        alias_reads = 0
+
+        def racing_alias_read(sid, source_path):
+            nonlocal alias_reads
+            aliases = real_alias_read(sid, source_path)
+            alias_reads += 1
+            if alias_reads == 1:
+                alias_read_started.set()
+                assert release_alias_read.wait(timeout=2)
+            return aliases
+
+        monkeypatch.setattr(
+            machine,
+            "_claude_history_client_message_ids",
+            racing_alias_read,
+        )
+        build = asyncio.create_task(machine._build_history(
+            session_id, limit=4, detail="summary", allow_stale=True))
+        assert await asyncio.to_thread(alias_read_started.wait, 2)
+        try:
+            await asyncio.to_thread(
+                machine._claude_client_messages.put,
+                session_id,
+                transcript,
+                native_id,
+                client_id,
+            )
+            machine._bump_history_revision(session_id)
+        finally:
+            release_alias_read.set()
+        history = await build
+
+        assert calls == [{}, {native_id: client_id}]
+        assert history.authoritative is True
+        assert history.revision == machine._history_revision(session_id)
+        assert len(history.turns) == 1
+        assert history.turns[0].clientMsgId == client_id
+
+    asyncio.run(go())
+
+
+def test_claude_switch_history_binds_active_prompt_before_projection(
+    monkeypatch, tmp_path,
+):
+    session_id = "f6cd73f7-86d7-4115-8123-121212121212"
+    native_id = "759d1121-1009-4882-8218-343434343434"
+    client_id = "6b09ee37-f861-4422-b98a-565656565656"
+    transcript = tmp_path / f"{session_id}.jsonl"
+    transcript.write_bytes(b"")
+    message = SimpleNamespace(
+        type="user",
+        uuid=native_id,
+        session_id=session_id,
+        message={"role": "user", "content": "switch immediately"},
+        parent_tool_use_id=None,
+    )
+    monkeypatch.setattr(mm, "transcript_path", lambda _sid: str(transcript))
+    monkeypatch.setattr(
+        "cc_remote.wrapper.stream.transcript_path",
+        lambda _sid: str(transcript),
+    )
+    monkeypatch.setattr(mm, "get_session_info", lambda _sid: None)
+    monkeypatch.setattr(
+        mm, "get_session_messages", lambda *_args, **_kwargs: [message])
+    monkeypatch.setattr(mm, "transcript_timestamps", lambda _sid: {})
+    monkeypatch.setattr(mm, "transcript_internal_user_events", lambda _sid: {})
+    monkeypatch.setattr(mm, "translate_subagent_history", lambda *_args: [])
+
+    async def go():
+        machine, transport = _mk_machine()
+        machine._history_index = None
+        ctx = _mk_ctx(session_id, session_id)
+        ctx.state = "running"
+        ctx.active_msg_id = client_id
+        ctx.claude_write_active = True
+        machine.sessions[session_id] = ctx
+        machine._start_claude_client_alias_probe(ctx)
+        transcript.write_text(json.dumps({
+            "type": "user",
+            "uuid": native_id,
+            "entrypoint": "sdk-py",
+            "promptSource": "sdk",
+            "message": {"role": "user", "content": "switch immediately"},
+        }) + "\n", encoding="utf-8")
+
+        history = await machine._build_history(
+            session_id, limit=4, detail="summary")
+
+        assert history.revision == machine._history_revision(session_id)
+        assert len(history.turns) == 1
+        assert history.turns[0].id == native_id
+        assert history.turns[0].clientMsgId == client_id
+        assert [
+            (message.msg_id, message.turn_id)
+            for message in transport.sent
+            if isinstance(message, TurnBinding)
+        ] == [(client_id, native_id)]
+
+    asyncio.run(go())
+
+
+def test_active_claude_history_keeps_latest_turn_open_without_caching_it(
+    monkeypatch, tmp_path,
+):
+    """A moving transcript is not proof that the SDK turn has completed.
+
+    Claude transcripts do not persist ResultMessage, so the ordinary history
+    translator closes the final row synthetically at EOF.  While the resident
+    SDK task is still active, exposing or caching that synthetic terminal makes
+    the browser render one completed process beside the real live process.
+    """
+    session_id = "f6cd73f7-86d7-4115-8512-3cf357fbd542"
+    native_user_id = "b4d79173-1111-4111-8111-111111111111"
+    assistant_id = "c4d79173-2222-4222-8222-222222222222"
+    transcript = tmp_path / f"{session_id}.jsonl"
+    transcript.write_text("{}\n", encoding="utf-8")
+    messages = [
+        SimpleNamespace(
+            type="user",
+            uuid=native_user_id,
+            session_id=session_id,
+            message={"role": "user", "content": "inspect both projects"},
+            parent_tool_use_id=None,
+        ),
+        SimpleNamespace(
+            type="assistant",
+            uuid=assistant_id,
+            session_id=session_id,
+            message={
+                "role": "assistant",
+                "stop_reason": None,
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "I'll SSH in and take a look at both projects.",
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_01RyxActiveHistory",
+                        "name": "Bash",
+                        "input": {"command": "ssh nono pwd"},
+                    },
+                ],
+            },
+            parent_tool_use_id=None,
+        ),
+    ]
+    monkeypatch.setattr(mm, "transcript_path", lambda _sid: str(transcript))
+    monkeypatch.setattr(
+        "cc_remote.wrapper.stream.transcript_path",
+        lambda _sid: str(transcript),
+    )
+    monkeypatch.setattr(mm, "get_session_messages", lambda *_args, **_kwargs: messages)
+    monkeypatch.setattr(mm, "transcript_timestamps", lambda _sid: {})
+    monkeypatch.setattr(mm, "transcript_internal_user_events", lambda _sid: {})
+    monkeypatch.setattr(mm, "translate_subagent_history", lambda *_args: [])
+
+    async def go():
+        machine, _ = _mk_machine()
+        ctx = _mk_ctx(session_id, session_id)
+        ctx.state = "running"
+        ctx.claude_write_active = True
+        machine.sessions[session_id] = ctx
+
+        active = await machine._build_history(
+            session_id, limit=4, detail="summary")
+        assert active.in_progress is True
+        assert len(active.turns) == 1
+        assert active.turns[0].done is False
+
+        # ResultMessage is lifecycle truth even when it adds no transcript row.
+        # An active open projection must therefore not survive as an exact
+        # fingerprint cache hit after the resident task becomes idle.
+        ctx.state = "idle"
+        ctx.claude_write_active = False
+        completed = await machine._build_history(
+            session_id, limit=4, detail="summary")
+        assert completed.in_progress is False
+        assert len(completed.turns) == 1
+        assert completed.turns[0].done is True
+
+        # Conversely, a completed cache entry cannot close a later active read
+        # of the same snapshot while the live SDK stream owns the lifecycle.
+        ctx.state = "running"
+        ctx.claude_write_active = True
+        active_again = await machine._build_history(
+            session_id, limit=4, detail="summary")
+        assert active_again.turns[0].done is False
+
+    asyncio.run(go())
 
 
 def test_codex_image_view_supplement_keeps_official_detail_and_deduplicates():
@@ -485,6 +1092,7 @@ def test_codex_turn_detail_lazily_recovers_missing_official_image_view(
             for key in machine._codex_history_image_views
         )
         machine._bump_history_revision("session-image-view")
+        machine._invalidate_codex_history("session-image-view")
         assert not any(
             key[0] == "session-image-view"
             for key in machine._codex_history_image_views
@@ -3069,9 +3677,12 @@ def test_compacted_claude_history_pages_across_compact_boundary(
     async def go():
         machine, _ = _mk_machine()
         machine._history_index = HistoryIndexStore(tmp_path / "compact-state")
+        machine._claude_client_messages.put(
+            "claude-compact", transcript, "turn-after", "browser-turn-after")
         newest = await machine._build_history(
             "claude-compact", limit=1, detail="summary")
         assert [turn.prompt for turn in newest.turns] == ["after compact"]
+        assert newest.turns[0].clientMsgId == "browser-turn-after"
         assert newest.has_more is True
 
         older = await machine._build_history(

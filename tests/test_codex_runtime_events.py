@@ -463,7 +463,10 @@ def test_codex_work_list_recovers_one_unbound_exact_cwd_match(
         await machine._handle_list_sessions(ListSessions(
             engine="codex", space="work", client_id="client-1"))
 
-        assert store.get_by_session("recovered-thread") is not None
+        recovered = store.get_by_session(
+            "recovered-thread", codex_profile_id="primary")
+        assert recovered is not None
+        assert recovered.codex_profile_id == "primary"
         listing = next(message for message in transport.sent
                        if message.type == "session_list")
         assert [item.session_id for item in listing.sessions] == [

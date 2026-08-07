@@ -369,6 +369,26 @@ try {
   assert.equal(specializedQuotaOnly.limit, null,
     "a model-specific quota must not masquerade as the account quota");
   assert.equal(specializedQuotaOnly.weekly, null);
+  const freeQuotaReport = {
+    ...quotaReport,
+    account: {
+      auth_type: "chatgpt", plan_type: "free", requires_openai_auth: true,
+    },
+    rate_limits: [{
+      limit_id: "codex", limit_name: "codex", plan_type: "free",
+      primary: {
+        used_percent: 11, resets_at: 1_800_500_000,
+        window_duration_mins: 43_200,
+      },
+      secondary: null,
+    }],
+  } satisfies StatusReport;
+  const freeQuota = accountQuotaWindows(freeQuotaReport);
+  assert.equal(freeQuota.limit?.limit_id, "codex",
+    "the authoritative account bucket must survive non-Plus window shapes");
+  assert.equal(remainingPercent(freeQuota.overall), 89);
+  assert.equal(freeQuota.fiveHour, null);
+  assert.equal(freeQuota.weekly, null);
   const unknownWindows = accountQuotaWindows({
     ...quotaReport,
     rate_limits: [{
@@ -424,6 +444,50 @@ try {
   assert.match(failedUsageMarkup, /账户额度暂不可用/);
   assert.doesNotMatch(failedUsageMarkup, /剩余 60%|剩余 25%|width:60%|width:25%/,
     "a failed account-switch refresh must quarantine the previous report");
+  const authenticatedWithoutQuotaMarkup = renderToStaticMarkup(
+    createElement(UsageMeter, {
+      open: true,
+      report: {
+        ...quotaReport,
+        account: {
+          auth_type: "chatgpt",
+          plan_type: "free",
+          requires_openai_auth: true,
+        },
+        rate_limits: [],
+      },
+      error: null,
+      loading: false,
+      onToggle: () => {},
+      onRefresh: () => {},
+    }),
+  );
+  assert.match(
+    authenticatedWithoutQuotaMarkup,
+    /账户已登录；本次额度读取失败，请刷新重试。/,
+  );
+  assert.doesNotMatch(
+    authenticatedWithoutQuotaMarkup,
+    /暂未提供账户额度/,
+    "an authenticated account must not be presented as missing",
+  );
+  const freeUsageMarkup = renderToStaticMarkup(createElement(UsageMeter, {
+    open: true,
+    report: freeQuotaReport,
+    error: null,
+    loading: false,
+    onToggle: () => {},
+    onRefresh: () => {},
+    onOpenStatus: () => {},
+  }));
+  assert.match(freeUsageMarkup, /Codex 总额度/);
+  assert.match(freeUsageMarkup, /剩余 89%/);
+  assert.match(freeUsageMarkup, /43200 分钟窗口/);
+  assert.doesNotMatch(
+    freeUsageMarkup,
+    /读取失败|5 小时额度|每周额度/,
+    "a valid Free quota must not be rendered as a failed Plus-style pair",
+  );
 
   assert.equal(TRANSIENT_BANNER_TTL_MS, 6_000);
   const transientBanner = renderToStaticMarkup(createElement(ReconnectBanner, {

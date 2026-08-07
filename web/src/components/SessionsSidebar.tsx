@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type TouchEvent } from "react";
-import type { SessionInfo, Space, State } from "../protocol";
+import type { CodexProfileInfo, Engine, SessionInfo, Space, State } from "../protocol";
 import type { CompletionBadgeKind } from "../completion-badges";
 import { Icon, ClaudeMark } from "../icons";
 import {
@@ -13,10 +13,14 @@ import {
   sessionMenuCapabilities,
 } from "../session-worktree";
 import { useImeSubmit } from "../use-ime-submit";
+import { codexProfilePresentation } from "../codex-profile-presentation";
 
 interface Props {
   open: boolean;
+  engine: Engine;
   space: Space;
+  codexProfiles?: CodexProfileInfo[];
+  defaultCodexProfileId?: string | null;
   onSpaceChange: (space: Space) => void;
   sessions: SessionInfo[];
   // Live state per resident session (from the client's runtimes), overriding the
@@ -58,7 +62,8 @@ function sessionDateGroup(value?: string | null): { key: string; label: string }
   return { key: "older", label: "更早" };
 }
 
-export function SessionsSidebar({ open, space, onSpaceChange, sessions, liveStates,
+export function SessionsSidebar({ open, engine, space,
+  codexProfiles = [], defaultCodexProfileId, onSpaceChange, sessions, liveStates,
   completionBadges, activeSessionId, onSelect, onNew, onNewInDir, onClose,
   onRename, onArchive, onPin, onDelete, onForkWorktree, onMigrate }: Props) {
   const [q, setQ] = useState("");
@@ -66,19 +71,37 @@ export function SessionsSidebar({ open, space, onSpaceChange, sessions, liveStat
   const [lifting, setLifting] = useState(false);
   const [renaming, setRenaming] = useState<{ id: string; value: string } | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [codexProfileFilter, setCodexProfileFilter] = useState("all");
   // "archived" group starts collapsed; project groups start expanded.
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({ archived: true });
   const [expandedDirectories, setExpandedDirectories] = useState<Record<string, boolean>>({});
   const pressTimer = useRef<number | null>(null);
   const pressStart = useRef<{ x: number; y: number } | null>(null);
 
+  const profilePresentationFor = (session: SessionInfo) =>
+    engine === "codex" && space === "code"
+      ? codexProfilePresentation(
+        codexProfiles,
+        defaultCodexProfileId,
+        session.codex_profile_id,
+      )
+      : null;
   const filter = q.toLowerCase();
-  const matches = (s: SessionInfo) =>
-    !filter
-    || (s.summary || "").toLowerCase().includes(filter)
-    || (s.first_prompt || "").toLowerCase().includes(filter)
-    || (s.cwd || "").toLowerCase().includes(filter)
-    || s.session_id.toLowerCase().includes(filter);
+  const matches = (s: SessionInfo) => {
+    const profilePresentation = profilePresentationFor(s);
+    return (
+      (engine !== "codex" || space !== "code"
+        || codexProfileFilter === "all"
+        || s.codex_profile_id === codexProfileFilter)
+      && (!filter
+        || (s.summary || "").toLowerCase().includes(filter)
+        || (s.first_prompt || "").toLowerCase().includes(filter)
+        || (s.cwd || "").toLowerCase().includes(filter)
+        || (s.codex_profile_label || "").toLowerCase().includes(filter)
+        || (profilePresentation?.fullLabel ?? "").toLowerCase().includes(filter)
+        || (s.native_session_id || s.session_id).toLowerCase().includes(filter))
+    );
+  };
   const filtered = sessions.filter(matches);
   const archived = filtered.filter((s) => s.tag === "archived");
   const active = filtered.filter((s) => s.tag !== "archived");
@@ -124,7 +147,8 @@ export function SessionsSidebar({ open, space, onSpaceChange, sessions, liveStat
     setMenuCardId(null); setLifting(false);
   };
   const doCopyId = (s: SessionInfo) => {
-    navigator.clipboard?.writeText(s.session_id).catch(() => {});
+    navigator.clipboard?.writeText(
+      s.native_session_id ?? s.session_id).catch(() => {});
     setCopiedId(s.session_id);
     window.setTimeout(() => setCopiedId(null), 1200);
   };
@@ -136,6 +160,15 @@ export function SessionsSidebar({ open, space, onSpaceChange, sessions, liveStat
 
   // reset menu/lift state when the sidebar closes (so it doesn't linger into the next open)
   useEffect(() => { if (!open) { setMenuCardId(null); setLifting(false); } }, [open]);
+
+  useEffect(() => {
+    if (engine !== "codex" || space !== "code"
+        || (codexProfileFilter !== "all"
+          && !codexProfiles.some(
+            (profile) => profile.id === codexProfileFilter))) {
+      setCodexProfileFilter("all");
+    }
+  }, [codexProfileFilter, codexProfiles, engine, space]);
 
   // dismiss the ⋯ popover on any click outside it — covers the sidebar header, footer,
   // the side scrim, and the rest of the page (not just .s-scroll). The long-press lift
@@ -227,15 +260,24 @@ export function SessionsSidebar({ open, space, onSpaceChange, sessions, liveStat
       : completion ? "已完成" : null;
     const forkBlocked = isWorktreeForkBlockedByState(st);
     const migrationBlocked = isSessionMigrationBlockedByState(st);
+    const profilePresentation = profilePresentationFor(s);
     return (
       <div
         key={s.session_id}
-        className={"scard" + (isActive ? " active" : "") + (isArchived ? " archived" : "") + (isMenu ? " menu-open" : "") + (isMenu && lifting ? " lifting" : "")}
+        className={"scard" + (profilePresentation ? " has-profile-ribbon" : "") + (isActive ? " active" : "") + (isArchived ? " archived" : "") + (isMenu ? " menu-open" : "") + (isMenu && lifting ? " lifting" : "")}
         onTouchStart={(e) => onCardTouchStart(s, e)}
         onTouchMove={onCardTouchMove}
         onTouchEnd={onCardTouchEnd}
         onClick={onTitleClick}
       >
+        {profilePresentation && (
+          <span
+            className={`scard-profile-ribbon tone-${profilePresentation.tone}`}
+            title={`Codex 账号：${profilePresentation.fullLabel}`}
+          >
+            {profilePresentation.name}
+          </span>
+        )}
         <div className="scard-top">
           <span className="scard-title">
             {s.summary || (s.first_prompt || "").slice(0, 40) || s.session_id.slice(0, 8)}
@@ -379,6 +421,31 @@ export function SessionsSidebar({ open, space, onSpaceChange, sessions, liveStat
               <Icon name="code" size={18} />Code
             </button>
           </div>
+          {engine === "codex" && space === "code"
+              && codexProfiles.length > 1 && (
+            <div className="codex-profile-filter" role="group"
+              aria-label="筛选 Codex 账号">
+              <button className={codexProfileFilter === "all" ? "active" : ""}
+                onClick={() => setCodexProfileFilter("all")}>全部</button>
+              {codexProfiles.map((profile) => (
+                (() => {
+                  const presentation = codexProfilePresentation(
+                    codexProfiles, defaultCodexProfileId, profile.id);
+                  return (
+                    <button key={profile.id}
+                      className={codexProfileFilter === profile.id ? "active" : ""}
+                      onClick={() => setCodexProfileFilter(profile.id)}
+                      title={profile.error ?? presentation?.fullLabel ?? profile.label}>
+                      {presentation && (
+                        <i className={`profile-tone tone-${presentation.tone}`} />
+                      )}
+                      {presentation?.fullLabel ?? profile.label}
+                    </button>
+                  );
+                })()
+              ))}
+            </div>
+          )}
           <div className="search">
             <Icon name="search" size={17} />
             <input value={q} onChange={(e) => setQ(e.target.value)}

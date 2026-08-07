@@ -23,6 +23,8 @@
     <string>__HOME__/.local/bin/claude</string>
     <key>CC_REMOTE_CODEX_DAEMON</key>
     <string>auto</string>
+    <key>CC_REMOTE_CODEX_PROFILES_FILE</key>
+    <string>__HOME__/.cc-remote/codex-profiles.json</string>
     <key>PATH</key>
     <string>__HOME__/.local/bin:__HOME__/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
   </dict>

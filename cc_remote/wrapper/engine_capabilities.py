@@ -68,12 +68,25 @@ def _inside(path: Path, root: Path) -> bool:
         return False
 
 
-def _skill_roots(engine: str, cwd: str) -> dict[str, tuple[Path, ...]]:
+def _codex_config_home(
+    codex_home: str | os.PathLike[str] | None = None,
+) -> Path:
+    raw = codex_home or os.environ.get("CODEX_HOME")
+    if raw:
+        return Path(raw).expanduser().resolve(strict=False)
+    return (Path.home() / ".codex").resolve(strict=False)
+
+
+def _skill_roots(
+    engine: str,
+    cwd: str,
+    codex_home: str | os.PathLike[str] | None = None,
+) -> dict[str, tuple[Path, ...]]:
     project = Path(cwd)
     if engine == "codex":
-        home = Path.home()
+        home = _codex_config_home(codex_home)
         return {
-            "user": (home / ".codex" / "skills",),
+            "user": (home / "skills",),
             "project": (
                 project / ".codex" / "skills",
                 project / ".agents" / "skills",
@@ -85,17 +98,33 @@ def _skill_roots(engine: str, cwd: str) -> dict[str, tuple[Path, ...]]:
     }
 
 
-def _skill_containment_base(engine: str, scope: str, cwd: str) -> Path:
+def _skill_containment_base(
+    engine: str,
+    scope: str,
+    cwd: str,
+    codex_home: str | os.PathLike[str] | None = None,
+) -> Path:
     if scope == "user":
-        return claude_config_dir() if engine == "claude" else Path.home()
+        return (
+            claude_config_dir()
+            if engine == "claude"
+            else _codex_config_home(codex_home)
+        )
     return Path(cwd)
 
 
-def _skill_scope(path: Path, engine: str, cwd: str) -> str | None:
+def _skill_scope(
+    path: Path,
+    engine: str,
+    cwd: str,
+    codex_home: str | os.PathLike[str] | None = None,
+) -> str | None:
     resolved = path.resolve(strict=False)
-    for scope, roots in _skill_roots(engine, cwd).items():
+    for scope, roots in _skill_roots(
+        engine, cwd, codex_home=codex_home,
+    ).items():
         base = _skill_containment_base(
-            engine, scope, cwd
+            engine, scope, cwd, codex_home=codex_home,
         ).resolve(strict=False)
         for root in roots:
             resolved_root = root.resolve(strict=False)
@@ -113,18 +142,42 @@ def _public_url(value: Any) -> str | None:
     return value if parsed.scheme == "https" and parsed.hostname else None
 
 
-async def _codex_component(method: str, params: dict[str, Any], cwd: str):
+async def _codex_component(
+    method: str,
+    params: dict[str, Any],
+    cwd: str,
+    *,
+    codex_home: str | os.PathLike[str] | None = None,
+):
+    request = (
+        codex_rpc(method, params, cwd=cwd)
+        if codex_home is None
+        else codex_rpc(
+            method, params, cwd=cwd, codex_home=os.fspath(codex_home),
+        )
+    )
     return await asyncio.wait_for(
-        codex_rpc(method, params, cwd=cwd), timeout=_COMPONENT_TIMEOUT)
+        request, timeout=_COMPONENT_TIMEOUT)
 
 
 async def _codex_components(
     requests: list[tuple[str, dict[str, Any]]],
     cwd: str,
+    *,
+    codex_home: str | os.PathLike[str] | None = None,
 ) -> list[Any | Exception]:
     try:
-        return await codex_rpc_batch(
-            requests, cwd=cwd, timeout=_COMPONENT_TIMEOUT,
+        return await (
+            codex_rpc_batch(
+                requests, cwd=cwd, timeout=_COMPONENT_TIMEOUT,
+            )
+            if codex_home is None
+            else codex_rpc_batch(
+                requests,
+                cwd=cwd,
+                timeout=_COMPONENT_TIMEOUT,
+                codex_home=os.fspath(codex_home),
+            )
         )
     except Exception as exc:
         return [exc for _request in requests]
@@ -135,6 +188,7 @@ async def codex_capabilities(
     space: str,
     *,
     skills_only: bool = False,
+    codex_home: str | os.PathLike[str] | None = None,
 ) -> tuple[list[dict], list[str], list[str]]:
     requests = {
         "skills": ("skills/list", {"cwds": [cwd], "forceReload": False}),
@@ -145,7 +199,13 @@ async def codex_capabilities(
     }
     if skills_only:
         requests = {"skills": requests["skills"]}
-    results = await _codex_components(list(requests.values()), cwd)
+    results = await (
+        _codex_components(list(requests.values()), cwd)
+        if codex_home is None
+        else _codex_components(
+            list(requests.values()), cwd, codex_home=codex_home,
+        )
+    )
     values = dict(zip(requests, results))
     items: list[dict] = []
     errors: list[str] = []
@@ -173,7 +233,7 @@ async def codex_capabilities(
                 if space == "code":
                     actions.append("disable" if bool(skill.get("enabled")) else "enable")
                     if scope in {"user", "repo"} and _skill_scope(
-                        Path(path), "codex", cwd
+                        Path(path), "codex", cwd, codex_home=codex_home,
                     ) is not None:
                         actions.append("remove")
                 items.append({
@@ -482,8 +542,18 @@ async def _claude_plugins(binary: str) -> list[dict]:
     return items
 
 
-async def _codex_plugin_inventory(cwd: str) -> AsyncIterator[tuple[dict, dict]]:
-    raw = await _codex_component("plugin/list", {"cwds": [cwd]}, cwd)
+async def _codex_plugin_inventory(
+    cwd: str,
+    *,
+    codex_home: str | os.PathLike[str] | None = None,
+) -> AsyncIterator[tuple[dict, dict]]:
+    raw = await (
+        _codex_component("plugin/list", {"cwds": [cwd]}, cwd)
+        if codex_home is None
+        else _codex_component(
+            "plugin/list", {"cwds": [cwd]}, cwd, codex_home=codex_home,
+        )
+    )
     if not isinstance(raw, dict):
         return
     for marketplace in raw.get("marketplaces") or []:
@@ -494,15 +564,30 @@ async def _codex_plugin_inventory(cwd: str) -> AsyncIterator[tuple[dict, dict]]:
                 yield marketplace, plugin
 
 
-async def _codex_plugin_state(plugin_id: str, cwd: str):
-    async for marketplace, plugin in _codex_plugin_inventory(cwd):
+async def _codex_plugin_state(
+    plugin_id: str,
+    cwd: str,
+    *,
+    codex_home: str | os.PathLike[str] | None = None,
+):
+    async for marketplace, plugin in _codex_plugin_inventory(
+        cwd, codex_home=codex_home,
+    ):
         if _text(plugin.get("id"), 512) == plugin_id:
             return marketplace, plugin
     raise ValueError("Codex 插件不存在或当前目录不可见")
 
 
-async def _manage_codex_plugin(plugin_id: str, action: str, cwd: str) -> None:
-    marketplace, plugin = await _codex_plugin_state(plugin_id, cwd)
+async def _manage_codex_plugin(
+    plugin_id: str,
+    action: str,
+    cwd: str,
+    *,
+    codex_home: str | os.PathLike[str] | None = None,
+) -> None:
+    marketplace, plugin = await _codex_plugin_state(
+        plugin_id, cwd, codex_home=codex_home,
+    )
     installed = bool(plugin.get("installed"))
     if installed == (action == "install"):
         return
@@ -521,9 +606,16 @@ async def _manage_codex_plugin(plugin_id: str, action: str, cwd: str) -> None:
             params["remoteMarketplaceName"] = marketplace_name
         method = "plugin/install"
     try:
-        await codex_rpc(method, params, cwd=cwd)
+        if codex_home is None:
+            await codex_rpc(method, params, cwd=cwd)
+        else:
+            await codex_rpc(
+                method, params, cwd=cwd, codex_home=os.fspath(codex_home),
+            )
     except CodexRpcOutcomeUnknown:
-        _, current = await _codex_plugin_state(plugin_id, cwd)
+        _, current = await _codex_plugin_state(
+            plugin_id, cwd, codex_home=codex_home,
+        )
         if bool(current.get("installed")) != (action == "install"):
             raise
 
@@ -547,11 +639,18 @@ async def _manage_claude_plugin(
         raise ValueError(f"Claude 插件{('安装' if action == 'install' else '卸载')}失败")
 
 
-def _local_skill_path(engine: str, skill_id: str, cwd: str) -> Path:
-    for scope, roots in _skill_roots(engine, cwd).items():
+def _local_skill_path(
+    engine: str,
+    skill_id: str,
+    cwd: str,
+    codex_home: str | os.PathLike[str] | None = None,
+) -> Path:
+    for scope, roots in _skill_roots(
+        engine, cwd, codex_home=codex_home,
+    ).items():
         for root in roots:
             base = _skill_containment_base(
-                engine, scope, cwd
+                engine, scope, cwd, codex_home=codex_home,
             ).resolve(strict=False)
             if root.is_symlink() or not _inside(root.resolve(strict=False), base):
                 continue
@@ -574,9 +673,23 @@ def _local_skill_path(engine: str, skill_id: str, cwd: str) -> Path:
     raise ValueError("Skill 不存在、已变化或不可管理，请刷新后重试")
 
 
-async def _codex_skill_path(skill_id: str, cwd: str) -> tuple[Path, str, bool]:
-    raw = await _codex_component(
-        "skills/list", {"cwds": [cwd], "forceReload": True}, cwd
+async def _codex_skill_path(
+    skill_id: str,
+    cwd: str,
+    *,
+    codex_home: str | os.PathLike[str] | None = None,
+) -> tuple[Path, str, bool]:
+    raw = await (
+        _codex_component(
+            "skills/list", {"cwds": [cwd], "forceReload": True}, cwd,
+        )
+        if codex_home is None
+        else _codex_component(
+            "skills/list",
+            {"cwds": [cwd], "forceReload": True},
+            cwd,
+            codex_home=codex_home,
+        )
     )
     if not isinstance(raw, dict):
         raise ValueError("Codex Skill 目录暂不可用")
@@ -604,17 +717,18 @@ def _create_skill(
     name: str,
     description: str,
     instructions: str,
+    codex_home: str | os.PathLike[str] | None = None,
 ) -> None:
     if not _SKILL_NAME.fullmatch(name):
         raise ValueError("Skill 名称仅允许字母、数字、点、下划线和短横线")
-    roots = _skill_roots(engine, cwd)[scope]
+    roots = _skill_roots(engine, cwd, codex_home=codex_home)[scope]
     root = roots[0] if scope == "user" or engine != "codex" else roots[-1]
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     if root.is_symlink() or not root.is_dir():
         raise ValueError("Skill 根目录不安全")
     root = root.resolve(strict=True)
     base = _skill_containment_base(
-        engine, scope, cwd
+        engine, scope, cwd, codex_home=codex_home,
     ).resolve(strict=True)
     if not _inside(root, base):
         raise ValueError("Skill 根目录不能指向用户或项目目录之外")
@@ -647,13 +761,18 @@ def _create_skill(
         raise
 
 
-def _trash_skill(path: Path, engine: str, cwd: str) -> None:
+def _trash_skill(
+    path: Path,
+    engine: str,
+    cwd: str,
+    codex_home: str | os.PathLike[str] | None = None,
+) -> None:
     if path.is_symlink() or not path.is_dir():
         raise ValueError("Skill 目录不安全")
-    scope = _skill_scope(path, engine, cwd)
+    scope = _skill_scope(path, engine, cwd, codex_home=codex_home)
     if scope is None:
         raise ValueError("系统或管理员 Skill 不能删除")
-    roots = _skill_roots(engine, cwd)[scope]
+    roots = _skill_roots(engine, cwd, codex_home=codex_home)[scope]
     root = next((root.resolve(strict=False) for root in roots
                  if path.resolve(strict=True).parent == root.resolve(strict=False)), None)
     if root is None:
@@ -675,6 +794,7 @@ async def manage_engine_skill(
     description: str = "",
     instructions: str = "",
     scope: str = "user",
+    codex_home: str | os.PathLike[str] | None = None,
 ) -> None:
     if space == "work":
         raise ValueError("Work 不允许修改 Code 扩展")
@@ -686,7 +806,7 @@ async def manage_engine_skill(
             raise ValueError("创建 Skill 需要名称和说明")
         await asyncio.to_thread(
             _create_skill, engine, target, scope, name,
-            description, instructions,
+            description, instructions, codex_home,
         )
         return
     if not skill_id:
@@ -694,23 +814,37 @@ async def manage_engine_skill(
     if action in {"enable", "disable"}:
         if engine != "codex":
             raise ValueError("Claude CLI 没有独立的 Skill 启停接口")
-        path, _scope, enabled = await _codex_skill_path(skill_id, target)
+        path, _scope, enabled = await _codex_skill_path(
+            skill_id, target, codex_home=codex_home,
+        )
         desired = action == "enable"
         if enabled != desired:
-            await codex_rpc(
-                "skills/config/write", {"path": str(path), "enabled": desired},
-                cwd=target,
-            )
+            params = {"path": str(path), "enabled": desired}
+            if codex_home is None:
+                await codex_rpc("skills/config/write", params, cwd=target)
+            else:
+                await codex_rpc(
+                    "skills/config/write",
+                    params,
+                    cwd=target,
+                    codex_home=os.fspath(codex_home),
+                )
         return
     if action != "remove":
         raise ValueError("不支持的 Skill 操作")
     if engine == "codex":
-        path, native_scope, _enabled = await _codex_skill_path(skill_id, target)
+        path, native_scope, _enabled = await _codex_skill_path(
+            skill_id, target, codex_home=codex_home,
+        )
         if native_scope not in {"user", "repo"}:
             raise ValueError("系统或管理员 Skill 不能删除")
     else:
-        path = await asyncio.to_thread(_local_skill_path, engine, skill_id, target)
-    await asyncio.to_thread(_trash_skill, path.resolve(strict=True), engine, target)
+        path = await asyncio.to_thread(
+            _local_skill_path, engine, skill_id, target, codex_home,
+        )
+    await asyncio.to_thread(
+        _trash_skill, path.resolve(strict=True), engine, target, codex_home,
+    )
 
 
 def _atomic_update_json(path: Path, mutate) -> None:
@@ -880,6 +1014,7 @@ async def manage_engine_plugin(
     *,
     space: str = "code",
     claude_bin: str = "",
+    codex_home: str | os.PathLike[str] | None = None,
 ) -> None:
     if space == "work":
         raise ValueError("Work 不允许修改引擎插件")
@@ -887,7 +1022,9 @@ async def manage_engine_plugin(
     if not os.path.isdir(target):
         raise ValueError("插件目录不存在")
     if engine == "codex":
-        await _manage_codex_plugin(plugin_id, action, target)
+        await _manage_codex_plugin(
+            plugin_id, action, target, codex_home=codex_home,
+        )
     else:
         binary, _ = resolve_claude_cli(claude_bin)
         await _manage_claude_plugin(plugin_id, action, binary)
@@ -924,13 +1061,14 @@ async def engine_capabilities(
     claude_bin: str = "",
     *,
     skills_only: bool = False,
+    codex_home: str | os.PathLike[str] | None = None,
 ):
     target = os.path.realpath(os.path.expanduser(cwd))
     if not os.path.isdir(target):
         raise ValueError("capability cwd does not exist")
     if engine == "codex":
         return await codex_capabilities(
-            target, space, skills_only=skills_only,
+            target, space, skills_only=skills_only, codex_home=codex_home,
         )
     return await claude_capabilities(
         target, space, claude_bin, skills_only=skills_only,

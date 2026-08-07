@@ -237,6 +237,11 @@ export interface WrapperDisconnected extends Base { type: "wrapper_disconnected"
 export interface WrapperReconnected extends Base { type: "wrapper_reconnected"; cc_session_id?: string | null; state: State; generation?: string | null }
 
 // sessions
+export interface CodexProfileInfo {
+  id: string;
+  label: string;
+  error?: string | null;
+}
 export interface SessionInfo {
   session_id: string;
   summary?: string | null;
@@ -252,6 +257,9 @@ export interface SessionInfo {
   codex_status?: CodexThreadStatus | null;
   space?: Space | null;
   work_id?: string | null;
+  native_session_id?: string | null;
+  codex_profile_id?: string | null;
+  codex_profile_label?: string | null;
 }
 export interface ListSessions extends Base { type: "list_sessions"; engine?: Engine; space?: Space }
 export interface SwitchSession extends Base { type: "switch_session"; session_id: string; engine?: Engine; space?: Space }
@@ -260,6 +268,7 @@ export interface NewSession extends Base {
   request_id?: string | null;
   cwd?: string | null;
   engine?: "claude" | "codex";
+  codex_profile_id?: string | null;
   space?: Space;
   project_id?: string | null;
   model?: string | null;
@@ -274,7 +283,7 @@ export interface NewSession extends Base {
   images?: QueryImg[] | null;
   files?: QueryFile[] | null;
 }
-export interface SessionList extends Base { type: "session_list"; engine: Engine; space?: Space; request_id?: string | null; sessions: SessionInfo[] }
+export interface SessionList extends Base { type: "session_list"; engine: Engine; space?: Space; request_id?: string | null; sessions: SessionInfo[]; codex_profiles?: CodexProfileInfo[]; default_codex_profile_id?: string | null }
 export interface SessionListInvalidated extends Base { type: "session_list_invalidated"; engine: Engine; space?: Space }
 export interface SessionActivity extends Base { type: "session_activity"; engine: Engine; session_id: string; state: State }
 export interface SessionFocus extends Base { type: "session_focus"; session_id: string; cwd?: string | null; request_id?: string | null }
@@ -341,12 +350,14 @@ export interface GetPermissionProfiles extends Base {
   type: "get_permission_profiles";
   client_id?: string | null;
   cwd?: string | null;
+  codex_profile_id?: string | null;
 }
 export interface PermissionProfiles extends Base {
   type: "permission_profiles";
   profiles: PermissionProfileInfo[];
   request_id?: string | null;
   cwd?: string | null;
+  codex_profile_id?: string | null;
 }
 export interface SetPermissionProfile extends Base {
   type: "set_permission_profile";
@@ -401,7 +412,7 @@ export interface ArtifactInvalidated extends Base { type: "artifact_invalidated"
 // which reasoning levels it accepts — and `turn/start` does NOT validate the level
 // (it accepts `bogus-zzz`), so one we invent client-side only fails later inside the
 // model API. The server is authoritative; data.ts's table is a fallback.
-export interface GetModels extends Base { type: "get_models"; engine?: string | null; client_id?: string | null; cwd?: string | null }
+export interface GetModels extends Base { type: "get_models"; engine?: string | null; client_id?: string | null; cwd?: string | null; codex_profile_id?: string | null }
 export interface CatalogModel {
   id: string;
   display_name: string;
@@ -412,15 +423,15 @@ export interface CatalogModel {
 }
 // Effective controls for a NEW no-override session. These are display metadata,
 // not the focused session's controls and not implicit overrides on NewSession.
-export interface Models extends Base { type: "models"; engine: string; models: CatalogModel[]; default_model?: string | null; default_effort?: string | null; cwd?: string | null }
-export interface GetEngineCapabilities extends Base { type: "get_engine_capabilities"; engine: Engine; space?: Space; client_id?: string | null; cwd?: string | null; skills_only?: boolean }
-export interface ManageEnginePlugin extends Base { type: "manage_engine_plugin"; engine: Engine; action: "install" | "uninstall"; plugin_id: string; space?: Space; client_id?: string | null; cwd?: string | null }
-export interface ManageEngineSkill extends Base { type: "manage_engine_skill"; engine: Engine; action: "create" | "remove" | "enable" | "disable"; skill_id?: string | null; name?: string | null; description?: string | null; instructions?: string | null; scope?: "user" | "project"; space?: Space; client_id?: string | null; cwd?: string | null }
-export interface ManageEngineHook extends Base { type: "manage_engine_hook"; engine: Engine; action: "create" | "remove"; hook_id?: string | null; event?: string | null; matcher?: string | null; command?: string | null; timeout?: number | null; scope?: "user" | "project"; space?: Space; client_id?: string | null; cwd?: string | null }
+export interface Models extends Base { type: "models"; engine: string; models: CatalogModel[]; default_model?: string | null; default_effort?: string | null; cwd?: string | null; codex_profile_id?: string | null }
+export interface GetEngineCapabilities extends Base { type: "get_engine_capabilities"; engine: Engine; space?: Space; client_id?: string | null; cwd?: string | null; skills_only?: boolean; codex_profile_id?: string | null }
+export interface ManageEnginePlugin extends Base { type: "manage_engine_plugin"; engine: Engine; action: "install" | "uninstall"; plugin_id: string; space?: Space; client_id?: string | null; cwd?: string | null; codex_profile_id?: string | null }
+export interface ManageEngineSkill extends Base { type: "manage_engine_skill"; engine: Engine; action: "create" | "remove" | "enable" | "disable"; skill_id?: string | null; name?: string | null; description?: string | null; instructions?: string | null; scope?: "user" | "project"; space?: Space; client_id?: string | null; cwd?: string | null; codex_profile_id?: string | null }
+export interface ManageEngineHook extends Base { type: "manage_engine_hook"; engine: Engine; action: "create" | "remove"; hook_id?: string | null; event?: string | null; matcher?: string | null; command?: string | null; timeout?: number | null; scope?: "user" | "project"; space?: Space; client_id?: string | null; cwd?: string | null; codex_profile_id?: string | null }
 export type EngineCapabilityKind = "skill" | "plugin" | "app" | "mcp" | "hook";
 export type EngineCapabilityAction = "install" | "uninstall" | "enable" | "disable" | "remove";
 export interface EngineCapabilityItem { kind: EngineCapabilityKind; id: string; name: string; description?: string | null; enabled?: boolean | null; installed?: boolean | null; status?: string | null; scope?: string | null; source?: string | null; tool_count?: number | null; resource_count?: number | null; install_url?: string | null; actions?: EngineCapabilityAction[]; event?: string | null; matcher?: string | null; handler_type?: string | null; detail?: string | null }
-export interface EngineCapabilities extends Base { type: "engine_capabilities"; engine: Engine; space: Space; request_id?: string | null; cwd: string; items: EngineCapabilityItem[]; errors?: string[]; notes?: string[]; skills_only: boolean }
+export interface EngineCapabilities extends Base { type: "engine_capabilities"; engine: Engine; space: Space; request_id?: string | null; cwd: string; items: EngineCapabilityItem[]; errors?: string[]; notes?: string[]; skills_only: boolean; codex_profile_id?: string | null }
 export interface AskOption { label: string; ds?: string }
 export interface AskUser extends Base { type: "ask_user"; ask_id: string; header?: string | null; question: string; options: AskOption[]; allow_text?: boolean; secret?: boolean; multi_select?: boolean }
 export interface AskUserClosed extends Base { type: "ask_user_closed"; ask_id: string; reason: "answered" | "cancelled" | "timeout" | "superseded" }
@@ -547,7 +558,7 @@ export type ServerEvent =
   | ProcessEvent | TurnPlan | TurnDiff | TurnBinding
   | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
 
-export const PROTOCOL_VERSION = 31;
+export const PROTOCOL_VERSION = 32;
 
 const CONTROL_MODES = new Set<ControlMode>([
   "remote", "codex_shared", "claude_broker", "external_cli", "agent_view", "desktop",

@@ -60,11 +60,11 @@ machine). The **full step-by-step guide is in the main [README](../README.md#生
   template. The runtime reads the current user's mode-0600 device JSON instead
   of embedding control credentials in the plist.
 
-Protocol v31 is a coordinated upgrade: publish freshly built Relay/Web and
+Protocol v32 is a coordinated upgrade: publish freshly built Relay/Web and
 Wrapper artifacts from the same tagged commit. The strict protocol gate is
 intentional and mixed protocol versions will not communicate. `setup-vps.sh`
 rejects a missing or mismatched web build manifest. Stop the wrapper first;
-activate the v31 relay/web release; then start the v31 wrapper.
+activate the v32 relay/web release; then start the v32 wrapper.
 
 ## Native terminal coordination
 
@@ -75,6 +75,14 @@ activate the v31 relay/web release; then start the v31 wrapper.
   shell, escalates to SIGKILL, or silently adopts a process.
 - **Codex Code:** `CC_REMOTE_CODEX_DAEMON=auto` prefers Codex's official shared
   app-server daemon. Set it to `off` only to force the legacy private stdio path.
+  Optional multi-account installs provide either inline
+  `CC_REMOTE_CODEX_PROFILES_JSON` or a private
+  `CC_REMOTE_CODEX_PROFILES_FILE`; the macOS LaunchAgent defaults the latter to
+  `~/.cc-remote/codex-profiles.json`. Each unique `CODEX_HOME` owns a daemon.
+  When a sibling home has no duplicate standalone payload, first bootstrap
+  safely reuses the verified primary managed CLI through a profile-local
+  `current` link; account data and daemon sockets remain isolated.
+  Leaving both empty preserves the exact single-account path and UI.
 - **Work:** both engines stay on private per-process control planes regardless
   of the Code settings.
 

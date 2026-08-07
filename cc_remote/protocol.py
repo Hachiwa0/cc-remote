@@ -28,7 +28,7 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 31
+PROTOCOL_VERSION = 32
 
 # Codex Desktop renders a 53-week daily token-activity calendar. Keep the wire
 # payload to that same bounded window so an account response can never turn a
@@ -871,6 +871,14 @@ class WrapperReconnected(_Base):
 
 # ---- sessions (list / switch / new) ----
 
+class CodexProfileInfo(BaseModel):
+    """Public account metadata. CODEX_HOME paths never cross the wire."""
+    model_config = ConfigDict(extra="forbid")
+    id: WireId
+    label: str = Field(min_length=1, max_length=48)
+    error: Optional[str] = Field(default=None, min_length=1, max_length=384)
+
+
 class SessionInfo(BaseModel):
     """A row in the sessions sidebar (subset of SDK SDKSessionInfo)."""
     model_config = ConfigDict(extra="forbid")
@@ -888,6 +896,12 @@ class SessionInfo(BaseModel):
     codex_status: Optional[CodexThreadStatus] = None  # authoritative app-server status
     space: Space = "code"
     work_id: Optional[WireId] = None
+    # ``session_id`` is the routing id. When multiple Codex profiles are
+    # configured, every profile is namespaced; copy/resume surfaces should use
+    # the native id below.
+    native_session_id: Optional[WireId] = None
+    codex_profile_id: Optional[WireId] = None
+    codex_profile_label: Optional[str] = Field(default=None, max_length=48)
 
 
 class ListSessions(_Command):
@@ -908,6 +922,8 @@ class SessionList(_Base):
     # then a refreshed list, so both responses intentionally carry the same id.
     request_id: Optional[WireId] = None
     sessions: list[SessionInfo]
+    codex_profiles: list[CodexProfileInfo] = Field(default_factory=list, max_length=32)
+    default_codex_profile_id: Optional[WireId] = None
 
 
 class SessionListInvalidated(_Base):
@@ -961,6 +977,7 @@ class NewSession(_Command):
     request_id: Optional[WireId] = None
     cwd: Optional[str] = Field(default=None, max_length=4096)
     engine: Engine = "claude"
+    codex_profile_id: Optional[WireId] = None
     space: Space = "code"
     project_id: Optional[WireId] = None
     model: Optional[ModelName] = None    # None -> engine default (settings.json / codex config)
@@ -985,6 +1002,7 @@ class NewSession(_Command):
         if (self.prompt is not None or self.images or self.files) and not self.msg_id:
             raise ValueError("msg_id is required when new_session carries a query")
         codex_only = {
+            "codex_profile_id": self.codex_profile_id,
             "collaboration_mode": self.collaboration_mode,
             "permission_mode": self.permission_mode,
             "permission_profile": self.permission_profile,
@@ -1000,6 +1018,8 @@ class NewSession(_Command):
             raise ValueError("Work session cwd is assigned by the wrapper")
         if self.space == "work" and self.web_search is not None:
             raise ValueError("Work web_search is fixed by the wrapper")
+        if self.space == "work" and self.codex_profile_id is not None:
+            raise ValueError("Codex Work uses the default profile")
         if self.space == "code" and self.project_id is not None:
             raise ValueError("project_id is only supported for Work sessions")
         return self
@@ -1399,6 +1419,7 @@ class GetModels(_Command):
     # Claude defaults can depend on project/local settings, so resolve them in
     # the same directory the prospective new session will use.
     cwd: Optional[str] = Field(default=None, max_length=4096)
+    codex_profile_id: Optional[WireId] = None
 
 
 class Models(_Base):
@@ -1419,6 +1440,7 @@ class Models(_Base):
     # Echoes GetModels.cwd for cwd-sensitive Claude defaults so a late response
     # can never be rendered against a different directory in the new-chat form.
     cwd: Optional[str] = Field(default=None, max_length=4096)
+    codex_profile_id: Optional[WireId] = None
 
 
 class GetEngineCapabilities(_Command):
@@ -1429,6 +1451,7 @@ class GetEngineCapabilities(_Command):
     client_id: Optional[WireId] = None
     cwd: Optional[str] = Field(default=None, max_length=4096)
     skills_only: bool = False
+    codex_profile_id: Optional[WireId] = None
 
 
 class ManageEnginePlugin(_Command):
@@ -1440,6 +1463,7 @@ class ManageEnginePlugin(_Command):
     space: Space = "code"
     client_id: Optional[WireId] = None
     cwd: Optional[str] = Field(default=None, max_length=4096)
+    codex_profile_id: Optional[WireId] = None
 
 
 class ManageEngineSkill(_Command):
@@ -1455,6 +1479,7 @@ class ManageEngineSkill(_Command):
     space: Space = "code"
     client_id: Optional[WireId] = None
     cwd: Optional[str] = Field(default=None, max_length=4096)
+    codex_profile_id: Optional[WireId] = None
 
 
 class ManageEngineHook(_Command):
@@ -1471,6 +1496,7 @@ class ManageEngineHook(_Command):
     space: Space = "code"
     client_id: Optional[WireId] = None
     cwd: Optional[str] = Field(default=None, max_length=4096)
+    codex_profile_id: Optional[WireId] = None
 
 
 class EngineCapabilityItem(BaseModel):
@@ -1505,6 +1531,7 @@ class EngineCapabilities(_Base):
     errors: list[str] = Field(default_factory=list, max_length=32)
     notes: list[str] = Field(default_factory=list, max_length=32)
     skills_only: bool = False
+    codex_profile_id: Optional[WireId] = None
 
 
 class SetPerm(_Command):
@@ -1534,6 +1561,7 @@ class GetPermissionProfiles(_Command):
     type: Literal["get_permission_profiles"] = "get_permission_profiles"
     client_id: Optional[WireId] = None
     cwd: Optional[str] = Field(default=None, max_length=4096)
+    codex_profile_id: Optional[WireId] = None
 
 
 class PermissionProfiles(_Base):
@@ -1542,6 +1570,7 @@ class PermissionProfiles(_Base):
     profiles: list[PermissionProfileInfo] = Field(max_length=128)
     request_id: Optional[WireId] = None
     cwd: Optional[str] = Field(default=None, max_length=4096)
+    codex_profile_id: Optional[WireId] = None
 
 
 class SetPermissionProfile(_Command):

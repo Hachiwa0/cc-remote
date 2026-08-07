@@ -32,7 +32,6 @@ log = logger("cc_remote.wrapper.codex_sessions")
 
 _CONFIG = os.path.expanduser("~/.codex/config.toml")
 _CONFIG_MAX_BYTES = 4 * 1024 * 1024
-
 _ROOT = os.path.expanduser("~/.codex/sessions")
 _ARCHIVE_ROOT = os.path.expanduser("~/.codex/archived_sessions")
 _SAFE_SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
@@ -44,7 +43,31 @@ _LIST_MAX_PAGES = 20
 _THREAD_STATUSES = frozenset({"notLoaded", "idle", "systemError", "active"})
 
 
-async def list_codex_sessions(limit: int = 60) -> list[dict[str, Any]]:
+def _codex_home(codex_home: str | os.PathLike[str] | None = None) -> str:
+    raw = codex_home or os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+    return os.path.realpath(os.path.expanduser(os.fspath(raw)))
+
+
+def _config_path(codex_home: str | os.PathLike[str] | None = None) -> str:
+    if codex_home is None:
+        return _CONFIG
+    return os.path.join(_codex_home(codex_home), "config.toml")
+
+
+def _session_roots(
+    codex_home: str | os.PathLike[str] | None = None,
+) -> tuple[str, str]:
+    if codex_home is None:
+        return _ROOT, _ARCHIVE_ROOT
+    home = _codex_home(codex_home)
+    return os.path.join(home, "sessions"), os.path.join(home, "archived_sessions")
+
+
+async def list_codex_sessions(
+    limit: int = 60,
+    *,
+    codex_home: str | os.PathLike[str] | None = None,
+) -> list[dict[str, Any]]:
     """List active and archived app-server threads, newest first.
 
     ``limit`` is applied independently to active and archived threads so a busy
@@ -52,7 +75,11 @@ async def list_codex_sessions(limit: int = 60) -> list[dict[str, Any]]:
     bounded and paginated with opaque app-server cursors.
     """
     per_state_limit = max(1, min(limit, _LIST_MAX_PER_ARCHIVE_STATE))
-    provider = codex_current_provider().strip()
+    provider = (
+        codex_current_provider()
+        if codex_home is None
+        else codex_current_provider(codex_home=codex_home)
+    ).strip()
     by_id: dict[str, dict[str, Any]] = {}
 
     for archived in (False, True):
@@ -74,7 +101,14 @@ async def list_codex_sessions(limit: int = 60) -> list[dict[str, Any]]:
             if provider:
                 params["modelProviders"] = [provider]
 
-            response = await codex_rpc("thread/list", params)
+            response = (
+                await codex_rpc("thread/list", params)
+                if codex_home is None
+                else await codex_rpc(
+                    "thread/list", params,
+                    codex_home=os.fspath(codex_home),
+                )
+            )
             if not isinstance(response, dict) or not isinstance(response.get("data"), list):
                 raise RuntimeError("codex thread/list returned an invalid response")
             page = response["data"][:remaining]
@@ -149,71 +183,119 @@ def _updated_sort_key(value: Any) -> float:
     return parsed if math.isfinite(parsed) else -1.0
 
 
-def codex_session_cwd(session_id: str) -> Optional[str]:
+def codex_session_cwd(
+    session_id: str,
+    *,
+    codex_home: str | os.PathLike[str] | None = None,
+) -> Optional[str]:
     """The cwd a Codex thread was started in (for resume). None if not found."""
-    path = _rollout_path(session_id)
+    path = (
+        _rollout_path(session_id)
+        if codex_home is None
+        else _rollout_path(session_id, codex_home=codex_home)
+    )
     if not path:
         return None
     meta = _read_meta(path)
     return meta.get("cwd") if meta else None
 
 
-def codex_rollout_path(session_id: str) -> Optional[str]:
+def codex_rollout_path(
+    session_id: str,
+    *,
+    codex_home: str | os.PathLike[str] | None = None,
+) -> Optional[str]:
     """Public: the rollout .jsonl for a Codex thread (for history replay)."""
-    return _rollout_path(session_id)
+    return (
+        _rollout_path(session_id)
+        if codex_home is None
+        else _rollout_path(session_id, codex_home=codex_home)
+    )
 
 
-def codex_model(default: str = "gpt-5-codex") -> str:
+def codex_model(
+    default: str = "gpt-5-codex",
+    *,
+    codex_home: str | os.PathLike[str] | None = None,
+) -> str:
     """The model Codex is configured to use (from ~/.codex/config.toml). Used to
     show the right model readout for live Codex sessions (not a Claude model)."""
-    return _config_value("model", default)[:256]
+    return _config_value("model", default, codex_home=codex_home)[:256]
 
 
-def codex_effort(default: str = "high") -> str:
+def codex_effort(
+    default: str = "high",
+    *,
+    codex_home: str | os.PathLike[str] | None = None,
+) -> str:
     """The default reasoning effort from ~/.codex/config.toml (model_reasoning_effort)."""
-    return _config_value("model_reasoning_effort", default)[:64]
+    return _config_value(
+        "model_reasoning_effort", default, codex_home=codex_home)[:64]
 
 
-def codex_current_provider() -> str:
+def codex_current_provider(
+    *,
+    codex_home: str | os.PathLike[str] | None = None,
+) -> str:
     """The provider Codex is configured for right now (config.toml model_provider).
     A codex rollout carries provider-encrypted reasoning, so a session from a
     DIFFERENT provider can't be resumed here — the list is filtered to this one."""
-    return _config_value("model_provider", "")[:256]
+    return _config_value("model_provider", "", codex_home=codex_home)[:256]
 
 
-def codex_context_window(default: int = 256000) -> int:
+def codex_context_window(
+    default: int = 256000,
+    *,
+    codex_home: str | os.PathLike[str] | None = None,
+) -> int:
     """Fallback context window (tokens) for a fresh session before any turn has
     reported one. The AUTHORITATIVE value comes from the live server's
     thread/tokenUsage/updated (tokenUsage.modelContextWindow) and overrides this;
     ~/.codex/config.toml's model_context_window is only a user-declared estimate
     (it can disagree with the server, e.g. 400000 in config vs 258400 live)."""
     try:
-        return int(_config_value("model_context_window", str(default)))
+        return int(_config_value(
+            "model_context_window", str(default), codex_home=codex_home))
     except (ValueError, TypeError):
         return default
 
 
-def codex_fast_enabled() -> bool:
+def codex_fast_enabled(
+    *,
+    codex_home: str | os.PathLike[str] | None = None,
+) -> bool:
     """True for either accepted/reported top-level Codex Fast tier name."""
-    return (_config_value("service_tier", "") or "").lower() in {
+    return (_config_value(
+        "service_tier", "", codex_home=codex_home) or "").lower() in {
         "fast", "priority",
     }
 
 
-def codex_approval(default: str = "never") -> str:
+def codex_approval(
+    default: str = "never",
+    *,
+    codex_home: str | os.PathLike[str] | None = None,
+) -> str:
     """The top-level Codex approval policy used for a new thread."""
-    value = _config_value("approval_policy", default)
+    value = _config_value(
+        "approval_policy", default, codex_home=codex_home)
     return value if value in {"untrusted", "on-request", "never"} else default
 
 
-def codex_web_search(default: str = "cached") -> str:
+def codex_web_search(
+    default: str = "cached",
+    *,
+    codex_home: str | os.PathLike[str] | None = None,
+) -> str:
     """The top-level search mode inherited by a new no-override thread."""
-    value = _config_value("web_search", default)
+    value = _config_value("web_search", default, codex_home=codex_home)
     return value if value in {"cached", "live"} else default
 
 
 def codex_session_settings(
     session_id: str, max_bytes: int = 64 * 1024 * 1024,
+    *,
+    codex_home: str | os.PathLike[str] | None = None,
 ) -> dict:
     """The per-thread settings carried by the latest bounded rollout tail.
 
@@ -231,7 +313,11 @@ def codex_session_settings(
     Returns {} when the rollout is missing/unreadable; the caller falls back to the
     config defaults (correct for a brand-new session).
     """
-    path = _rollout_path(session_id)
+    path = (
+        _rollout_path(session_id)
+        if codex_home is None
+        else _rollout_path(session_id, codex_home=codex_home)
+    )
     if not path:
         return {}
     try:
@@ -340,9 +426,14 @@ def codex_session_settings(
     return out
 
 
-def _config_value(key: str, default: str) -> str:
+def _config_value(
+    key: str,
+    default: str,
+    *,
+    codex_home: str | os.PathLike[str] | None = None,
+) -> str:
     try:
-        target = os.path.realpath(_CONFIG)
+        target = os.path.realpath(_config_path(codex_home))
         if os.path.getsize(target) > _CONFIG_MAX_BYTES:
             return default
         with open(target, "rb") as f:
@@ -361,7 +452,11 @@ def _config_value(key: str, default: str) -> str:
 
 
 # ---- internals ----
-def _rollout_path(session_id: str) -> Optional[str]:
+def _rollout_path(
+    session_id: str,
+    *,
+    codex_home: str | os.PathLike[str] | None = None,
+) -> Optional[str]:
     try:
         if not _SAFE_SESSION_ID.fullmatch(session_id):
             return None
@@ -370,7 +465,7 @@ def _rollout_path(session_id: str) -> Optional[str]:
         # thread/archive moves the rollout out of ``sessions``. Archived rows
         # still need history, cwd lookup, and engine detection so unarchive never
         # falls through to the Claude SDK.
-        for source_root in (_ROOT, _ARCHIVE_ROOT):
+        for source_root in _session_roots(codex_home):
             matches = glob.iglob(
                 os.path.join(source_root, "**", f"*{safe_id}*.jsonl"),
                 recursive=True,

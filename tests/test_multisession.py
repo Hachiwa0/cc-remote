@@ -42,6 +42,8 @@ def _mk_machine():
     cfg = WrapperConfig()
     state_tmp = tempfile.TemporaryDirectory(prefix="cc-remote-test-")
     cfg.state_dir = Path(state_tmp.name)  # don't touch real state
+    cfg.claude_work_root = cfg.state_dir / "work" / "claude"
+    cfg.codex_work_root = cfg.state_dir / "work" / "codex"
     tr = _StubTransport()
     machine = WrapperMachine(cfg, tr)
     # Keep the auto-cleanup owner alive exactly as long as the test machine.
@@ -156,17 +158,19 @@ def test_current_turn_replay_never_reuses_previous_turn_during_preflight():
         generation="g", message_id="new-not-emitted") == []
 
 
-# ---- emit routing (sid = ctx.session_id or ctx.key) ----
+# ---- emit routing (sid = the context's browser routing key) ----
 
 def test_emit_routes_by_temp_key_before_capture_then_real_sid():
     async def run():
         m, tr = _mk_machine()
         ctx = _mk_ctx(key="tmp-xyz", session_id=None)
+        m.sessions[ctx.key] = ctx
         await m._emit_locked(ctx, UserMsg(msg_id="m1", prompt="hi"))
         assert tr.sent[-1].sid == "tmp-xyz"     # routed by temp key, NOT None
-        ctx.session_id = "real-1"
+        await m._capture_session_id(ctx, "real-1")
         await m._emit_locked(ctx, UserMsg(msg_id="m2", prompt="hi"))
-        assert tr.sent[-1].sid == "real-1"      # routed by real sid once known
+        assert ctx.key == "real-1"
+        assert tr.sent[-1].sid == "real-1"      # routing key re-keyed atomically
     asyncio.run(run())
 
 

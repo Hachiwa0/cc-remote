@@ -276,7 +276,7 @@ def test_legacy_migration_rebuilds_all_derived_history_rows(
 
     migrated = HistoryIndexStore(state_dir)
     with sqlite3.connect(migrated.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
         for table in (
             "history_pages",
             "history_turn_details",
@@ -323,7 +323,7 @@ def test_v10_migration_invalidates_only_claude_translation_rows(tmp_path):
 
     migrated = HistoryIndexStore(state_dir)
     with sqlite3.connect(migrated.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
         for table in (
             "history_pages", "history_turn_details", "history_image_assets",
         ):
@@ -342,7 +342,9 @@ def test_v10_migration_invalidates_only_claude_translation_rows(tmp_path):
     ) == _page("codex-session")
 
 
-def test_v11_migration_preserves_pages_and_adds_compact_index(tmp_path):
+def test_v11_migration_invalidates_claude_pages_and_adds_compact_index(
+    tmp_path,
+):
     source_path = tmp_path / "transcript.jsonl"
     source_path.write_text("{}\n")
     source = HistorySourceFingerprint.capture(source_path)
@@ -365,9 +367,9 @@ def test_v11_migration_preserves_pages_and_adds_compact_index(tmp_path):
     migrated = HistoryIndexStore(state_dir)
     assert migrated.get_page(
         "claude-session", "claude", source, before=None, limit=4,
-    ) == _page("claude-session")
+    ) is None
     with sqlite3.connect(migrated.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
         tables = {
             row[0] for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'"
@@ -378,6 +380,54 @@ def test_v11_migration_preserves_pages_and_adds_compact_index(tmp_path):
         "claude_compact_records",
         "claude_compact_queue",
     } <= tables
+
+
+@pytest.mark.parametrize("old_version", [12, 13, 14])
+def test_recent_migration_invalidates_only_claude_projection_rows(
+    tmp_path, old_version,
+):
+    source_path = tmp_path / "transcript.jsonl"
+    source_path.write_text("{}\n")
+    source = HistorySourceFingerprint.capture(source_path)
+    state_dir = tmp_path / "state"
+    store = HistoryIndexStore(state_dir)
+
+    for engine in ("claude", "codex"):
+        session_id = f"{engine}-session"
+        assert store.put_page(
+            session_id, engine, source, before=None, limit=4,
+            page=_page(session_id),
+        )
+        store.put_image_asset(
+            session_id, engine, source, session_id, f"{engine}-image",
+            "thumbnail", "image/png", 1, 1, engine.encode(),
+        )
+
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            "INSERT INTO claude_compact_sources ("
+            "source_path, source_device, source_inode, indexed_size, "
+            "source_head_sha256, source_tail_sha256, record_count, updated_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (str(source_path), 1, 2, 3, "head", "tail", 1, 1.0),
+        )
+        connection.execute(f"PRAGMA user_version={old_version}")
+
+    migrated = HistoryIndexStore(state_dir)
+    with sqlite3.connect(migrated.path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
+        for table in (
+            "history_pages", "history_turn_details", "history_image_assets",
+        ):
+            assert connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE engine='claude'"
+            ).fetchone()[0] == 0
+            assert connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE engine='codex'"
+            ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM claude_compact_sources"
+        ).fetchone()[0] == 1
 
 
 def test_history_index_rejects_one_page_larger_than_total_budget(tmp_path):

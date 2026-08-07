@@ -9,14 +9,17 @@ import time
 from types import SimpleNamespace
 
 import pytest
+from claude_agent_sdk.types import ResultMessage, ToolResultBlock, UserMessage
 
 from cc_remote.protocol import (
     AssistantMsgStart, ERR_DRAIN_TIMEOUT, Error, Interrupt, StateEvent,
-    TurnEnd, UserMsg,
+    TurnBinding, TurnEnd, UserMsg,
 )
+from cc_remote.config import WrapperConfig
 from cc_remote.wrapper import codex_sessions as codex_sessions_module
 from cc_remote.wrapper import codex_stream as codex_stream_module
 from cc_remote.wrapper import machine as machine_module
+from cc_remote.wrapper.machine import WrapperMachine
 from cc_remote.wrapper.codex_sessions import codex_session_settings
 from cc_remote.wrapper.codex_stream import (
     codex_native_rollback_turns,
@@ -24,7 +27,8 @@ from cc_remote.wrapper.codex_stream import (
 )
 from cc_remote.wrapper.sanitize import bounded_text, bounded_tool_input
 from cc_remote.wrapper.session import _session_file, load_session_id, save_session_id
-from tests.test_multisession import _mk_ctx, _mk_machine
+from cc_remote.wrapper.stream import replayed_user_message_id
+from tests.test_multisession import _StubTransport, _mk_ctx, _mk_machine
 
 
 class _StalledSdk:
@@ -56,6 +60,347 @@ class _StalledSdk:
 
     async def force_reconnect(self, resume_id, cwd):
         self.reconnects += 1
+
+
+def test_claude_replayed_user_id_excludes_tool_protocol_envelopes():
+    native_id = "2259073b-7676-455f-b7b0-b9b3892dbe93"
+    assert replayed_user_message_id(UserMessage(
+        content="继续", uuid=native_id,
+    )) == native_id
+    assert replayed_user_message_id(UserMessage(
+        content=[ToolResultBlock(tool_use_id="tool-1", content="done")],
+        uuid=native_id,
+    )) is None
+    assert replayed_user_message_id(UserMessage(
+        content="subagent input",
+        uuid=native_id,
+        parent_tool_use_id="tool-1",
+    )) is None
+
+
+def test_claude_live_replayed_user_uuid_is_persisted_as_browser_alias(
+    monkeypatch, tmp_path,
+):
+    session_id = "fa800ca3-18e3-4391-b401-a33fe52e2f56"
+    native_id = "2259073b-7676-455f-b7b0-b9b3892dbe93"
+    client_id = "6b09ee37-f861-4422-b98a-21f509c951b0"
+    transcript = tmp_path / f"{session_id}.jsonl"
+    transcript.write_text("{}\n")
+    monkeypatch.setattr(
+        machine_module, "transcript_path", lambda _sid: str(transcript))
+
+    class ReplaySdk:
+        effort = "high"
+        applied_effort = "high"
+        model = None
+        next_turn_id = None
+
+        async def query(self, _prompt):
+            return None
+
+        async def receive_response(self):
+            yield UserMessage(content="继续", uuid=native_id)
+            yield ResultMessage(
+                subtype="success",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id=session_id,
+            )
+
+        def observe_goal_message(self, _message, _thread_id):
+            return False, None
+
+        async def refresh_goal(self, _session_id):
+            return None
+
+        def release_background_messages(self):
+            return None
+
+    async def run():
+        machine, _transport = _mk_machine()
+        ctx = _mk_ctx(session_id, session_id)
+        ctx.sdk = ReplaySdk()
+        ctx.state = "running"
+        ctx.active_msg_id = client_id
+        machine.sessions[ctx.key] = ctx
+
+        async def no_external_owner(_sid):
+            return False
+
+        monkeypatch.setattr(machine, "_prime_claude_ownership", no_external_owner)
+        await machine._run_turn(ctx, "继续")
+
+        assert machine._claude_client_messages.get(
+            session_id, transcript) == {native_id: client_id}
+        assert ctx.claude_client_message_ids == {}
+        assert ctx.state == "idle"
+
+    asyncio.run(run())
+
+
+def test_claude_run_turn_binds_transcript_before_delayed_sdk_replay(
+    monkeypatch, tmp_path,
+):
+    session_id = "fa800ca3-18e3-4391-b401-010101010101"
+    native_id = "2259073b-7676-455f-b7b0-020202020202"
+    client_id = "6b09ee37-f861-4422-b98a-030303030303"
+    transcript = tmp_path / f"{session_id}.jsonl"
+    transcript.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(
+        machine_module, "transcript_path", lambda _sid: str(transcript))
+
+    async def run():
+        class DelayedReplaySdk:
+            effort = "high"
+            applied_effort = "high"
+            model = None
+            next_turn_id = None
+
+            def __init__(self):
+                self.query_written = asyncio.Event()
+                self.release_replay = asyncio.Event()
+
+            async def query(self, _prompt):
+                with transcript.open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps({
+                        "type": "user",
+                        "uuid": native_id,
+                        "entrypoint": "sdk-py",
+                        "message": {"role": "user", "content": "hello"},
+                    }) + "\n")
+                self.query_written.set()
+
+            async def receive_response(self):
+                await self.release_replay.wait()
+                yield UserMessage(content="hello", uuid=native_id)
+                yield ResultMessage(
+                    subtype="success",
+                    duration_ms=1,
+                    duration_api_ms=1,
+                    is_error=False,
+                    num_turns=1,
+                    session_id=session_id,
+                )
+
+            def observe_goal_message(self, _message, _thread_id):
+                return False, None
+
+            async def refresh_goal(self, _session_id):
+                return None
+
+            def release_background_messages(self):
+                return None
+
+        machine, transport = _mk_machine()
+        sdk = DelayedReplaySdk()
+        ctx = _mk_ctx(session_id, session_id)
+        ctx.sdk = sdk
+        ctx.state = "running"
+        ctx.active_msg_id = client_id
+        machine.sessions[ctx.key] = ctx
+
+        async def no_external_owner(_sid):
+            return False
+
+        monkeypatch.setattr(machine, "_prime_claude_ownership", no_external_owner)
+        turn = asyncio.create_task(machine._run_turn(ctx, "hello"))
+        await asyncio.wait_for(sdk.query_written.wait(), timeout=1)
+        assert ctx.claude_client_alias_probe is not None
+        await machine._advance_claude_client_alias_probe(ctx)
+        assert machine._claude_client_messages.get(
+            session_id, transcript) == {native_id: client_id}
+
+        sdk.release_replay.set()
+        await asyncio.wait_for(turn, timeout=1)
+        assert ctx.state == "idle"
+        assert not [
+            message for message in transport.sent
+            if isinstance(message, Error)
+        ]
+        assert [
+            (message.msg_id, message.turn_id)
+            for message in transport.sent
+            if isinstance(message, TurnBinding)
+        ] == [(client_id, native_id)]
+
+    asyncio.run(run())
+
+
+def test_claude_alias_flush_never_enters_multi_profile_codex_history(
+    monkeypatch, tmp_path,
+):
+    session_id = "f6cd73f7-86d7-4115-8512-3cf357fbd542"
+    native_id = "759d1121-1009-4882-8218-b31296d7e20b"
+    client_id = "6b09ee37-f861-4422-b98a-21f509c951b0"
+    transcript = tmp_path / f"{session_id}.jsonl"
+    transcript.write_text("{}\n")
+    primary = tmp_path / "codex-primary"
+    stack = tmp_path / "codex-stack"
+    primary.mkdir()
+    stack.mkdir()
+    cfg = WrapperConfig()
+    cfg.state_dir = tmp_path / "state"
+    cfg.claude_work_root = cfg.state_dir / "work" / "claude"
+    cfg.codex_work_root = cfg.state_dir / "work" / "codex"
+    cfg.codex_profiles_json = json.dumps({
+        "primary": {
+            "label": "Primary",
+            "home": str(primary),
+            "default": True,
+        },
+        "stack": {
+            "label": "Stack",
+            "home": str(stack),
+        },
+    })
+    transport = _StubTransport()
+    machine = WrapperMachine(cfg, transport)
+    monkeypatch.setattr(
+        machine_module, "transcript_path", lambda _sid: str(transcript))
+    ctx = _mk_ctx(session_id, session_id)
+    ctx.active_msg_id = client_id
+    ctx.claude_client_message_ids[native_id] = client_id
+    machine.sessions[ctx.key] = ctx
+
+    async def run():
+        await machine._flush_claude_client_message_ids(ctx)
+
+        assert machine._claude_client_messages.get(
+            session_id, transcript) == {native_id: client_id}
+        assert ctx.claude_client_message_ids == {}
+        assert not [
+            message for message in transport.sent
+            if isinstance(message, TurnBinding)
+        ]
+
+    asyncio.run(run())
+
+
+def test_claude_alias_metadata_failure_keeps_turn_binding_idempotent(
+    monkeypatch,
+):
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("claude-alias-failure", "claude-alias-failure")
+        ctx.active_msg_id = "browser-message"
+        machine.sessions[ctx.key] = ctx
+
+        async def fail_flush(_ctx):
+            raise RuntimeError("metadata store unavailable")
+
+        monkeypatch.setattr(
+            machine, "_flush_claude_client_message_ids", fail_flush)
+        assert await machine._remember_claude_client_message_id(
+            ctx, "native-message") is True
+        assert await machine._remember_claude_client_message_id(
+            ctx, "native-message") is False
+
+        assert ctx.claude_client_message_ids == {
+            "native-message": "browser-message",
+        }
+        assert [
+            (message.msg_id, message.turn_id)
+            for message in transport.sent
+            if isinstance(message, TurnBinding)
+        ] == [("browser-message", "native-message")]
+
+    asyncio.run(run())
+
+
+def test_claude_alias_binding_rejects_stale_turn_generation():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("claude-generation", "claude-generation")
+        ctx.active_msg_id = "browser-old"
+        machine.sessions[ctx.key] = ctx
+        machine._start_claude_client_alias_probe(ctx)
+        old_generation = ctx.claude_client_alias_generation
+
+        ctx.active_msg_id = "browser-new"
+        machine._start_claude_client_alias_probe(ctx)
+        assert await machine._remember_claude_client_message_id(
+            ctx,
+            "native-old",
+            expected_msg_id="browser-old",
+            expected_generation=old_generation,
+        ) is False
+        assert ctx.claude_client_message_ids == {}
+        assert not [
+            message for message in transport.sent
+            if isinstance(message, TurnBinding)
+        ]
+
+    asyncio.run(run())
+
+
+def test_new_claude_session_flushes_pending_browser_alias_after_rekey(
+    monkeypatch, tmp_path,
+):
+    session_id = "fa800ca3-18e3-4391-b401-a33fe52e2f56"
+    native_id = "2259073b-7676-455f-b7b0-b9b3892dbe93"
+    client_id = "6b09ee37-f861-4422-b98a-21f509c951b0"
+    transcript = tmp_path / f"{session_id}.jsonl"
+    transcript.write_text("{}\n")
+    monkeypatch.setattr(
+        machine_module, "transcript_path", lambda _sid: str(transcript))
+
+    class NewSessionReplaySdk:
+        effort = "high"
+        applied_effort = "high"
+        model = None
+        next_turn_id = None
+
+        async def query(self, _prompt):
+            return None
+
+        async def receive_response(self):
+            yield UserMessage(content="继续", uuid=native_id)
+            yield ResultMessage(
+                subtype="success",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id=session_id,
+            )
+
+        def observe_goal_message(self, _message, _thread_id):
+            return False, None
+
+        def rekey_goal(self, _session_id):
+            return None
+
+        async def refresh_goal(self, _session_id):
+            return None
+
+        def release_background_messages(self):
+            return None
+
+    async def run():
+        machine, _transport = _mk_machine()
+        ctx = _mk_ctx("tmp-client-alias", None)
+        ctx.sdk = NewSessionReplaySdk()
+        ctx.state = "running"
+        ctx.active_msg_id = client_id
+        machine.sessions[ctx.key] = ctx
+
+        async def no_external_owner(_sid):
+            return False
+
+        monkeypatch.setattr(machine, "_prime_claude_ownership", no_external_owner)
+        await machine._run_turn(ctx, "继续")
+
+        assert ctx.key == session_id
+        assert machine.sessions[session_id] is ctx
+        assert "tmp-client-alias" not in machine.sessions
+        assert machine._claude_client_messages.get(
+            session_id, transcript,
+        ) == {native_id: client_id}
+        assert ctx.claude_client_message_ids == {}
+
+    asyncio.run(run())
 
 
 def test_codex_session_id_accepts_app_server_thread_id_notifications():

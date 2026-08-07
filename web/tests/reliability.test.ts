@@ -116,6 +116,7 @@ import type {
   History,
   PreviewAsset,
   ServerEvent,
+  SessionList,
   SessionControl,
 } from "../src/protocol.ts";
 import type { Block, Turn } from "../src/reducer.ts";
@@ -183,9 +184,52 @@ import {
   ComposerDraftStore,
   composerDraftKey,
 } from "../src/composer-drafts.ts";
-import { updateScopedSessionLifecycle } from "../src/session-list.ts";
+import {
+  normalizeSessionList,
+  updateScopedSessionLifecycle,
+} from "../src/session-list.ts";
+import { codexProfilePresentation } from
+  "../src/codex-profile-presentation.ts";
 
 const composerDrafts = new ComposerDraftStore();
+const oneCodexProfile = [{ id: "primary", label: "Main" }];
+assert.equal(
+  codexProfilePresentation(oneCodexProfile, "primary", "primary"),
+  null,
+  "single-account installs must not gain profile UI or layout",
+);
+const presentationProfiles = [
+  { id: "primary", label: "Main" },
+  ...Array.from({ length: 13 }, (_, index) => ({
+    id: `secondary-${index}`,
+    label: `Account ${index + 2}`,
+  })),
+];
+assert.deepEqual(
+  codexProfilePresentation(presentationProfiles, "primary", "primary"),
+  {
+    name: "default",
+    label: "Main",
+    fullLabel: "default · Main",
+    tone: 0,
+  },
+);
+assert.equal(
+  codexProfilePresentation(
+    presentationProfiles, "primary", "secondary-0")?.name,
+  "luna",
+);
+assert.equal(
+  codexProfilePresentation(
+    presentationProfiles, "primary", "secondary-11")?.name,
+  "neptunus",
+);
+assert.equal(
+  codexProfilePresentation(
+    presentationProfiles, "primary", "secondary-12")?.name,
+  "more",
+  "accounts beyond the twelve named ribbons share the bounded fallback label",
+);
 const longPermissionProfileLabel = permissionProfileLabel(
   `custom-${"authorization-boundary-".repeat(20)}`);
 assert.ok(longPermissionProfileLabel?.endsWith("…"));
@@ -488,12 +532,16 @@ assert.deepEqual(matchSkills("", skillCatalog).map((item) => item.name),
   "only enabled Skills may be offered for explicit invocation");
 const repoSkillKey = skillCatalogKey(
   "machine-a", "codex", "code", "/repo/a");
+const stackSkillKey = skillCatalogKey(
+  "machine-a", "codex", "code", "/repo/a", "stack");
 assert.notEqual(repoSkillKey, skillCatalogKey(
   "machine-a", "codex", "code", "/repo/b"),
   "Skill catalogs from different repositories must never share a cache entry");
 assert.notEqual(repoSkillKey, skillCatalogKey(
   "machine-b", "codex", "code", "/repo/a"),
   "Skill catalogs must remain inside the machine authorization boundary");
+assert.notEqual(repoSkillKey, stackSkillKey,
+  "Skill catalogs from different CODEX_HOME profiles must never share a cache entry");
 assert.notEqual(
   skillCatalogReadKey(repoSkillKey, true),
   skillCatalogReadKey(repoSkillKey, false),
@@ -533,6 +581,14 @@ assert.equal(skillCatalogResponseMatches(
   { ...skillRead, cwd: "" }, skillResponse), true,
   "an omitted cwd must accept the wrapper's resolved default directory",
 );
+assert.equal(skillCatalogResponseMatches(
+  { ...skillRead, key: stackSkillKey, codexProfileId: "stack" },
+  { ...skillResponse, codex_profile_id: "stack" },
+), true, "a capability response may complete only its exact Codex profile read");
+assert.equal(skillCatalogResponseMatches(
+  { ...skillRead, key: stackSkillKey, codexProfileId: "stack" },
+  { ...skillResponse, codex_profile_id: "primary" },
+), false, "a late capability response from another Codex profile is rejected");
 assert.equal(skillCatalogRefreshSucceeded(skillResponse), true);
 assert.equal(skillCatalogRefreshSucceeded({
   ...skillResponse,
@@ -886,7 +942,7 @@ const historyBeforeResume = historyAppSource.match(
 assert.equal(historyBeforeResume.length, 3,
   "every existing-session activation must request first paint before engine resume");
 assert.match(historyAppSource,
-  /msg\.type === "session_list" && ownership[\s\S]*historySessionListsRef/,
+  /if \(msg\.type === "session_list" && !ownership\) return;[\s\S]*historySessionListsRef/,
   "only an ownership-accepted SessionList may seed a Claude history cwd hint");
 assert.match(historyAppSource,
   /resolveHistoryCwdHint\(historySessionListsRef\.current, sid\)/,
@@ -1043,7 +1099,7 @@ assert.match(historyAppSource,
 assert.match(historyAppSource,
   /onLoadHistoryImage=\{historyView\.recovering\s*\? undefined/,
   "display-only recovery turns must not issue history-image reads");
-assert.match(cacheSource, /const CACHE_VER = 11/,
+assert.match(cacheSource, /const CACHE_VER = 12/,
   "Claude prompt aliases must invalidate v10 rows which can paint twice");
 assert.match(cacheSource, /objectStore\(STORE\)\.delete\(sessionId\)/);
 assert.match(cacheSource, /job\.epoch !== sessionEpoch\(job\.sid\)/,
@@ -2895,7 +2951,8 @@ const reducerHarness = await createServer({
 });
 try {
   const {
-    createRuntime, initialState, reduce, MAX_TURN_BLOCKS, MAX_TURN_BLOCK_CHARS,
+    createRuntime, initialState, modelCatalogScopeKey, reduce,
+    MAX_TURN_BLOCKS, MAX_TURN_BLOCK_CHARS,
     OMITTED_PROCESS_ITEM_ID,
   } = await reducerHarness.ssrLoadModule("/src/reducer.ts");
   const event = (body: Record<string, unknown>): ServerEvent => ({
@@ -3181,6 +3238,187 @@ try {
   });
   assert.equal(ownerA.scopeKey in clearedInherited.cwdByScope, false);
 
+  const profileOwner = {
+    ...ownerB,
+    scopeKey: "machine-b:code:codex",
+    codexProfileId: "stack",
+  };
+  let profileState = {
+    ...initialState,
+    newChat: {
+      cwd: "/work/profile",
+      cwdSource: "explicit" as const,
+      model: null,
+      effort: null,
+      codexProfileId: "stack",
+    },
+  };
+  profileState = reduce(profileState, {
+    type: "event",
+    ownership: profileOwner,
+    event: event({
+      type: "session_list",
+      engine: "codex",
+      space: "code",
+      codex_profiles: [
+        { id: "primary", label: "主账号" },
+        { id: "stack", label: "Stack" },
+      ],
+      default_codex_profile_id: "primary",
+      sessions: [{
+        session_id: "stack@same-native-id",
+        native_session_id: "same-native-id",
+        codex_profile_id: "stack",
+        codex_profile_label: "Stack",
+        engine: "codex",
+        space: "code",
+      }],
+    }),
+  });
+  assert.equal(
+    profileState.codexProfileByScope[profileOwner.scopeKey], "stack",
+    "the selected new-session profile survives an authoritative Code list",
+  );
+  assert.equal(profileState.newChat?.codexProfileId, "stack");
+  profileState = reduce(profileState, { type: "event", event: event({
+    type: "models",
+    engine: "codex",
+    codex_profile_id: "primary",
+    models: [{
+      id: "primary-model", display_name: "Primary", description: "",
+      efforts: ["high"], default_effort: "high",
+    }],
+  }) });
+  profileState = reduce(profileState, { type: "event", event: event({
+    type: "models",
+    engine: "codex",
+    codex_profile_id: "stack",
+    models: [{
+      id: "stack-model", display_name: "Stack", description: "",
+      efforts: ["xhigh"], default_effort: "xhigh",
+    }],
+  }) });
+  assert.equal(
+    profileState.catalog[modelCatalogScopeKey("codex", "primary")][0].id,
+    "primary-model",
+  );
+  assert.equal(
+    profileState.catalog[modelCatalogScopeKey("codex", "stack")][0].id,
+    "stack-model",
+    "late model catalogs must remain in their own CODEX_HOME lane",
+  );
+  const workProfileState = reduce(profileState, {
+    type: "event",
+    ownership: {
+      ...profileOwner,
+      scopeKey: "machine-b:work:codex",
+      space: "work" as const,
+      codexProfileId: null,
+    },
+    event: event({
+      type: "session_list",
+      engine: "codex",
+      space: "work",
+      codex_profiles: profileState.codexProfiles,
+      default_codex_profile_id: "primary",
+      sessions: [],
+    }),
+  });
+  assert.equal(workProfileState.newChat?.codexProfileId, "primary",
+    "Codex Work always resolves to the default account");
+
+  const profileCatalogFailure = reduce({
+    ...profileState,
+    focusedSid: "stack@same-native-id",
+    sessions: [
+      {
+        session_id: "primary-old",
+        native_session_id: "primary-old",
+        codex_profile_id: "primary",
+        engine: "codex",
+        space: "code",
+      },
+      {
+        session_id: "stack@same-native-id",
+        native_session_id: "same-native-id",
+        codex_profile_id: "stack",
+        engine: "codex",
+        space: "code",
+      },
+    ],
+  }, {
+    type: "event",
+    ownership: profileOwner,
+    event: event({
+      type: "session_list",
+      engine: "codex",
+      space: "code",
+      codex_profiles: [
+        { id: "primary", label: "主账号" },
+        { id: "stack", label: "Stack", error: "会话列表暂不可用" },
+      ],
+      default_codex_profile_id: "primary",
+      sessions: [{
+        session_id: "primary-new",
+        native_session_id: "primary-new",
+        codex_profile_id: "primary",
+        engine: "codex",
+        space: "code",
+      }],
+    }),
+  });
+  assert.deepEqual(
+    profileCatalogFailure.sessions.map(
+      (session: { session_id: string }) => session.session_id),
+    ["primary-new", "stack@same-native-id"],
+    "a partial catalog failure keeps only the failed profile's prior rows",
+  );
+  assert.equal(profileCatalogFailure.focusedSid, "stack@same-native-id",
+    "a transient sibling profile failure must not eject the focused session");
+
+  const normalizedPartialCatalog = normalizeSessionList(
+    [
+      {
+        session_id: "primary-old",
+        native_session_id: "primary-old",
+        codex_profile_id: "primary",
+        engine: "codex",
+        space: "code",
+      },
+      {
+        session_id: "stack@same-native-id",
+        native_session_id: "same-native-id",
+        codex_profile_id: "stack",
+        engine: "codex",
+        space: "code",
+      },
+    ],
+    profileState.codexProfiles,
+    "primary",
+    event({
+      type: "session_list",
+      engine: "codex",
+      space: "code",
+      codex_profiles: [
+        { id: "primary", label: "主账号" },
+        { id: "stack", label: "Stack", error: "会话列表暂不可用" },
+      ],
+      default_codex_profile_id: "primary",
+      sessions: [{
+        session_id: "primary-new",
+        native_session_id: "primary-new",
+        codex_profile_id: "primary",
+        engine: "codex",
+        space: "code",
+      }],
+    }) as SessionList,
+  );
+  assert.deepEqual(
+    normalizedPartialCatalog.sessions.map((session) => session.session_id),
+    ["primary-new", "stack@same-native-id"],
+    "App refs and reducer share the same partial-success projection",
+  );
+
   const createdPlaceholder = reduce(initialState, {
     type: "event", ownership: ownerB,
     event: event({
@@ -3203,6 +3441,22 @@ try {
   assert.deepEqual(rekeyedPlaceholder.sessions.map((session: { session_id: string }) =>
   session.session_id), ["real-created"],
   "rekey must atomically migrate the temporary sidebar row");
+  const profiledPlaceholder = reduce(initialState, {
+    type: "event", ownership: profileOwner,
+    event: event({
+      type: "session_focus", session_id: "tmp-profiled", cwd: "/work/new",
+      request_id: "create-profiled",
+    }),
+  });
+  const profiledRekey = reduce(profiledPlaceholder, {
+    type: "event", ownership: profileOwner,
+    event: event({
+      type: "session_rekey", old_key: "tmp-profiled",
+      session_id: "stack@native-created", cwd: "/work/new",
+    }),
+  });
+  assert.equal(profiledRekey.sessions[0].native_session_id, "native-created",
+    "a rekeyed Codex placeholder must expose the native id before SessionList");
   const lifecycleRekey = reduce({
     ...initialState,
     focusedSid: "tmp-running",
@@ -4288,7 +4542,7 @@ try {
     revision: "claude-legacy-r1",
     generation: "claude-legacy-g1",
     // v10 could persist the transcript UUID before promptId became an exact
-    // client alias. CACHE_VER=11 prevents this row from reaching the reducer;
+    // client alias. CACHE_VER=12 prevents this row from reaching the reducer;
     // keep the downstream convergence check as a second safety boundary.
     turns: [{
       id: legacyClaudeNativeId,
@@ -4362,6 +4616,76 @@ try {
   );
   assert.equal(repeatedClaudePrompt.length, 2,
     "two real Claude prompts with equal text and distinct ids must both remain");
+  const repeatedClaudeSid = "claude-repeated-prompt-history";
+  let repeatedClaudeState = reduce({
+    ...initialState,
+    focusedSid: repeatedClaudeSid,
+    runtimes: {
+      [repeatedClaudeSid]: {
+        ...createRuntime(),
+        state: "idle" as const,
+        syncReady: true,
+        turns: [{
+          id: "claude-client-first",
+          clientMsgId: "claude-client-first",
+          prompt: "继续",
+          blocks: [],
+          done: true,
+        }],
+      },
+    },
+  }, {
+    type: "query_sent",
+    sid: repeatedClaudeSid,
+    prompt: "继续",
+    msg_id: "claude-client-second",
+    ts: 23_000,
+  });
+  repeatedClaudeState = reduce(repeatedClaudeState, {
+    type: "event",
+    event: event({
+      type: "history",
+      session_id: repeatedClaudeSid,
+      revision: "claude-repeated-r1",
+      generation: "claude-repeated-g1",
+      build_seq: 1,
+      live_seq: 0,
+      detail: "summary",
+      authoritative: true,
+      has_more: false,
+      in_progress: true,
+      events: [],
+      turns: [
+        {
+          id: "claude-native-first",
+          clientMsgId: "claude-client-first",
+          prompt: "继续",
+          blocks: [],
+          done: true,
+          detailEventCount: 0,
+          detailLoaded: false,
+        },
+        {
+          id: "claude-native-second",
+          clientMsgId: "claude-client-second",
+          prompt: "继续",
+          blocks: [],
+          done: false,
+          detailEventCount: 0,
+          detailLoaded: false,
+        },
+      ],
+    }),
+  });
+  assert.deepEqual(
+    repeatedClaudeState.runtimes[repeatedClaudeSid].turns.map(
+      (turn: Turn) => [turn.clientMsgId, turn.prompt]),
+    [
+      ["claude-client-first", "继续"],
+      ["claude-client-second", "继续"],
+    ],
+    "switch-back History reconciles equal Claude prompts by exact client id without collapsing either turn",
+  );
 
   const runningAliasSid = "history-running-steer-alias";
   const runningAliasNativeTurn = "history-running-native-task";
@@ -8279,6 +8603,25 @@ try {
     onPickCwd: () => {},
     onSend: () => true,
   }));
+  const multiProfileNewChatMarkup = renderToStaticMarkup(createElement(
+    NewChatView,
+    {
+      cwd: "~", engine: "codex", catalog: liveNewChatCatalog,
+      controlScopeKey: "machine-a:code:codex\0stack",
+      model: null, effort: null,
+      defaultModel: "gpt-future", defaultEffort: "low",
+      codexProfiles: [
+        { id: "primary", label: "Main" },
+        { id: "stack", label: "Stack" },
+      ],
+      defaultCodexProfileId: "primary",
+      codexProfileId: "stack",
+      onPickCodexProfile: () => {},
+      onPickModel: () => {}, onPickEffort: () => {},
+      onPickCwd: () => {},
+      onSend: () => true,
+    },
+  ));
   for (const markup of [newChatMarkup, codexNewChatMarkup]) {
     assert.match(markup, /aria-label="添加照片"/);
     assert.match(markup, /aria-label="添加文件"/);
@@ -8308,6 +8651,19 @@ try {
   assert.match(codexNewChatMarkup, /权限与执行环境/);
   assert.match(codexNewChatMarkup, /Full Access/);
   assert.doesNotMatch(newChatMarkup, /class="newchat-access"/);
+  for (const markup of [newChatMarkup, codexNewChatMarkup]) {
+    assert.doesNotMatch(markup, /class="newchat-context"/,
+      "single-account and Claude new-chat preserve the historical cwd DOM");
+    assert.match(markup, /<\/div><button class="newchat-cwd"/,
+      "the historical cwd button remains a direct new-chat-card child");
+  }
+  assert.doesNotMatch(codexNewChatMarkup, /aria-label="选择 Codex 账号"/,
+    "single-account installs keep the historical new-chat layout");
+  assert.match(layoutCss, /\.newchat-cwd\{[^}]*align-self:center/,
+    "the historical cwd pill keeps its own centering rule");
+  assert.match(multiProfileNewChatMarkup, /class="newchat-context"/);
+  assert.match(multiProfileNewChatMarkup, /aria-label="选择 Codex 账号"/);
+  assert.match(multiProfileNewChatMarkup, />luna · Stack</);
   const artifactsMarkup = renderToStaticMarkup(createElement(WorkArtifactsSheet, {
     open: true,
     artifacts: [
@@ -8323,6 +8679,7 @@ try {
   assert.doesNotMatch(artifactsMarkup, /暂不可预览|disabled=""/);
   const sidebarProps = {
     open: true,
+    engine: "codex" as const,
     space: "code" as const,
     onSpaceChange: () => {},
     sessions: [
@@ -8356,6 +8713,48 @@ try {
     2,
     "a newly running turn must hide an older completion label",
   );
+  const profileSidebarMarkup = renderToStaticMarkup(createElement(
+    SessionsSidebar,
+    {
+      ...sidebarProps,
+      codexProfiles: [
+        { id: "primary", label: "Main" },
+        { id: "stack", label: "Stack" },
+      ],
+      defaultCodexProfileId: "primary",
+      sessions: [
+        {
+          session_id: "primary@native-a", native_session_id: "native-a",
+          codex_profile_id: "primary", codex_profile_label: "Main",
+          summary: "Primary", state: "idle", engine: "codex", space: "code",
+        },
+        {
+          session_id: "stack@native-b", native_session_id: "native-b",
+          codex_profile_id: "stack", codex_profile_label: "Stack",
+          summary: "Stack", state: "idle", engine: "codex", space: "code",
+        },
+      ],
+    },
+  ));
+  assert.match(profileSidebarMarkup,
+    /class="scard-profile-ribbon tone-0"[^>]*>default</);
+  assert.match(profileSidebarMarkup,
+    /class="scard-profile-ribbon tone-1"[^>]*>luna</);
+  assert.match(profileSidebarMarkup, /Codex 账号：luna · Stack/);
+  const singleProfileSidebarMarkup = renderToStaticMarkup(createElement(
+    SessionsSidebar,
+    {
+      ...sidebarProps,
+      codexProfiles: oneCodexProfile,
+      defaultCodexProfileId: "primary",
+      sessions: [{
+        session_id: "native-only", codex_profile_id: "primary",
+        codex_profile_label: "Main", summary: "Only", state: "idle",
+      }],
+    },
+  ));
+  assert.doesNotMatch(singleProfileSidebarMarkup, /profile-ribbon|profile-filter/,
+    "single-account sidebar output remains free of profile-only DOM");
   const btwDraftStore = new ComposerDraftStore();
   const btwPanelMarkup = renderToStaticMarkup(createElement(BtwPanel, {
     sid: "btw-render",
@@ -13135,10 +13534,15 @@ assert.equal(newChatProfilesFrame.cwd, "/tmp/prospective-project");
 assert.equal("sid" in newChatProfilesFrame, false,
   "prospective cwd discovery must not inherit the previously focused session");
 
+relay.sendGetPermissionProfiles("/tmp/prospective-project", "stack");
+const stackProfilesFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
+assert.equal(stackProfilesFrame.codex_profile_id, "stack");
+
 relay.sendNewSession(
   "/tmp/project", "codex", "gpt-5.6-sol", "xhigh",
   { prompt: "先制定计划", msg_id: "first-plan-message" }, "plan",
   "on-request", ":danger-full-access", "live", "fast",
+  "code", null, "stack",
 );
 const newPlanFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
 assert.equal(newPlanFrame.type, "new_session");
@@ -13149,6 +13553,18 @@ assert.equal(newPlanFrame.permission_profile, ":danger-full-access");
 assert.equal(newPlanFrame.web_search, "live");
 assert.equal(newPlanFrame.service_tier, "fast");
 assert.equal(newPlanFrame.prompt, "先制定计划");
+assert.equal(newPlanFrame.codex_profile_id, "stack");
+
+relay.sendNewSession(
+  null, "codex", null, null,
+  { prompt: "Work uses primary", msg_id: "work-primary-message" },
+  "default", "never", undefined, undefined, "fast",
+  "work", "project-1", "stack",
+);
+const workSessionFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
+assert.equal(workSessionFrame.space, "work");
+assert.equal("codex_profile_id" in workSessionFrame, false,
+  "Codex Work must not send or freeze a secondary profile");
 
 relay.sendNewSession(
   "/tmp/project", "claude", null, null,
@@ -13167,13 +13583,18 @@ assert.equal(claudeDefaultsFrame.cwd, "/tmp/project");
 assert.equal(typeof claudeDefaultsFrame.cmd_id, "string");
 assert.equal(typeof claudeDefaultsFrame.client_id, "string");
 
+relay.sendGetModels("codex", undefined, "stack");
+const stackModelsFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
+assert.equal(stackModelsFrame.codex_profile_id, "stack");
+
 const skillOnlyCapabilitiesRequestId = relay.sendGetEngineCapabilities(
-  "codex", "code", "/tmp/project", true,
+  "codex", "code", "/tmp/project", true, "stack",
 );
 const skillOnlyCapabilitiesFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
 assert.equal(skillOnlyCapabilitiesFrame.type, "get_engine_capabilities");
 assert.equal(skillOnlyCapabilitiesFrame.skills_only, true);
 assert.equal(skillOnlyCapabilitiesFrame.cwd, "/tmp/project");
+assert.equal(skillOnlyCapabilitiesFrame.codex_profile_id, "stack");
 assert.equal(typeof skillOnlyCapabilitiesFrame.client_id, "string");
 assert.equal(
   skillOnlyCapabilitiesFrame.cmd_id, skillOnlyCapabilitiesRequestId,
@@ -13218,6 +13639,13 @@ assert.match(appSource,
 assert.match(appSource,
   /notificationOriginRef\.current === null[\s\S]*?authoritativeSurfaceListsRef\.current\.delete\(surfaceKey\)/,
   "each notification click must invalidate a pre-click target catalog");
+const sessionListOwnershipGuard = appSource.indexOf(
+  'if (msg.type === "session_list" && !ownership) return;');
+const guardedSessionEngineWrite = appSource.indexOf(
+  "ws.setSessionEngines", sessionListOwnershipGuard);
+assert.ok(sessionListOwnershipGuard >= 0
+  && guardedSessionEngineWrite > sessionListOwnershipGuard,
+"an unowned or stale SessionList must be rejected before it can rewrite profile ownership");
 assert.match(appSource, /resolveNotificationNavigation\(\{/,
   "notification navigation must pass through the fail-closed resolver");
 assert.match(appSource, /focusListedSession\(navigation\.session\)/,
@@ -14104,6 +14532,91 @@ scopedSocket.receive({
 assert.equal(scopedObserved.length, beforeReconnectFrame,
   "a delayed frame from an older underlying WebSocket generation is dropped");
 scopedRelay.stop();
+
+// Codex account ownership is frozen together with the normal surface epoch.
+// Identical native UUIDs must remain routed by their profile-prefixed sid
+// through list -> switch and temp focus -> rekey lifecycles.
+const profileOwnershipObserved: Array<{ event: ServerEvent; ownership?: {
+  scopeKey: string; codexProfileId?: string | null;
+  surfaceEpoch: number; connectionGeneration: number;
+} }> = [];
+const profileOwnershipRelay = new RelayWs({
+  onEvent: (event, ownership) => {
+    profileOwnershipObserved.push({ event, ownership });
+  },
+  onConnState: () => {},
+}, "machine-profile");
+profileOwnershipRelay.start();
+const profileOwnershipSocket = FakeWebSocket.instances.at(-1);
+assert.ok(profileOwnershipSocket);
+profileOwnershipSocket.onopen?.();
+profileOwnershipRelay.setSurface("codex", "code");
+assert.equal(profileOwnershipRelay.sendListSessions("codex", "code"), true);
+const profileListRequest = JSON.parse(
+  profileOwnershipSocket.sent.at(-1) ?? "{}") as { cmd_id?: string };
+profileOwnershipSocket.receive({
+  type: "session_list",
+  engine: "codex",
+  space: "code",
+  request_id: profileListRequest.cmd_id,
+  codex_profiles: [
+    { id: "primary", label: "主账号" },
+    { id: "stack", label: "Stack" },
+  ],
+  default_codex_profile_id: "primary",
+  sessions: [{
+    session_id: "stack@same-native-id",
+    native_session_id: "same-native-id",
+    codex_profile_id: "stack",
+    codex_profile_label: "Stack",
+    engine: "codex",
+    space: "code",
+  }],
+});
+profileOwnershipRelay.setFocusedSid(
+  "stack@same-native-id", "codex", "code");
+profileOwnershipRelay.sendSwitchSession(
+  "stack@same-native-id", "codex", "code");
+profileOwnershipSocket.receive({
+  type: "session_focus",
+  session_id: "stack@same-native-id",
+  cwd: "/repo/stack",
+});
+assert.equal(
+  profileOwnershipObserved.at(-1)?.ownership?.codexProfileId,
+  "stack",
+  "switch focus inherits the accepted list's exact Codex profile",
+);
+
+assert.equal(profileOwnershipRelay.sendNewSession(
+  "/repo/stack", "codex", null, null,
+  { prompt: "new stack thread", msg_id: "profile-create" },
+  "default", "never", undefined, undefined, "fast",
+  "code", null, "stack",
+), true);
+profileOwnershipSocket.receive({
+  type: "session_focus",
+  session_id: "tmp-profile-create",
+  request_id: "profile-create",
+  cwd: "/repo/stack",
+});
+assert.equal(
+  profileOwnershipObserved.at(-1)?.ownership?.codexProfileId,
+  "stack",
+  "new-session focus retains the request-time account",
+);
+profileOwnershipSocket.receive({
+  type: "session_rekey",
+  old_key: "tmp-profile-create",
+  session_id: "stack@new-native-id",
+  cwd: "/repo/stack",
+});
+assert.equal(
+  profileOwnershipObserved.at(-1)?.ownership?.codexProfileId,
+  "stack",
+  "temp rekey atomically inherits the originating Codex profile",
+);
+profileOwnershipRelay.stop();
 
 const goalOwnershipObserved: Array<{ event: ServerEvent; ownership?: {
   scopeKey: string; surfaceEpoch: number; connectionGeneration: number;

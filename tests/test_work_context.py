@@ -98,6 +98,33 @@ def test_migrated_work_baseline_recovers_from_native_histories(
     assert recover_work_context_baseline("codex", "codex-session") == 16_774
 
 
+def test_codex_work_baseline_uses_the_default_profile_home(
+    tmp_path: Path, monkeypatch,
+):
+    codex = tmp_path / "codex.jsonl"
+    codex.write_text(
+        '{"type":"event_msg","payload":{"type":"token_count",'
+        '"info":{"last_token_usage":{"input_tokens":321,'
+        '"output_tokens":12}}}}\n',
+        encoding="utf-8",
+    )
+    homes = []
+
+    def rollout(session_id, *, codex_home=None):
+        assert session_id == "codex-session"
+        homes.append(codex_home)
+        return str(codex)
+
+    monkeypatch.setattr(work_context_module, "codex_rollout_path", rollout)
+
+    assert recover_work_context_baseline(
+        "codex",
+        "codex-session",
+        codex_home=str(tmp_path / "profile-home"),
+    ) == 321
+    assert homes == [str(tmp_path / "profile-home")]
+
+
 def test_work_registry_persists_context_baseline_once(tmp_path: Path):
     store = WorkRegistry(tmp_path / "work", "codex")
     record = store.create_session()

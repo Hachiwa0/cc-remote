@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,7 +11,7 @@ from claude_agent_sdk.types import ResultMessage, SystemMessage
 
 from cc_remote.wrapper import claude_external as claude_external_module
 from cc_remote.wrapper import machine as machine_module
-from cc_remote.protocol import Query, Takeover
+from cc_remote.protocol import Query, Takeover, TurnBinding
 from cc_remote.wrapper.claude_controls import ClaudeControls
 from cc_remote.wrapper.claude_external import (
     claude_session_holders,
@@ -751,6 +752,67 @@ def test_only_an_active_wrapper_query_can_attribute_growth_as_own(tmp_path):
     asyncio.run(go())
 
 
+def test_initial_claude_owner_scan_does_not_mirror_active_managed_turn(
+    tmp_path,
+):
+    """The first fail-closed scan may unlock control, not replay partial history."""
+    async def go():
+        machine, _ = _mk_machine()
+        path = tmp_path / "session.jsonl"
+        path.write_bytes(b"")
+        ctx = _mk_ctx("sid", "sid")
+        ctx.state = "running"
+        ctx.claude_write_active = True
+        machine.sessions["sid"] = ctx
+        watch = _watch(path)
+        watch["scan_complete"] = False
+        machine._watch["sid"] = watch
+        mirrored = []
+
+        async def mirror(sid):
+            mirrored.append(sid)
+
+        machine._push_mirrored_history = mirror
+        await machine._poll_claude_watch(
+            "sid", watch, set(), 1000.0,
+            ownership_scan_complete=True,
+        )
+
+        assert watch["scan_complete"] is True
+        assert machine._is_external("sid") is False
+        assert mirrored == []
+
+    asyncio.run(go())
+
+
+def test_initial_claude_owner_scan_still_mirrors_idle_unlock(tmp_path):
+    """An idle browser must still receive the ownership transition promptly."""
+    async def go():
+        machine, _ = _mk_machine()
+        path = tmp_path / "session.jsonl"
+        path.write_bytes(b"")
+        ctx = _mk_ctx("sid", "sid")
+        machine.sessions["sid"] = ctx
+        watch = _watch(path)
+        watch["scan_complete"] = False
+        machine._watch["sid"] = watch
+        mirrored = []
+
+        async def mirror(sid):
+            mirrored.append(sid)
+
+        machine._push_mirrored_history = mirror
+        await machine._poll_claude_watch(
+            "sid", watch, set(), 1000.0,
+            ownership_scan_complete=True,
+        )
+
+        assert machine._is_external("sid") is False
+        assert mirrored == ["sid"]
+
+    asyncio.run(go())
+
+
 def test_delayed_sdk_rows_remain_owned_after_result(tmp_path):
     async def go():
         machine, _ = _mk_machine()
@@ -819,6 +881,236 @@ def test_explicit_cli_row_wins_during_wrapper_write(tmp_path):
         )
 
         assert ctx.needs_reload is True
+
+    asyncio.run(go())
+
+
+def test_managed_claude_transcript_user_binds_before_sdk_replay(
+    monkeypatch, tmp_path,
+):
+    async def go():
+        session_id = "f6cd73f7-86d7-4115-8512-3cf357fbd542"
+        native_id = "759d1121-1009-4882-8218-b31296d7e20b"
+        client_id = "6b09ee37-f861-4422-b98a-21f509c951b0"
+        path = tmp_path / f"{session_id}.jsonl"
+        path.write_bytes(b"")
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx(session_id, session_id)
+        ctx.state = "running"
+        ctx.active_msg_id = client_id
+        ctx.claude_write_active = True
+        machine.sessions[ctx.key] = ctx
+        watch = _watch(path)
+        machine._watch[session_id] = watch
+        monkeypatch.setattr(
+            machine_module, "transcript_path", lambda _sid: str(path))
+        machine._start_claude_client_alias_probe(ctx)
+
+        rows = [
+            {
+                "type": "queue-operation",
+                "operation": "enqueue",
+                "content": "same prompt",
+                "sessionId": session_id,
+            },
+            {
+                "type": "user",
+                "uuid": native_id,
+                "sessionId": session_id,
+                "entrypoint": "sdk-py",
+                "promptSource": "sdk",
+                "isSidechain": False,
+                "message": {"role": "user", "content": "same prompt"},
+            },
+        ]
+        path.write_text(
+            "".join(json.dumps(row) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+        await machine._poll_claude_watch(
+            session_id,
+            watch,
+            set(),
+            1000.0,
+            ownership_scan_complete=True,
+        )
+
+        assert machine._claude_client_messages.get(
+            session_id, path) == {native_id: client_id}
+        bindings = [
+            message for message in transport.sent
+            if isinstance(message, TurnBinding)
+        ]
+        assert [(item.msg_id, item.turn_id) for item in bindings] == [
+            (client_id, native_id)
+        ]
+        assert ctx.state == "running"
+
+    asyncio.run(go())
+
+
+def test_managed_claude_alias_probe_waits_for_complete_jsonl_row(
+    monkeypatch, tmp_path,
+):
+    async def go():
+        session_id = "f6cd73f7-86d7-4115-8123-111111111111"
+        native_id = "759d1121-1009-4882-8218-222222222222"
+        client_id = "6b09ee37-f861-4422-b98a-333333333333"
+        path = tmp_path / f"{session_id}.jsonl"
+        path.write_bytes(b"")
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx(session_id, session_id)
+        ctx.state = "running"
+        ctx.active_msg_id = client_id
+        ctx.claude_write_active = True
+        machine.sessions[ctx.key] = ctx
+        watch = _watch(path)
+        machine._watch[session_id] = watch
+        monkeypatch.setattr(
+            machine_module, "transcript_path", lambda _sid: str(path))
+        machine._start_claude_client_alias_probe(ctx)
+
+        row = (json.dumps({
+            "type": "user",
+            "uuid": native_id,
+            "sessionId": session_id,
+            "entrypoint": "sdk-py",
+            "message": {"role": "user", "content": "hello"},
+        }) + "\n").encode()
+        split = len(row) // 2
+        path.write_bytes(row[:split])
+        await machine._poll_claude_watch(
+            session_id, watch, set(), 1000.0,
+            ownership_scan_complete=True,
+        )
+        assert machine._claude_client_messages.get(session_id, path) == {}
+        assert not [
+            message for message in transport.sent
+            if isinstance(message, TurnBinding)
+        ]
+
+        with path.open("ab") as stream:
+            stream.write(row[split:])
+        await machine._poll_claude_watch(
+            session_id, watch, set(), 1001.0,
+            ownership_scan_complete=True,
+        )
+        assert machine._claude_client_messages.get(
+            session_id, path) == {native_id: client_id}
+        assert [
+            (message.msg_id, message.turn_id)
+            for message in transport.sent
+            if isinstance(message, TurnBinding)
+        ] == [(client_id, native_id)]
+
+    asyncio.run(go())
+
+
+def test_managed_claude_alias_probe_skips_tool_result_user_envelope(
+    monkeypatch, tmp_path,
+):
+    async def go():
+        session_id = "f6cd73f7-86d7-4115-8123-444444444444"
+        native_id = "759d1121-1009-4882-8218-555555555555"
+        client_id = "6b09ee37-f861-4422-b98a-666666666666"
+        path = tmp_path / f"{session_id}.jsonl"
+        path.write_bytes(b"")
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx(session_id, session_id)
+        ctx.state = "running"
+        ctx.active_msg_id = client_id
+        ctx.claude_write_active = True
+        machine.sessions[ctx.key] = ctx
+        watch = _watch(path)
+        machine._watch[session_id] = watch
+        monkeypatch.setattr(
+            machine_module, "transcript_path", lambda _sid: str(path))
+        machine._start_claude_client_alias_probe(ctx)
+
+        tool_result = {
+            "type": "user",
+            "uuid": "tool-result-envelope",
+            "entrypoint": "sdk-py",
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "tool-1"}],
+            },
+        }
+        path.write_text(json.dumps(tool_result) + "\n", encoding="utf-8")
+        await machine._poll_claude_watch(
+            session_id, watch, set(), 1000.0,
+            ownership_scan_complete=True,
+        )
+        assert ctx.claude_client_alias_probe is not None
+        assert not [
+            message for message in transport.sent
+            if isinstance(message, TurnBinding)
+        ]
+
+        real_user = {
+            "type": "user",
+            "uuid": native_id,
+            "promptSource": "sdk",
+            "message": {"role": "user", "content": "hello"},
+        }
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(real_user) + "\n")
+        await machine._poll_claude_watch(
+            session_id, watch, set(), 1001.0,
+            ownership_scan_complete=True,
+        )
+        assert machine._claude_client_messages.get(
+            session_id, path) == {native_id: client_id}
+        assert [
+            (message.msg_id, message.turn_id)
+            for message in transport.sent
+            if isinstance(message, TurnBinding)
+        ] == [(client_id, native_id)]
+
+    asyncio.run(go())
+
+
+def test_managed_claude_alias_probe_rejects_transcript_inode_replacement(
+    monkeypatch, tmp_path,
+):
+    async def go():
+        session_id = "f6cd73f7-86d7-4115-8123-777777777777"
+        native_id = "759d1121-1009-4882-8218-888888888888"
+        client_id = "6b09ee37-f861-4422-b98a-999999999999"
+        path = tmp_path / f"{session_id}.jsonl"
+        path.write_bytes(b"")
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx(session_id, session_id)
+        ctx.state = "running"
+        ctx.active_msg_id = client_id
+        ctx.claude_write_active = True
+        machine.sessions[ctx.key] = ctx
+        watch = _watch(path)
+        machine._watch[session_id] = watch
+        machine._push_mirrored_history = lambda _sid: asyncio.sleep(0)
+        monkeypatch.setattr(
+            machine_module, "transcript_path", lambda _sid: str(path))
+        machine._start_claude_client_alias_probe(ctx)
+
+        replacement = tmp_path / "replacement.jsonl"
+        replacement.write_text(json.dumps({
+            "type": "user",
+            "uuid": native_id,
+            "entrypoint": "sdk-py",
+            "message": {"role": "user", "content": "hello"},
+        }) + "\n", encoding="utf-8")
+        replacement.replace(path)
+        await machine._poll_claude_watch(
+            session_id, watch, set(), 1000.0,
+            ownership_scan_complete=True,
+        )
+
+        assert ctx.claude_client_alias_probe is None
+        assert machine._claude_client_messages.get(session_id, path) == {}
+        assert not [
+            message for message in transport.sent
+            if isinstance(message, TurnBinding)
+        ]
 
     asyncio.run(go())
 

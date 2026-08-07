@@ -38,6 +38,20 @@ class CodexGoalMutation:
 
 
 @dataclass
+class ClaudeClientAliasProbe:
+    """Frozen transcript append boundary for one browser-originated turn."""
+
+    msg_id: str
+    generation: int
+    session_id: Optional[str]
+    path: Optional[str]
+    file_id: Optional[tuple[int, int]]
+    offset: int
+    allow_new_file: bool
+    partial: bytes = b""
+
+
+@dataclass
 class SessionContext:
     # None until the first ResultMessage/init SystemMessage captures the real id
     # (a brand-new session). A resumed session knows its id at spawn time.
@@ -54,6 +68,11 @@ class SessionContext:
     seq: int = 0                       # per-session monotonic counter
     state: State = "idle"
     engine: str = "claude"             # "claude" (SdkHandle) | "codex" (CodexHandle)
+    # Codex's complete local account boundary. ``session_id`` remains the
+    # native app-server UUID while ``key`` is the browser-facing routing id
+    # (namespaced for every profile when multiple profiles are configured).
+    # Claude leaves this unset.
+    codex_profile_id: Optional[str] = None
     # Product-space identity. Work sessions are native engine sessions whose
     # cwd and metadata are owned by cc-remote's private Work registry.
     space: str = "code"
@@ -171,6 +190,15 @@ class SessionContext:
     # the transcript. ``state=running`` starts earlier, during reconnect and
     # final ownership checks, so it is not sufficient write attribution.
     claude_write_active: bool = False
+    # Claude assigns transcript UUIDs inside its child. A turn-local append
+    # boundary learns the first real sdk-py user row without waiting for the
+    # later --replay-user-messages echo; replay remains the exact fallback.
+    # Keep a bounded same-process copy while the durable, source-bound store is
+    # unavailable or a new session has not captured its real id/path yet.
+    claude_client_message_ids: dict[str, str] = field(default_factory=dict)
+    claude_client_alias_bound_msg_id: Optional[str] = None
+    claude_client_alias_generation: int = 0
+    claude_client_alias_probe: Optional[ClaudeClientAliasProbe] = None
     # Authoritative v15 ownership/control projection.  These fields belong to
     # the resident session rather than to any browser so reconnects and history
     # refreshes cannot resurrect a stale read-only banner.  `control_revision`

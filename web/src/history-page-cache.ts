@@ -14,7 +14,8 @@ const HISTORY_PAGE_CACHE_SCOPE_INDEX = "scope";
 const HISTORY_PAGE_CACHE_SESSION_INDEX = "session";
 const HISTORY_PAGE_CACHE_LRU_INDEX = "lru";
 const DEFAULT_HISTORY_PAGE_CACHE_BYTES = 64 * 1024 * 1024;
-const RECORD_VERSION = 1;
+const LEGACY_RECORD_VERSIONS = new Set([1, 2] as const);
+const RECORD_VERSION = 3;
 
 export interface HistoryPageCacheSessionScope {
   machineId: string;
@@ -28,7 +29,7 @@ export interface HistoryPageCacheScope extends HistoryPageCacheSessionScope {
 }
 
 export interface HistoryPageCacheStoredRecord {
-  version: typeof RECORD_VERSION;
+  version: 1 | 2 | typeof RECORD_VERSION;
   key: string;
   scopeKey: string;
   sessionKey: string;
@@ -191,11 +192,15 @@ function validRecord(
     scopeKey: string;
     sessionKey: string;
     pageKey: string;
+    engine: string;
   },
 ): value is HistoryPageCacheStoredRecord {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const record = value as Partial<HistoryPageCacheStoredRecord>;
-  return record.version === RECORD_VERSION
+  const compatibleVersion = record.version === RECORD_VERSION
+    || (LEGACY_RECORD_VERSIONS.has(record.version as 1 | 2)
+      && expected.engine === "codex");
+  return compatibleVersion
     && record.key === expected.key
     && record.scopeKey === expected.scopeKey
     && record.sessionKey === expected.sessionKey
@@ -713,6 +718,7 @@ export class HistoryPageCache {
       scopeKey: historyPageCacheScopeKey(scope),
       sessionKey: historyPageCacheSessionKey(scope),
       pageKey,
+      engine: scope.engine,
     };
     try {
       if (!this.snapshotMatches(scope, epoch)
@@ -763,6 +769,7 @@ export class HistoryPageCache {
       scopeKey: historyPageCacheScopeKey(scope),
       sessionKey: historyPageCacheSessionKey(scope),
       pageKey: page.pageKey,
+      engine: scope.engine,
     };
     try {
       const previousValue = await this.storage.read(key);
