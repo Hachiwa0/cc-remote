@@ -25,6 +25,15 @@ export function remainingPercent(
   return clampPercent(100 - window.used_percent);
 }
 
+export function quotaWindowLabel(minutes?: number | null): string {
+  if (minutes == null || !Number.isFinite(minutes) || minutes <= 0) {
+    return "滚动窗口";
+  }
+  if (minutes === 300) return "5 小时窗口";
+  if (minutes === 10_080) return "一周窗口";
+  return `${minutes} 分钟窗口`;
+}
+
 export function accountQuotaWindows(
   report?: StatusReport | null,
 ): QuotaWindows {

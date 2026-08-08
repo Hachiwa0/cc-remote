@@ -3,6 +3,7 @@ import type { StatusRateWindow, StatusReport } from "../protocol";
 import {
   accountQuotaWindows,
   quotaTone,
+  quotaWindowLabel,
   remainingPercent,
 } from "../rate-limit-usage";
 
@@ -63,7 +64,7 @@ function QuotaRow({
     <i><span className={tone} style={{ width: `${remaining ?? 0}%` }} /></i>
     <small>
       {showDuration && window?.window_duration_mins != null
-        ? `${window.window_duration_mins} 分钟窗口 · `
+        ? `${quotaWindowLabel(window.window_duration_mins)} · `
         : ""}
       {resetTime(window?.resets_at)}
     </small>

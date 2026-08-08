@@ -25,7 +25,7 @@ try {
   const { UsageMeter } = await harness.ssrLoadModule(
     "/src/components/UsageMeter.tsx");
   const {
-    accountQuotaWindows, quotaTone, remainingPercent,
+    accountQuotaWindows, quotaTone, quotaWindowLabel, remainingPercent,
   } = await harness.ssrLoadModule("/src/rate-limit-usage.ts");
   const { statusNotices } = await harness.ssrLoadModule(
     "/src/notice-presentation.ts");
@@ -271,6 +271,10 @@ try {
   }));
   assert.match(statusMarkup, /需要关注/);
   assert.match(statusMarkup, /运行状态/);
+  assert.match(statusMarkup, /剩余 60%/);
+  assert.match(statusMarkup, /5 小时窗口/);
+  assert.match(statusMarkup, /width:60%/);
+  assert.doesNotMatch(statusMarkup, /40% 已用/);
   assert.doesNotMatch(statusMarkup,
     /crash|warning|wrapper|private|traceback|secret|rate_limit_reached/i,
     "the status sheet must not expose provider diagnostics or raw enums");
@@ -299,6 +303,9 @@ try {
   assert.equal(quotaTone(50), "warn");
   assert.equal(quotaTone(21), "warn");
   assert.equal(quotaTone(20), "critical");
+  assert.equal(quotaWindowLabel(300), "5 小时窗口");
+  assert.equal(quotaWindowLabel(10_080), "一周窗口");
+  assert.equal(quotaWindowLabel(1_440), "1440 分钟窗口");
   const separateQuotaLimits = accountQuotaWindows({
     ...quotaReport,
     rate_limits: [{
@@ -363,6 +370,20 @@ try {
     assert.equal(remainingPercent(accountQuota.weekly), 98,
       "cached updates and explicit reads must show the same account quota");
   }
+  const completeStatusMarkup = renderToStaticMarkup(createElement(StatusSheet, {
+    open: true,
+    report: { ...quotaReport, rate_limits: competingQuotaBuckets },
+    notices: [],
+    error: null,
+    onClose: () => {},
+    onRefresh: () => {},
+  }));
+  assert.match(completeStatusMarkup, /GPT-5.3-Codex-Spark/,
+    "complete status must render every model-specific bucket returned upstream");
+  assert.match(completeStatusMarkup, /剩余 100%/);
+  assert.match(completeStatusMarkup, /剩余 98%/);
+  assert.match(completeStatusMarkup, /一周窗口/);
+  assert.doesNotMatch(completeStatusMarkup, /10080 分钟窗口|% 已用/);
   const specializedQuotaOnly = accountQuotaWindows({
     ...quotaReport, rate_limits: [competingQuotaBuckets[0]],
   });

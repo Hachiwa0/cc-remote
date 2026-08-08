@@ -347,6 +347,10 @@
 .status-context-card span { color:var(--dim); font-family:var(--mono); font-size:10.5px; }
 .status-context-card > i,.status-rate-window > i { display:block; height:6px; overflow:hidden; border-radius:4px; background:var(--border); margin-top:7px; }
 .status-context-card > i span,.status-rate-window > i span { display:block; height:100%; border-radius:inherit; background:var(--accent); }
+.status-rate-window > i .good { background:color-mix(in srgb,var(--ok) 68%,white); }
+.status-rate-window > i .warn { background:var(--warn); }
+.status-rate-window > i .critical { background:var(--danger); }
+.status-rate-window > i .unknown { background:var(--border-strong); }
 .status-rates { display:grid; gap:8px; }
 .status-rate-card { padding:11px 12px; border:1px solid var(--border); border-radius:12px; background:var(--bg); }
 .status-rate-head { display:flex; justify-content:space-between; align-items:center; }
