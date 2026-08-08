@@ -6610,6 +6610,51 @@ def test_wrapper_steer_success_echoes_without_mutating_turn_lifecycle():
     asyncio.run(run())
 
 
+def test_wrapper_steer_rebinds_lease_before_live_echo_failure():
+    class Sdk:
+        turn_id = "native-turn"
+        turn_active = True
+        shared_daemon_affinity = True
+
+        async def steer(
+            self, prompt, images=None, *, client_user_message_id=None,
+        ):
+            assert prompt == "accepted before disconnect"
+            assert images == []
+            assert client_user_message_id == "steer-message"
+            return self.turn_id
+
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _install_running_steer_context(machine, Sdk())
+        machine._claim_codex_turn(
+            ctx, "native-turn", "original-message")
+        original_send = transport.send
+
+        async def fail_live_echo(message):
+            if isinstance(message, TurnSteered):
+                raise RuntimeError("relay disconnected after native acceptance")
+            await original_send(message)
+
+        transport.send = fail_live_echo
+        result = await machine._handle_steer(Steer(
+            sid=ctx.key,
+            cmd_id="steer-command",
+            client_id="client-1",
+            prompt="accepted before disconnect",
+            msg_id="steer-message",
+        ))
+
+        assert isinstance(result, TurnSteered)
+        lease = machine._codex_turn_leases.get(ctx.key)
+        assert lease is not None
+        assert lease.turn_id == "native-turn"
+        assert lease.msg_id == "steer-message"
+        assert ctx.active_msg_id == "steer-message"
+
+    asyncio.run(run())
+
+
 def test_wrapper_steer_failure_is_correlated_without_lifecycle_mutation():
     class Sdk:
         turn_id = "native-turn"

@@ -11,7 +11,8 @@ from cc_remote.codex_daemon_restart import (
 )
 from cc_remote.protocol import (
     Delta, Effort, Error, GetStatus, Model, Query, SessionActivity,
-    SessionControl, StatusReport, Takeover, TurnEnd, UserMsg,
+    SessionControl, StateEvent, StatusReport, Takeover, TurnBinding, TurnEnd,
+    UserMsg,
 )
 from cc_remote.wrapper.codex_external import HolderScan, ProcessIdentity
 from tests.test_codex_external import _CodexSdk, _record_async, _watch
@@ -427,6 +428,17 @@ def test_restarted_wrapper_reclaims_only_leased_active_daemon_turn(
         assert not [
             event for event in transport.sent if isinstance(event, UserMsg)
         ]
+        recovery_events = [
+            event for event in transport.sent
+            if isinstance(event, (TurnBinding, StateEvent))
+        ]
+        assert [type(event) for event in recovery_events[:2]] == [
+            TurnBinding, StateEvent,
+        ]
+        assert recovery_events[0].msg_id == "logical-message"
+        assert recovery_events[0].turn_id == "owned-turn"
+        assert recovery_events[1].state == "running"
+        assert recovery_events[1].msg_id == "logical-message"
 
         await machine._handle_interrupt(SimpleNamespace(sid="sid"))
         task = ctx.codex_spontaneous_task
@@ -458,6 +470,37 @@ def test_unmarked_daemon_generation_persists_a_recoverable_turn_lease():
     assert lease.msg_id == "logical-message"
     assert lease.daemon_epoch is None
     assert ctx.codex_owned_turn_id == "owned-turn"
+
+
+def test_lease_rebind_retry_uses_last_durable_message_id():
+    machine, _transport = _mk_machine()
+    ctx = _mk_ctx("sid", "sid")
+    ctx.engine = "codex"
+    ctx.space = "code"
+    ctx.sdk = _SharedSdk()
+    machine.sessions[ctx.key] = ctx
+    machine._claim_codex_turn(ctx, "owned-turn", "message-a")
+
+    durable_rebind = machine._codex_turn_leases.rebind
+    attempts = 0
+
+    def fail_once(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return False
+        return durable_rebind(*args, **kwargs)
+
+    machine._codex_turn_leases.rebind = fail_once
+    assert machine._rebind_codex_turn(
+        ctx, "owned-turn", "message-b") is False
+    assert ctx.codex_owned_msg_id == "message-a"
+    assert machine._rebind_codex_turn(
+        ctx, "owned-turn", "message-c") is True
+    assert ctx.codex_owned_msg_id == "message-c"
+    lease = machine._codex_turn_leases.get("sid")
+    assert lease is not None
+    assert lease.msg_id == "message-c"
 
 
 def test_restarted_wrapper_continues_leased_turn_aborted_by_account_switch(

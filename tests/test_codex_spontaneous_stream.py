@@ -1200,6 +1200,8 @@ def test_machine_projects_later_cli_user_item_as_turn_steer():
         handle = CodexHandle(machine.cfg)
         handle.thread_id = ctx.session_id
         handle.proc = SimpleNamespace(returncode=None)
+        handle._using_daemon_proxy = True
+        handle._daemon_proxy_established = True
         ctx.sdk = handle
         machine.sessions[ctx.key] = ctx
         handle.turn_lifecycle_callback = (
@@ -1217,15 +1219,34 @@ def test_machine_projects_later_cli_user_item_as_turn_steer():
                 "id": "answer-before-steer", "type": "agentMessage",
                 "text": "working", "phase": "commentary",
             }),
-            _notification("item/completed", turn_id, item={
-                "id": "cli-second", "type": "userMessage",
-                "text": "second CLI prompt",
-            }),
-            _notification("turn/completed", turn_id, turn={
-                "id": turn_id, "status": "completed",
-            }),
         ]:
             await handle._dispatch(message)
+
+        await handle._dispatch(_notification(
+            "item/completed", turn_id, item={
+                "id": "cli-second", "type": "userMessage",
+                "text": "second CLI prompt",
+            }))
+
+        async def wait_for_second_user():
+            while not any(
+                isinstance(event, TurnSteered)
+                and event.msg_id == "cli-second"
+                for event in transport.sent
+            ):
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(wait_for_second_user(), timeout=1)
+        lease = machine._codex_turn_leases.get(ctx.key)
+        assert lease is not None
+        assert lease.turn_id == turn_id
+        assert lease.msg_id == "cli-second"
+        assert lease.automatic is True
+
+        await handle._dispatch(_notification(
+            "turn/completed", turn_id, turn={
+                "id": turn_id, "status": "completed",
+            }))
 
         task = ctx.codex_spontaneous_task
         assert task is not None
@@ -1257,6 +1278,8 @@ def test_machine_reconciles_remote_steer_user_item_without_second_steer(
         handle = CodexHandle(machine.cfg)
         handle.thread_id = ctx.session_id
         handle.proc = SimpleNamespace(returncode=None)
+        handle._using_daemon_proxy = True
+        handle._daemon_proxy_established = True
         ctx.sdk = handle
         machine.sessions[ctx.key] = ctx
         handle.turn_lifecycle_callback = (
@@ -1301,6 +1324,11 @@ def test_machine_reconciles_remote_steer_user_item_without_second_steer(
             prompt="guide from Remote",
         ))
         assert isinstance(result, Error if outcome_unknown else TurnSteered)
+        lease = machine._codex_turn_leases.get(ctx.key)
+        assert lease is not None
+        assert lease.msg_id == (
+            "cli-first" if outcome_unknown else "remote-steer"
+        )
 
         official_user = {
             "id": "official-remote-steer",
@@ -1308,8 +1336,18 @@ def test_machine_reconciles_remote_steer_user_item_without_second_steer(
             "type": "userMessage",
             "content": [{"type": "text", "text": "guide from Remote"}],
         }
+        await handle._dispatch(
+            _notification("item/started", turn_id, item=official_user))
+
+        async def wait_for_remote_lease():
+            while True:
+                current = machine._codex_turn_leases.get(ctx.key)
+                if current is not None and current.msg_id == "remote-steer":
+                    return
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(wait_for_remote_lease(), timeout=1)
         for message in [
-            _notification("item/started", turn_id, item=official_user),
             _notification("item/completed", turn_id, item=official_user),
             _notification("turn/completed", turn_id, turn={
                 "id": turn_id, "status": "completed",

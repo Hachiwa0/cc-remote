@@ -237,6 +237,16 @@ export interface SessionRuntime {
   // Latest ordered live-row owner and the downstream sequence which established
   // it. This stays runtime-only and is never persisted as conversation content.
   liveOwner: { turnId: string; seq: number } | null;
+  // Exact logical/native owner announced by TurnBinding but not yet consumed by
+  // a narrative frame. Keeping this runtime-only prevents a wrapper restart
+  // from manufacturing a second prompt-less row while preserving the sequence
+  // and generation fences which make delayed replay safe.
+  pendingLiveBinding: {
+    msgId: string;
+    turnId: string;
+    seq: number;
+    generation: string | null;
+  } | null;
   // A wrapper restart invalidated every unscoped liveTaskId fallback still
   // present in the visible projection. New-generation events establish an
   // ordered owner; old legacy identities remain ineligible for this generation.
@@ -396,7 +406,8 @@ export function createRuntime(): SessionRuntime {
     historyGeneration: null, pendingHistoryGeneration: null,
     pendingHistoryCandidateBuildSeq: null,
     historyBuildSeq: 0, historyLiveSeq: 0,
-    historyFence: null, liveOwner: null, legacyLiveFallbackBlocked: false,
+    historyFence: null, liveOwner: null, pendingLiveBinding: null,
+    legacyLiveFallbackBlocked: false,
     lastLiveSeq: 0, lastLifecycleSeq: 0,
     hasLoadedOlderHistory: false,
     hydratedCacheTurnIds: [],
@@ -701,6 +712,125 @@ function findExplicitLiveTaskOwner(
     !turn.done && !!turn.liveTaskId);
 }
 
+function runtimeOrderingGeneration(runtime: SessionRuntime): string | null {
+  return runtime.controlGeneration ?? runtime.historyGeneration;
+}
+
+function activatePendingLiveBinding(
+  runtime: SessionRuntime,
+  turns: Turn[],
+  eventSeq: number | null | undefined,
+  nativeTurnId?: string | null,
+  create = true,
+): Turn | undefined {
+  const binding = runtime.pendingLiveBinding;
+  if (!binding) return undefined;
+  if (binding.generation !== runtimeOrderingGeneration(runtime)) {
+    runtime.pendingLiveBinding = null;
+    return undefined;
+  }
+  if (typeof eventSeq === "number" && eventSeq < binding.seq) return undefined;
+  if (nativeTurnId && nativeTurnId !== binding.turnId) return undefined;
+  // A delayed binding/replay from a completed turn may still be in the ring.
+  // Only a current running lifecycle may reopen its exact logical segment.
+  if (runtime.state !== "running") return undefined;
+
+  const matches = turns.filter((turn) =>
+    turnHasIdentityAlias(turn, binding.msgId));
+  if (matches.length > 1) return undefined;
+  let owner = matches[0];
+  if (!owner) {
+    if (!create) return undefined;
+    owner = {
+      id: binding.msgId,
+      clientMsgId: binding.msgId,
+      prompt: "",
+      blocks: [],
+      done: false,
+    };
+    turns.push(owner);
+  }
+  if (owner.forkPointId && owner.forkPointId !== binding.turnId
+      && owner.liveTaskId !== binding.turnId) return undefined;
+  if (owner.done) {
+    owner.done = false;
+    owner.doneTs = undefined;
+    owner.durationMs = undefined;
+    owner.interrupted = undefined;
+    owner.error = undefined;
+    owner.progress = undefined;
+    delete owner.terminalSource;
+  }
+  owner.forkPointId ??= binding.turnId;
+  runtime.liveOwner = {
+    turnId: owner.id,
+    seq: Math.max(binding.seq, eventSeq ?? binding.seq),
+  };
+  return owner;
+}
+
+function bindAuthoritativeActiveHistoryHead(
+  runtime: SessionRuntime,
+  turns: Turn[],
+  msgId: string,
+  nativeTurnId: string,
+  seq: number,
+  newestId: string | null = runtime.historyNewestId,
+  assumeRunning = false,
+): Turn | undefined {
+  if ((!assumeRunning && runtime.state !== "running") || !newestId) {
+    return undefined;
+  }
+  const heads = turns.filter((turn) =>
+    !turn.done
+    && (canonicalTurnId(turn) === newestId
+      || turnHasIdentityAlias(turn, newestId))
+    && findTurnByEngineId([turn], nativeTurnId) === turn);
+  if (heads.length !== 1) return undefined;
+  const head = heads[0];
+  if (head.clientMsgId && head.clientMsgId !== msgId
+      && !turnHasIdentityAlias(head, msgId)) return undefined;
+  const logicalOwners = turns.filter((turn) =>
+    turnHasIdentityAlias(turn, msgId));
+  if (logicalOwners.length > 1) return undefined;
+  head.clientMsgId ??= msgId;
+  const logical = logicalOwners[0];
+  if (logical && logical !== head) {
+    const headIndex = turns.indexOf(head);
+    const logicalIndex = turns.indexOf(logical);
+    const mergedTurns = mergeInitialHistory(
+      [head], [logical], { preserveLiveTailOpen: true });
+    if (mergedTurns.length !== 1) return undefined;
+    const merged = mergedTurns[0];
+    merged.forkPointId = nativeTurnId;
+    const first = Math.min(headIndex, logicalIndex);
+    const second = Math.max(headIndex, logicalIndex);
+    turns.splice(second, 1);
+    turns.splice(first, 1, merged);
+    runtime.liveOwner = { turnId: merged.id, seq };
+    return merged;
+  }
+  head.forkPointId ??= nativeTurnId;
+  runtime.liveOwner = { turnId: head.id, seq };
+  return head;
+}
+
+function findBoundLiveTaskOwner(
+  runtime: SessionRuntime,
+  turns: Turn[],
+  nativeTurnId: string | null | undefined,
+  eventSeq: number | null | undefined,
+  create = true,
+): Turn | undefined {
+  const pending = activatePendingLiveBinding(
+    runtime, turns, eventSeq, nativeTurnId, create);
+  if (pending) return pending;
+  const explicit = findExplicitLiveTaskOwner(runtime, turns);
+  return explicit && (!nativeTurnId
+      || findTurnByEngineId([explicit], nativeTurnId) === explicit)
+    ? explicit : undefined;
+}
+
 function remapExplicitLiveTaskOwner(
   owner: SessionRuntime["liveOwner"],
   turns: Turn[],
@@ -733,7 +863,11 @@ function openUnboundLiveTurn(
   turns: Turn[],
   fallbackId: string,
   ts?: number,
+  eventSeq?: number | null,
 ): Turn {
+  const bound = activatePendingLiveBinding(
+    runtime, turns, eventSeq, undefined, true);
+  if (bound) return bound;
   const owner = findCurrentUnownedLiveOwner(runtime, turns);
   if (owner) return owner;
   if (!runtime.legacyLiveFallbackBlocked) {
@@ -1363,6 +1497,7 @@ function switchControlGeneration(
   if (orderingGeneration != null && orderingGeneration !== generation) {
     runtime.historyFence = null;
     runtime.liveOwner = null;
+    runtime.pendingLiveBinding = null;
     runtime.legacyLiveFallbackBlocked = true;
   }
   if (runtime.historyGeneration !== null
@@ -2490,6 +2625,13 @@ function reduceEvent(
               && targetLiveTaskOwner && (!sourceLiveTaskOwner
                 || targetLiveTaskOwner.seq > sourceLiveTaskOwner.seq)
             ? targetLiveTaskOwner : sourceLiveTaskOwner ?? targetLiveTaskOwner;
+          const sourcePendingBinding = source.pendingLiveBinding;
+          const targetPendingBinding = mergeTarget.pendingLiveBinding;
+          const mergedPendingBinding = sameLiveOrderingScope
+              && targetPendingBinding && (!sourcePendingBinding
+                || targetPendingBinding.seq > sourcePendingBinding.seq)
+            ? targetPendingBinding
+            : sourcePendingBinding ?? targetPendingBinding;
           const mergedRuntime: SessionRuntime = {
             ...target,
             ...source,
@@ -2533,6 +2675,7 @@ function reduceEvent(
                       )
                 : source.historyFence,
             liveOwner: mergedLiveTaskOwner,
+            pendingLiveBinding: mergedPendingBinding,
             historyGeneration: source.historyRevision == null
               ? mergeTarget.historyGeneration : source.historyGeneration,
             pendingHistoryGeneration:
@@ -2798,6 +2941,7 @@ function reduceEvent(
         rt.historyLiveSeq = 0;
         rt.historyFence = null;
         rt.liveOwner = null;
+        rt.pendingLiveBinding = null;
         rt.hasLoadedOlderHistory = false;
         rt.hydratedCacheTurnIds = [];
         rt.liveDetailTurnIds = [];
@@ -3183,6 +3327,7 @@ function reduceEvent(
           base.turns.filter((turn) => observedIds.has(turn.id)),
         );
       }
+      let boundHistoryOwner: SessionRuntime["liveOwner"] = null;
       const currentRunningHistory = !e.before
         && e.in_progress === true
         && e.live_seq != null
@@ -3190,10 +3335,31 @@ function reduceEvent(
         && base.lastLifecycleSeq <= e.live_seq
         && (base.historyGeneration == null
           || e.generation === base.historyGeneration);
-      if (currentRunningHistory) {
+      if (currentRunningHistory && e.live_seq != null) {
         turns = reopenAuthoritativeActiveHistoryHead(
           base, turns, e.newest_id, e.live_seq,
           e.compaction_continuation_turn_ids);
+        const binding = base.pendingLiveBinding;
+        const responseGeneration = e.generation
+          ?? base.controlGeneration ?? base.historyGeneration;
+        if (binding && binding.generation === responseGeneration
+            && e.live_seq >= binding.seq) {
+          const bindingRuntime = {
+            ...base,
+            state: "running" as const,
+            liveOwner: base.liveOwner ? { ...base.liveOwner } : null,
+          };
+          bindAuthoritativeActiveHistoryHead(
+            bindingRuntime,
+            turns,
+            binding.msgId,
+            binding.turnId,
+            binding.seq,
+            e.newest_id ?? null,
+            true,
+          );
+          boundHistoryOwner = bindingRuntime.liveOwner;
+        }
       }
       // A later canonical terminal is sufficient to settle a shell which an
       // earlier running History reopened across a compact boundary. Do not
@@ -3250,6 +3416,35 @@ function reduceEvent(
           && base.lastLifecycleSeq <= e.live_seq));
       const hadModel = e.events.some((ev) => (ev as { type?: string }).type === "model");
       const hadEffort = e.events.some((ev) => (ev as { type?: string }).type === "effort");
+      const nextHistoryGeneration = acceptsControlState
+        ? (e.generation ?? base.historyGeneration)
+        : base.historyGeneration;
+      const nextOrderingGeneration = base.controlGeneration
+        ?? nextHistoryGeneration;
+      let pendingLiveBinding = base.pendingLiveBinding;
+      let liveOwner = boundHistoryOwner
+        ?? remapExplicitLiveTaskOwner(base.liveOwner, turns);
+      if (pendingLiveBinding
+          && pendingLiveBinding.generation !== nextOrderingGeneration) {
+        pendingLiveBinding = null;
+      }
+      if (pendingLiveBinding && acceptsControlState && !racedLiveEvent
+          && e.in_progress === false && e.live_seq != null
+          && e.live_seq >= pendingLiveBinding.seq) {
+        pendingLiveBinding = null;
+      }
+      if (pendingLiveBinding && acceptsControlState
+          && e.in_progress === true) {
+        const exactBindingOwners = turns.filter((turn) =>
+          turnHasIdentityAlias(turn, pendingLiveBinding!.msgId));
+        if (exactBindingOwners.length === 1
+            && !exactBindingOwners[0].done) {
+          liveOwner = {
+            turnId: exactBindingOwners[0].id,
+            seq: pendingLiveBinding.seq,
+          };
+        }
+      }
       let historyBrowse = state.historyBrowse;
       let retainedHistoryBrowse = state.retainedHistoryBrowse;
       if (historyBrowse?.sid === sid) {
@@ -3308,9 +3503,7 @@ function reduceEvent(
               ? e.revision : base.historyRevision,
             pendingHistoryRevision: acceptsControlState
               ? null : base.pendingHistoryRevision,
-            historyGeneration: acceptsControlState
-              ? (e.generation ?? base.historyGeneration)
-              : base.historyGeneration,
+            historyGeneration: nextHistoryGeneration,
             pendingHistoryGeneration: acceptsControlState
               ? null : base.pendingHistoryGeneration,
             pendingHistoryCandidateBuildSeq: acceptsControlState
@@ -3324,6 +3517,8 @@ function reduceEvent(
             historyFence: acceptsControlState
               ? (e.live_seq ?? null)
               : base.historyFence,
+            liveOwner,
+            pendingLiveBinding,
             historyNewestId: acceptsControlState
               ? (Object.prototype.hasOwnProperty.call(e, "newest_id")
                   ? (e.newest_id ?? null)
@@ -3765,6 +3960,7 @@ function reduceEvent(
           turn.progress = undefined;
         }
         if (e.state === "idle") {
+          rt.pendingLiveBinding = null;
           rt.pendingQuestion = null;
           const doneTs = eventTimestampMs(e.ts) ?? Date.now();
           for (const candidate of turns) {
@@ -4012,6 +4208,7 @@ function reduceEvent(
             rt.historyLiveSeq = 0;
             rt.historyFence = null;
             rt.liveOwner = null;
+            rt.pendingLiveBinding = null;
             rt.historyGeneration = null;
             rt.historyNewestId = null;
             rt.lastLiveSeq = 0;
@@ -4255,6 +4452,11 @@ function reduceEvent(
     }
     case "turn_steered": {
       const next = patch(state, e.sid, (rt) => {
+        if (rt.pendingLiveBinding
+            && (typeof e.seq !== "number"
+              || e.seq >= rt.pendingLiveBinding.seq)) {
+          rt.pendingLiveBinding = null;
+        }
         const turns = cloneTurns(rt.turns);
         const imgs = (e.images && e.images.length) ? e.images : undefined;
         const fileMeta = (e.files && e.files.length)
@@ -4356,7 +4558,7 @@ function reduceEvent(
         const t = findTurnOwningMessage(turns, e.message_id)
           ?? preSteerTurn(rt, turns)
           ?? openUnboundLiveTurn(
-            rt, turns, e.message_id, eventTimestampMs(e.ts));
+            rt, turns, e.message_id, eventTimestampMs(e.ts), e.seq);
         markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
         t.progress = undefined;
         const block = mutableTurnBlocks(t).find((b) => b.kind === "text"
@@ -4375,7 +4577,7 @@ function reduceEvent(
         const t = findTurnOwningMessage(turns, e.message_id)
           ?? preSteerTurn(rt, turns)
           ?? openUnboundLiveTurn(
-            rt, turns, e.message_id, eventTimestampMs(e.ts));
+            rt, turns, e.message_id, eventTimestampMs(e.ts), e.seq);
         markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
         t.progress = undefined;
         let block = mutableTurnBlocks(t).find((b) => b.kind === "text"
@@ -4408,7 +4610,7 @@ function reduceEvent(
           ?? findTurnOwningMessage(turns, e.message_id)
           ?? preSteerTurn(rt, turns)
           ?? openUnboundLiveTurn(
-            rt, turns, e.message_id, eventTimestampMs(e.ts));
+            rt, turns, e.message_id, eventTimestampMs(e.ts), e.seq);
         markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
         markTurnDetailAsLive(rt, t.id, boundCompletedTurns);
         t.progress = undefined;
@@ -4507,6 +4709,10 @@ function reduceEvent(
         // delayed subagent update creates a phantom new turn or attaches to the
         // wrong conversation.
         if (!owner) owner = findTurnOwningItem(turns, e.parent_id);
+        if (!owner) {
+          owner = findBoundLiveTaskOwner(
+            rt, turns, e.turn_id, e.seq, true);
+        }
         if (!owner) owner = findTurnByEngineId(turns, e.turn_id);
         if (!owner) {
           owner = openTurn(
@@ -4565,6 +4771,7 @@ function reduceEvent(
       return patch(state, e.sid, (rt) => {
         const turns = cloneTurns(rt.turns);
         let t = findTurnOwningItem(turns, e.item_id)
+          ?? findBoundLiveTaskOwner(rt, turns, e.turn_id, e.seq, true)
           ?? findTurnByEngineId(turns, e.turn_id);
         if (!t) {
           t = openTurn(
@@ -4593,6 +4800,7 @@ function reduceEvent(
       return patch(state, e.sid, (rt) => {
         const turns = cloneTurns(rt.turns);
         let t = findTurnOwningItem(turns, e.item_id)
+          ?? findBoundLiveTaskOwner(rt, turns, e.turn_id, e.seq, true)
           ?? findTurnByEngineId(turns, e.turn_id);
         if (!t) {
           t = openTurn(
@@ -4620,24 +4828,66 @@ function reduceEvent(
           clearAcceptance(rt);
         }
         const turns = cloneTurns(rt.turns);
-        const optimisticIndex = turns.findIndex((turn) =>
+        const seq = typeof e.seq === "number" ? e.seq : 0;
+        const binding = {
+          msgId: e.msg_id,
+          turnId: e.turn_id,
+          seq,
+          generation: runtimeOrderingGeneration(rt),
+        };
+        const currentOwner = rt.liveOwner
+          ? turns.find((turn) =>
+              turnHasIdentityAlias(turn, rt.liveOwner!.turnId))
+          : undefined;
+        const bindingOwnsCurrentRow = !!currentOwner
+          && turnHasIdentityAlias(currentOwner, e.msg_id);
+        const bindingCanSupersedeOwner = !rt.liveOwner
+          || bindingOwnsCurrentRow || seq > rt.liveOwner.seq;
+        const current = rt.pendingLiveBinding;
+        if (bindingCanSupersedeOwner && (
+          !current || current.generation !== binding.generation
+            || seq >= current.seq
+        )) {
+          rt.pendingLiveBinding = binding;
+        }
+        if (bindingCanSupersedeOwner) {
+          bindAuthoritativeActiveHistoryHead(
+            rt, turns, e.msg_id, e.turn_id, seq);
+        }
+        const exact = turns.filter((turn) =>
           turnHasIdentityAlias(turn, e.msg_id));
-        if (optimisticIndex < 0) return;
-        turns[optimisticIndex].forkPointId = e.turn_id;
-        const authoritativeIndex = turns.findIndex((turn, index) => (
-          index !== optimisticIndex
-          && (turn.forkPointId === e.turn_id || turn.id === e.turn_id)
-        ));
-        if (authoritativeIndex >= 0) {
-          const optimistic = turns[optimisticIndex];
-          const authoritative = turns[authoritativeIndex];
-          const merged = mergeInitialHistory(
-            [authoritative], [optimistic])[0] ?? optimistic;
-          merged.forkPointId = e.turn_id;
-          const first = Math.min(optimisticIndex, authoritativeIndex);
-          const second = Math.max(optimisticIndex, authoritativeIndex);
-          turns.splice(second, 1);
-          turns.splice(first, 1, merged);
+        if (exact.length === 1) {
+          const owner = exact[0];
+          const ownerIndex = turns.indexOf(owner);
+          const wasInitialUnboundOwner = !owner.done
+            && !turnHasBoundEngineId(owner);
+          const authoritativeCandidates = turns.filter((turn, index) =>
+            index !== ownerIndex
+            && (turn.forkPointId === e.turn_id || turn.id === e.turn_id));
+          if (!owner.forkPointId || owner.forkPointId === e.turn_id
+              || owner.liveTaskId === e.turn_id) {
+            owner.forkPointId = e.turn_id;
+            if (!owner.done && boundCompletedTurns) {
+              rt.liveOwner = { turnId: owner.id, seq };
+            }
+          }
+          // The initial Query may materialize in History before its first
+          // TurnBinding.  It is the only safe native-id-only merge: steer rows
+          // already carry liveTaskId, and completed predecessors must never be
+          // collapsed into a later segment which shares this native task.
+          if (wasInitialUnboundOwner
+              && authoritativeCandidates.length === 1) {
+            const authoritative = authoritativeCandidates[0];
+            const authoritativeIndex = turns.indexOf(authoritative);
+            const merged = mergeInitialHistory(
+              [authoritative], [owner])[0] ?? owner;
+            merged.forkPointId = e.turn_id;
+            const first = Math.min(ownerIndex, authoritativeIndex);
+            const second = Math.max(ownerIndex, authoritativeIndex);
+            turns.splice(second, 1);
+            turns.splice(first, 1, merged);
+            rt.liveOwner = { turnId: merged.id, seq };
+          }
         }
         if (boundCompletedTurns) replaceWithBoundedTurns(rt, turns);
         else rt.turns = turns;
@@ -4646,7 +4896,9 @@ function reduceEvent(
       return patch(state, e.sid, (rt) => {
         const turns = cloneTurns(rt.turns);
         const unknownSteerOwner = preSteerTurn(rt, turns);
-        let t = findTurnByEngineId(turns, e.turn_id);
+        let t = findBoundLiveTaskOwner(
+          rt, turns, e.turn_id, e.seq, false)
+          ?? findTurnByEngineId(turns, e.turn_id);
         if (!t) {
           const openTurns = turns.filter((turn) => !turn.done
             && !(rt.acceptanceKind === "steer_unknown"
@@ -4703,6 +4955,12 @@ function reduceEvent(
             t.detailRestorePending = true;
             t.detailRestoreIncomplete = true;
           }
+        }
+        const terminalBinding = rt.pendingLiveBinding;
+        if (terminalBinding && terminalBinding.turnId === e.turn_id
+            && (typeof e.seq !== "number"
+              || e.seq >= terminalBinding.seq)) {
+          rt.pendingLiveBinding = null;
         }
         if (t && t === unknownSteerOwner) {
           resolveUnknownPendingSteer(

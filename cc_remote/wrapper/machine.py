@@ -2503,6 +2503,58 @@ class WrapperMachine:
             )
             return
         ctx.codex_owned_turn_id = turn_id
+        ctx.codex_owned_msg_id = logical_msg_id
+
+    def _rebind_codex_turn(
+        self,
+        ctx: SessionContext,
+        turn_id: str,
+        msg_id: str,
+    ) -> bool:
+        """Persist one proven in-turn user boundary without replacing a lease."""
+        session_id = self._ctx_wire_sid(ctx)
+        if (
+            not self._codex_shared_affinity(ctx)
+            or not session_id
+            or not turn_id
+            or not msg_id
+            or ctx.codex_owned_turn_id != turn_id
+            or not ctx.codex_owned_msg_id
+        ):
+            return False
+        daemon_epoch = (
+            None
+            if ctx.codex_daemon_epoch == _CODEX_DAEMON_UNMARKED_EPOCH
+            else ctx.codex_daemon_epoch
+        )
+        try:
+            rebound = self._codex_turn_leases.rebind(
+                session_id,
+                turn_id,
+                msg_id,
+                expected_msg_id=ctx.codex_owned_msg_id,
+                daemon_epoch=daemon_epoch,
+            )
+        except Exception as exc:
+            # The upstream mutation is already authoritative.  Losing only its
+            # crash-recovery hint must not turn that accepted input into a
+            # client-visible failure which invites a duplicate retry.
+            log.warning(
+                "Codex turn lease could not be rebound",
+                session_id=session_id,
+                turn_id=turn_id,
+                error_type=type(exc).__name__,
+            )
+            return False
+        if not rebound:
+            log.warning(
+                "stale Codex turn lease rebind ignored",
+                session_id=session_id,
+                turn_id=turn_id,
+            )
+        if rebound:
+            ctx.codex_owned_msg_id = msg_id
+        return rebound
 
     def _release_codex_turn(
         self, ctx: SessionContext, turn_id: Optional[str] = None,
@@ -2525,6 +2577,7 @@ class WrapperMachine:
             return
         if released and owned == target:
             ctx.codex_owned_turn_id = None
+            ctx.codex_owned_msg_id = None
 
     async def _recover_codex_owned_turn(
         self, ctx: SessionContext, session_id: str,
@@ -2612,6 +2665,7 @@ class WrapperMachine:
             # marker.  In both cases daemon ownership proves the logical Remote
             # turn must cross the account handoff instead of becoming idle.
             ctx.codex_owned_turn_id = lease.turn_id
+            ctx.codex_owned_msg_id = lease.msg_id
             ctx.codex_recovered_turn_id = lease.turn_id
             ctx.codex_recovered_msg_id = lease.msg_id
             ctx.codex_recovered_automatic = lease.automatic
@@ -2668,6 +2722,7 @@ class WrapperMachine:
         if not callable(recover):
             return False
         ctx.codex_owned_turn_id = lease.turn_id
+        ctx.codex_owned_msg_id = lease.msg_id
         ctx.codex_recovered_turn_id = lease.turn_id
         ctx.codex_recovered_msg_id = lease.msg_id
         ctx.codex_recovered_automatic = lease.automatic
@@ -2695,6 +2750,7 @@ class WrapperMachine:
             return True
 
         ctx.codex_owned_turn_id = None
+        ctx.codex_owned_msg_id = None
         ctx.codex_recovered_turn_id = None
         ctx.codex_recovered_msg_id = None
         ctx.codex_recovered_automatic = None
@@ -10148,6 +10204,11 @@ class WrapperMachine:
                     files=file_meta,
                 )
                 self._remember_codex_published_steer(ctx, event)
+                self._rebind_codex_turn(
+                    ctx,
+                    turn_id,
+                    cmd.msg_id,
+                )
                 try:
                     await self._emit(ctx, event)
                 except Exception as exc:
@@ -12243,6 +12304,11 @@ class WrapperMachine:
                 ctx.codex_spontaneous_anchor_id = user.message_id
                 logical_msg_id = user.message_id
                 ctx.active_msg_id = user.message_id
+                self._rebind_codex_turn(
+                    ctx,
+                    current_turn_id,
+                    user.message_id,
+                )
                 await self._emit(ctx, UserMsg(
                     msg_id=user.message_id,
                     client_msg_id=user.client_id,
@@ -12269,6 +12335,11 @@ class WrapperMachine:
                 ctx.codex_published_steers.pop(user.client_id, None)
                 logical_msg_id = user.client_id
                 ctx.active_msg_id = user.client_id
+                self._rebind_codex_turn(
+                    ctx,
+                    current_turn_id,
+                    user.client_id,
+                )
                 await self._emit(ctx, UserMsg(
                     msg_id=user.message_id,
                     client_msg_id=user.client_id,
@@ -12285,6 +12356,11 @@ class WrapperMachine:
             # replacements for its prompt.
             logical_msg_id = user.message_id
             ctx.active_msg_id = user.message_id
+            self._rebind_codex_turn(
+                ctx,
+                current_turn_id,
+                user.message_id,
+            )
             await self._emit(ctx, TurnSteered(
                 msg_id=user.message_id,
                 turn_id=current_turn_id,
@@ -12530,10 +12606,6 @@ class WrapperMachine:
             return "continued"
 
         try:
-            if announce_running:
-                await self._emit(ctx, StateEvent(state="running"))
-                log.info("state transition", sid=ctx.session_id, state="running")
-
             # A continuation can win just as the preceding managed consumer is
             # unwinding. Preserve wire order: its TurnEnd must land before this
             # new empty-prompt turn begins.
@@ -12544,6 +12616,21 @@ class WrapperMachine:
                 return
 
             ctx.active_msg_id = logical_msg_id
+            if recovered_msg_id is not None:
+                # A replacement wrapper starts a fresh sequence generation.  An
+                # exact logical/native owner must enter that ring before any
+                # recovered tail, otherwise the browser correctly refuses to
+                # route unbound deltas into an old-generation row.
+                await self._emit(ctx, TurnBinding(
+                    msg_id=recovered_msg_id,
+                    turn_id=current_turn_id,
+                ))
+            if announce_running:
+                await self._emit(ctx, StateEvent(
+                    state="running",
+                    msg_id=logical_msg_id,
+                ))
+                log.info("state transition", sid=ctx.session_id, state="running")
             # turn/started is delivered only after app-server has already begun
             # executing the automatic continuation. A filesystem pre-image taken
             # here could be a half-turn snapshot, so preserve count alignment with
@@ -12944,6 +13031,11 @@ class WrapperMachine:
         ctx.codex_uncertain_steer = None
         ctx.active_msg_id = pending.msg_id
         self._remember_codex_published_steer(ctx, pending)
+        self._rebind_codex_turn(
+            ctx,
+            pending.turn_id,
+            pending.msg_id,
+        )
         try:
             await self._emit(ctx, pending)
         except Exception as exc:

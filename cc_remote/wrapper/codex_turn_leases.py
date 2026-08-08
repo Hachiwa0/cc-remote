@@ -315,6 +315,60 @@ class CodexTurnLeaseStore:
             leases.pop(next(iter(leases)))
         self._write(leases)
 
+    def rebind(
+        self,
+        session_id: str,
+        turn_id: str,
+        msg_id: str,
+        *,
+        expected_msg_id: Optional[str] = None,
+        daemon_epoch: Optional[str] = None,
+    ) -> bool:
+        """Move one live lease to a newer logical message boundary.
+
+        A native Codex turn may contain several accepted user items.  Recovery
+        needs the latest visible segment, but a stale wrapper must never replace
+        a newer segment merely because both messages share the same native turn.
+        This compare-and-swap therefore preserves every non-message lease field
+        and changes nothing unless the durable owner still matches the caller's
+        exact turn, daemon generation, and (when supplied) previous message.
+        """
+        if not all(self._valid_text(value)
+                   for value in (session_id, turn_id, msg_id)):
+            raise ValueError("invalid Codex turn lease rebind")
+        if (
+            expected_msg_id is not None
+            and not self._valid_text(expected_msg_id)
+        ):
+            raise ValueError("invalid expected Codex message id")
+        if daemon_epoch is not None and not self._valid_epoch(daemon_epoch):
+            raise ValueError("invalid Codex daemon epoch")
+
+        leases, profile_revision = self._read_state()
+        current = leases.get(session_id)
+        if (
+            current is None
+            or current.turn_id != turn_id
+            or current.daemon_epoch != daemon_epoch
+            or (
+                expected_msg_id is not None
+                and current.msg_id not in {expected_msg_id, msg_id}
+            )
+        ):
+            return False
+        if current.msg_id == msg_id:
+            return True
+        leases[session_id] = CodexTurnLease(
+            session_id=session_id,
+            turn_id=current.turn_id,
+            msg_id=msg_id,
+            daemon_epoch=current.daemon_epoch,
+            automatic=current.automatic,
+            updated_at=time.time(),
+        )
+        self._write(leases, profile_revision=profile_revision)
+        return True
+
     def release(
         self, session_id: str, *, turn_id: Optional[str] = None,
     ) -> bool:

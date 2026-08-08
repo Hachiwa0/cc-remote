@@ -1100,8 +1100,8 @@ assert.match(historyAppSource,
 assert.match(historyAppSource,
   /onLoadHistoryImage=\{historyView\.recovering\s*\? undefined/,
   "display-only recovery turns must not issue history-image reads");
-assert.match(cacheSource, /const CACHE_VER = 14/,
-  "completed replay-orphan pollution must invalidate older cache rows");
+assert.match(cacheSource, /const CACHE_VER = 15/,
+  "ambiguous recovery-owner projections must invalidate older cache rows");
 assert.match(cacheSource, /objectStore\(STORE\)\.delete\(sessionId\)/);
 assert.match(cacheSource, /job\.epoch !== sessionEpoch\(job\.sid\)/,
   "a debounced pre-marker write must not recreate the deleted cache row");
@@ -10670,6 +10670,378 @@ try {
     repairedReplayBlock.kind === "text" ? repairedReplayBlock.text : null,
     delayedReplayText,
     "authoritative History heals a previously persisted duplicate",
+  );
+
+  // A replacement wrapper resumes an already-visible Remote-owned Codex turn
+  // under a fresh sequence generation.  Its exact TurnBinding must restore the
+  // old logical owner before a recovered process/text tail arrives; sharing the
+  // native task id alone remains insufficient because steer segments share it.
+  const recoveredOwnerSid = "recovered-wrapper-owner-binding";
+  const recoveredOwnerMsg = "recovered-remote-message";
+  const recoveredNativeTurn = "recovered-native-turn";
+  let recoveredOwnerState = {
+    ...initialState,
+    focusedSid: recoveredOwnerSid,
+    runtimes: {
+      [recoveredOwnerSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        controlGeneration: "recovered-old-generation",
+        historyGeneration: "recovered-old-generation",
+        turns: [{
+          id: recoveredOwnerMsg,
+          clientMsgId: recoveredOwnerMsg,
+          prompt: "执行收紧后的计划。",
+          forkPointId: recoveredNativeTurn,
+          blocks: [],
+          done: false,
+        }],
+      },
+    },
+  };
+  recoveredOwnerState = reduce(recoveredOwnerState, {
+    type: "event",
+    event: event({
+      type: "replay_start",
+      sid: recoveredOwnerSid,
+      from_seq: 1,
+      to_seq: 5,
+      truncated: false,
+      generation: "recovered-new-generation",
+    }),
+  });
+  recoveredOwnerState = reduce(recoveredOwnerState, {
+    type: "event",
+    event: event({
+      type: "turn_binding",
+      sid: recoveredOwnerSid,
+      seq: 1,
+      msg_id: recoveredOwnerMsg,
+      turn_id: recoveredNativeTurn,
+    }),
+  });
+  recoveredOwnerState = reduce(recoveredOwnerState, {
+    type: "event",
+    event: event({
+      type: "state",
+      sid: recoveredOwnerSid,
+      seq: 2,
+      state: "running",
+      msg_id: recoveredOwnerMsg,
+    }),
+  });
+  recoveredOwnerState = reduce(recoveredOwnerState, {
+    type: "event",
+    event: event({
+      type: "process",
+      sid: recoveredOwnerSid,
+      seq: 3,
+      item_id: "recovered-process",
+      kind: "command",
+      phase: "end",
+      status: "succeeded",
+      turn_id: recoveredNativeTurn,
+      title: "continued after restart",
+    }),
+  });
+  recoveredOwnerState = reduce(recoveredOwnerState, {
+    type: "event",
+    event: event({
+      type: "assistant_msg_start",
+      sid: recoveredOwnerSid,
+      seq: 4,
+      message_id: "recovered-final",
+      channel: "final",
+    }),
+  });
+  recoveredOwnerState = reduce(recoveredOwnerState, {
+    type: "event",
+    event: event({
+      type: "delta",
+      sid: recoveredOwnerSid,
+      seq: 5,
+      message_id: "recovered-final",
+      channel: "final",
+      text: "one recovered answer",
+    }),
+  });
+  assert.equal(
+    recoveredOwnerState.runtimes[recoveredOwnerSid].turns.length,
+    1,
+    "new-generation recovered tail stays on the exact old logical owner",
+  );
+  assert.deepEqual(
+    recoveredOwnerState.runtimes[recoveredOwnerSid].turns[0].blocks.map(
+      (block: Block) => block.kind === "process"
+        ? block.item_id : block.kind === "text" ? block.message_id : null,
+    ),
+    ["recovered-process", "recovered-final"],
+    "process-first and assistant recovery events share one bound segment",
+  );
+  recoveredOwnerState = reduce(recoveredOwnerState, {
+    type: "event",
+    event: event({
+      type: "turn_end",
+      sid: recoveredOwnerSid,
+      seq: 6,
+      turn_id: recoveredNativeTurn,
+      result: { subtype: "success", duration_ms: 1, is_error: false },
+    }),
+  });
+  assert.equal(
+    recoveredOwnerState.runtimes[recoveredOwnerSid].turns[0].done,
+    true,
+  );
+  assert.equal(
+    recoveredOwnerState.runtimes[recoveredOwnerSid].pendingLiveBinding,
+    null,
+  );
+
+  // A cold browser can receive the recovery binding before both live content
+  // and History.  The first real content may open an internal empty-prompt
+  // owner, but canonical History must later fill that exact row rather than
+  // painting a second transcript copy.
+  const coldRecoveredSid = "cold-recovered-owner-binding";
+  let coldRecoveredState = {
+    ...initialState,
+    focusedSid: coldRecoveredSid,
+    runtimes: {
+      [coldRecoveredSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        controlGeneration: "cold-recovered-generation",
+        historyGeneration: "cold-recovered-generation",
+        legacyLiveFallbackBlocked: true,
+      },
+    },
+  };
+  for (const recoveredEvent of [
+    event({
+      type: "turn_binding",
+      sid: coldRecoveredSid,
+      seq: 1,
+      msg_id: "cold-client-message",
+      turn_id: "cold-native-turn",
+    }),
+    event({
+      type: "state",
+      sid: coldRecoveredSid,
+      seq: 2,
+      state: "running",
+      msg_id: "cold-client-message",
+    }),
+    event({
+      type: "assistant_msg_start",
+      sid: coldRecoveredSid,
+      seq: 3,
+      message_id: "cold-live-answer",
+      channel: "commentary",
+    }),
+    event({
+      type: "delta",
+      sid: coldRecoveredSid,
+      seq: 4,
+      message_id: "cold-live-answer",
+      channel: "commentary",
+      text: "recovering",
+    }),
+  ]) {
+    coldRecoveredState = reduce(coldRecoveredState, {
+      type: "event",
+      event: recoveredEvent,
+    });
+  }
+  assert.equal(coldRecoveredState.runtimes[coldRecoveredSid].turns.length, 1);
+  assert.equal(coldRecoveredState.runtimes[coldRecoveredSid].turns[0].prompt, "");
+  coldRecoveredState = reduce(coldRecoveredState, {
+    type: "event",
+    event: event({
+      type: "history",
+      sid: coldRecoveredSid,
+      session_id: coldRecoveredSid,
+      revision: "cold-recovered-r1",
+      generation: "cold-recovered-generation",
+      build_seq: 1,
+      live_seq: 4,
+      detail: "summary",
+      authoritative: true,
+      has_more: false,
+      newest_id: "cold-official-message",
+      in_progress: true,
+      events: [],
+      turns: [{
+        id: "cold-official-message",
+        prompt: "continue the active task",
+        forkPointId: "cold-native-turn",
+        done: false,
+        blocks: [],
+      }],
+    }),
+  });
+  assert.equal(
+    coldRecoveredState.runtimes[coldRecoveredSid].turns.length,
+    1,
+    "History arriving after recovery content preserves one projection",
+  );
+  assert.equal(
+    coldRecoveredState.runtimes[coldRecoveredSid].turns[0].prompt,
+    "continue the active task",
+  );
+  assert.equal(
+    coldRecoveredState.runtimes[coldRecoveredSid].turns[0].blocks[0].kind
+      === "text"
+      ? coldRecoveredState.runtimes[coldRecoveredSid].turns[0].blocks[0].text
+      : null,
+    "recovering",
+    "a lagging active History head keeps its newer bound live tail",
+  );
+
+  const historyFirstRecoverySid = "history-before-recovery-binding";
+  let historyFirstRecoveryState = {
+    ...initialState,
+    focusedSid: historyFirstRecoverySid,
+    runtimes: {
+      [historyFirstRecoverySid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        controlGeneration: "history-first-generation",
+        historyGeneration: "history-first-generation",
+        legacyLiveFallbackBlocked: true,
+      },
+    },
+  };
+  historyFirstRecoveryState = reduce(historyFirstRecoveryState, {
+    type: "event",
+    event: event({
+      type: "history",
+      sid: historyFirstRecoverySid,
+      session_id: historyFirstRecoverySid,
+      revision: "history-first-r1",
+      generation: "history-first-generation",
+      build_seq: 1,
+      live_seq: 0,
+      detail: "summary",
+      authoritative: true,
+      has_more: false,
+      newest_id: "history-first-official",
+      in_progress: true,
+      events: [],
+      turns: [{
+        id: "history-first-official",
+        prompt: "keep going",
+        forkPointId: "history-first-native",
+        done: false,
+        blocks: [],
+      }],
+    }),
+  });
+  for (const recoveredEvent of [
+    event({
+      type: "turn_binding",
+      sid: historyFirstRecoverySid,
+      seq: 1,
+      msg_id: "history-first-client",
+      turn_id: "history-first-native",
+    }),
+    event({
+      type: "state",
+      sid: historyFirstRecoverySid,
+      seq: 2,
+      state: "running",
+      msg_id: "history-first-client",
+    }),
+    event({
+      type: "assistant_msg_start",
+      sid: historyFirstRecoverySid,
+      seq: 3,
+      message_id: "history-first-tail",
+      channel: "final",
+    }),
+  ]) {
+    historyFirstRecoveryState = reduce(historyFirstRecoveryState, {
+      type: "event",
+      event: recoveredEvent,
+    });
+  }
+  assert.equal(
+    historyFirstRecoveryState.runtimes[historyFirstRecoverySid].turns.length,
+    1,
+    "History-before-binding recovery also retains one exact owner",
+  );
+  assert.equal(
+    historyFirstRecoveryState.runtimes[historyFirstRecoverySid].turns[0]
+      .blocks[0].kind === "text"
+      ? historyFirstRecoveryState.runtimes[historyFirstRecoverySid].turns[0]
+        .blocks[0].message_id
+      : null,
+    "history-first-tail",
+  );
+
+  // An older binding for a completed predecessor cannot steal a newer steer
+  // owner even though both segments intentionally share one native task id.
+  const staleBindingSid = "stale-binding-after-steer";
+  let staleBindingState = {
+    ...initialState,
+    focusedSid: staleBindingSid,
+    runtimes: {
+      [staleBindingSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        controlGeneration: "stale-binding-generation",
+        historyGeneration: "stale-binding-generation",
+        legacyLiveFallbackBlocked: true,
+        liveOwner: { turnId: "current-steer", seq: 20 },
+        turns: [{
+          id: "initial-message",
+          clientMsgId: "initial-message",
+          prompt: "start",
+          forkPointId: "shared-steer-task",
+          blocks: [],
+          done: true,
+        }, {
+          id: "current-steer",
+          clientMsgId: "current-steer",
+          prompt: "continue differently",
+          liveTaskId: "shared-steer-task",
+          blocks: [],
+          done: false,
+        }],
+      },
+    },
+  };
+  staleBindingState = reduce(staleBindingState, {
+    type: "event",
+    event: event({
+      type: "turn_binding",
+      sid: staleBindingSid,
+      seq: 10,
+      msg_id: "initial-message",
+      turn_id: "shared-steer-task",
+    }),
+  });
+  staleBindingState = reduce(staleBindingState, {
+    type: "event",
+    event: event({
+      type: "assistant_msg_start",
+      sid: staleBindingSid,
+      seq: 21,
+      message_id: "current-steer-answer",
+      channel: "final",
+    }),
+  });
+  assert.equal(staleBindingState.runtimes[staleBindingSid].turns.length, 2);
+  assert.equal(staleBindingState.runtimes[staleBindingSid].turns[0].done, true);
+  assert.equal(
+    staleBindingState.runtimes[staleBindingSid].turns[1].blocks[0].kind
+      === "text"
+      ? staleBindingState.runtimes[staleBindingSid].turns[1].blocks[0].message_id
+      : null,
+    "current-steer-answer",
+    "an older binding cannot reopen the completed predecessor",
   );
 
   const completeDetailText = "complete detail payload after the summary prefix";

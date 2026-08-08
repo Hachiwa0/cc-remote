@@ -50,3 +50,59 @@ def test_codex_turn_lease_reads_legacy_record_without_daemon_epoch(tmp_path):
     assert lease is not None
     assert lease.daemon_epoch is None
     assert lease.automatic is False
+
+
+def test_codex_turn_lease_rebind_is_compare_and_swap(tmp_path):
+    store = CodexTurnLeaseStore(tmp_path)
+    store.claim(
+        "session",
+        "turn-a",
+        "message-a",
+        daemon_epoch="a" * 32,
+        automatic=True,
+    )
+
+    assert store.rebind(
+        "session",
+        "turn-a",
+        "message-b",
+        expected_msg_id="message-a",
+        daemon_epoch="a" * 32,
+    ) is True
+    rebound = store.get("session")
+    assert rebound is not None
+    assert rebound.msg_id == "message-b"
+    assert rebound.automatic is True
+
+    assert store.rebind(
+        "session",
+        "turn-a",
+        "stale-message",
+        expected_msg_id="message-a",
+        daemon_epoch="a" * 32,
+    ) is False
+    assert store.rebind(
+        "session",
+        "turn-a",
+        "wrong-generation",
+        expected_msg_id="message-b",
+        daemon_epoch="b" * 32,
+    ) is False
+    assert store.rebind(
+        "session",
+        "turn-b",
+        "wrong-turn",
+        expected_msg_id="message-b",
+        daemon_epoch="a" * 32,
+    ) is False
+    assert store.get("session") == rebound
+
+    # Reliable-command replay may repeat the same accepted boundary.
+    assert store.rebind(
+        "session",
+        "turn-a",
+        "message-b",
+        expected_msg_id="message-a",
+        daemon_epoch="a" * 32,
+    ) is True
+    assert store.get("session") == rebound

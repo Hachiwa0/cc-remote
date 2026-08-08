@@ -39,7 +39,9 @@ const SCHEMA = 1;
 // the same conversations without guessing whether repeated prose was pollution.
 // v14 discards completed prompt-less replay orphans which an older matcher kept
 // when several tool blocks legitimately shared one assistant message id.
-const CACHE_VER = 14;
+// v15 discards projections written when a wrapper restart recovered the tail of
+// an active Codex turn without re-announcing its exact logical message owner.
+const CACHE_VER = 15;
 const MAX_CACHE_SESSIONS = 64;
 const MAX_CACHE_TURNS = 100;
 const MAX_CACHE_BYTES = 2 * 1024 * 1024;

@@ -165,6 +165,10 @@ class SessionContext:
     # A shared-daemon turn started by Remote is leased on disk so a replacement
     # wrapper can safely reattach without classifying it as Codex App ownership.
     codex_owned_turn_id: Optional[str] = None
+    # Last logical message id successfully written into that durable lease.
+    # This deliberately differs from active_msg_id after a transient write
+    # failure so the next authoritative boundary can retry the same CAS base.
+    codex_owned_msg_id: Optional[str] = None
     codex_recovered_turn_id: Optional[str] = None
     codex_recovered_msg_id: Optional[str] = None
     codex_recovered_automatic: Optional[bool] = None
