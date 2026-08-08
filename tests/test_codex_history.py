@@ -18,6 +18,7 @@ from cc_remote.wrapper.codex_rpc import (
     CodexRpcResponseTooLarge,
 )
 from cc_remote.wrapper.codex_stream import (
+    codex_history_native_witness,
     codex_history_image_views,
     codex_history_turn_user,
     codex_history_turn_users,
@@ -284,10 +285,86 @@ def test_summary_page_is_chronological_and_preserves_native_identity():
         assert page.oldest_id == "user-old"
         assert page.newest_id == "user-new"
         assert page.has_more is True
+        assert page.native_turn_ids == ("native-new", "native-old")
         assert page.turns[0]["blocks"][-1]["text"] == "old answer"
         assert page.turns[0]["detailEventCount"] >= 1
 
     asyncio.run(run())
+
+
+def test_native_history_witness_ignores_abnormal_payloads_and_dedupes_steers(
+    tmp_path,
+):
+    path = tmp_path / "projection-witness.jsonl"
+    rows = [
+        {
+            "type": "event_msg",
+            "payload": {"type": "task_started", "turn_id": "native-old"},
+        },
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "turn_id": "native-old",
+                "message": "old prompt",
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {"type": "task_complete", "turn_id": "native-old"},
+        },
+        {
+            "type": "event_msg",
+            "payload": {"type": "task_started", "turn_id": "native-new"},
+        },
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "turn_id": "native-new",
+                "message": "first prompt",
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "rate_limits": {"credits": {"balance": "not-a-float"}},
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "turn_id": "native-new",
+                "message": "steered prompt",
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {"type": "task_complete", "turn_id": "native-new"},
+        },
+    ]
+    with path.open("wb") as target:
+        for row in rows[:5]:
+            target.write(json.dumps(row).encode() + b"\n")
+        target.write(b'{"oversized":"' + b"x" * (1024 * 1024 + 1) + b'"}\n')
+        target.write(b'{not-json}\n')
+        for row in rows[5:]:
+            target.write(json.dumps(row).encode() + b"\n")
+
+    witness = codex_history_native_witness(
+        str(path), max_turns=4, max_scan_bytes=4 * 1024 * 1024)
+
+    assert witness.turn_ids == ("native-new", "native-old")
+    assert witness.scanned_to_start is True
+    assert witness.has_more_turns is False
+
+    bounded = codex_history_native_witness(
+        str(path), max_turns=1, max_scan_bytes=4 * 1024 * 1024)
+    assert bounded.turn_ids == ("native-new",)
+    assert bounded.scanned_to_start is True
+    assert bounded.has_more_turns is True
 
 
 def test_summary_page_recovers_goal_prompt_for_assistant_only_native_turn():

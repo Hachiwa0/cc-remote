@@ -36,6 +36,7 @@ from cc_remote.protocol import (
 from cc_remote.wrapper import machine as mm
 from cc_remote.wrapper import stream as stream_module
 from cc_remote.wrapper.codex_history import (
+    CodexHistoryCursorError,
     CodexHistoryPage,
     CodexHistoryUnsupported,
 )
@@ -62,6 +63,33 @@ from cc_remote.wrapper.stream import (
     translate_history,
 )
 from tests.test_multisession import _mk_machine, _mk_ctx
+
+
+def _write_projection_rollout(path, native_turn_ids: list[str]) -> None:
+    rows: list[dict] = [{
+        "type": "session_meta",
+        "payload": {"id": "sanitized-projection-session"},
+    }]
+    for index, turn_id in enumerate(native_turn_ids):
+        rows.extend((
+            {
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": turn_id},
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "turn_id": turn_id,
+                    "message": f"prompt {index}",
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "turn_id": turn_id},
+            },
+        ))
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
 
 
 def _delayed_retry_transcript_rows() -> list[dict]:
@@ -1317,6 +1345,182 @@ def test_requested_codex_summary_falls_back_only_for_unsupported_capability(
         )
         assert history.error is None
         assert len(fallback_calls) == 1
+
+    asyncio.run(run())
+
+
+def test_requested_codex_summary_pins_rollout_only_after_stable_omission(
+    monkeypatch, tmp_path,
+):
+    rollout = tmp_path / "incomplete-official.jsonl"
+    _write_projection_rollout(
+        rollout, ["native-old", "native-middle", "native-new"])
+    monkeypatch.setattr(
+        mm, "codex_rollout_path", lambda _sid: str(rollout))
+    invalidations = []
+
+    class IncompleteOfficial:
+        def __init__(self):
+            self.calls = 0
+
+        async def summary_page(self, *_args, **_kwargs):
+            self.calls += 1
+            return CodexHistoryPage(
+                events=(),
+                turns=(),
+                has_more=False,
+                oldest_id=None,
+                newest_id=None,
+                native_turn_ids=("native-old",),
+            )
+
+        def invalidate_thread(self, sid):
+            invalidations.append(sid)
+
+        async def turn_events(self, *_args, **_kwargs):
+            raise CodexHistoryCursorError("rollout history has no locator")
+
+    async def run():
+        machine, _transport = _mk_machine()
+        official = IncompleteOfficial()
+        machine._codex_history = official
+        ctx = _mk_ctx("projection-gap", "projection-gap")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+        old_revision = machine._history_revision(ctx.key)
+        newest = await machine._build_requested_history(
+            ctx.key, before=None, limit=2, cwd=ctx.cwd, detail="summary")
+        assert newest.oldest_id is not None
+        older = await machine._build_requested_history(
+            ctx.key, before=newest.oldest_id, limit=2,
+            cwd=ctx.cwd, detail="summary")
+        detail = await machine._handle_get_turn_detail(GetTurnDetail(
+            session_id=ctx.key,
+            turn_id=newest.turns[-1].id,
+            revision=newest.revision,
+        ))
+
+        assert newest.authoritative is True
+        assert [turn.prompt for turn in newest.turns] == [
+            "prompt 1", "prompt 2",
+        ]
+        assert [turn.prompt for turn in older.turns] == ["prompt 0"]
+        assert detail.authoritative is True
+        assert detail.events
+        assert official.calls == 1
+        assert invalidations == [ctx.key]
+        assert machine._history_revision(ctx.key) != old_revision
+        assert machine._codex_rollout_history_active(ctx.key) is True
+        assert newest.revision == older.revision == detail.revision
+
+    asyncio.run(run())
+
+
+def test_requested_codex_summary_keeps_moving_projection_non_authoritative(
+    monkeypatch, tmp_path,
+):
+    rollout = tmp_path / "moving-official.jsonl"
+    _write_projection_rollout(rollout, ["native-old", "native-new"])
+    monkeypatch.setattr(
+        mm, "codex_rollout_path", lambda _sid: str(rollout))
+
+    class StaleOfficial:
+        async def summary_page(self, *_args, **_kwargs):
+            return CodexHistoryPage(
+                events=(),
+                turns=(),
+                has_more=False,
+                oldest_id=None,
+                newest_id=None,
+                native_turn_ids=("native-old",),
+            )
+
+    native_witness = mm.codex_history_native_witness
+
+    def moving_witness(path, **kwargs):
+        witness = native_witness(path, **kwargs)
+        with open(path, "ab") as target:
+            target.write(b'{"type":"event_msg","payload":{"type":"delta"}}\n')
+        return witness
+
+    async def run():
+        machine, _transport = _mk_machine()
+        machine._codex_history = StaleOfficial()
+        ctx = _mk_ctx("projection-moving", "projection-moving")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+        retries = []
+        monkeypatch.setattr(mm, "codex_history_native_witness", moving_witness)
+        monkeypatch.setattr(
+            machine,
+            "_schedule_official_codex_history_refresh",
+            lambda sid, **kwargs: retries.append((sid, kwargs)),
+        )
+        monkeypatch.setattr(
+            machine,
+            "_build_history",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("moving official page changed source")),
+        )
+
+        history = await machine._build_requested_history(
+            ctx.key, before=None, limit=4, cwd=ctx.cwd, detail="summary")
+
+        assert history.authoritative is False
+        assert history.error is None
+        assert machine._codex_rollout_history_active(ctx.key) is False
+        assert retries == [(ctx.key, {"limit": 4, "cwd": ctx.cwd})]
+
+    asyncio.run(run())
+
+
+def test_requested_codex_summary_accepts_matching_rollback_projection(
+    monkeypatch, tmp_path,
+):
+    rollout = tmp_path / "official-rollback.jsonl"
+    _write_projection_rollout(
+        rollout, ["native-old", "native-middle", "native-new"])
+    monkeypatch.setattr(
+        mm, "codex_rollout_path", lambda _sid: str(rollout))
+
+    class MatchingOfficial:
+        native_turn_ids = (
+            "native-new", "native-middle", "native-old",
+        )
+
+        async def summary_page(self, *_args, **_kwargs):
+            return CodexHistoryPage(
+                events=(),
+                turns=(),
+                has_more=False,
+                oldest_id=None,
+                newest_id=None,
+                native_turn_ids=self.native_turn_ids,
+            )
+
+        def invalidate_thread(self, _sid):
+            return None
+
+    async def run():
+        machine, _transport = _mk_machine()
+        official = MatchingOfficial()
+        machine._codex_history = official
+        ctx = _mk_ctx("projection-rollback", "projection-rollback")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+
+        initial = await machine._build_requested_history(
+            ctx.key, before=None, limit=4, cwd=ctx.cwd, detail="summary")
+        assert initial.authoritative is True
+
+        _write_projection_rollout(rollout, ["native-old"])
+        official.native_turn_ids = ("native-old",)
+        machine._invalidate_session_history(ctx, ctx.key)
+        rolled_back = await machine._build_requested_history(
+            ctx.key, before=None, limit=4, cwd=ctx.cwd, detail="summary")
+
+        assert rolled_back.authoritative is True
+        assert machine._codex_rollout_history_active(ctx.key) is False
 
     asyncio.run(run())
 

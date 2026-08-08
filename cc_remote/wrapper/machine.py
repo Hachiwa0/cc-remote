@@ -200,19 +200,20 @@ from cc_remote.wrapper.codex_handle import (
 from cc_remote.wrapper.codex_turn_leases import CodexTurnLeaseStore
 from cc_remote.wrapper.codex_permissions import codex_permission_profiles
 from cc_remote.wrapper.codex_stream import (
-    CodexHistoryImageView, CodexStreamTranslator,
+    CodexHistoryImageView, CodexHistoryNativeWitness, CodexStreamTranslator,
     coalesce_codex_live_notifications,
     codex_live_user_message,
     codex_history_image_views, codex_session_id, is_turn_terminal,
     codex_history_boundary_user, codex_history_turn_user,
     codex_history_turn_users,
-    codex_history_window,
+    codex_history_native_witness, codex_history_window,
     codex_native_rollback_turns,
     codex_translate_history,
 )
 from cc_remote.wrapper.codex_history import (
     CodexHistoryCursorError,
     CodexHistoryInvalidResponse,
+    CodexHistoryPage,
     CodexHistoryUnsupported,
     CodexOfficialHistory,
 )
@@ -1043,6 +1044,63 @@ class _CodexGoalRecoveryMiss:
     stable: bool
 
 
+class _CodexOfficialProjectionIncomplete(RuntimeError):
+    """A stable rollout proves that the official newest page omitted turns."""
+
+
+def _codex_official_projection_outcome(
+    page: CodexHistoryPage,
+    witness: CodexHistoryNativeWitness,
+) -> str:
+    """Classify official completeness without treating absence as evidence.
+
+    The app-server can expose additional native rows that an older rollout
+    shape cannot classify. Only rollout ids missing from a stable official page
+    prove the destructive failure mode we are guarding against.
+    """
+    official = page.native_turn_ids
+    rollout = witness.turn_ids
+    if not rollout:
+        if not official:
+            return "match" if witness.scanned_to_start else "inconclusive"
+        return "not-applicable"
+    if not official:
+        return "mismatch"
+
+    official_set = set(official)
+    shared_indices = [
+        index for index, turn_id in enumerate(rollout)
+        if turn_id in official_set
+    ]
+    if not page.has_more:
+        if witness.has_more_turns or any(
+            turn_id not in official_set for turn_id in rollout
+        ):
+            return "mismatch"
+        return "match" if witness.scanned_to_start else "inconclusive"
+    if not shared_indices:
+        return "inconclusive"
+
+    last_shared = max(shared_indices)
+    if any(
+        turn_id not in official_set
+        for turn_id in rollout[:last_shared + 1]
+    ):
+        return "mismatch"
+    shared_rollout = [
+        turn_id for turn_id in rollout[:last_shared + 1]
+        if turn_id in official_set
+    ]
+    shared_set = set(shared_rollout)
+    shared_official = [
+        turn_id for turn_id in official
+        if turn_id in shared_set
+    ]
+    if shared_official != shared_rollout:
+        return "mismatch"
+    return "match"
+
+
 class _CodexHistoryProfiles:
     """Dispatch official history reads to the matching CODEX_HOME.
 
@@ -1315,6 +1373,11 @@ class WrapperMachine:
         # over its authoritative transcript.  The per-process generation also
         # makes a crash after native rollback safe without another disk journal.
         self._history_revision_epochs: dict[str, int] = {}
+        # A stable official-page omission pins this routed sid to the bounded
+        # rollout projection for the current History revision. The routed id
+        # includes the Codex profile, so identical native UUIDs in two accounts
+        # can never share fallback state.
+        self._codex_rollout_history_revisions: dict[str, str] = {}
         # SessionContext objects are evicted and recreated while this wrapper
         # generation stays alive. Keep each sid's control revision outside the
         # resident context so a rebuilt Snapshot cannot move backwards and be
@@ -1825,6 +1888,7 @@ class WrapperMachine:
 
     def _invalidate_codex_history(self, sid: str) -> None:
         """Invalidate only Codex-native supplements for one routed thread id."""
+        self._codex_rollout_history_revisions.pop(sid, None)
         for key in tuple(self._codex_history_image_views):
             if key[0] == sid:
                 self._codex_history_image_views.pop(key, None)
@@ -1847,6 +1911,20 @@ class WrapperMachine:
         for key in tuple(self._codex_goal_recovery_misses):
             if key[0] == sid:
                 self._codex_goal_recovery_misses.pop(key, None)
+
+    def _codex_rollout_history_active(self, sid: str) -> bool:
+        return self._codex_rollout_history_revisions.get(
+            sid) == self._history_revision(sid)
+
+    def _activate_codex_rollout_history(self, sid: str) -> str:
+        """Start one clean rollout generation after a proven official omission."""
+        self._bump_history_revision(sid)
+        # Drop official page cursors, locators and detail rows before any
+        # rollout page can be requested under the new revision.
+        self._invalidate_codex_history(sid)
+        revision = self._history_revision(sid)
+        self._codex_rollout_history_revisions[sid] = revision
+        return revision
 
     def _invalidate_session_history(
         self,
@@ -8574,6 +8652,18 @@ class WrapperMachine:
             _codex_compaction_continuation_ids(ctx)
             if before is None else []
         )
+        source_path: str | None = None
+        source_before: HistorySourceFingerprint | None = None
+        source_capture_failed = False
+        if before is None:
+            try:
+                source_path = await asyncio.to_thread(
+                    self._codex_rollout_for_wire, sid)
+                if source_path:
+                    source_before = await asyncio.to_thread(
+                        HistorySourceFingerprint.capture, source_path)
+            except OSError:
+                source_capture_failed = source_path is not None
         page = await self._codex_history.summary_page(
             sid,
             before=before,
@@ -8585,6 +8675,41 @@ class WrapperMachine:
             # both once; later mirrors reuse the generation-local bounded cache.
             hydrate_recent=2 if before is None else 0,
         )
+
+        projection_outcome = "not-applicable"
+        if before is None and source_path:
+            if source_capture_failed or source_before is None:
+                projection_outcome = "inconclusive"
+            else:
+                try:
+                    witness = await asyncio.to_thread(
+                        codex_history_native_witness,
+                        source_path,
+                        max_turns=max(
+                            (limit or 4) + 1,
+                            len(page.native_turn_ids) + 1,
+                        ),
+                        max_scan_bytes=(
+                            self.cfg.codex_history_window_max_bytes),
+                    )
+                    source_after = await asyncio.to_thread(
+                        HistorySourceFingerprint.capture, source_path)
+                except OSError:
+                    projection_outcome = "inconclusive"
+                else:
+                    if (
+                        source_after != source_before
+                        or self._history_revision(sid) != revision
+                    ):
+                        projection_outcome = "inconclusive"
+                    else:
+                        projection_outcome = _codex_official_projection_outcome(
+                            page, witness)
+        if projection_outcome == "mismatch" and not in_progress:
+            raise _CodexOfficialProjectionIncomplete(
+                "stable rollout contains turns omitted by official history")
+        if projection_outcome == "mismatch":
+            projection_outcome = "inconclusive"
 
         control_rows: list[dict] = []
         if before is None and ctx is not None:
@@ -8602,6 +8727,7 @@ class WrapperMachine:
             generation=self.instance_id,
             build_seq=build_seq,
             live_seq=ctx.seq if ctx is not None else None,
+            authoritative=projection_outcome != "inconclusive",
             events=control_rows,
             turns=[
                 ConversationTurn.model_validate(turn)
@@ -8642,9 +8768,42 @@ class WrapperMachine:
             or watch.get("engine") == "codex"
         )
         if is_codex and detail == "summary":
+            if self._codex_rollout_history_active(sid):
+                return await self._build_history(
+                    sid,
+                    before=before,
+                    limit=limit,
+                    cwd_hint=cwd,
+                    detail=detail,
+                    allow_stale=True,
+                )
             try:
-                return await self._build_official_codex_history(
+                history = await self._build_official_codex_history(
                     sid, before=before, limit=limit)
+                if (
+                    before is None
+                    and history.authoritative is False
+                    and history.error is None
+                ):
+                    self._schedule_official_codex_history_refresh(
+                        sid, limit=limit, cwd=cwd)
+                return history
+            except _CodexOfficialProjectionIncomplete:
+                revision = self._activate_codex_rollout_history(sid)
+                log.warning(
+                    "official Codex history omitted stable rollout turns; "
+                    "using rollout",
+                    session_id=sid,
+                    revision=revision,
+                )
+                return await self._build_history(
+                    sid,
+                    before=before,
+                    limit=limit,
+                    cwd_hint=cwd,
+                    detail=detail,
+                    allow_stale=True,
+                )
             except CodexHistoryUnsupported:
                 # Older app-server builds retain the source-window rollout
                 # parser. This is a capability fallback, never a response/error
@@ -8703,6 +8862,55 @@ class WrapperMachine:
         return await self._build_history(
             sid, before=before, limit=limit, cwd_hint=cwd, detail=detail,
             allow_stale=True)
+
+    def _schedule_official_codex_history_refresh(
+        self,
+        sid: str,
+        *,
+        limit: int | None,
+        cwd: str | None,
+    ) -> None:
+        """Retry a moving official snapshot without silently changing source."""
+        key = (sid, "", limit or 0, f"{cwd or ''}\0summary\0official")
+        current = self._history_refresh_tasks.get(key)
+        if current is not None and not current.done():
+            return
+
+        async def refresh() -> None:
+            try:
+                for delay in (0.25, 1.0):
+                    await asyncio.sleep(delay)
+                    history = await self._build_requested_history(
+                        sid,
+                        before=None,
+                        limit=limit,
+                        cwd=cwd,
+                        detail="summary",
+                    )
+                    if history.authoritative is False:
+                        if history.error is not None:
+                            return
+                        continue
+                    history.sid = sid
+                    await self.transport.send(history)
+                    return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning(
+                    "official Codex history retry failed",
+                    session_id=sid,
+                    error_type=type(exc).__name__,
+                )
+
+        task = asyncio.create_task(refresh())
+        self._history_refresh_tasks[key] = task
+
+        def forget(done: asyncio.Task) -> None:
+            if self._history_refresh_tasks.get(key) is done:
+                self._history_refresh_tasks.pop(key, None)
+
+        task.add_done_callback(forget)
 
     async def _history_page_singleflight(self, cmd, sid: str) -> History:
         before = getattr(cmd, "before", None)

@@ -163,6 +163,29 @@ class CodexAutomaticUserRecovery:
     seen_turn_ids: frozenset[str] = frozenset()
 
 
+@dataclass(frozen=True)
+class CodexHistoryNativeWitness:
+    """Bounded rollout evidence for the visible native-turn projection.
+
+    ``turn_ids`` are newest first and de-duplicated so a native turn containing
+    multiple steered user segments is compared with exactly one official
+    ``thread/turns/list`` row. ``scanned_to_start`` is true only when the byte
+    budget covered the complete frozen rollout; ``has_more_turns`` records a
+    native boundary beyond the bounded id tuple without retaining every id.
+    """
+
+    turn_ids: tuple[str, ...] = ()
+    scanned_to_start: bool = False
+    has_more_turns: bool = False
+
+
+@dataclass(frozen=True)
+class _CodexHistoryBoundary:
+    offset: int
+    cursor: str
+    native_turn_id: str | None
+
+
 def _bounded_jsonl_records(file, *, end_offset: int | None = None):
     """Yield bounded complete records with stable absolute byte offsets.
 
@@ -667,7 +690,7 @@ def _history_goal_objective_before_offset(
     return (False, None)
 
 
-def _history_boundaries(
+def _history_boundary_records(
     path: str,
     *,
     use_turns: bool,
@@ -679,7 +702,7 @@ def _history_boundaries(
         ):
             cursor = _history_user_cursor(path, offset, line)
             if cursor is not None:
-                yield offset, cursor
+                yield _CodexHistoryBoundary(offset, cursor, None)
         return
 
     # A task_started without a user_message is ambiguous. It is an independent
@@ -724,8 +747,10 @@ def _history_boundaries(
                 # need stable per-record cursors; the oldest message keeps the
                 # task id so existing pagination cursors remain compatible.
                 for boundary, _cursor, extra_cursor in segment_users[:-1]:
-                    yield boundary, extra_cursor
-                yield offset, turn_cursor
+                    yield _CodexHistoryBoundary(
+                        boundary, extra_cursor, turn_cursor)
+                yield _CodexHistoryBoundary(
+                    offset, turn_cursor, turn_cursor)
             elif not segment_account_switch:
                 pending_assistant_only = (offset, turn_cursor)
             segment_users = []
@@ -734,7 +759,9 @@ def _history_boundaries(
 
         if (pending_assistant_only is not None
                 and _history_terminal_marker(line)):
-            yield pending_assistant_only
+            offset, turn_cursor = pending_assistant_only
+            yield _CodexHistoryBoundary(
+                offset, turn_cursor, turn_cursor)
             pending_assistant_only = None
     if (
         pending_assistant_only is not None
@@ -742,7 +769,64 @@ def _history_boundaries(
             path, pending_assistant_only[0],
         )[0] is not None
     ):
-        yield pending_assistant_only
+        offset, turn_cursor = pending_assistant_only
+        yield _CodexHistoryBoundary(offset, turn_cursor, turn_cursor)
+
+
+def _history_boundaries(
+    path: str,
+    *,
+    use_turns: bool,
+    max_scan_bytes: int | None = None,
+):
+    """Compatibility iterator exposing only the stable paging cursor pair."""
+    for boundary in _history_boundary_records(
+        path,
+        use_turns=use_turns,
+        max_scan_bytes=max_scan_bytes,
+    ):
+        yield boundary.offset, boundary.cursor
+
+
+def codex_history_native_witness(
+    path: str,
+    *,
+    max_turns: int,
+    max_scan_bytes: int = _DEFAULT_HISTORY_WINDOW_MAX_BYTES,
+) -> CodexHistoryNativeWitness:
+    """Return bounded, native-turn evidence without translating the rollout.
+
+    Boundary records are deliberately the only decoded payloads. Large tool,
+    token-count, reasoning, or malformed records therefore cannot recreate the
+    upstream app-server projection failure this witness is meant to detect.
+    """
+    bounded_turns = max(1, int(max_turns))
+    byte_budget = max(1024 * 1024, int(max_scan_bytes))
+    source_size = os.path.getsize(path)
+    turn_ids: list[str] = []
+    seen: set[str] = set()
+    has_more_turns = False
+    for boundary in _history_boundary_records(
+        path,
+        use_turns=True,
+        max_scan_bytes=byte_budget,
+    ):
+        turn_id = boundary.native_turn_id
+        if (
+            turn_id is None
+            or turn_id in seen
+        ):
+            continue
+        if len(turn_ids) >= bounded_turns:
+            has_more_turns = True
+            continue
+        seen.add(turn_id)
+        turn_ids.append(turn_id)
+    return CodexHistoryNativeWitness(
+        turn_ids=tuple(turn_ids),
+        scanned_to_start=source_size <= byte_budget,
+        has_more_turns=has_more_turns,
+    )
 
 
 def codex_history_window(

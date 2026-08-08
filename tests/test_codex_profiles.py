@@ -944,6 +944,21 @@ def test_profile_history_rpc_uses_native_uuid_and_matching_home(
     ]
 
 
+def test_profile_history_rollout_fallback_isolated_for_same_native_uuid(
+    tmp_path: Path,
+) -> None:
+    machine, _transport = _machine(tmp_path)
+    primary_sid = "primary@same-native-id"
+    stack_sid = "stack@same-native-id"
+
+    primary_revision = machine._activate_codex_rollout_history(primary_sid)
+
+    assert machine._codex_rollout_history_active(primary_sid) is True
+    assert machine._codex_rollout_history_active(stack_sid) is False
+    assert primary_revision == machine._history_revision(primary_sid)
+    assert machine._history_revision(stack_sid) != primary_revision
+
+
 def test_profile_catalog_partial_failure_is_scoped_and_all_failure_is_terminal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

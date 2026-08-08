@@ -82,6 +82,10 @@ class CodexHistoryPage:
     has_more: bool
     oldest_id: str | None
     newest_id: str | None
+    # Native ids are newest first, matching the official descending page. They
+    # stay wrapper-private and let the caller validate projection completeness
+    # without guessing from visible steer-segment ids.
+    native_turn_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -972,6 +976,10 @@ class CodexOfficialHistory:
             has_more=next_cursor is not None,
             oldest_id=oldest_id,
             newest_id=newest_id,
+            native_turn_ids=tuple(
+                _wire_id(turn["id"], "turn")
+                for turn in validated_rows
+            ),
         )
 
     def _locator(self, thread_id: str, visible_turn_id: str) -> _TurnLocator:
