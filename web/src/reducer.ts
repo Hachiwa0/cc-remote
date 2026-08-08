@@ -4900,6 +4900,16 @@ function reduceEvent(
         let t = findBoundLiveTaskOwner(
           rt, turns, e.turn_id, e.seq, false)
           ?? findTurnByEngineId(turns, e.turn_id);
+        if (!t && e.checkpoint_id) {
+          // Claude binds the optimistic row to its native user/checkpoint UUID,
+          // while ResultMessage identifies the terminal with the final assistant
+          // UUID.  Codex has no checkpoint_id and keeps the strict turn_id path
+          // above; this exact Claude identity fallback must happen before the
+          // legacy single-open-row heuristic rejects an already-bound owner.
+          t = findBoundLiveTaskOwner(
+            rt, turns, e.checkpoint_id, e.seq, false)
+            ?? findTurnByEngineId(turns, e.checkpoint_id);
+        }
         if (!t) {
           const openTurns = turns.filter((turn) => !turn.done
             && !(rt.acceptanceKind === "steer_unknown"
@@ -4958,7 +4968,9 @@ function reduceEvent(
           }
         }
         const terminalBinding = rt.pendingLiveBinding;
-        if (terminalBinding && terminalBinding.turnId === e.turn_id
+        if (terminalBinding
+            && (terminalBinding.turnId === e.turn_id
+              || terminalBinding.turnId === e.checkpoint_id)
             && (typeof e.seq !== "number"
               || e.seq >= terminalBinding.seq)) {
           rt.pendingLiveBinding = null;

@@ -4702,6 +4702,92 @@ try {
     }],
     "switching to Codex and back reconciles Claude History with the one live prompt",
   );
+
+  // Claude's live TurnBinding names the replayed native user/checkpoint UUID,
+  // but ResultMessage closes the turn with the final assistant UUID.  They are
+  // deliberately different identities: route the terminal through checkpoint_id
+  // so an idle sidebar cannot leave the answer row spinning forever.
+  const claudeTerminalAliasSid = "claude-terminal-checkpoint-alias";
+  const claudeClientMessage = "11111111-1111-4111-8111-111111111111";
+  const claudeUserCheckpoint = "22222222-2222-4222-8222-222222222222";
+  const claudeAssistantTerminal = "33333333-3333-4333-8333-333333333333";
+  let claudeTerminalAliasState = reduce({
+    ...initialState,
+    focusedSid: claudeTerminalAliasSid,
+    runtimes: {
+      [claudeTerminalAliasSid]: {
+        ...createRuntime(), state: "running" as const, syncReady: true,
+      },
+    },
+  }, {
+    type: "query_sent",
+    sid: claudeTerminalAliasSid,
+    prompt: "完成这项工作",
+    msg_id: claudeClientMessage,
+    ts: 22_200,
+  });
+  for (const liveEvent of [
+    event({
+      type: "turn_binding",
+      sid: claudeTerminalAliasSid,
+      seq: 1,
+      msg_id: claudeClientMessage,
+      turn_id: claudeUserCheckpoint,
+    }),
+    event({
+      type: "assistant_msg_start",
+      sid: claudeTerminalAliasSid,
+      seq: 2,
+      message_id: claudeAssistantTerminal,
+      channel: "final",
+    }),
+    event({
+      type: "delta",
+      sid: claudeTerminalAliasSid,
+      seq: 3,
+      message_id: claudeAssistantTerminal,
+      channel: "final",
+      text: "已经完成。",
+    }),
+    event({
+      type: "turn_end",
+      sid: claudeTerminalAliasSid,
+      seq: 4,
+      turn_id: claudeAssistantTerminal,
+      checkpoint_id: claudeUserCheckpoint,
+      result: { subtype: "success", duration_ms: 5, is_error: false },
+    }),
+  ]) {
+    claudeTerminalAliasState = reduce(claudeTerminalAliasState, {
+      type: "event", event: liveEvent,
+    });
+  }
+  const settledClaudeAlias = claudeTerminalAliasState.runtimes[
+    claudeTerminalAliasSid
+  ];
+  assert.equal(settledClaudeAlias.turns.length, 1);
+  assert.equal(settledClaudeAlias.turns[0].done, true,
+    "Claude's assistant terminal closes the checkpoint-bound client row");
+  assert.ok(
+    settledClaudeAlias.turns[0].blocks.every(
+      (block: Block) => block.done),
+    "the terminal also settles the answer block which drove the tail spinner",
+  );
+  assert.equal(
+    settledClaudeAlias.turns[0].forkPointId,
+    claudeAssistantTerminal,
+    "the final assistant UUID remains the authoritative Claude fork point",
+  );
+  assert.equal(
+    settledClaudeAlias.turns[0].checkpointId,
+    claudeUserCheckpoint,
+    "the native user UUID remains available for Claude file rewind",
+  );
+  assert.equal(settledClaudeAlias.pendingLiveBinding, null,
+    "the checkpoint-matched terminal consumes its pending live binding");
+  assert.equal(settledClaudeAlias.state, "running",
+    "TurnEnd repairs presentation without unlocking before State(idle)");
+
   const legacyClaudeNativeId = "b1934482-d098-4e11-990d-3e91f2586358";
   const legacyClaudeClientId = "d37608f7-713d-42e2-b10f-4a93f60b03e1";
   const legacyClaudePrompt =
