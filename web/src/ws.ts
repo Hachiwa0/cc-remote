@@ -1188,8 +1188,7 @@ export class RelayWs {
     const ownership = this.ownershipSnapshot(
       this.newSessionEngine,
       this.newSessionSpace,
-      this.newSessionEngine === "codex" && this.newSessionSpace === "code"
-        ? codexProfileId : null,
+      this.newSessionEngine === "codex" ? codexProfileId : null,
     );
     this.pendingOwnershipByRequest[requestId] = ownership;
     const obj: Record<string, unknown> = {
@@ -1197,7 +1196,7 @@ export class RelayWs {
     };
     if (cwd) obj.cwd = cwd;
     if (engine && engine !== "claude") obj.engine = engine;
-    if (engine === "codex" && space === "code" && codexProfileId) {
+    if (engine === "codex" && codexProfileId) {
       obj.codex_profile_id = codexProfileId;
     }
     if (space !== "code") obj.space = space;
@@ -1368,13 +1367,17 @@ export class RelayWs {
 
   sendCreateWorkSchedule(engine: "claude" | "codex", title: string,
                          prompt: string, nextRunAt: number,
-                         repeatSeconds?: number, projectId?: string): boolean {
+                         repeatSeconds?: number, projectId?: string,
+                         codexProfileId?: string): boolean {
     const command: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "create_work_schedule", engine,
       title, prompt, next_run_at: nextRunAt, ts: nowTs(),
     };
     if (repeatSeconds) command.repeat_seconds = repeatSeconds;
     if (projectId) command.project_id = projectId;
+    if (engine === "codex" && codexProfileId) {
+      command.codex_profile_id = codexProfileId;
+    }
     return this.send(command);
   }
 

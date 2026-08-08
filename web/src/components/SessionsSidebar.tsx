@@ -14,11 +14,13 @@ import {
 } from "../session-worktree";
 import { useImeSubmit } from "../use-ime-submit";
 import { codexProfilePresentation } from "../codex-profile-presentation";
+import { newWorkProfileForSidebarFilter } from "../work-profile-selection";
 
 interface Props {
   open: boolean;
   engine: Engine;
   space: Space;
+  profileScopeKey: string;
   codexProfiles?: CodexProfileInfo[];
   defaultCodexProfileId?: string | null;
   onSpaceChange: (space: Space) => void;
@@ -29,7 +31,7 @@ interface Props {
   completionBadges?: Record<string, CompletionBadgeKind>;
   activeSessionId: string | null;
   onSelect: (id: string) => void;
-  onNew: () => void;
+  onNew: (codexProfileId?: string) => void;
   onNewInDir: (cwd: string) => void;
   onClose: () => void;
   onRename: (id: string, title: string) => void;
@@ -63,7 +65,8 @@ function sessionDateGroup(value?: string | null): { key: string; label: string }
 }
 
 export function SessionsSidebar({ open, engine, space,
-  codexProfiles = [], defaultCodexProfileId, onSpaceChange, sessions, liveStates,
+  profileScopeKey, codexProfiles = [], defaultCodexProfileId,
+  onSpaceChange, sessions, liveStates,
   completionBadges, activeSessionId, onSelect, onNew, onNewInDir, onClose,
   onRename, onArchive, onPin, onDelete, onForkWorktree, onMigrate }: Props) {
   const [q, setQ] = useState("");
@@ -71,15 +74,27 @@ export function SessionsSidebar({ open, engine, space,
   const [lifting, setLifting] = useState(false);
   const [renaming, setRenaming] = useState<{ id: string; value: string } | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
-  const [codexProfileFilter, setCodexProfileFilter] = useState("all");
+  const [codexProfileFilters, setCodexProfileFilters] =
+    useState<Record<string, string>>({});
   // "archived" group starts collapsed; project groups start expanded.
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({ archived: true });
   const [expandedDirectories, setExpandedDirectories] = useState<Record<string, boolean>>({});
   const pressTimer = useRef<number | null>(null);
   const pressStart = useRef<{ x: number; y: number } | null>(null);
 
+  const showCodexProfileManagement =
+    engine === "codex" && codexProfiles.length > 1;
+  const codexProfileFilter = codexProfileFilters[profileScopeKey] ?? "all";
+  const setCodexProfileFilter = (profileId: string) => {
+    setCodexProfileFilters((current) => (
+      current[profileScopeKey] === profileId
+        ? current
+        : { ...current, [profileScopeKey]: profileId }
+    ));
+  };
+
   const profilePresentationFor = (session: SessionInfo) =>
-    engine === "codex" && space === "code"
+    engine === "codex"
       ? codexProfilePresentation(
         codexProfiles,
         defaultCodexProfileId,
@@ -90,7 +105,7 @@ export function SessionsSidebar({ open, engine, space,
   const matches = (s: SessionInfo) => {
     const profilePresentation = profilePresentationFor(s);
     return (
-      (engine !== "codex" || space !== "code"
+      (!showCodexProfileManagement
         || codexProfileFilter === "all"
         || s.codex_profile_id === codexProfileFilter)
       && (!filter
@@ -162,13 +177,21 @@ export function SessionsSidebar({ open, engine, space,
   useEffect(() => { if (!open) { setMenuCardId(null); setLifting(false); } }, [open]);
 
   useEffect(() => {
-    if (engine !== "codex" || space !== "code"
+    if (!showCodexProfileManagement
         || (codexProfileFilter !== "all"
           && !codexProfiles.some(
             (profile) => profile.id === codexProfileFilter))) {
-      setCodexProfileFilter("all");
+      setCodexProfileFilters((current) => {
+        if ((current[profileScopeKey] ?? "all") === "all") return current;
+        return { ...current, [profileScopeKey]: "all" };
+      });
     }
-  }, [codexProfileFilter, codexProfiles, engine, space]);
+  }, [
+    codexProfileFilter,
+    codexProfiles,
+    profileScopeKey,
+    showCodexProfileManagement,
+  ]);
 
   // dismiss the ⋯ popover on any click outside it — covers the sidebar header, footer,
   // the side scrim, and the rest of the page (not just .s-scroll). The long-press lift
@@ -422,8 +445,7 @@ export function SessionsSidebar({ open, engine, space,
               <Icon name="code" size={18} />Code
             </button>
           </div>
-          {engine === "codex" && space === "code"
-              && codexProfiles.length > 1 && (
+          {showCodexProfileManagement && (
             <div className="codex-profile-filter" role="group"
               aria-label="筛选 Codex 账号">
               <button className={codexProfileFilter === "all" ? "active" : ""}
@@ -461,7 +483,11 @@ export function SessionsSidebar({ open, engine, space,
             <div className={"s-lift-scrim" + (lifting ? " show" : "")} onClick={closeMenu} />
           </div>
           <div className="s-foot">
-            <button className="newbtn" onClick={onNew}><Icon name="plus" size={19} />{space === "work" ? "新工作" : "新会话"}</button>
+            <button className="newbtn" onClick={() => onNew(
+              newWorkProfileForSidebarFilter(
+                engine, space, codexProfileFilter,
+              ),
+            )}><Icon name="plus" size={19} />{space === "work" ? "新工作" : "新会话"}</button>
           </div>
         </div>
       </aside>

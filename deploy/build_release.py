@@ -52,6 +52,7 @@ _WRAPPER_DEPLOY = (
     "python-version.txt",
     "release_manifest.py",
     "validate_protocol_bundle.py",
+    "work_registry_snapshot.py",
 )
 _WRAPPER_SCRIPTS = (
     "codex-auth-daemon-restart",

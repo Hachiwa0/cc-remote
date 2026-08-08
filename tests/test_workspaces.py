@@ -129,6 +129,39 @@ class WorkRegistryTests(unittest.TestCase):
         self.assertEqual(records[("stack", "same-native-id")].work_id,
                          sibling.work_id)
 
+        with self.assertRaisesRegex(ValueError, "profile is required"):
+            store.get_by_session("same-native-id")
+        with self.assertRaisesRegex(ValueError, "account-aware"):
+            store.records_by_session()
+        with self.assertRaisesRegex(ValueError, "profile is required"):
+            store.update_title("same-native-id", "must not cross accounts")
+        with self.assertRaisesRegex(ValueError, "profile is required"):
+            store.delete("same-native-id")
+
+        store.update_title(
+            "same-native-id", "Stack only", codex_profile_id="stack",
+        )
+        unchanged = store.get_by_session(
+            "same-native-id", codex_profile_id="primary",
+        )
+        updated = store.get_by_session(
+            "same-native-id", codex_profile_id="stack",
+        )
+        assert unchanged is not None and updated is not None
+        self.assertIsNone(unchanged.title)
+        self.assertEqual(updated.title, "Stack only")
+
+        deleted = store.delete(
+            "same-native-id", codex_profile_id="stack",
+        )
+        self.assertEqual(deleted.work_id, sibling.work_id)
+        self.assertIsNotNone(store.get_by_session(
+            "same-native-id", codex_profile_id="primary",
+        ))
+        self.assertIsNone(store.get_by_session(
+            "same-native-id", codex_profile_id="stack",
+        ))
+
     def test_legacy_codex_work_profile_is_assigned_only_once(self):
         store = WorkRegistry(self.root, "codex")
         record = store.create_session()
@@ -286,6 +319,71 @@ class WorkRegistryTests(unittest.TestCase):
         self.assertEqual(schedule["last_run_status"], "succeeded")
         self.assertEqual(schedule["last_session_id"], "session-ok")
 
+    def test_codex_schedule_freezes_profile_for_every_retry(self):
+        store = WorkRegistry(self.root / "codex", "codex")
+        now = time.time()
+        with self.assertRaisesRegex(ValueError, "profile is required"):
+            store.create_schedule("未绑定", "不会运行", now - 1)
+        schedule_id = store.create_schedule(
+            "Stack 任务", "生成报告", now - 1,
+            codex_profile_id="stack",
+        )
+
+        run = store.claim_due_schedules(now)[0]
+        self.assertEqual(run["schedule_id"], schedule_id)
+        self.assertEqual(run["codex_profile_id"], "stack")
+        with self.assertRaisesRegex(ValueError, "cannot change"):
+            store.complete_schedule(
+                run["run_id"], None, "failed",
+                codex_profile_id="primary",
+            )
+        self.assertEqual(
+            store.complete_schedule(
+                run["run_id"], None, "account removed",
+                codex_profile_id="stack", retryable=False,
+            ),
+            "failed",
+        )
+        schedule = store.dashboard()["schedules"][0]
+        self.assertEqual(schedule["codex_profile_id"], "stack")
+        self.assertEqual(schedule["last_codex_profile_id"], "stack")
+
+    def test_legacy_schedule_profile_backfill_is_topology_independent(self):
+        store = WorkRegistry(self.root / "legacy-codex", "codex")
+        store.initialize()
+        now = time.time()
+        with sqlite3.connect(store.db_path) as db:
+            db.execute(
+                """INSERT INTO work_schedules
+                   (schedule_id, title, prompt, next_run_at, enabled,
+                    created_at, updated_at)
+                   VALUES ('legacy', '旧任务', '生成报告', ?, 1, ?, ?)""",
+                (now - 1, now, now),
+            )
+            db.execute(
+                """INSERT INTO work_schedule_runs
+                   (run_id, schedule_id, scheduled_for, status, available_at,
+                    attempt, created_at, updated_at)
+                   VALUES ('legacy-run', 'legacy', ?, 'queued', ?, 0, ?, ?)""",
+                (now - 1, now, now, now),
+            )
+
+        self.assertEqual(store.assign_legacy_codex_profile("stack"), 0)
+        # A second startup remains a no-op even though no topology revision was
+        # created for this schema-only ownership migration.
+        self.assertEqual(store.assign_legacy_codex_profile("primary"), 0)
+        with sqlite3.connect(store.db_path) as db:
+            schedule_owner = db.execute(
+                "SELECT codex_profile_id FROM work_schedules "
+                "WHERE schedule_id = 'legacy'",
+            ).fetchone()[0]
+            run_owner = db.execute(
+                "SELECT codex_profile_id FROM work_schedule_runs "
+                "WHERE run_id = 'legacy-run'",
+            ).fetchone()[0]
+        self.assertEqual(schedule_owner, "stack")
+        self.assertEqual(run_owner, "stack")
+
     def test_deleting_running_schedule_defers_cleanup_until_completion(self):
         now = time.time()
         schedule_id = self.store.create_schedule(
@@ -328,6 +426,25 @@ class WorkRegistryTests(unittest.TestCase):
         self.assertEqual(stores.classify("codex", "same-id", claude.cwd), "code")
         with self.assertRaises(ValueError):
             stores.for_engine("other")
+
+    def test_store_classification_requires_account_for_duplicate_codex_ids(self):
+        stores = WorkStores(self.root / "claude", self.root / "codex")
+        codex = stores.for_engine("codex")
+        primary = codex.create_session(codex_profile_id="primary")
+        stack = codex.create_session(codex_profile_id="stack")
+        codex.bind_session(
+            primary.work_id, "same-id", codex_profile_id="primary",
+        )
+        codex.bind_session(
+            stack.work_id, "same-id", codex_profile_id="stack",
+        )
+
+        with self.assertRaisesRegex(ValueError, "profile is required"):
+            stores.classify("codex", "same-id", primary.cwd)
+        self.assertEqual(stores.classify(
+            "codex", "same-id", primary.cwd,
+            codex_profile_id="primary",
+        ), "work")
 
     def test_unbound_records_are_indexed_by_canonical_private_cwd(self):
         unbound = self.store.create_session()

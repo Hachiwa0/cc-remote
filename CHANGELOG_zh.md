@@ -4,6 +4,13 @@
 
 ## 未发布
 
+- Wrapper、Relay 与 Web 的协同 wire gate 升级到 protocol v33，并为 Codex Work
+  新增多账号支持。新 Work 会话与定时任务都可选择任一已配置 Profile，账号归属会
+  独立于当前默认账号持久化，并在重试和 wrapper 重启后保持不变。即使早期账号拓扑
+  迁移已经完成，升级时仍会幂等地把旧 Work 数据绑定到当时的默认账号。Profile 被
+  移除后既有 Work 仍保持原归属并 fail-closed，不会被改绑；临时目录读取失败会保留
+  对应账号最后一次成功的会话投影，不会触发静默回退。wrapper 发布会先快照两个 Work SQLite 注册表，
+  验证账号归属迁移，并在失败回滚时先恢复匹配数据再启动旧代码。
 - Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v31。wrapper 内部的目录
   变化不再广播无关联会话列表，而是发送不进入重放环的失效提示；当前可见页面会
   将并发提示合并为绑定自身连接 generation 与 surface 的列表读取。流式公式可识别

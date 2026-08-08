@@ -1301,6 +1301,9 @@ assert.match(layoutCss,
   /\.scard-profile-ribbon\s*\{[^}]*top\s*:\s*-6px[^}]*height\s*:\s*16px[^}]*max-width\s*:\s*64px[^}]*font-family\s*:\s*var\(--mono\)[^}]*font-size\s*:\s*8\.5px/s,
   "profile keycaps must hang compactly from the card edge");
 assert.match(layoutCss,
+  /\.work-profile-owner\s*\{[^}]*max-width\s*:\s*72px[^}]*height\s*:\s*19px[^}]*font\s*:\s*650 9px\/1 var\(--mono\)/s,
+  "a multi-account Work owner stays compact in the shared header");
+assert.match(layoutCss,
   /@media \(max-width:980px\)\{\s*\.artifact-panel\{[^}]*top:calc\(var\(--app-offset-top,0px\) \+ 10px\)[^}]*bottom:auto[^}]*height:calc\(var\(--app-height,100dvh\) - 20px\)[^}]*max-height:none/s,
   "mobile artifact previews must fill the visual viewport instead of shrink-wrapping iframe or Markdown content");
 
@@ -3423,8 +3426,26 @@ try {
       sessions: [],
     }),
   });
-  assert.equal(workProfileState.newChat?.codexProfileId, "primary",
-    "Codex Work always resolves to the default account");
+  assert.equal(workProfileState.newChat?.codexProfileId, "stack",
+    "Codex Work preserves the selected account");
+
+  const removedProfileState = reduce(profileState, {
+    type: "event",
+    ownership: profileOwner,
+    event: event({
+      type: "session_list",
+      engine: "codex",
+      space: "code",
+      codex_profiles: [{ id: "primary", label: "Main" }],
+      default_codex_profile_id: "primary",
+      sessions: [],
+    }),
+  });
+  assert.equal(removedProfileState.newChat?.codexProfileId, "stack");
+  assert.equal(
+    removedProfileState.codexProfileByScope[profileOwner.scopeKey], "stack",
+    "a removed selection must not silently fall back while a draft is open",
+  );
 
   const profileCatalogFailure = reduce({
     ...profileState,
@@ -8656,6 +8677,11 @@ try {
     "/src/components/NewChatView.tsx");
   const { WorkArtifactsSheet } = await reducerHarness.ssrLoadModule(
     "/src/components/WorkArtifactsSheet.tsx");
+  const {
+    newWorkProfileForSidebarFilter,
+    resolveWorkScheduleProfile,
+  } = await reducerHarness.ssrLoadModule(
+    "/src/work-profile-selection.ts");
   const { SessionsSidebar } = await reducerHarness.ssrLoadModule(
     "/src/components/SessionsSidebar.tsx");
   const { BtwPanel } = await reducerHarness.ssrLoadModule(
@@ -8671,9 +8697,24 @@ try {
     "Claude Work must not probe or inherit the Code cwd",
   );
   assert.deepEqual(
-    newChatCatalogRequest("codex", "work", "/ignored"),
-    { engine: "codex" },
-    "Codex keeps using its machine catalog without inventing a cwd scope",
+    newChatCatalogRequest("codex", "work", "/ignored", "stack"),
+    { engine: "codex", codexProfileId: "stack" },
+    "Codex Work reads the selected account without inventing a cwd scope",
+  );
+  assert.equal(
+    newWorkProfileForSidebarFilter("codex", "work", "stack"),
+    "stack",
+    "a filtered Work list carries that account into the new-work form",
+  );
+  assert.equal(
+    newWorkProfileForSidebarFilter("codex", "work", "all"),
+    undefined,
+    "the all-account Work view preserves the existing new-work preference",
+  );
+  assert.equal(
+    newWorkProfileForSidebarFilter("codex", "code", "stack"),
+    undefined,
+    "the Work shortcut must not change Code's existing new-session behavior",
   );
   assert.deepEqual(resolveNewChatLocalDefaults(
     "claude", "code", "/repo",
@@ -8778,6 +8819,39 @@ try {
       onSend: () => true,
     },
   ));
+  const multiProfileWorkMarkup = renderToStaticMarkup(createElement(
+    NewChatView,
+    {
+      cwd: "~", engine: "codex", space: "work",
+      catalog: liveNewChatCatalog,
+      controlScopeKey: "machine-a:work:codex\0stack",
+      model: null, effort: null,
+      defaultModel: "gpt-future", defaultEffort: "low",
+      codexProfiles: [
+        { id: "primary", label: "Main" },
+        { id: "stack", label: "Stack", error: "会话列表暂不可用" },
+      ],
+      defaultCodexProfileId: "primary",
+      codexProfileId: "stack",
+      onPickCodexProfile: () => {},
+      onPickModel: () => {}, onPickEffort: () => {},
+      onPickCwd: () => {},
+      onSend: () => true,
+    },
+  ));
+  const removedProfileWorkMarkup = renderToStaticMarkup(createElement(
+    NewChatView,
+    {
+      cwd: "~", engine: "codex", space: "work",
+      controlScopeKey: "machine-a:work:codex\0removed",
+      codexProfiles: [{ id: "primary", label: "Main" }],
+      defaultCodexProfileId: "primary",
+      codexProfileId: "removed",
+      onPickCodexProfile: () => {},
+      onPickCwd: () => {},
+      onSend: () => true,
+    },
+  ));
   for (const markup of [newChatMarkup, codexNewChatMarkup]) {
     assert.match(markup, /aria-label="添加照片"/);
     assert.match(markup, /aria-label="添加文件"/);
@@ -8820,6 +8894,18 @@ try {
   assert.match(multiProfileNewChatMarkup, /class="newchat-context"/);
   assert.match(multiProfileNewChatMarkup, /aria-label="选择 Codex 账号"/);
   assert.match(multiProfileNewChatMarkup, />nyx · Stack</);
+  assert.match(multiProfileWorkMarkup, /aria-label="选择 Codex 账号"/);
+  assert.match(multiProfileWorkMarkup, />nyx · Stack · 目录暂不可用</);
+  assert.match(multiProfileWorkMarkup, /会话列表暂不可用/,
+    "a transient catalog error warns without removing the Work account");
+  assert.match(removedProfileWorkMarkup, />已移除账号</);
+  assert.match(removedProfileWorkMarkup, /所选 Codex 账号已移除，请重新选择/);
+  assert.deepEqual(
+    resolveWorkScheduleProfile(
+      [{ id: "primary", label: "Main" }], null, "removed"),
+    { profileId: "removed", missing: true },
+    "a removed schedule owner must require an explicit replacement",
+  );
   const artifactsMarkup = renderToStaticMarkup(createElement(WorkArtifactsSheet, {
     open: true,
     artifacts: [
@@ -8837,6 +8923,7 @@ try {
     open: true,
     engine: "codex" as const,
     space: "code" as const,
+    profileScopeKey: "machine-a:codex:code",
     onSpaceChange: () => {},
     sessions: [
       { session_id: "done-main", summary: "Main", state: "idle" },
@@ -8897,6 +8984,36 @@ try {
   assert.match(profileSidebarMarkup,
     /class="scard-profile-ribbon tone-1"[^>]*>nyx</);
   assert.match(profileSidebarMarkup, /Codex 账号：nyx · Stack/);
+  const workProfileSidebarMarkup = renderToStaticMarkup(createElement(
+    SessionsSidebar,
+    {
+      ...sidebarProps,
+      space: "work" as const,
+      codexProfiles: [
+        { id: "primary", label: "Main" },
+        { id: "stack", label: "Stack" },
+      ],
+      defaultCodexProfileId: "primary",
+      sessions: [
+        {
+          session_id: "primary@work-a", native_session_id: "work-a",
+          codex_profile_id: "primary", codex_profile_label: "Main",
+          summary: "Primary Work", state: "idle", engine: "codex", space: "work",
+        },
+        {
+          session_id: "stack@work-b", native_session_id: "work-b",
+          codex_profile_id: "stack", codex_profile_label: "Stack",
+          summary: "Stack Work", state: "idle", engine: "codex", space: "work",
+        },
+      ],
+    },
+  ));
+  assert.match(workProfileSidebarMarkup, /aria-label="筛选 Codex 账号"/);
+  assert.match(workProfileSidebarMarkup,
+    /class="scard-profile-ribbon tone-0"[^>]*>default</);
+  assert.match(workProfileSidebarMarkup,
+    /class="scard-profile-ribbon tone-1"[^>]*>nyx</);
+  assert.match(workProfileSidebarMarkup, /Codex 账号：nyx · Stack/);
   const singleProfileSidebarMarkup = renderToStaticMarkup(createElement(
     SessionsSidebar,
     {
@@ -8911,6 +9028,25 @@ try {
   ));
   assert.doesNotMatch(singleProfileSidebarMarkup, /profile-ribbon|profile-filter/,
     "single-account sidebar output remains free of profile-only DOM");
+  const singleProfileWorkSidebarMarkup = renderToStaticMarkup(createElement(
+    SessionsSidebar,
+    {
+      ...sidebarProps,
+      space: "work" as const,
+      codexProfiles: oneCodexProfile,
+      defaultCodexProfileId: "primary",
+      sessions: [{
+        session_id: "work-only", native_session_id: "work-only",
+        codex_profile_id: "primary", codex_profile_label: "Main",
+        summary: "Only Work", state: "idle", engine: "codex", space: "work",
+      }],
+    },
+  ));
+  assert.doesNotMatch(
+    singleProfileWorkSidebarMarkup,
+    /profile-ribbon|profile-filter/,
+    "single-account Work keeps its historical sidebar DOM",
+  );
   const btwDraftStore = new ComposerDraftStore();
   const btwPanelMarkup = renderToStaticMarkup(createElement(BtwPanel, {
     sid: "btw-render",
@@ -14349,8 +14485,16 @@ relay.sendNewSession(
 );
 const workSessionFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
 assert.equal(workSessionFrame.space, "work");
-assert.equal("codex_profile_id" in workSessionFrame, false,
-  "Codex Work must not send or freeze a secondary profile");
+assert.equal(workSessionFrame.codex_profile_id, "stack",
+  "Codex Work freezes the selected account with the create request");
+
+relay.sendCreateWorkSchedule(
+  "codex", "Stack report", "Build it", Date.now() / 1000 + 60,
+  86400, "project-1", "stack",
+);
+const workScheduleFrame = JSON.parse(socket.sent.at(-1) ?? "{}");
+assert.equal(workScheduleFrame.type, "create_work_schedule");
+assert.equal(workScheduleFrame.codex_profile_id, "stack");
 
 relay.sendNewSession(
   "/tmp/project", "claude", null, null,
@@ -14502,9 +14646,30 @@ assert.match(appSource,
 assert.doesNotMatch(appSource, /className="work-artifacts-btn"/);
 assert.doesNotMatch(appSource, /className="work-head-manage"/);
 assert.doesNotMatch(appSource, /sendSetWorkGrant|目录授权/);
+assert.match(appSource,
+  /focusedSession\?\.native_session_id[\s\S]{0,180}nativeCodexSessionId\(rt\.ccSessionId\)/,
+  "the Work header must not expose a profile-namespaced routing id");
+assert.match(appSource,
+  /<span className=\{`work-profile-owner tone-\$\{focusedWorkProfile\.tone\}`\}/,
+  "multi-account Work must expose its immutable owner in the header");
+assert.doesNotMatch(appSource,
+  /<button className=\{`work-profile-owner/,
+  "an existing Work owner is informational and must not become switchable");
+assert.match(appSource,
+  /workDashboardMachineId === machineId[\s\S]{0,180}workDashboards\[engine\]/,
+  "Work dashboard data must not cross a device boundary");
+assert.match(appSource,
+  /<WorkDashboardSheet[\s\S]{0,180}key=\{sessionScopeKey\(machineId, engine, "work"\)\}/,
+  "the Work manager must remount across device and engine scopes");
+assert.match(appSource,
+  /setWorkManagerOpen\(false\);[\s\S]{0,180}setWorkDashboards\(\{\}\);/,
+  "switching devices must close and clear the previous Work manager");
 const sidebarSource = readFileSync(
   resolve(process.cwd(), "src/components/SessionsSidebar.tsx"), "utf8");
 assert.doesNotMatch(sidebarSource, /onGrant|目录授权/);
+assert.match(sidebarSource,
+  /codexProfileFilters\[profileScopeKey\]\s*\?\?\s*"all"/,
+  "Code, Work and different devices must not share one account filter");
 const newChatSource = readFileSync(
   resolve(process.cwd(), "src/components/NewChatView.tsx"), "utf8");
 assert.match(newChatSource, /autoFocus=\{autoFocus\}/,
@@ -14607,6 +14772,9 @@ assert.doesNotMatch(composerSource, /⚡/,
   "the Fast control must not add a lightning marker");
 const workDashboardSource = readFileSync(
   resolve(process.cwd(), "src/components/WorkDashboardSheet.tsx"), "utf8");
+assert.match(workDashboardSource,
+  /Drafts and account choices may outlive[\s\S]*\[props\.scopeKey\]/,
+  "Work manager drafts and schedule owners must reset across control scopes");
 assert.match(workDashboardSource, /<DateTimePicker value=\{scheduleAt\}/,
   "Work schedules must use the themed date-time picker");
 assert.doesNotMatch(workDashboardSource, /datetime-local/,
@@ -15401,6 +15569,28 @@ assert.equal(
   profileOwnershipObserved.at(-1)?.ownership?.codexProfileId,
   "stack",
   "temp rekey atomically inherits the originating Codex profile",
+);
+profileOwnershipRelay.setSurface("codex", "work");
+assert.equal(profileOwnershipRelay.sendNewSession(
+  null, "codex", null, null,
+  { prompt: "new stack work", msg_id: "profile-work-create" },
+  "default", "never", undefined, undefined, "default",
+  "work", null, "stack",
+), true);
+profileOwnershipSocket.receive({
+  type: "session_focus",
+  session_id: "tmp-profile-work-create",
+  request_id: "profile-work-create",
+  cwd: "/private/work/stack",
+});
+assert.equal(
+  profileOwnershipObserved.at(-1)?.ownership?.scopeKey,
+  "machine-profile:work:codex",
+);
+assert.equal(
+  profileOwnershipObserved.at(-1)?.ownership?.codexProfileId,
+  "stack",
+  "a Work temp session retains its request-time account",
 );
 profileOwnershipRelay.stop();
 

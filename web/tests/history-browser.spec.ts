@@ -4042,6 +4042,35 @@ test("new-chat controls fit when the visual app height is keyboard-sized", async
   expect(layout.liveBottom).toBeLessThanOrEqual(layout.sheetBottom + 1);
 });
 
+test("Work multi-account controls filter labels and seed a new immutable owner", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 720, height: 900 });
+  await page.goto("/tests/history-browser.html?profile-sidebar=work");
+
+  await expect(page.getByRole("group", {
+    name: "筛选 Codex 账号",
+  })).toBeVisible();
+  await expect(page.locator(".scard-profile-ribbon")).toHaveCount(2);
+
+  await page.getByRole("button", { name: "nyx · Stack" }).click();
+  await expect(page.locator(".scard")).toHaveCount(1);
+  await expect(page.locator(".scard-profile-ribbon")).toHaveText("nyx");
+  await page.getByRole("button", { name: "新工作" }).click();
+  await expect(page.getByTestId("new-work-profile")).toHaveText("stack");
+
+  await page.getByRole("tab", { name: "Code" }).click();
+  await expect(page.getByRole("button", { name: "全部" })).toHaveClass(/active/);
+  await expect(page.locator(".scard")).toHaveCount(2);
+
+  await page.getByRole("tab", { name: "Work" }).click();
+  await expect(page.getByRole("button", { name: "nyx · Stack" })).toHaveClass(/active/);
+  await expect(page.locator(".scard")).toHaveCount(1);
+
+  await page.getByRole("button", { name: "全部" }).click();
+  await expect(page.locator(".scard")).toHaveCount(2);
+});
+
 test("profile keycaps hang from session cards without shifting titles", async ({
   page,
 }) => {

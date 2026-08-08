@@ -167,6 +167,7 @@ releases="$appdir/releases"
 current="$appdir/current"
 runtimes="$appdir/runtimes"
 target="$releases/$release_name"
+rollback_root="$appdir/rollback-data"
 stage=""
 previous=""
 switched=0
@@ -177,14 +178,19 @@ device_had_file=0
 device_backup=""
 device_changed=0
 unit_verify_dir=""
+rollback_snapshot=""
+snapshot_created=0
+service_stopped=0
+service_was_running=0
 
-mkdir -p "$releases" "$runtimes"
+mkdir -p "$releases" "$runtimes" "$rollback_root"
 if [ "$system" = darwin ]; then
   mkdir -p "$config_dir" "$(dirname "$service_file")" "$log_dir"
-  chmod 0700 "$config_dir"
+  chmod 0700 "$config_dir" "$rollback_root"
 else
   install -d -o root -g root -m 0755 "$appdir" "$releases" "$runtimes"
   install -d -o root -g root -m 0700 "$config_dir"
+  install -d -o root -g root -m 0700 "$rollback_root"
 fi
 
 if [ -L "$current" ]; then
@@ -201,17 +207,44 @@ restart_after_rollback() {
   if [ "$system" = darwin ]; then
     domain="gui/$(id -u)"
     launchctl bootout "$domain/$service_label" >/dev/null 2>&1 || true
-    if [ -n "$previous" ] && [ -f "$service_file" ]; then
-      launchctl bootstrap "$domain" "$service_file" >/dev/null 2>&1 || true
-      launchctl kickstart -k "$domain/$service_label" >/dev/null 2>&1 || true
+    if [ "$service_was_running" -eq 1 ] && [ -n "$previous" ] && \
+       [ -f "$service_file" ]; then
+      launchctl bootstrap "$domain" "$service_file" >/dev/null 2>&1 &&
+        launchctl kickstart -k "$domain/$service_label" >/dev/null 2>&1
     fi
   else
-    systemctl daemon-reload >/dev/null 2>&1 || true
-    if [ -n "$previous" ] && [ -f "$service_file" ]; then
-      systemctl restart "$service_label" >/dev/null 2>&1 || true
+    systemctl daemon-reload >/dev/null 2>&1 || return 1
+    if [ "$service_was_running" -eq 1 ] && [ -n "$previous" ] && \
+       [ -f "$service_file" ]; then
+      systemctl restart "$service_label" >/dev/null 2>&1
     else
       systemctl stop "$service_label" >/dev/null 2>&1 || true
     fi
+  fi
+}
+
+stop_wrapper_service() {
+  if [ "$system" = darwin ]; then
+    domain="gui/$(id -u)"
+    launchctl bootout "$domain/$service_label" >/dev/null 2>&1 || true
+  else
+    systemctl stop "$service_label" >/dev/null 2>&1 || true
+  fi
+  for _attempt in $(seq 1 10); do
+    if ! wrapper_service_active; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+wrapper_service_active() {
+  if [ "$system" = darwin ]; then
+    domain="gui/$(id -u)"
+    launchctl print "$domain/$service_label" >/dev/null 2>&1
+  else
+    systemctl is-active --quiet "$service_label"
   fi
 }
 
@@ -219,34 +252,61 @@ cleanup() {
   status=$?
   trap - EXIT HUP INT TERM
   if [ "$status" -ne 0 ]; then
+    rollback_ready=1
+    if [ "$snapshot_created" -eq 1 ]; then
+      # Never start old code against a database migrated by the failed new
+      # release. Stop the new process first, then restore the complete SQLite
+      # images (including committed WAL pages captured by the backup API).
+      if ! stop_wrapper_service; then
+        rollback_ready=0
+        echo "ERROR: new wrapper could not be stopped; data was not restored" >&2
+      elif ! "$target/.venv/bin/python" \
+          "$target/deploy/work_registry_snapshot.py" restore \
+          --snapshot "$rollback_snapshot"; then
+        rollback_ready=0
+        echo "ERROR: Work registry restore failed; wrapper remains stopped" >&2
+      fi
+    fi
     if [ "$switched" -eq 1 ]; then
       if [ -n "$previous" ]; then
-        "$target/.venv/bin/python" "$target/deploy/atomic_symlink.py" \
-          "$previous" "$current" >/dev/null 2>&1 || true
+        if ! "$target/.venv/bin/python" "$target/deploy/atomic_symlink.py" \
+            "$previous" "$current" >/dev/null 2>&1; then
+          rollback_ready=0
+        fi
       elif [ -L "$current" ]; then
-        rm -f -- "$current"
+        rm -f -- "$current" || rollback_ready=0
       fi
     fi
     if [ "$service_changed" -eq 1 ]; then
       if [ "$service_had_file" -eq 1 ] && [ -n "$service_backup" ]; then
-        cp -p "$service_backup" "$service_file" >/dev/null 2>&1 || true
+        cp -p "$service_backup" "$service_file" >/dev/null 2>&1 || \
+          rollback_ready=0
       elif [ "$service_had_file" -eq 0 ] && [ -f "$service_file" ]; then
-        rm -f -- "$service_file"
+        rm -f -- "$service_file" || rollback_ready=0
       fi
     fi
     if [ "$device_changed" -eq 1 ] && [ "$device_had_file" -eq 1 ] &&
        [ -n "$device_backup" ]; then
       device_recovery="$device_file.failed-$release_name-$$"
-      cp -p "$device_file" "$device_recovery" >/dev/null 2>&1 || true
-      cp -p "$device_backup" "$device_file" >/dev/null 2>&1 || true
+      cp -p "$device_file" "$device_recovery" >/dev/null 2>&1 || \
+        rollback_ready=0
+      cp -p "$device_backup" "$device_file" >/dev/null 2>&1 || \
+        rollback_ready=0
       echo "New device credential retained for recovery: $device_recovery" >&2
     elif [ "$device_changed" -eq 1 ]; then
       echo "New device credential retained for a retry: $device_file" >&2
     fi
-    if [ "$switched" -eq 1 ] || [ "$service_changed" -eq 1 ]; then
-      restart_after_rollback
+    if [ "$rollback_ready" -eq 1 ] && { [ "$service_stopped" -eq 1 ] || \
+       [ "$switched" -eq 1 ] || [ "$service_changed" -eq 1 ]; }; then
+      if ! restart_after_rollback; then
+        rollback_ready=0
+      fi
     fi
-    echo "ERROR: wrapper activation failed; the previous release was restored" >&2
+    if [ "$rollback_ready" -eq 1 ]; then
+      echo "ERROR: wrapper activation failed; code and Work data were restored" >&2
+    else
+      echo "ERROR: wrapper activation failed; manual data recovery is required" >&2
+    fi
   fi
   [ -z "$stage" ] || rm -rf -- "$stage"
   [ -z "$service_backup" ] || rm -f -- "$service_backup"
@@ -346,24 +406,76 @@ if [ ! -f "$device_file" ] || [ -L "$device_file" ]; then
 fi
 chmod 0600 "$device_file"
 
+# Work metadata lives outside immutable release directories. Capture it before
+# activation so a code rollback also restores the schema and fixed account
+# ownership understood by the previous wrapper.
+if [ "$service_had_file" -eq 1 ]; then
+  if [ "$system" = darwin ]; then
+    domain="gui/$(id -u)"
+    if launchctl print "$domain/$service_label" >/dev/null 2>&1; then
+      service_was_running=1
+    fi
+  elif systemctl is-active --quiet "$service_label"; then
+    service_was_running=1
+  fi
+fi
+if [ "$service_was_running" -eq 1 ]; then
+  stop_wrapper_service || die "existing wrapper could not be stopped safely"
+  service_stopped=1
+fi
+rollback_snapshot="$(
+  mktemp -d "$rollback_root/activation-$release_name.XXXXXX"
+)"
+snapshot_args=(
+  snapshot
+  --destination "$rollback_snapshot"
+  --home "$target_home"
+)
+if [ "$system" = darwin ] && [ "$service_had_file" -eq 1 ]; then
+  snapshot_args+=(--plist "$service_file")
+elif [ "$system" = linux ] && [ -f "$config_dir/wrapper.env" ]; then
+  snapshot_args+=(--env-file "$config_dir/wrapper.env")
+fi
+"$target/.venv/bin/python" "$target/deploy/work_registry_snapshot.py" \
+  "${snapshot_args[@]}" >/dev/null
+snapshot_created=1
+
 if [ "$system" = darwin ]; then
   "$target/.venv/bin/python" - \
     "$target/deploy/com.muggle.cc-remote.wrapper.plist.in" \
-    "$service_file" "$current" "$target_home" "$log_dir" <<'PY'
+    "$service_file" "$current" "$target_home" "$log_dir" \
+    "$service_backup" <<'PY'
 from pathlib import Path
+import plistlib
 import sys
 from xml.sax.saxutils import escape
 
-source, destination, current, home, log_dir = map(Path, sys.argv[1:])
+source, destination, current, home, log_dir = map(Path, sys.argv[1:6])
+previous_plist = Path(sys.argv[6]) if sys.argv[6] else None
 text = source.read_text(encoding="utf-8")
+work_roots = {
+    "CLAUDE_WORK_ROOT": str(home / ".claude" / "cc-remote" / "work"),
+    "CODEX_WORK_ROOT": str(home / ".codex" / "cc-remote" / "work"),
+}
+if previous_plist is not None:
+    with previous_plist.open("rb") as stream:
+        previous = plistlib.load(stream)
+    environment = previous.get("EnvironmentVariables", {})
+    if isinstance(environment, dict):
+        for key in work_roots:
+            value = environment.get(key)
+            if isinstance(value, str) and value:
+                work_roots[key] = value
 values = {
     "__CURRENT__": escape(str(current)),
     "__HOME__": escape(str(home)),
     "__LOG_DIR__": escape(str(log_dir)),
+    "__CLAUDE_WORK_ROOT__": escape(work_roots["CLAUDE_WORK_ROOT"]),
+    "__CODEX_WORK_ROOT__": escape(work_roots["CODEX_WORK_ROOT"]),
 }
 for marker, value in values.items():
     text = text.replace(marker, value)
-if "__" in text:
+if any(marker in text for marker in values):
     raise SystemExit("unresolved LaunchAgent template marker")
 staged = destination.with_name(f".{destination.name}.new")
 staged.write_text(text, encoding="utf-8")
@@ -439,11 +551,30 @@ else
   systemctl is-active --quiet "$service_label"
 fi
 
+migration_ready=0
+for _attempt in $(seq 1 20); do
+  if "$target/.venv/bin/python" \
+      "$target/deploy/work_registry_snapshot.py" verify \
+      --snapshot "$rollback_snapshot" >/dev/null 2>&1; then
+    migration_ready=1
+    break
+  fi
+  wrapper_service_active || break
+  sleep 1
+done
+if [ "$migration_ready" -ne 1 ]; then
+  "$target/.venv/bin/python" \
+    "$target/deploy/work_registry_snapshot.py" verify \
+    --snapshot "$rollback_snapshot" || true
+  die "Codex Work profile migration did not become ready"
+fi
+
 echo
 echo "Wrapper v$version installed from $git_sha."
 echo "Active release: $target"
 if [ -n "$previous" ] && [ "$previous" != "$target" ]; then
   echo "Previous release retained for rollback: $previous"
+  echo "Matching Work data snapshot: $rollback_snapshot"
 fi
 if [ "$system" = darwin ]; then
   echo "Logs: $log_dir"

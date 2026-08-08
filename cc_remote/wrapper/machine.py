@@ -1620,14 +1620,32 @@ class WrapperMachine:
             getattr(cfg, "claude_work_root", fallback_work / "claude"),
             getattr(cfg, "codex_work_root", fallback_work / "codex"),
         )
+        self._codex_work_profile_migration_ok = (
+            self._codex_profile_migration_ok
+        )
         transition = self._codex_profile_transition
         if transition is not None and self._codex_profile_migration_ok:
             try:
                 self._migrate_codex_profile_state(transition)
             except Exception as exc:
                 self._codex_profile_migration_ok = False
+                self._codex_work_profile_migration_ok = False
                 log.warning(
                     "Codex profile state migration is incomplete",
+                    error_type=type(exc).__name__,
+                )
+        if self._codex_profile_migration_ok:
+            try:
+                # Schedule ownership was introduced after the account topology
+                # journal.  Repair it independently so an already-applied
+                # topology revision cannot leave legacy tasks unowned.
+                self._work.for_engine("codex").assign_legacy_codex_profile(
+                    self._codex_profiles.default.id
+                )
+            except Exception as exc:
+                self._codex_work_profile_migration_ok = False
+                log.warning(
+                    "Codex Work profile ownership migration is incomplete",
                     error_type=type(exc).__name__,
                 )
         if self._codex_profile_migration_ok and transition is not None:
@@ -1638,6 +1656,7 @@ class WrapperMachine:
                 )
             except Exception as exc:
                 self._codex_profile_migration_ok = False
+                self._codex_work_profile_migration_ok = False
                 log.warning(
                     "Codex profile topology could not be persisted",
                     error_type=type(exc).__name__,
@@ -4326,7 +4345,10 @@ class WrapperMachine:
                 for engine in ("claude", "codex"):
                     if (
                         engine == "codex"
-                        and not self._codex_profile_migration_ok
+                        and (
+                            not self._codex_profile_migration_ok
+                            or not self._codex_work_profile_migration_ok
+                        )
                     ):
                         continue
                     due = await asyncio.to_thread(
@@ -4362,6 +4384,9 @@ class WrapperMachine:
         run_id = str(schedule["run_id"])
         record = None
         ctx = None
+        codex_profile = None
+        profile_id: str | None = None
+        retryable = True
         lease_task: asyncio.Task | None = None
         try:
             started = await asyncio.to_thread(
@@ -4378,12 +4403,21 @@ class WrapperMachine:
             lease_task = asyncio.create_task(
                 self._renew_work_schedule_lease(store, run_id)
             )
+            if engine == "codex":
+                selected_profile_id = schedule.get("codex_profile_id")
+                if not isinstance(selected_profile_id, str):
+                    retryable = False
+                    raise ValueError("Codex Work schedule has no owning profile")
+                profile_id = selected_profile_id
+                try:
+                    codex_profile = self._codex_profile(profile_id)
+                except (RuntimeError, ValueError):
+                    retryable = False
+                    raise
             record = await asyncio.to_thread(
                 store.create_session,
                 schedule.get("project_id"),
-                codex_profile_id=(
-                    self._codex_profiles.default.id
-                    if engine == "codex" else None),
+                codex_profile_id=profile_id,
             )
             ctx = await self._spawn(
                 resume_id=None,
@@ -4392,10 +4426,7 @@ class WrapperMachine:
                 space="work",
                 work_id=record.work_id,
                 permission_mode=("on-request" if engine == "codex" else None),
-                **(
-                    {"codex_profile_id": self._codex_profiles.default.id}
-                    if engine == "codex" else {}
-                ),
+                **self._codex_spawn_profile_kwargs(codex_profile),
             )
             if ctx is None:
                 raise RuntimeError("engine spawn failed")
@@ -4411,10 +4442,8 @@ class WrapperMachine:
             await ctx.turn_task
             if not ctx.session_id:
                 raise RuntimeError("scheduled session id unavailable")
-            profile_id = (
-                self._codex_profile_for_ctx(ctx).id
-                if engine == "codex" else None
-            )
+            if engine == "codex":
+                profile_id = self._codex_profile_for_ctx(ctx).id
             status = await asyncio.to_thread(
                 store.complete_schedule,
                 run_id,
@@ -4449,17 +4478,19 @@ class WrapperMachine:
                 schedule_id=schedule_id,
                 error_type=type(exc).__name__,
             )
-            message = "执行失败，请检查引擎和权限配置"
-            profile_id = (
-                self._codex_profile_for_ctx(ctx).id
-                if engine == "codex" and ctx is not None else None
+            message = (
+                "绑定的 Codex 账号不可用，请恢复账号配置"
+                if not retryable else "执行失败，请检查引擎和权限配置"
             )
+            if engine == "codex" and ctx is not None:
+                profile_id = self._codex_profile_for_ctx(ctx).id
             status = await asyncio.to_thread(
                 store.complete_schedule,
                 run_id,
                 ctx.session_id if ctx is not None else None,
                 message,
                 codex_profile_id=profile_id,
+                retryable=retryable,
             )
             if ctx is not None and not ctx.session_id:
                 try:
@@ -10830,11 +10861,6 @@ class WrapperMachine:
                 raise ValueError("Codex profile is only valid for Codex")
             return None
         requested = getattr(cmd, "codex_profile_id", None)
-        if getattr(cmd, "space", "code") == "work":
-            default = self._codex_profile()
-            if requested is not None and requested != default.id:
-                raise ValueError("Codex Work uses the default profile")
-            return default
         return self._codex_profile(requested)
 
     def _engine_capability_cwd(
@@ -15545,13 +15571,83 @@ class WrapperMachine:
             # A create/rename/archive committed while this snapshot was being
             # built. Never let the old rows replace the optimistic temp row.
             return await self._refresh_codex_session_catalog()
+        cached = self._codex_session_list_cache
+        failed_profile_ids = {profile_id for profile_id, _ in profile_errors}
+        if failed_profile_ids and cached is not None:
+            # A profile catalog is a rebuildable projection, not an
+            # authoritative deletion signal. Keep only that profile's last
+            # known rows while its native store is unavailable; successful
+            # profiles still replace their own rows immediately. This also
+            # prevents an all-profile daemon restart from painting the sidebar
+            # from a warm cache and then erasing it with an empty refresh.
+            stale_rows = [
+                row for row in cached[1]
+                if row.get("codex_profile_id") in failed_profile_ids
+            ]
+            raw = self._bounded_codex_profile_catalog([*raw, *stale_rows])
         self._codex_session_profile_errors = profile_errors
-        if len(profile_errors) == len(self._codex_profiles):
-            raise RuntimeError("every Codex profile catalog read failed")
         self._codex_session_list_cache = (
             time.monotonic(), raw, profile_errors,
         )
         return raw
+
+    def _bounded_codex_profile_catalog(
+        self, candidates: list[dict],
+    ) -> list[dict]:
+        """Deduplicate and fairly bound fresh/stale rows across profiles."""
+        buckets = {profile.id: [] for profile in self._codex_profiles}
+        seen: set[tuple[str, str]] = set()
+        for item in candidates:
+            profile_id = item.get("codex_profile_id")
+            session_id = item.get("session_id")
+            if (
+                not isinstance(profile_id, str)
+                or not isinstance(session_id, str)
+                or profile_id not in buckets
+                or (profile_id, session_id) in seen
+            ):
+                continue
+            seen.add((profile_id, session_id))
+            buckets[profile_id].append(item)
+        rows_by_profile = list(buckets.values())
+        for profile_rows in rows_by_profile:
+            profile_rows.sort(
+                key=lambda row: _codex_catalog_sort_key(
+                    row.get("last_modified")),
+                reverse=True,
+            )
+
+        rows: list[dict] = []
+        row_bytes = 0
+        indices = [0] * len(rows_by_profile)
+        while len(rows) < self.CODEX_SESSION_LIST_MAX_ROWS:
+            remaining = False
+            for position, profile_rows in enumerate(rows_by_profile):
+                index = indices[position]
+                if index >= len(profile_rows):
+                    continue
+                remaining = True
+                item = profile_rows[index]
+                indices[position] += 1
+                encoded_size = len(json.dumps(
+                    item,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")) + 64
+                if row_bytes + encoded_size > self.CODEX_SESSION_LIST_MAX_BYTES:
+                    continue
+                rows.append(item)
+                row_bytes += encoded_size
+                if len(rows) >= self.CODEX_SESSION_LIST_MAX_ROWS:
+                    break
+            if not remaining:
+                break
+        rows.sort(
+            key=lambda row: _codex_catalog_sort_key(
+                row.get("last_modified")),
+            reverse=True,
+        )
+        return rows
 
     async def _read_codex_profile_catalog(
         self,
@@ -15624,44 +15720,14 @@ class WrapperMachine:
                 )
                 continue
             rows_by_profile.append(profile_rows or [])
-        rows: list[dict] = []
-        row_bytes = 0
-        indices = [0] * len(rows_by_profile)
-        while len(rows) < self.CODEX_SESSION_LIST_MAX_ROWS:
-            remaining = False
-            for position, profile_rows in enumerate(rows_by_profile):
-                index = indices[position]
-                if index >= len(profile_rows):
-                    continue
-                remaining = True
-                item = profile_rows[index]
-                indices[position] += 1
-                encoded_size = len(json.dumps(
-                    item,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                ).encode("utf-8")) + 64
-                if row_bytes + encoded_size > self.CODEX_SESSION_LIST_MAX_BYTES:
-                    continue
-                rows.append(item)
-                row_bytes += encoded_size
-                if len(rows) >= self.CODEX_SESSION_LIST_MAX_ROWS:
-                    break
-            if not remaining:
-                break
-        rows.sort(
-            key=lambda row: _codex_catalog_sort_key(
-                row.get("last_modified")),
-            reverse=True,
-        )
-        return rows, tuple(errors)
+        return self._bounded_codex_profile_catalog([
+            item for profile_rows in rows_by_profile for item in profile_rows
+        ]), tuple(errors)
 
     async def _read_all_codex_profile_sessions(self) -> list[dict]:
         """Compatibility seam for direct account-catalog reads and tests."""
         rows, profile_errors = await self._read_codex_profile_catalog()
         self._codex_session_profile_errors = profile_errors
-        if len(profile_errors) == len(self._codex_profiles):
-            raise RuntimeError("every Codex profile catalog read failed")
         return rows
 
     async def _list_codex_sessions(self, cmd) -> None:
@@ -16212,12 +16278,24 @@ class WrapperMachine:
             return error
         engine = getattr(cmd, "engine", "claude")
         space = getattr(cmd, "space", "code")
+        if (
+            engine == "codex"
+            and space == "work"
+            and not self._codex_work_profile_migration_ok
+        ):
+            error = Error(
+                code=ERR_INTERNAL,
+                message="Codex Work 账号归属迁移未完成，请重启后重试。",
+                request_id=getattr(cmd, "request_id", None),
+                to=getattr(cmd, "client_id", None),
+            )
+            await self.transport.send(error)
+            return error
         codex_profile = None
         if engine == "codex":
             requested_profile_id = getattr(cmd, "codex_profile_id", None)
             try:
-                codex_profile = self._codex_profile(
-                    None if space == "work" else requested_profile_id)
+                codex_profile = self._codex_profile(requested_profile_id)
             except ValueError:
                 error = Error(
                     code=ERR_AUTH,
@@ -17869,6 +17947,10 @@ class WrapperMachine:
         schedules = []
         for raw in data.get("schedules", []):
             schedule = dict(raw)
+            # Tombstones are wrapper-private lifecycle state. The dashboard
+            # query already excludes them; never leak the nullable SQL column
+            # into the strict public WorkScheduleInfo model.
+            schedule.pop("deleted_at", None)
             profile_id = schedule.pop("last_codex_profile_id", None)
             native_sid = schedule.get("last_session_id")
             if (
@@ -17970,9 +18052,19 @@ class WrapperMachine:
                 # accept a task already far in the past that would run by accident.
                 if cmd.next_run_at < time.time() - 60:
                     raise ValueError("schedule time is in the past")
+                schedule_profile_id = None
+                if engine == "codex":
+                    if not self._codex_work_profile_migration_ok:
+                        raise RuntimeError(
+                            "Codex Work profile ownership migration is incomplete"
+                        )
+                    schedule_profile_id = self._codex_profile(
+                        getattr(cmd, "codex_profile_id", None)
+                    ).id
                 await asyncio.to_thread(
                     store.create_schedule, cmd.title.strip(), cmd.prompt.strip(),
-                    cmd.next_run_at, cmd.repeat_seconds, cmd.project_id)
+                    cmd.next_run_at, cmd.repeat_seconds, cmd.project_id,
+                    codex_profile_id=schedule_profile_id)
             elif cmd.type == "delete_work_schedule":
                 await asyncio.to_thread(store.delete_schedule, cmd.schedule_id)
             else:
@@ -20186,6 +20278,19 @@ class WrapperMachine:
                 await self._emit_to_sid(sid, error)
             else:
                 await self._emit_focused(error)
+
+        if (
+            engine == "codex"
+            and space == "work"
+            and not self._codex_work_profile_migration_ok
+        ):
+            await reject(
+                ERR_INTERNAL,
+                "Codex Work 账号归属迁移未完成，请重启后重试。",
+                route="sid",
+                sid=wire_resume_id,
+            )
+            return None
 
         if saved_codex_controls.cwd_override is not None:
             try:

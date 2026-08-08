@@ -4,6 +4,18 @@
 
 ## Unreleased
 
+- Upgrade the coordinated Wrapper/Relay/Web wire gate to protocol v33 and add
+  multi-account Codex Work. New Work sessions and schedules can select any
+  configured profile, persist that ownership independently of the current
+  default, and keep the same account across retries and wrapper restarts.
+  Legacy Work rows are idempotently assigned to the upgrade-time default even
+  when an earlier account-topology migration already completed. Removed
+  profiles leave existing Work bound and fail closed instead of being
+  reassigned; transient catalog read failures remain warnings, retain each
+  failed profile's last-known
+  session projection, and never trigger a silent fallback. Wrapper activation
+  now snapshots both Work SQLite registries, verifies the ownership migration,
+  and restores matching data before restarting old code after a failed release.
 - Upgrade the coordinated Wrapper/Relay/Web gate to protocol v31. Wrapper-side
   catalog mutations now broadcast an unbuffered invalidation instead of an
   uncorrelated session list; each visible browser coalesces the hint into its

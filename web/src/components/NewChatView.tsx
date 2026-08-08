@@ -32,8 +32,7 @@ export function newChatCatalogRequest(
   if (engine === "codex") {
     return {
       engine,
-      ...(space === "code" && codexProfileId
-        ? { codexProfileId } : {}),
+      ...(codexProfileId ? { codexProfileId } : {}),
     };
   }
   return space === "code" ? { engine, cwd } : null;
@@ -309,12 +308,18 @@ export function NewChatView({ cwd, controlScopeKey,
       ...patch,
     }));
   };
-  const selectedCodexProfile = engine === "codex" && space === "code"
+  const selectedCodexProfile = engine === "codex"
     ? codexProfiles.find((profile) => profile.id === codexProfileId) ?? null
     : null;
-  const selectedProfileError = selectedCodexProfile?.error ?? null;
+  const selectedProfileMissing = engine === "codex" && !!codexProfileId
+    && selectedCodexProfile === null;
+  // A catalog read can fail while direct app-server startup still succeeds.
+  // Warn without treating that transient read as an authentication verdict.
+  const selectedProfileWarning = selectedProfileMissing
+    ? "所选 Codex 账号已移除，请重新选择。"
+    : selectedCodexProfile?.error ?? null;
   const canSend = (text.trim().length > 0 || hasAttachments)
-    && !creating && !importing && !selectedProfileError;
+    && !creating && !importing && !selectedProfileMissing;
   const modelList = modelsFor(engine, catalog);
   const effectiveModel = model ?? defaultModel;
   const effortList = newChatEfforts(engine, effectiveModel, catalog);
@@ -381,7 +386,8 @@ export function NewChatView({ cwd, controlScopeKey,
 
   const send = (value = taRef.current?.value ?? text) => {
     const prompt = value.trim();
-    if ((!prompt && !hasAttachments) || creating || importing) return;
+    if ((!prompt && !hasAttachments) || creating || importing
+        || selectedProfileMissing) return;
     setCreating(true);
     const queued = onSend(
       prompt, images.length ? images : undefined, files.length ? files : undefined,
@@ -417,7 +423,37 @@ export function NewChatView({ cwd, controlScopeKey,
     </button>
   );
   const showCodexProfileSelector =
-    engine === "codex" && space === "code" && codexProfiles.length > 1;
+    engine === "codex"
+    && (codexProfiles.length > 1 || selectedProfileMissing);
+  const profileSelector = showCodexProfileSelector ? (
+    <label className="newchat-profile">
+      <span>账号</span>
+      <select value={codexProfileId ?? ""}
+        onChange={(event) => onPickCodexProfile?.(event.target.value)}
+        disabled={creating || importing || !onPickCodexProfile}
+        aria-label="选择 Codex 账号">
+        {selectedProfileMissing && codexProfileId && (
+          <option value={codexProfileId} disabled>已移除账号</option>
+        )}
+        {codexProfiles.map((profile) => (
+          <option key={profile.id} value={profile.id}>
+            {codexProfilePresentation(
+              codexProfiles,
+              defaultCodexProfileId,
+              profile.id,
+            )?.fullLabel ?? profile.label}
+            {profile.error ? " · 目录暂不可用" : ""}
+          </option>
+        ))}
+      </select>
+    </label>
+  ) : null;
+  const profileWarning = selectedProfileWarning ? (
+    <div className="newchat-profile-error" role="status">
+      <Icon name="warning" size={14} />
+      <span>{selectedProfileWarning}</span>
+    </div>
+  ) : null;
 
   return (
     <div className={"newchat " + (space === "work" ? "work-newchat" : "code-newchat")}>
@@ -432,6 +468,12 @@ export function NewChatView({ cwd, controlScopeKey,
             <div className="work-private-note"><Icon name="lock" size={14} />
               默认只访问这项工作的私有目录；需要其他资料时直接上传。
             </div>
+            {(profileSelector || profileWarning) && (
+              <div className="newchat-context work-profile-context">
+                {profileSelector}
+                {profileWarning}
+              </div>
+            )}
             <div className="work-project-bar">
               <select value={selectedProjectId ?? ""}
                 onChange={(event) => onSelectProject?.(event.target.value || null)}>
@@ -448,43 +490,16 @@ export function NewChatView({ cwd, controlScopeKey,
               <span>{workDashboard.plugins.length} 个工作模板</span>
             </div>}
           </>
-        ) : showCodexProfileSelector ? (
+        ) : profileSelector ? (
           <div className="newchat-context">
-            <label className="newchat-profile">
-              <span>账号</span>
-              <select value={codexProfileId ?? ""}
-                onChange={(event) => onPickCodexProfile?.(event.target.value)}
-                disabled={creating || importing || !onPickCodexProfile}
-                aria-label="选择 Codex 账号">
-                {codexProfiles.map((profile) => (
-                  <option key={profile.id} value={profile.id}>
-                    {codexProfilePresentation(
-                      codexProfiles,
-                      defaultCodexProfileId,
-                      profile.id,
-                    )?.fullLabel ?? profile.label}
-                    {profile.error ? " · 不可用" : ""}
-                  </option>
-                ))}
-              </select>
-            </label>
+            {profileSelector}
             {cwdButton}
-            {selectedProfileError && (
-              <div className="newchat-profile-error" role="status">
-                <Icon name="warning" size={14} />
-                <span>{selectedProfileError}</span>
-              </div>
-            )}
+            {profileWarning}
           </div>
         ) : (
           <>
             {cwdButton}
-            {selectedProfileError && (
-              <div className="newchat-profile-error" role="status">
-                <Icon name="warning" size={14} />
-                <span>{selectedProfileError}</span>
-              </div>
-            )}
+            {profileWarning}
           </>
         )}
 

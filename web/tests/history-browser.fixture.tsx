@@ -1940,9 +1940,14 @@ export function HistoryBrowserFixture() {
 }
 
 function ProfileSidebarFixture() {
-  const theme = new URLSearchParams(window.location.search).get("theme") === "dark"
+  const params = new URLSearchParams(window.location.search);
+  const theme = params.get("theme") === "dark"
     ? "dark"
     : "light";
+  const [space, setSpace] = useState<Space>(
+    params.get("profile-sidebar") === "work" ? "work" : "code",
+  );
+  const [newProfileId, setNewProfileId] = useState("none");
   useEffect(() => {
     const root = document.documentElement;
     const previousEngine = root.dataset.engine;
@@ -1967,7 +1972,7 @@ function ProfileSidebarFixture() {
     pinned: true,
     state: "idle",
     engine: "codex",
-    space: "code",
+    space,
     codex_profile_id: "stack",
     codex_profile_label: "Stack",
   }, {
@@ -1976,32 +1981,36 @@ function ProfileSidebarFixture() {
     cwd: "/repo/cc-remote",
     state: "idle",
     engine: "codex",
-    space: "code",
+    space,
     codex_profile_id: "primary",
     codex_profile_label: "Main",
   }];
   const noop = () => {};
   return (
-    <SessionsSidebar
-      open
-      engine="codex"
-      space="code"
-      codexProfiles={profiles}
-      defaultCodexProfileId="primary"
-      sessions={sessions}
-      activeSessionId="profile-sidebar-active"
-      onSpaceChange={noop}
-      onSelect={noop}
-      onNew={noop}
-      onNewInDir={noop}
-      onClose={noop}
-      onRename={noop}
-      onArchive={noop}
-      onPin={noop}
-      onDelete={noop}
-      onForkWorktree={noop}
-      onMigrate={noop}
-    />
+    <>
+      <output data-testid="new-work-profile" hidden>{newProfileId}</output>
+      <SessionsSidebar
+        open
+        engine="codex"
+        space={space}
+        profileScopeKey={`fixture:codex:${space}`}
+        codexProfiles={profiles}
+        defaultCodexProfileId="primary"
+        sessions={sessions}
+        activeSessionId="profile-sidebar-active"
+        onSpaceChange={setSpace}
+        onSelect={noop}
+        onNew={(profileId) => setNewProfileId(profileId ?? "none")}
+        onNewInDir={noop}
+        onClose={noop}
+        onRename={noop}
+        onArchive={noop}
+        onPin={noop}
+        onDelete={noop}
+        onForkWorktree={noop}
+        onMigrate={noop}
+      />
+    </>
   );
 }
 

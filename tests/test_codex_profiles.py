@@ -16,6 +16,7 @@ from cc_remote.protocol import (
     SessionList,
     SessionListInvalidated,
     WorkArtifacts,
+    WorkDashboard,
     deserialize,
     serialize,
 )
@@ -959,40 +960,101 @@ def test_profile_history_rollout_fallback_isolated_for_same_native_uuid(
     assert machine._history_revision(stack_sid) != primary_revision
 
 
-def test_profile_catalog_partial_failure_is_scoped_and_all_failure_is_terminal(
+def test_profile_catalog_failures_preserve_the_public_account_registry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    machine, _transport = _machine(tmp_path)
+    machine, transport = _machine(tmp_path)
     primary_home = str((tmp_path / "primary").resolve())
     stack_home = str((tmp_path / "stack").resolve())
-    failing = {stack_home}
+    failing: set[str] = set()
+    empty: set[str] = set()
 
     async def list_sessions(_limit, *, codex_home=None):
         if codex_home in failing:
             raise RuntimeError("profile unavailable")
+        if codex_home in empty:
+            return []
         return [{
             "session_id": "same-native-id",
             "summary": f"from {codex_home}",
-            "last_modified": 10,
+            "last_modified": "2026-08-08T12:00:00Z",
         }]
 
     monkeypatch.setattr(machine_module, "list_codex_sessions", list_sessions)
 
-    rows = asyncio.run(machine._read_all_codex_profile_sessions())
-    assert [(row["session_id"], row["codex_profile_id"]) for row in rows] == [
+    rows = asyncio.run(machine._refresh_codex_session_catalog())
+    assert {
+        (row["session_id"], row["codex_profile_id"]) for row in rows
+    } == {
         ("primary@same-native-id", "primary"),
-    ]
+        ("stack@same-native-id", "stack"),
+    }
+
+    failing.add(stack_home)
+    rows = asyncio.run(machine._refresh_codex_session_catalog())
+    # The healthy profile is fresh while the failed profile keeps its last
+    # known projection instead of disappearing from the sidebar.
+    assert {
+        (row["session_id"], row["codex_profile_id"]) for row in rows
+    } == {
+        ("primary@same-native-id", "primary"),
+        ("stack@same-native-id", "stack"),
+    }
     assert machine._codex_session_profile_errors == (
         ("stack", "会话列表暂不可用"),
     )
 
+    empty.add(primary_home)
+    rows = asyncio.run(machine._refresh_codex_session_catalog())
+    assert {row["session_id"] for row in rows} == {"stack@same-native-id"}
+    empty.clear()
+    rows = asyncio.run(machine._refresh_codex_session_catalog())
+    assert {row["session_id"] for row in rows} == {
+        "primary@same-native-id", "stack@same-native-id",
+    }
+
     failing.add(primary_home)
-    with pytest.raises(RuntimeError, match="every Codex profile"):
-        asyncio.run(machine._read_all_codex_profile_sessions())
+    rows = asyncio.run(machine._refresh_codex_session_catalog())
+    assert {row["session_id"] for row in rows} == {
+        "primary@same-native-id", "stack@same-native-id",
+    }
     assert dict(machine._codex_session_profile_errors) == {
         "primary": "会话列表暂不可用",
         "stack": "会话列表暂不可用",
     }
+
+    transport.sent.clear()
+    result = asyncio.run(machine._list_codex_sessions(SimpleNamespace(
+        engine="codex", space="code", cmd_id="all-failed",
+        client_id="client-1",
+    )))
+    assert isinstance(result, SessionList)
+    assert {session.session_id for session in result.sessions} == {
+        "primary@same-native-id", "stack@same-native-id",
+    }
+    assert {profile.id for profile in result.codex_profiles} == {
+        "primary", "stack",
+    }
+    assert all(profile.error for profile in result.codex_profiles)
+    assert transport.sent == [result]
+
+
+def test_profile_catalog_all_failure_without_cache_returns_empty_registry_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    machine, _transport = _machine(tmp_path)
+
+    async def unavailable(_limit, *, codex_home=None):
+        raise RuntimeError(f"profile unavailable: {codex_home}")
+
+    monkeypatch.setattr(machine_module, "list_codex_sessions", unavailable)
+
+    rows = asyncio.run(machine._refresh_codex_session_catalog())
+
+    assert rows == []
+    assert {profile_id for profile_id, _ in (
+        machine._codex_session_profile_errors
+    )} == {"primary", "stack"}
 
 
 def test_stale_profile_catalog_generation_cannot_replace_current_errors(
@@ -1312,9 +1374,11 @@ def test_profile_remap_retries_do_not_apply_completed_store_twice(
         CodexControlStore, "migrate_profile_sessions", fail_controls)
     failed = WrapperMachine(cfg, _StubTransport())
     assert not failed._codex_profile_migration_ok
+    assert not failed._codex_work_profile_migration_ok
     assert (tmp_path / "state" / "codex-profile-transition.json").exists()
     drifted, _transport = _machine(tmp_path)
     assert not drifted._codex_profile_migration_ok
+    assert not drifted._codex_work_profile_migration_ok
     with pytest.raises(RuntimeError, match="migration is incomplete"):
         drifted._codex_profile()
     monkeypatch.setattr(
@@ -1322,6 +1386,7 @@ def test_profile_remap_retries_do_not_apply_completed_store_twice(
 
     recovered = WrapperMachine(cfg, _StubTransport())
     assert recovered._codex_profile_migration_ok
+    assert recovered._codex_work_profile_migration_ok
     assert recovered._codex_turn_leases.get(
         "stack@same-native-id").turn_id == "turn-primary"
     assert recovered._codex_turn_leases.get(
@@ -1714,6 +1779,14 @@ def test_profile_rename_displaces_removed_target_without_crossing_accounts(
         work_a.work_id, "same-native-id", codex_profile_id="a")
     work.bind_session(
         work_b.work_id, "same-native-id", codex_profile_id="b")
+    work.create_schedule(
+        "A schedule", "from A", time.time() + 3600,
+        codex_profile_id="a",
+    )
+    work.create_schedule(
+        "B schedule", "from B", time.time() + 3600,
+        codex_profile_id="b",
+    )
 
     renamed_cfg = WrapperConfig()
     renamed_cfg.state_dir = state
@@ -1747,6 +1820,13 @@ def test_profile_rename_displaces_removed_target_without_crossing_accounts(
         "same-native-id", codex_profile_id="b").work_id == work_a.work_id
     assert renamed_work.get_by_session(
         "same-native-id", codex_profile_id="a").work_id == work_b.work_id
+    assert {
+        row["title"]: row["codex_profile_id"]
+        for row in renamed_work.dashboard()["schedules"]
+    } == {
+        "A schedule": "b",
+        "B schedule": "a",
+    }
 
 
 def test_missing_profile_file_is_a_controlled_single_profile_downgrade(
@@ -2028,7 +2108,7 @@ def test_profile_model_permission_and_capability_reads_use_matching_home(
         report = await machine._handle_get_engine_capabilities(
             SimpleNamespace(
                 engine="codex",
-                space="code",
+                space="work",
                 cwd=str(tmp_path),
                 codex_profile_id="stack",
                 skills_only=True,
@@ -2044,3 +2124,174 @@ def test_profile_model_permission_and_capability_reads_use_matching_home(
         ("permissions", stack_home),
         ("capabilities", stack_home),
     ]
+
+
+def test_new_codex_work_session_freezes_selected_profile_before_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    machine, transport = _machine(tmp_path)
+    captured: dict[str, object] = {}
+
+    async def activate_runtime_events() -> None:
+        return None
+
+    async def spawn(**kwargs):
+        captured.update(kwargs)
+        ctx = SessionContext(
+            session_id=None,
+            sdk=SimpleNamespace(
+                collaboration_mode="default",
+                service_tier=None,
+                activate_runtime_events=activate_runtime_events,
+            ),
+            buffer=RingBuffer(100, 1024 * 1024),
+            cwd=str(kwargs["cwd"]),
+            key="tmp-stack-work",
+            engine="codex",
+            space="work",
+            work_id=str(kwargs["work_id"]),
+            codex_profile_id=str(kwargs["codex_profile_id"]),
+        )
+        machine.sessions[ctx.key] = ctx
+        return ctx
+
+    monkeypatch.setattr(machine, "_spawn", spawn)
+
+    async def run() -> None:
+        await machine._handle_new_session(SimpleNamespace(
+            engine="codex",
+            space="work",
+            codex_profile_id="stack",
+            project_id=None,
+            request_id="work-stack-1",
+            client_id="client-1",
+            images=None,
+            files=None,
+            model=None,
+            effort=None,
+            collaboration_mode=None,
+            permission_mode="never",
+            permission_profile=None,
+            web_search=None,
+            service_tier=None,
+            prompt=None,
+            msg_id=None,
+        ))
+
+    asyncio.run(run())
+
+    assert captured["codex_profile_id"] == "stack"
+    record = machine._work.for_engine("codex").get_by_work_id(
+        str(captured["work_id"])
+    )
+    assert record is not None
+    assert record.codex_profile_id == "stack"
+    assert machine.focused_sid == "tmp-stack-work"
+    assert not [item for item in transport.sent if isinstance(item, Error)]
+
+
+def test_codex_work_schedule_runs_only_on_its_bound_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    machine, _transport = _machine(tmp_path)
+    store = machine._work.for_engine("codex")
+    now = time.time()
+    store.create_schedule(
+        "Stack schedule", "run once", now - 1,
+        codex_profile_id="stack",
+    )
+    schedule = store.claim_due_schedules(now)[0]
+    captured: dict[str, object] = {}
+
+    async def spawn(**kwargs):
+        captured.update(kwargs)
+        ctx = SessionContext(
+            session_id="scheduled-native",
+            sdk=object(),
+            buffer=RingBuffer(100, 1024 * 1024),
+            cwd=str(kwargs["cwd"]),
+            key="stack@scheduled-native",
+            engine="codex",
+            space="work",
+            work_id=str(kwargs["work_id"]),
+            codex_profile_id="stack",
+        )
+        store.bind_session(
+            ctx.work_id, ctx.session_id, codex_profile_id="stack",
+        )
+        machine.sessions[ctx.key] = ctx
+        return ctx
+
+    async def query(command):
+        ctx = machine.sessions[command.sid]
+        ctx.turn_task = asyncio.create_task(asyncio.sleep(0))
+        return SimpleNamespace(type="command_ack")
+
+    async def broadcast(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(machine, "_spawn", spawn)
+    monkeypatch.setattr(machine, "_handle_query", query)
+    monkeypatch.setattr(machine, "_broadcast_work_schedule_state", broadcast)
+
+    asyncio.run(machine._run_work_schedule("codex", schedule))
+
+    assert captured["codex_profile_id"] == "stack"
+    result = store.dashboard()["schedules"][0]
+    assert result["codex_profile_id"] == "stack"
+    assert result["last_codex_profile_id"] == "stack"
+    assert result["last_run_status"] == "succeeded"
+
+
+def test_codex_work_schedule_mutation_freezes_selected_profile(
+    tmp_path: Path,
+) -> None:
+    machine, transport = _machine(tmp_path)
+
+    result = asyncio.run(machine._handle_work_mutation(SimpleNamespace(
+        type="create_work_schedule",
+        engine="codex",
+        title="Stack schedule",
+        prompt="run on stack",
+        next_run_at=time.time() + 3600,
+        repeat_seconds=None,
+        project_id=None,
+        codex_profile_id="stack",
+        client_id="client-1",
+    )))
+
+    assert isinstance(result, WorkDashboard)
+    assert len(result.schedules) == 1
+    assert result.schedules[0].codex_profile_id == "stack"
+    assert transport.sent == [result]
+
+
+def test_codex_work_schedule_missing_profile_fails_without_retry_or_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    machine, _transport = _machine(tmp_path)
+    store = machine._work.for_engine("codex")
+    now = time.time()
+    store.create_schedule(
+        "Removed account", "must not run", now - 1,
+        codex_profile_id="removed",
+    )
+    schedule = store.claim_due_schedules(now)[0]
+
+    async def forbidden_spawn(**_kwargs):
+        raise AssertionError("a removed profile must not reach app-server")
+
+    async def broadcast(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(machine, "_spawn", forbidden_spawn)
+    monkeypatch.setattr(machine, "_broadcast_work_schedule_state", broadcast)
+
+    asyncio.run(machine._run_work_schedule("codex", schedule))
+
+    result = store.dashboard()["schedules"][0]
+    assert result["codex_profile_id"] == "removed"
+    assert result["last_codex_profile_id"] == "removed"
+    assert result["last_run_status"] == "failed"
+    assert result["last_run_attempt"] == 1
+    assert "账号不可用" in result["last_error"]

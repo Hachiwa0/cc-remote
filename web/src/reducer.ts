@@ -121,7 +121,7 @@ export function modelCatalogScopeKey(
     : engine;
 }
 
-function nativeCodexSessionId(sessionId: string): string {
+export function nativeCodexSessionId(sessionId: string): string {
   const separator = sessionId.indexOf("@");
   return separator >= 0 ? sessionId.slice(separator + 1) : sessionId;
 }
@@ -2837,12 +2837,13 @@ function reduceEvent(
       let selectedCodexProfileId: string | null = null;
       if (e.engine === "codex" && ownership && codexProfiles.length > 0) {
         const known = new Set(codexProfiles.map((profile) => profile.id));
-        const preferred = ownership.space === "work"
-          ? defaultCodexProfileId
-          : state.newChat?.codexProfileId
-            ?? state.codexProfileByScope[ownership.scopeKey]
-            ?? defaultCodexProfileId;
-        selectedCodexProfileId = preferred && known.has(preferred)
+        const preferred = state.newChat?.codexProfileId
+          ?? state.codexProfileByScope[ownership.scopeKey]
+          ?? defaultCodexProfileId;
+        // A non-null selection is user/account ownership state, not a catalog
+        // fallback hint. Preserve a removed id so the composer can stop and ask
+        // for an explicit replacement instead of silently using the default.
+        selectedCodexProfileId = preferred
           ? preferred
           : defaultCodexProfileId && known.has(defaultCodexProfileId)
             ? defaultCodexProfileId

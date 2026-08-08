@@ -28,7 +28,7 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 32
+PROTOCOL_VERSION = 33
 
 # Codex Desktop renders a 53-week daily token-activity calendar. Keep the wire
 # payload to that same bounded window so an account response can never turn a
@@ -1018,8 +1018,6 @@ class NewSession(_Command):
             raise ValueError("Work session cwd is assigned by the wrapper")
         if self.space == "work" and self.web_search is not None:
             raise ValueError("Work web_search is fixed by the wrapper")
-        if self.space == "work" and self.codex_profile_id is not None:
-            raise ValueError("Codex Work uses the default profile")
         if self.space == "code" and self.project_id is not None:
             raise ValueError("project_id is only supported for Work sessions")
         return self
@@ -1143,6 +1141,7 @@ class WorkScheduleInfo(BaseModel):
     model_config = ConfigDict(extra="forbid")
     schedule_id: WireId
     project_id: Optional[WireId] = None
+    codex_profile_id: Optional[WireId] = None
     title: str = Field(max_length=200)
     prompt: str = Field(max_length=64 * 1024)
     next_run_at: float = Field(ge=0)
@@ -1231,10 +1230,17 @@ class CreateWorkSchedule(_Command):
     type: Literal["create_work_schedule"] = "create_work_schedule"
     engine: Engine = "claude"
     project_id: Optional[WireId] = None
+    codex_profile_id: Optional[WireId] = None
     title: str = Field(min_length=1, max_length=200)
     prompt: str = Field(min_length=1, max_length=64 * 1024)
     next_run_at: float = Field(ge=0)
     repeat_seconds: Optional[int] = Field(default=None, ge=60, le=31_536_000)
+
+    @model_validator(mode="after")
+    def profile_matches_engine(self):
+        if self.engine != "codex" and self.codex_profile_id is not None:
+            raise ValueError("Codex profile is only valid for Codex schedules")
+        return self
 
 
 class DeleteWorkSchedule(_Command):

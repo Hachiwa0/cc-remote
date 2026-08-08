@@ -59,12 +59,33 @@ machine). The **full step-by-step guide is in the main [README](../README.md#生
 - `com.muggle.cc-remote.wrapper.plist.in` — secret-free macOS LaunchAgent
   template. The runtime reads the current user's mode-0600 device JSON instead
   of embedding control credentials in the plist.
+- `work_registry_snapshot.py` — snapshots provider-local Work SQLite databases
+  through SQLite's backup API, restores the matching pre-release images before
+  an older wrapper is restarted, and verifies the v33 Codex ownership backfill.
 
-Protocol v32 is a coordinated upgrade: publish freshly built Relay/Web and
+Protocol v33 is a coordinated upgrade: publish freshly built Relay/Web and
 Wrapper artifacts from the same tagged commit. The strict protocol gate is
 intentional and mixed protocol versions will not communicate. `setup-vps.sh`
 rejects a missing or mismatched web build manifest. Stop the wrapper first;
-activate the v32 relay/web release; then start the v32 wrapper.
+activate the v33 relay/web release; then start the v33 wrapper.
+
+The wrapper installer treats local Work data as part of the release
+transaction. It stops the existing service, writes a private snapshot below
+the install root's `rollback-data/`, starts the new release, and refuses the
+activation unless the Codex Work schema and all legacy ownership rows are
+ready. On failure it stops the new process, restores both SQLite images, then
+restores and starts the previous code. If data restoration fails, it leaves the
+wrapper stopped instead of running old code against a new schema. A manual or
+legacy-layout deployment must use the same order: stop the wrapper, run
+`work_registry_snapshot.py snapshot` from the new staging tree, activate and
+verify v33, and retain that snapshot with the previous release. To roll back,
+stop v33, run `work_registry_snapshot.py restore`, then switch and start the old
+release. Never copy only `registry.sqlite3` while the wrapper is live because
+committed state may still be in its WAL file. Restoring a pre-release snapshot
+also restores pre-release Work metadata: sessions, projects, or schedule state
+created after activation will no longer be registered (their private files are
+not deleted). Use this for immediate failed activation; after normal use,
+prefer a roll-forward fix unless that metadata rollback is explicitly accepted.
 
 ## Native terminal coordination
 
@@ -84,7 +105,9 @@ activate the v32 relay/web release; then start the v32 wrapper.
   `current` link; account data and daemon sockets remain isolated.
   Leaving both empty preserves the exact single-account path and UI.
 - **Work:** both engines stay on private per-process control planes regardless
-  of the Code settings.
+  of the Code settings. Codex Work sessions and schedules may select any
+  configured profile; the local registry freezes that ownership across retries
+  and default-profile changes.
 
 ## Security (short version)
 

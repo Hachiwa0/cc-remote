@@ -14,6 +14,7 @@ import {
   deferredQueueCapacity,
   initialState,
   modelCatalogScopeKey,
+  nativeCodexSessionId,
   reduce,
   type PendingQuery,
   type PreviewAuthorizationState,
@@ -51,6 +52,7 @@ import { CapabilitiesSheet, type HookDraft, type SkillDraft } from "./components
 import { TerminalControl } from "./components/TerminalControl";
 import { DeviceSheet, type PairingState, type RemoteDevice } from "./components/DeviceSheet";
 import { HeaderMenu } from "./components/HeaderMenu";
+import { codexProfilePresentation } from "./codex-profile-presentation";
 import { parseGoalCommand } from "./goal-command";
 import {
   dismissGoalUi,
@@ -318,6 +320,8 @@ export default function App() {
   });
   const [workProjectId, setWorkProjectId] = useState<string | null>(null);
   const [workDashboards, setWorkDashboards] = useState<Partial<Record<Engine, WorkDashboard>>>({});
+  const [workDashboardMachineId, setWorkDashboardMachineId] =
+    useState(machineId);
   const [workArtifactsBySid, setWorkArtifactsBySid] = useState<Record<string, WorkArtifactInfo[]>>({});
   const [completionReceipts, setCompletionReceipts] = useState<CompletionReceipts>({});
   const [btwSendModeBySid, setBtwSendModeBySid] = useState<
@@ -555,6 +559,10 @@ export default function App() {
     setCapabilitiesByScope({});
     setStatusOpenSid(null);
     setUsageActivityOpen(false);
+    setWorkManagerOpen(false);
+    setWorkProjectId(null);
+    setWorkDashboards({});
+    setWorkDashboardMachineId(machineId);
     setWorkArtifactsOpen(false);
     setWorkArtifactsBySid({});
     setGoalUiByScope((current) => Object.fromEntries(
@@ -601,26 +609,34 @@ export default function App() {
     }),
   ) as Record<string, CompletionBadgeKind>;
   const activeScopeKey = sessionScopeKey(machineId, engine, space);
+  const activeWorkDashboard = workDashboardMachineId === machineId
+    ? workDashboards[engine] ?? null
+    : null;
+  const activeWorkProjectId = workDashboardMachineId === machineId
+    ? workProjectId
+    : null;
   const currentCwd = state.cwdByScope[activeScopeKey] ?? "";
   const newChatCwd = state.newChat?.cwd ?? null;
   const knownCodexProfileIds = new Set(
     state.codexProfiles.map((profile) => profile.id));
   const requestedNewChatProfileId = engine === "codex"
-    ? (space === "work"
-      ? state.defaultCodexProfileId
-      : state.newChat?.codexProfileId
-        ?? state.codexProfileByScope[activeScopeKey]
-        ?? state.defaultCodexProfileId)
+    ? state.newChat?.codexProfileId
+      ?? state.codexProfileByScope[activeScopeKey]
+      ?? state.defaultCodexProfileId
     : null;
-  const newChatCodexProfileId = requestedNewChatProfileId
-      && knownCodexProfileIds.has(requestedNewChatProfileId)
+  // Preserve an explicitly selected id even if a later registry refresh drops
+  // it. Silently replacing a drafted Work turn with the default account would
+  // cross the user's billing and conversation boundary.
+  const newChatCodexProfileId = engine === "codex"
     ? requestedNewChatProfileId
-    : engine === "codex"
-      ? state.codexProfiles.find(
+      ?? state.codexProfiles.find(
         (profile) => profile.id === state.defaultCodexProfileId)?.id
-        ?? state.codexProfiles[0]?.id
-        ?? null
-      : null;
+      ?? state.codexProfiles[0]?.id
+      ?? null
+    : null;
+  const newChatCodexProfileMissing = engine === "codex"
+    && !!newChatCodexProfileId
+    && !knownCodexProfileIds.has(newChatCodexProfileId);
   const newChatCatalogScopeKey = modelCatalogScopeKey(
     engine, newChatCodexProfileId);
   const newChatCatalog = catalogForEngineProfile(
@@ -648,6 +664,18 @@ export default function App() {
   const focusedCodexProfileId = focusedEngine === "codex"
     ? focusedSession?.codex_profile_id ?? state.defaultCodexProfileId
     : null;
+  const focusedWorkProfile = space === "work" && !state.newChat
+    && focusedEngine === "codex" && focusedSession?.codex_profile_id
+    ? codexProfilePresentation(
+      state.codexProfiles,
+      state.defaultCodexProfileId,
+      focusedSession.codex_profile_id,
+    )
+    : null;
+  const focusedNativeSessionId = focusedSession?.native_session_id
+    ?? (focusedEngine === "codex" && rt.ccSessionId
+      ? nativeCodexSessionId(rt.ccSessionId)
+      : rt.ccSessionId);
   const focusedCatalog = catalogForEngineProfile(
     state.catalog, focusedEngine, focusedCodexProfileId);
   const capabilityCwd = focusedSession?.cwd || currentCwd;
@@ -1202,7 +1230,7 @@ export default function App() {
   }, [space]);
   useEffect(() => {
     if (newChatCwd === null || state.connState !== "connected"
-        || !state.wrapperOnline) return;
+        || !state.wrapperOnline || newChatCodexProfileMissing) return;
     const request = newChatCatalogRequest(
       engine, space, newChatCwd, newChatCodexProfileId);
     if (!request) return;
@@ -1212,6 +1240,7 @@ export default function App() {
     engine,
     newChatCwd,
     newChatCodexProfileId,
+    newChatCodexProfileMissing,
     space,
     state.connState,
     state.wrapperOnline,
@@ -1298,10 +1327,8 @@ export default function App() {
       cwd: "~",
       cwdSource: "default",
       codexProfileId: nextEngine === "codex"
-        ? nextSpace === "work"
-          ? current.defaultCodexProfileId
-          : current.codexProfileByScope[focusScopeKey]
-            ?? current.defaultCodexProfileId
+        ? current.codexProfileByScope[focusScopeKey]
+          ?? current.defaultCodexProfileId
         : null,
     });
     setNewChatAutoFocus(false);
@@ -2358,6 +2385,7 @@ export default function App() {
             );
           }
           if (msg.type === "work_dashboard") {
+            setWorkDashboardMachineId(machineId);
             setWorkDashboards((current) => ({ ...current, [msg.engine]: msg }));
             setWorkProjectId((current) => current && msg.projects.some(
               (project) => project.project_id === current) ? current : null);
@@ -3484,7 +3512,9 @@ export default function App() {
                             permissionProfile?: string,
                             webSearch?: CodexWebSearchMode,
                             serviceTier?: CodexServiceTier): boolean => {
-    if (!wsRef.current || !state.newChat) return false;
+    if (!wsRef.current || !state.newChat || newChatCodexProfileMissing) {
+      return false;
+    }
     const { cwd, cwdSource, model, effort } = state.newChat;
     // Null is meaningful: let the local CLI/app-server use its configured defaults.
     // Only explicit user choices cross the wire; otherwise a stale fallback catalog
@@ -3504,9 +3534,8 @@ export default function App() {
         ? webSearch
         : undefined,
       engine === "codex" ? serviceTier : undefined,
-      space, space === "work" ? workProjectId : undefined,
-      engine === "codex" && space === "code"
-        ? newChatCodexProfileId : undefined);
+      space, space === "work" ? activeWorkProjectId : undefined,
+      engine === "codex" ? newChatCodexProfileId : undefined);
     if (queued) {
       pendingCreateRef.current = msg_id;
       createRequestsRef.current.set(msg_id, {
@@ -3545,7 +3574,7 @@ export default function App() {
     dispatch({ type: "set_new_chat_effort", effort });
   };
   const pickNewChatCodexProfile = (profileId: string) => {
-    if (engine !== "codex" || space !== "code") return;
+    if (engine !== "codex") return;
     setNewChatPermissionCatalog(null);
     dispatch({
       type: "set_new_chat_codex_profile",
@@ -4028,6 +4057,7 @@ export default function App() {
         open={sidebarOpen}
         engine={engine}
         space={space}
+        profileScopeKey={activeScopeKey}
         codexProfiles={state.codexProfiles}
         defaultCodexProfileId={state.defaultCodexProfileId}
         onSpaceChange={switchSpace}
@@ -4048,7 +4078,7 @@ export default function App() {
           const selected = state.sessions.find((s) => s.session_id === id);
           if (selected) focusListedSession(selected);
         }}
-        onNew={() => { if (!confirmArtifactDiscard()) return; cancelPendingNotificationTarget(); pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd: "~", cwdSource: "default", codexProfileId: newChatCodexProfileId }); if (isMobile()) setSidebarOpen(false); }}
+        onNew={(codexProfileId) => { if (!confirmArtifactDiscard()) return; cancelPendingNotificationTarget(); pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd: "~", cwdSource: "default", codexProfileId: codexProfileId ?? newChatCodexProfileId }); if (isMobile()) setSidebarOpen(false); }}
         onNewInDir={(cwd) => { if (!confirmArtifactDiscard()) return; cancelPendingNotificationTarget(); pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd, cwdSource: "explicit", codexProfileId: newChatCodexProfileId }); if (isMobile()) setSidebarOpen(false); }}
         onClose={() => setSidebarOpen(false)}
         onRename={(id, title) => wsRef.current?.sendRenameSession(id, title, engine, space)}
@@ -4124,8 +4154,16 @@ export default function App() {
                 <span className="surface-head-mark"><Icon name={space === "work" ? "work" : "code"} size={18} /></span>
                 <span>{space === "work" ? "Work" : "Code"}</span>
               </button>
+              {focusedWorkProfile && (
+                <span className={`work-profile-owner tone-${focusedWorkProfile.tone}`}
+                  title={`Codex 账号：${focusedWorkProfile.fullLabel}`}
+                  aria-label={`Codex 账号：${focusedWorkProfile.fullLabel}`}>
+                  <i className="profile-tone" />
+                  {focusedWorkProfile.name}
+                </span>
+              )}
             </div>
-            <div className="sub">{space === "work" ? "私有工作区 · " : ""}{rt.ccSessionId ? `session ${rt.ccSessionId.slice(0, 8)}` : "connected"}</div>
+            <div className="sub">{space === "work" ? "私有工作区 · " : ""}{focusedNativeSessionId ? `session ${focusedNativeSessionId.slice(0, 8)}` : "connected"}</div>
           </div>
           <span className={`hstat ${effectiveState}`}><span className="sd" />
             <span className="hstat-label">{effectiveState}</span></span>
@@ -4172,7 +4210,7 @@ export default function App() {
 
         {state.newChat ? (
           <NewChatView cwd={state.newChat.cwd}
-            controlScopeKey={engine === "codex" && space === "code"
+            controlScopeKey={engine === "codex"
               ? `${activeScopeKey}\u0000${newChatCodexProfileId ?? "__default__"}`
               : activeScopeKey}
             space={space}
@@ -4187,8 +4225,8 @@ export default function App() {
             codexProfiles={state.codexProfiles}
             defaultCodexProfileId={state.defaultCodexProfileId}
             codexProfileId={newChatCodexProfileId}
-            workDashboard={workDashboards[engine] ?? null}
-            selectedProjectId={workProjectId}
+            workDashboard={activeWorkDashboard}
+            selectedProjectId={activeWorkProjectId}
             onSelectProject={setWorkProjectId}
             onManageWork={() => setWorkManagerOpen(true)}
             onPickCwd={() => setDirPickerOpen(true)}
@@ -4528,16 +4566,26 @@ export default function App() {
       <ForkWorktreeSheet open={forkWorktreeSession !== null} session={forkWorktreeSession}
         creating={forkWorktreeCreating} error={forkWorktreeError}
         onConfirm={submitForkWorktree} onClose={closeForkWorktree} />
-      <WorkDashboardSheet open={workManagerOpen && space === "work"}
-        dashboard={workDashboards[engine] ?? null}
-        selectedProjectId={workProjectId}
+      <WorkDashboardSheet
+        key={sessionScopeKey(machineId, engine, "work")}
+        open={workManagerOpen && space === "work"}
+        scopeKey={sessionScopeKey(machineId, engine, "work")}
+        dashboard={activeWorkDashboard}
+        codexProfiles={state.codexProfiles}
+        defaultCodexProfileId={state.defaultCodexProfileId}
+        codexProfileId={state.newChat
+          ? newChatCodexProfileId : focusedCodexProfileId}
+        selectedProjectId={activeWorkProjectId}
         onSelectProject={setWorkProjectId}
         onClose={() => setWorkManagerOpen(false)}
         onCreateProject={(name, description) => !!wsRef.current?.sendCreateWorkProject(engine, name, description)}
         onDeleteProject={(projectId) => !!wsRef.current?.sendDeleteWorkProject(engine, projectId)}
         onAddSource={(projectId, kind, title, uri, file) => !!wsRef.current?.sendAddWorkSource(engine, projectId, kind, title, uri, file)}
         onDeleteSource={(sourceId) => !!wsRef.current?.sendDeleteWorkSource(engine, sourceId)}
-        onCreateSchedule={(title, prompt, nextRunAt, repeatSeconds, projectId) => !!wsRef.current?.sendCreateWorkSchedule(engine, title, prompt, nextRunAt, repeatSeconds, projectId)}
+        onCreateSchedule={(title, prompt, nextRunAt, repeatSeconds, projectId,
+          codexProfileId) => !!wsRef.current?.sendCreateWorkSchedule(
+          engine, title, prompt, nextRunAt, repeatSeconds, projectId,
+          codexProfileId)}
         onDeleteSchedule={(scheduleId) => !!wsRef.current?.sendDeleteWorkSchedule(engine, scheduleId)}
         onCreatePlugin={(name, instructions, projectId) => !!wsRef.current?.sendCreateWorkPlugin(engine, name, instructions, projectId)}
         onDeletePlugin={(pluginId) => !!wsRef.current?.sendDeleteWorkPlugin(engine, pluginId)} />

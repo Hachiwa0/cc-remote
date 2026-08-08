@@ -326,7 +326,7 @@ export interface AddWorkSource extends Base { type: "add_work_source"; engine?: 
 export interface DeleteWorkSource extends Base { type: "delete_work_source"; engine?: Engine; source_id: string }
 export interface CreateWorkPlugin extends Base { type: "create_work_plugin"; engine?: Engine; project_id?: string | null; name: string; instructions: string }
 export interface DeleteWorkPlugin extends Base { type: "delete_work_plugin"; engine?: Engine; plugin_id: string }
-export interface CreateWorkSchedule extends Base { type: "create_work_schedule"; engine?: Engine; project_id?: string | null; title: string; prompt: string; next_run_at: number; repeat_seconds?: number | null }
+export interface CreateWorkSchedule extends Base { type: "create_work_schedule"; engine?: Engine; project_id?: string | null; codex_profile_id?: string | null; title: string; prompt: string; next_run_at: number; repeat_seconds?: number | null }
 export interface DeleteWorkSchedule extends Base { type: "delete_work_schedule"; engine?: Engine; schedule_id: string }
 export interface GetWorkArtifacts extends Base { type: "get_work_artifacts"; engine?: Engine; session_id: string }
 export interface WorkArtifactInfo { path: string; size: number; modified_at: number; kind: "document" | "spreadsheet" | "presentation" | "image" | "pdf" | "file"; previewable: boolean }
@@ -334,7 +334,7 @@ export interface WorkArtifacts extends Base { type: "work_artifacts"; engine: En
 export interface WorkProjectInfo { project_id: string; name: string; description: string; created_at: number; updated_at: number }
 export interface WorkSourceInfo { source_id: string; project_id: string; kind: "file" | "link" | "note"; title: string; uri?: string | null; created_at: number }
 export interface WorkPluginInfo { plugin_id: string; project_id?: string | null; name: string; instructions: string; enabled: boolean; created_at: number; updated_at: number }
-export interface WorkScheduleInfo { schedule_id: string; project_id?: string | null; title: string; prompt: string; next_run_at: number; repeat_seconds?: number | null; enabled: boolean; last_run_at?: number | null; last_session_id?: string | null; last_error?: string | null; last_run_id?: string | null; last_run_status?: "queued" | "claimed" | "running" | "succeeded" | "failed" | null; last_run_attempt?: number | null; created_at: number; updated_at: number }
+export interface WorkScheduleInfo { schedule_id: string; project_id?: string | null; codex_profile_id?: string | null; title: string; prompt: string; next_run_at: number; repeat_seconds?: number | null; enabled: boolean; last_run_at?: number | null; last_session_id?: string | null; last_error?: string | null; last_run_id?: string | null; last_run_status?: "queued" | "claimed" | "running" | "succeeded" | "failed" | null; last_run_attempt?: number | null; created_at: number; updated_at: number }
 export interface WorkDashboard extends Base { type: "work_dashboard"; engine: Engine; projects: WorkProjectInfo[]; sources: WorkSourceInfo[]; plugins: WorkPluginInfo[]; schedules: WorkScheduleInfo[] }
 export interface DirEntry { name: string; path: string }
 export interface ListDir extends Base { type: "list_dir"; path?: string | null }
@@ -558,7 +558,7 @@ export type ServerEvent =
   | ProcessEvent | TurnPlan | TurnDiff | TurnBinding
   | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
 
-export const PROTOCOL_VERSION = 32;
+export const PROTOCOL_VERSION = 33;
 
 const CONTROL_MODES = new Set<ControlMode>([
   "remote", "codex_shared", "claude_broker", "external_cli", "agent_view", "desktop",
