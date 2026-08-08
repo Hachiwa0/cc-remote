@@ -215,9 +215,9 @@ Codex fails closed until it completes so account state cannot cross; Claude is
 unaffected.
 
 Only a multi-account sidebar adds colored diagonal ribbons. The default profile
-uses `default`; subsequent profiles use `luna`, `sol`, `aurora`, `vesper`,
-`caelus`, `terra`, `mercurius`, `venus`, `mars`, `jupiter`, `saturnus`, and
-`neptunus` in configuration order, then `more`. Selectors and tooltips retain
+uses `default`; subsequent profiles use `nyx`, `iris`, `echo`, `gaia`, `metis`,
+`themis`, `hestia`, `athena`, `hermes`, `atlas`, `orpheus`, and `asteria` in
+configuration order, then `more`. Selectors and tooltips retain
 the configured label. A secondary account's switch hook must publish the matching
 profile marker, for example:
 

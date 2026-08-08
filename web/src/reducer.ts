@@ -4387,7 +4387,14 @@ function reduceEvent(
           if (boundCompletedTurns) limitTurnBlocks(t);
         }
         block.channel = resolvedChannel(block.channel, e.channel ?? "unknown");
-        block.text = appendField(block.text, e.text, MAX_LIVE_TEXT_CHARS);
+        // History can win the race against an app-server replay and install the
+        // completed native item before its delayed deltas arrive. Native message
+        // ids are immutable, so a completed exact block is authoritative. Never
+        // use text containment here: repeated prose and bounded History prefixes
+        // are both legitimate content and cannot safely prove replay identity.
+        if (!block.done) {
+          block.text = appendField(block.text, e.text, MAX_LIVE_TEXT_CHARS);
+        }
         if (block.channel !== "final" && e.text.length > 0) {
           markTurnDetailAsLive(rt, t.id, boundCompletedTurns);
         }

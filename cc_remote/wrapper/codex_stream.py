@@ -32,6 +32,8 @@ from cc_remote.protocol import (
     StateEvent, ERR_CC_CRASH,
 )
 from cc_remote.wrapper.codex_external import (
+    codex_rollout_user_message,
+    codex_user_item_text,
     is_codex_account_switch_message,
     visible_codex_user_message,
 )
@@ -88,6 +90,49 @@ _MAX_HISTORY_REVERSE_RECORD_BYTES = 1024 * 1024
 _MAX_HISTORY_BOUNDARY_RECORD_BYTES = 1024 * 1024
 _MAX_HISTORY_BOUNDARY_FORWARD_BYTES = 64 * 1024 * 1024
 _MAX_OFFICIAL_AUTOMATIC_USER_SCAN_BYTES = 64 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class CodexLiveUserMessage:
+    """A visible user boundary carried by the app-server live protocol."""
+
+    message_id: str
+    turn_id: str
+    prompt: str
+    client_id: str | None = None
+
+
+def codex_live_user_message(message: object) -> CodexLiveUserMessage | None:
+    """Normalize one live ``userMessage`` item without accepting foreign shapes."""
+    if not isinstance(message, dict) or message.get("method") not in {
+        "item/started", "item/completed",
+    }:
+        return None
+    params = message.get("params")
+    item = params.get("item") if isinstance(params, dict) else None
+    if not isinstance(item, dict) or item.get("type") != "userMessage":
+        return None
+    message_id = item.get("id")
+    turn_id = params.get("turnId")
+    if (
+        not isinstance(message_id, str)
+        or not _SAFE_WIRE_ID.fullmatch(message_id)
+        or not isinstance(turn_id, str)
+        or not _SAFE_WIRE_ID.fullmatch(turn_id)
+    ):
+        return None
+    prompt = visible_codex_user_message(codex_user_item_text(item))
+    if not prompt:
+        return None
+    client_id = item.get("clientId")
+    if not isinstance(client_id, str) or not _SAFE_WIRE_ID.fullmatch(client_id):
+        client_id = None
+    return CodexLiveUserMessage(
+        message_id=message_id,
+        turn_id=turn_id,
+        prompt=prompt,
+        client_id=client_id,
+    )
 _GOAL_TURN_CORRELATION_SECONDS = 5.0
 _MAX_PENDING_HISTORY_COMPACTIONS = 32
 _MAX_HISTORY_IMAGE_VIEWS_PER_SEGMENT = 128
@@ -271,20 +316,25 @@ def _history_user_cursor(
     prefer_turn_id: bool = True,
 ) -> str | None:
     if (len(line) > _MAX_HISTORY_BOUNDARY_RECORD_BYTES
-            or (b'"type":"user_message"' not in line
-                and b'"type": "user_message"' not in line)):
+            or (
+                b'"user_message"' not in line
+                and b'"UserMessage"' not in line
+            )):
         return None
     try:
         row = json.loads(line)
     except (json.JSONDecodeError, ValueError):
         return None
     payload = row.get("payload") if isinstance(row, dict) else None
-    if (row.get("type") != "event_msg" or not isinstance(payload, dict)
-            or payload.get("type") != "user_message"):
+    if row.get("type") != "event_msg":
         return None
-    if not visible_codex_user_message(payload.get("message")):
+    user = codex_rollout_user_message(payload)
+    if user is None or not user.prompt:
         return None
-    turn_id = payload.get("turn_id")
+    if isinstance(user.message_id, str) and _SAFE_WIRE_ID.fullmatch(
+            user.message_id):
+        return user.message_id
+    turn_id = user.turn_id
     if (prefer_turn_id and isinstance(turn_id, str)
             and _SAFE_WIRE_ID.fullmatch(turn_id)):
         return turn_id
@@ -350,11 +400,11 @@ def _history_account_switch_marker(line: bytes) -> bool:
     except (json.JSONDecodeError, ValueError):
         return False
     payload = row.get("payload") if isinstance(row, dict) else None
+    user = codex_rollout_user_message(payload)
     return bool(
         row.get("type") == "event_msg"
-        and isinstance(payload, dict)
-        and payload.get("type") == "user_message"
-        and is_codex_account_switch_message(payload.get("message"))
+        and user is not None
+        and is_codex_account_switch_message(user.raw_text)
     )
 
 
@@ -822,17 +872,35 @@ def codex_history_boundary_user(
                         if image:
                             pending_images.append(image)
                 continue
-            if row_type != "event_msg" or payload_type != "user_message":
+            if row_type != "event_msg":
                 continue
-            prompt = visible_codex_user_message(payload.get("message"))
-            if not prompt:
+            user = codex_rollout_user_message(payload)
+            if user is None:
+                continue
+            if not user.prompt:
                 pending_images = []
                 continue
             if user_index:
                 user_index -= 1
                 pending_images = []
                 continue
-            event = UserMsg(msg_id=cursor, prompt=prompt)
+            message_id = (
+                user.message_id
+                if isinstance(user.message_id, str)
+                and _SAFE_WIRE_ID.fullmatch(user.message_id)
+                else cursor
+            )
+            client_id = (
+                user.client_id
+                if isinstance(user.client_id, str)
+                and _SAFE_WIRE_ID.fullmatch(user.client_id)
+                else None
+            )
+            event = UserMsg(
+                msg_id=message_id,
+                client_msg_id=client_id,
+                prompt=user.prompt,
+            )
             if pending_images:
                 event.images = pending_images
             raw_ts = row.get("timestamp")
@@ -966,18 +1034,16 @@ def codex_native_rollback_turns(path: str, logical_turns: int) -> int:
             except (json.JSONDecodeError, ValueError):
                 continue
             payload = row.get("payload") if isinstance(row, dict) else None
-            if (
-                row.get("type") != "event_msg"
-                or not isinstance(payload, dict)
-                or payload.get("type") != "user_message"
-            ):
+            if row.get("type") != "event_msg":
                 continue
-            message = payload.get("message")
-            if is_codex_account_switch_message(message):
+            user = codex_rollout_user_message(payload)
+            if user is None:
+                continue
+            if is_codex_account_switch_message(user.raw_text):
                 if groups:
                     groups[-1] += 1
                 continue
-            if visible_codex_user_message(message):
+            if user.prompt:
                 groups.append(1)
                 if len(groups) > logical_turns:
                     del groups[0]
@@ -2689,7 +2755,7 @@ def codex_translate_history(
     """Translate a Codex rollout .jsonl into wire events (same vocabulary as the
     live stream) + the model used. Codex analog of stream.translate_history.
 
-    A turn = event_msg/user_message -> (function_call/reasoning...) -> agent_message.
+    A turn = persisted user boundary -> (function_call/reasoning...) -> agent_message.
     Skips the <environment_context>/<permissions> developer/user envelope messages;
     uses the clean event_msg user_message / agent_message text. Returns
     (events, model)."""
@@ -2711,7 +2777,6 @@ def codex_translate_history(
     cur_channel = "unknown"
     last_ts = None
     pending_images: list = []   # input_image blocks seen before the next user_message
-    pending_user_message_id: str | None = None
     pending_compactions: list[
         tuple[str, float | None, str | None]
     ] = []
@@ -3259,22 +3324,23 @@ def codex_translate_history(
                             raw_ts,
                         )
                 pending_goal_prompt = None
-            elif t == "event_msg" and payload_type == "user_message":
+            elif (
+                t == "event_msg"
+                and (user_record := codex_rollout_user_message(p)) is not None
+            ):
                 pending_goal_prompt = None
                 pending_task_goal_prompt = None
                 pending_task_started = None
-                raw_client_id = p.get("client_id")
-                pending_user_message_id = (
-                    raw_client_id
-                    if isinstance(raw_client_id, str)
-                    and _SAFE_WIRE_ID.fullmatch(raw_client_id)
+                user_client_id = (
+                    user_record.client_id
+                    if isinstance(user_record.client_id, str)
+                    and _SAFE_WIRE_ID.fullmatch(user_record.client_id)
                     else None
                 )
-                raw_message = p.get("message")
                 account_switch_continuation = (
-                    is_codex_account_switch_message(raw_message)
+                    is_codex_account_switch_message(user_record.raw_text)
                 )
-                msg = visible_codex_user_message(raw_message)
+                msg = user_record.prompt
                 if (
                     account_switch_continuation
                     and events
@@ -3286,7 +3352,7 @@ def codex_translate_history(
                     # replacement terminal below becomes its sole boundary.
                     events.pop()
                 if msg:
-                    next_turn_id = p.get("turn_id") or pending_turn_id
+                    next_turn_id = user_record.turn_id or pending_turn_id
                     if turn_open:
                         # Codex accepts another user message while the same
                         # app-server task is still running.  That is steering,
@@ -3320,7 +3386,14 @@ def codex_translate_history(
                                 authoritative_boundary=False)
                     active_turn_id = str(next_turn_id) if next_turn_id else None
                     pending_turn_id = active_turn_id
-                    if task_has_user:
+                    if (
+                        isinstance(user_record.message_id, str)
+                        and _SAFE_WIRE_ID.fullmatch(user_record.message_id)
+                    ):
+                        # 0.147 persists the same authoritative item id returned
+                        # by official History and the live app-server stream.
+                        uid = user_record.message_id
+                    elif task_has_user:
                         # A steered message inside the same app-server task has
                         # no fresh turn id. Reusing active_turn_id would make the
                         # reducer drop it as a duplicate of the first user row.
@@ -3337,7 +3410,7 @@ def codex_translate_history(
                     active_msg_id = uid
                     um = UserMsg(
                         msg_id=uid,
-                        client_msg_id=pending_user_message_id,
+                        client_msg_id=user_client_id,
                         prompt=msg,
                     )
                     if pending_images:
@@ -3352,7 +3425,6 @@ def codex_translate_history(
                     flush_pending_compactions(active_turn_id)
                     task_has_user = True
                 pending_images = []   # consume (per user turn)
-                pending_user_message_id = None
             elif (t == "response_item"
                   and payload_type in {"function_call", "custom_tool_call"}):
                 open_assistant_only_turn()
@@ -4184,8 +4256,12 @@ def codex_history_image_views(
                     break
                 continue
 
-            if row_type == "event_msg" and payload_type == "user_message":
-                if not visible_codex_user_message(payload.get("message")):
+            if row_type == "event_msg":
+                user = codex_rollout_user_message(payload)
+            else:
+                user = None
+            if user is not None:
+                if not user.prompt:
                     continue
                 if saw_visible_user:
                     if current_segment == segment_index:

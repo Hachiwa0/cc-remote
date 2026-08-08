@@ -115,6 +115,7 @@ function mergeBlocks(
   preserveLiveOpen: boolean,
   preferCompletedHistoryPayload = false,
   allowCompatibilityTextMatch = true,
+  completedTextAuthority: "first" | "second" | "combine" = "first",
 ): Block[] {
   const out = history.map((block) => ({ ...block }));
   const processMatches = processBlockMatches(history, live);
@@ -204,7 +205,20 @@ function mergeBlocks(
       ? undefined : out[existingIndex] as TextBlock;
     if (existing) {
       matchedTextIndexes.add(existingIndex!);
-      existing.text = combineText(existing.text, block.text);
+      const sameNativeMessage = existing.message_id === block.message_id;
+      // A completed native item is immutable. For an exact stable message id,
+      // the caller selects the source-backed payload: initial History keeps its
+      // bounded canonical text, while an already-loaded detail page keeps its
+      // complete text across a later summary refresh. This deliberately uses
+      // identity and lifecycle only: content heuristics cannot distinguish a
+      // replay duplicate from legitimate repeated prose or a truncated summary.
+      existing.text = sameNativeMessage && existing.done && block.done
+        ? completedTextAuthority === "first"
+          ? existing.text
+          : completedTextAuthority === "second"
+            ? block.text
+            : combineText(existing.text, block.text)
+        : combineText(existing.text, block.text);
       existing.done = existing.done || block.done;
       if (block.channel !== "unknown") existing.channel = block.channel;
       if (block.liveOrder != null) {
@@ -247,6 +261,7 @@ export function mergeDetailWithLiveTail(
     true,
     preferCompletedDetailPayload,
     false,
+    preferCompletedDetailPayload ? "first" : "combine",
   );
 
   const identity = (block: Block): string => block.kind === "text"
@@ -610,7 +625,12 @@ export function restoreCachedTurnDetails(
   return restored;
 }
 
-function mergeTurn(history: Turn, live: Turn, preserveLiveOpen = false): Turn {
+function mergeTurn(
+  history: Turn,
+  live: Turn,
+  preserveLiveOpen = false,
+  completedTextAuthority: "first" | "second" | "combine" = "first",
+): Turn {
   const historyImageRefs = history.imageRefs?.length
     ? history.imageRefs : undefined;
   // A matched transcript row keeps its native lookup identity even when the
@@ -636,7 +656,14 @@ function mergeTurn(history: Turn, live: Turn, preserveLiveOpen = false): Turn {
     forkPointId: history.forkPointId ?? live.forkPointId,
     checkpointId: history.checkpointId ?? live.checkpointId,
     prompt: history.prompt || live.prompt,
-    blocks: mergeBlocks(history.blocks, live.blocks, preserveLiveOpen),
+    blocks: mergeBlocks(
+      history.blocks,
+      live.blocks,
+      preserveLiveOpen,
+      false,
+      true,
+      completedTextAuthority,
+    ),
     // A transcript has no ResultMessage, so its EOF is represented by a
     // synthetic TurnEnd.  While this same live tail is still running, that
     // marker is only a snapshot boundary and must not close the turn early.
@@ -719,7 +746,11 @@ export function mergeAuthoritativeTurnDetail(
   summary: Turn,
   detail: Turn,
 ): Turn {
-  const merged = mergeTurn(summary, detail, false);
+  // The summary owns lifecycle and ordering, but an already-loaded detail page
+  // owns the complete payload for an exact native message. In particular, a
+  // later summary refresh must not replace a >256 KiB final answer with the
+  // bounded "expand for full content" prefix again.
+  const merged = mergeTurn(summary, detail, false, "second");
   return {
     ...merged,
     id: summary.id,
@@ -1008,8 +1039,15 @@ export function mergeInitialHistory(
       }
       if (used.has(historyIndex)) continue;
       if (!activeCandidate) {
-        const keys = candidate.blocks.flatMap(blockKeys);
-        if (keys.length === 0 || new Set(keys).size !== keys.length
+        // Several tool calls assembled from one assistant item legitimately
+        // share its message id. Treat that repeated envelope id as corroborating
+        // evidence, not as two provisional rows claiming the same native item.
+        // The per-block primary ids must still be unique so genuinely duplicated
+        // text/tool/process blocks cannot be hidden by this reconciliation.
+        const primaryKeys = candidate.blocks.map(primaryBlockKey);
+        const keys = [...new Set(candidate.blocks.flatMap(blockKeys))];
+        if (primaryKeys.length === 0
+            || new Set(primaryKeys).size !== primaryKeys.length
             || !keys.every((key) => {
           const keyOwners = owners.get(key);
           return keyOwners?.size === 1 && keyOwners.has(historyIndex);

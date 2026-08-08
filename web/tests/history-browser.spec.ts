@@ -1446,7 +1446,7 @@ test("instant session cache preserves a heavy turn's complete process skeleton",
   ]);
 });
 
-test("session cache rejects v10 Claude rows before replay or hydration", async ({
+test("session cache rejects stale Claude and replay-orphan rows", async ({
   page,
 }) => {
   await page.goto("/tests/history-browser.html");
@@ -1454,6 +1454,7 @@ test("session cache rejects v10 Claude rows before replay or hydration", async (
     const cache = await import("/src/cache.ts");
     await cache.clearCache();
     const legacySid = "legacy-claude-prompt-alias";
+    const replayOrphanSid = "completed-replay-orphan";
     const database = await new Promise<IDBDatabase>((resolve, reject) => {
       const request = indexedDB.open("cc_remote_cache", 1);
       request.onsuccess = () => resolve(request.result);
@@ -1474,11 +1475,44 @@ test("session cache rejects v10 Claude rows before replay or hydration", async (
         generation: "legacy-g1",
         savedAt: Date.now(),
       }, legacySid);
+      tx.objectStore("sessions").put({
+        v: 13,
+        turns: [{
+          id: "native-history-turn",
+          prompt: "deploy",
+          blocks: [],
+          done: true,
+        }, {
+          id: "replayed-assistant-message",
+          prompt: "",
+          blocks: [{
+            kind: "tool",
+            message_id: "replayed-assistant-message",
+            tool_use_id: "replayed-tool-a",
+            tool: "Command",
+            input: {},
+            done: true,
+          }, {
+            kind: "tool",
+            message_id: "replayed-assistant-message",
+            tool_use_id: "replayed-tool-b",
+            tool: "Command",
+            input: {},
+            done: true,
+          }],
+          done: true,
+        }],
+        lastSeq: 43,
+        revision: "replay-orphan-r1",
+        generation: "replay-orphan-g1",
+        savedAt: Date.now(),
+      }, replayOrphanSid);
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
       tx.onabort = () => reject(tx.error);
     });
     const legacy = await cache.loadSession(legacySid);
+    const replayOrphan = await cache.loadSession(replayOrphanSid);
     const replay = await cache.loadAllReplayState();
     cache.saveSession("current-claude-prompt-alias", [{
       id: "browser-prompt-id",
@@ -1494,6 +1528,8 @@ test("session cache rejects v10 Claude rows before replay or hydration", async (
     return {
       legacy,
       legacyCursor: replay.cursors[legacySid],
+      replayOrphan,
+      replayOrphanCursor: replay.cursors[replayOrphanSid],
       currentIds: current?.turns.map((turn: {
         id: string; clientMsgId?: string; historyTurnId?: string;
       }) => [turn.id, turn.clientMsgId, turn.historyTurnId]),
@@ -1501,6 +1537,8 @@ test("session cache rejects v10 Claude rows before replay or hydration", async (
   });
   expect(result.legacy).toBeNull();
   expect(result.legacyCursor).toBeUndefined();
+  expect(result.replayOrphan).toBeNull();
+  expect(result.replayOrphanCursor).toBeUndefined();
   expect(result.currentIds).toEqual([[
     "browser-prompt-id", "browser-prompt-id", "claude-transcript-uuid",
   ]]);
@@ -4002,4 +4040,115 @@ test("new-chat controls fit when the visual app height is keyboard-sized", async
   });
   expect(layout.scrollHeight).toBeLessThanOrEqual(layout.clientHeight + 1);
   expect(layout.liveBottom).toBeLessThanOrEqual(layout.sheetBottom + 1);
+});
+
+test("profile keycaps hang from session cards without shifting titles", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 720, height: 900 });
+  await page.goto("/tests/history-browser.html?profile-sidebar=1");
+
+  const activeCard = page.locator(".scard.active");
+  await expect(activeCard).toBeVisible();
+  const geometry = await activeCard.evaluate((card) => {
+    const keycap = card.querySelector<HTMLElement>(".scard-profile-ribbon");
+    const title = card.querySelector<HTMLElement>(".scard-title");
+    const preview = card.querySelector<HTMLElement>(".scard-prev");
+    if (!keycap || !title || !preview) {
+      throw new Error("profile sidebar fixture is incomplete");
+    }
+    const cardRect = card.getBoundingClientRect();
+    const keycapRect = keycap.getBoundingClientRect();
+    const titleRect = title.getBoundingClientRect();
+    const previewRect = preview.getBoundingClientRect();
+    return {
+      cardLeft: cardRect.left,
+      cardTop: cardRect.top,
+      keycapTop: keycapRect.top,
+      keycapBottom: keycapRect.bottom,
+      keycapWidth: keycapRect.width,
+      titleLeft: titleRect.left,
+      titleTop: titleRect.top,
+      previewLeft: previewRect.left,
+      position: getComputedStyle(keycap).position,
+    };
+  });
+
+  expect(geometry.position).toBe("absolute");
+  expect(geometry.keycapTop).toBeLessThan(geometry.cardTop);
+  expect(geometry.keycapBottom).toBeGreaterThan(geometry.cardTop);
+  expect(geometry.keycapBottom).toBeLessThanOrEqual(geometry.titleTop);
+  expect(geometry.keycapWidth).toBeLessThanOrEqual(64);
+  expect(geometry.titleLeft - geometry.cardLeft).toBeLessThanOrEqual(18);
+  expect(Math.abs(geometry.titleLeft - geometry.previewLeft)).toBeLessThanOrEqual(1);
+
+  const ordinaryCard = page.locator(".scard").filter({
+    hasText: "cc-remote 派生",
+  });
+  const ordinaryGeometry = await ordinaryCard.evaluate((card) => {
+    const title = card.querySelector<HTMLElement>(".scard-title");
+    if (!title) throw new Error("ordinary profile title missing");
+    const style = getComputedStyle(card);
+    return {
+      titleInset:
+        title.getBoundingClientRect().left - card.getBoundingClientRect().left,
+      borderColor: style.borderTopColor,
+      backgroundColor: style.backgroundColor,
+    };
+  });
+  expect(ordinaryGeometry.titleInset).toBeLessThanOrEqual(18);
+  expect(ordinaryGeometry.borderColor).not.toBe("transparent");
+  expect(ordinaryGeometry.borderColor).not.toBe("rgba(0, 0, 0, 0)");
+  expect(ordinaryGeometry.backgroundColor).not.toBe("rgba(0, 0, 0, 0)");
+});
+
+test("profile session card edges remain visible in dark theme", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 720, height: 900 });
+  await page.goto("/tests/history-browser.html?profile-sidebar=1&theme=dark");
+  await page.waitForFunction(() =>
+    document.documentElement.dataset.theme === "dark"
+  );
+  await page.waitForTimeout(200);
+
+  const appearance = await page.locator(".scard").evaluateAll((cards) => {
+    const sample = (color: string) => {
+      const canvas = document.createElement("canvas");
+      canvas.width = 1;
+      canvas.height = 1;
+      const context = canvas.getContext("2d");
+      if (!context) throw new Error("canvas context unavailable");
+      context.clearRect(0, 0, 1, 1);
+      context.fillStyle = color;
+      context.fillRect(0, 0, 1, 1);
+      return Array.from(context.getImageData(0, 0, 1, 1).data);
+    };
+    const channelDelta = (left: number[], right: number[]) =>
+      Math.max(...left.slice(0, 3).map((value, index) =>
+        Math.abs(value - right[index])
+      ));
+    const sidebar = sample(getComputedStyle(document.documentElement)
+      .getPropertyValue("--sidebar"));
+    return cards.map((card) => {
+      const style = getComputedStyle(card);
+      const border = sample(style.borderTopColor);
+      const background = sample(style.backgroundColor);
+      return {
+        active: card.classList.contains("active"),
+        borderAlpha: border[3],
+        borderCardDelta: channelDelta(border, background),
+        borderSidebarDelta: channelDelta(border, sidebar),
+      };
+    });
+  });
+
+  expect(appearance).toHaveLength(2);
+  for (const card of appearance) {
+    expect(card.borderAlpha).toBe(255);
+    expect(card.borderCardDelta).toBeGreaterThanOrEqual(20);
+    expect(card.borderSidebarDelta).toBeGreaterThanOrEqual(20);
+  }
+  expect(appearance.some((card) => card.active)).toBe(true);
+  expect(appearance.some((card) => !card.active)).toBe(true);
 });

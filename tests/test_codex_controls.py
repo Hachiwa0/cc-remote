@@ -3502,6 +3502,8 @@ def test_machine_claude_ask_user_question_preserves_input_and_collects_answers()
     async def run():
         machine, transport = _mk_machine()
         ctx = _mk_ctx("claude-question", "claude-question")
+        ctx.state = "running"
+        ctx.active_msg_id = "claude-question-turn"
         tool_input = {
             "questions": [
                 {
@@ -3565,6 +3567,14 @@ def test_machine_claude_ask_user_question_preserves_input_and_collects_answers()
             and [option["label"] for option in message.options] == ["允许一次", "拒绝"]
             for message in transport.sent
         )
+        receipts = [
+            message for message in transport.sent
+            if isinstance(message, StateEvent)
+            and message.detail == "回答已收到，正在等待 Claude 继续。"
+        ]
+        assert len(receipts) == 1
+        assert receipts[0].msg_id == "claude-question-turn"
+        assert ctx.claude_progress_notice_active is True
 
     asyncio.run(run())
 

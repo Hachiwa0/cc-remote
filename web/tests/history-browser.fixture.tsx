@@ -20,10 +20,12 @@ import {
   type Turn,
 } from "../src/reducer";
 import type {
+  CodexProfileInfo,
   PermissionProfileInfo,
   QueryFile,
   QueryImg,
   ServerEvent,
+  SessionInfo,
   Space,
   StatusReport,
   ThreadGoal,
@@ -61,6 +63,7 @@ import { Composer } from "../src/components/Composer";
 import { ComposerDraftStore } from "../src/composer-drafts";
 import { GoalPanel } from "../src/components/GoalPanel";
 import { ProcessTimeline } from "../src/components/ProcessTimeline";
+import { SessionsSidebar } from "../src/components/SessionsSidebar";
 import { useMobileViewport } from "../src/use-mobile-viewport";
 
 const LONG_PERMISSION_PROFILE_ID =
@@ -1920,6 +1923,7 @@ function HistoryConversationBrowserFixture() {
 export function HistoryBrowserFixture() {
   const params = new URLSearchParams(window.location.search);
   const planUi = params.get("plan-ui");
+  if (params.has("profile-sidebar")) return <ProfileSidebarFixture />;
   if (planUi) return <PlanUiFixture mode={planUi} />;
   if (params.has("goal-ui")) {
     return <GoalUiFixture status={params.get("goal-status")} />;
@@ -1933,6 +1937,72 @@ export function HistoryBrowserFixture() {
     return <MobileViewportHistoryConversationBrowserFixture />;
   }
   return <HistoryConversationBrowserFixture />;
+}
+
+function ProfileSidebarFixture() {
+  const theme = new URLSearchParams(window.location.search).get("theme") === "dark"
+    ? "dark"
+    : "light";
+  useEffect(() => {
+    const root = document.documentElement;
+    const previousEngine = root.dataset.engine;
+    const previousTheme = root.dataset.theme;
+    root.dataset.engine = "codex";
+    root.dataset.theme = theme;
+    return () => {
+      if (previousEngine === undefined) delete root.dataset.engine;
+      else root.dataset.engine = previousEngine;
+      if (previousTheme === undefined) delete root.dataset.theme;
+      else root.dataset.theme = previousTheme;
+    };
+  }, [theme]);
+  const profiles: CodexProfileInfo[] = [
+    { id: "primary", label: "Main" },
+    { id: "stack", label: "Stack" },
+  ];
+  const sessions: SessionInfo[] = [{
+    session_id: "profile-sidebar-active",
+    first_prompt: "看看当前仓库。",
+    cwd: "/repo/cc-remote",
+    pinned: true,
+    state: "idle",
+    engine: "codex",
+    space: "code",
+    codex_profile_id: "stack",
+    codex_profile_label: "Stack",
+  }, {
+    session_id: "profile-sidebar-default",
+    summary: "cc-remote 派生",
+    cwd: "/repo/cc-remote",
+    state: "idle",
+    engine: "codex",
+    space: "code",
+    codex_profile_id: "primary",
+    codex_profile_label: "Main",
+  }];
+  const noop = () => {};
+  return (
+    <SessionsSidebar
+      open
+      engine="codex"
+      space="code"
+      codexProfiles={profiles}
+      defaultCodexProfileId="primary"
+      sessions={sessions}
+      activeSessionId="profile-sidebar-active"
+      onSpaceChange={noop}
+      onSelect={noop}
+      onNew={noop}
+      onNewInDir={noop}
+      onClose={noop}
+      onRename={noop}
+      onArchive={noop}
+      onPin={noop}
+      onDelete={noop}
+      onForkWorktree={noop}
+      onMigrate={noop}
+    />
+  );
 }
 
 function MobileViewportHistoryConversationBrowserFixture() {

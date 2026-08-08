@@ -202,6 +202,7 @@ from cc_remote.wrapper.codex_permissions import codex_permission_profiles
 from cc_remote.wrapper.codex_stream import (
     CodexHistoryImageView, CodexStreamTranslator,
     coalesce_codex_live_notifications,
+    codex_live_user_message,
     codex_history_image_views, codex_session_id, is_turn_terminal,
     codex_history_boundary_user, codex_history_turn_user,
     codex_history_turn_users,
@@ -256,7 +257,7 @@ from cc_remote.wrapper.claude_external import (
     classify_claude_growth,
 )
 from cc_remote.wrapper.codex_external import (
-    CodexTuiLogTracker, HolderScan, codex_app_server_proxy_socket,
+    CodexTuiLogTracker, HolderScan, codex_app_server_client_socket,
     parse_turn_markers,
     writable_rollout_holders,
 )
@@ -1166,6 +1167,10 @@ class WrapperMachine:
     CODEX_HISTORY_IMAGE_VIEW_CACHE_ENTRIES = 256
     CODEX_GOAL_RECOVERY_MISS_CACHE_ENTRIES = 2048
     CODEX_GOAL_RECOVERY_MAX_SOURCE_SCANS = 3
+    CODEX_LIVE_USER_ITEM_IDS = 512
+    CODEX_PUBLISHED_STEER_IDS = 512
+    CODEX_THREAD_STARTED_HINTS = 1024
+    CODEX_THREAD_STARTED_HINT_TTL_SECONDS = 30.0
     NOTIFICATION_TITLE_CAP = 512
     NOTIFICATION_TITLE_LENGTH = 120
     PREVIEW_WRITE_TOOLS = frozenset({
@@ -1403,6 +1408,15 @@ class WrapperMachine:
         self._codex_session_list_epoch = 0
         self._codex_session_list_refresh_epoch = -1
         self._codex_session_profile_errors: tuple[tuple[str, str], ...] = ()
+        # Every subscribed handle on one shared daemon can observe the same CLI
+        # thread creation. Deduplicate the content-free catalog hint before it
+        # becomes a browser refresh, and keep both the key set and tasks bounded.
+        self._codex_thread_started_hints: OrderedDict[
+            tuple[str, str], float
+        ] = OrderedDict()
+        self._codex_catalog_hint_tasks: set[asyncio.Task] = set()
+        self._codex_catalog_hint_dirty = False
+        self._codex_catalog_hint_last: tuple[str, str] | None = None
         # Catalog reads must never hold the serial command lane: a cold Codex
         # app-server startup can take tens of seconds on a very large store.
         self._session_list_command_tasks: set[asyncio.Task] = set()
@@ -2799,6 +2813,17 @@ class WrapperMachine:
                 ),
                 can_takeover=False,
             )
+        if (ctx.engine == "codex" and watch is not None
+                and not watch.get("scan_complete", False)):
+            return await self._set_session_control(
+                ctx,
+                control_mode="external_cli",
+                write_state="read_only",
+                terminal_attached=bool(
+                    watch.get("holders") or watch.get("private_holders")),
+                reason="Codex 进程归属暂不可确认；检查恢复后会自动解除",
+                can_takeover=False,
+            )
         if ctx.engine == "codex" and bool(
                 (watch or {}).get("desktop_active")):
             return await self._set_session_control(
@@ -4064,6 +4089,15 @@ class WrapperMachine:
             if list_tasks:
                 await asyncio.gather(*list_tasks, return_exceptions=True)
             self._session_list_command_tasks.clear()
+            catalog_hint_tasks = list(self._codex_catalog_hint_tasks)
+            for task in catalog_hint_tasks:
+                task.cancel()
+            if catalog_hint_tasks:
+                await asyncio.gather(
+                    *catalog_hint_tasks, return_exceptions=True)
+            self._codex_catalog_hint_tasks.clear()
+            self._codex_catalog_hint_dirty = False
+            self._codex_catalog_hint_last = None
             history_tasks = list(self._history_command_tasks.values())
             for task in history_tasks:
                 task.cancel()
@@ -6086,6 +6120,8 @@ class WrapperMachine:
     CODEX_TURN_TRACK_MAX = 512
     CODEX_TURN_ATTRIBUTION_GRACE = 3.0
     CLAUDE_OWNED_MESSAGE_MAX = 512
+    CLAUDE_SILENCE_NOTICE_SECONDS = 3 * 60.0
+    CLAUDE_SILENCE_WARNING_SECONDS = 10 * 60.0
     WATCH_READ_MAX = 4 * 1024 * 1024
     CODEX_TAIL_READ_MAX = 16 * 1024 * 1024
     MIRROR_LIMIT = 4        # lightweight moving head; older turns stay paged
@@ -6123,9 +6159,13 @@ class WrapperMachine:
             # Shared CLI clients are collaborators and never block Remote. A
             # private Codex App turn has no shared-daemon holder, so the watcher
             # marks only that case as desktop-owned/read-only.
-            return bool(w and w.get("desktop_active"))
+            return bool(w and (
+                not w.get("scan_complete", False)
+                or w.get("desktop_active")
+            ))
         if w and w.get("engine") == "codex":
-            return bool(w.get("external"))
+            return bool(
+                w.get("external") or not w.get("scan_complete", False))
         return bool(w) and bool(
             w.get("external")
             or not w.get("scan_complete", False)
@@ -6446,6 +6486,10 @@ class WrapperMachine:
             grouped.setdefault(profile_id, {})[sid] = path
 
         scans: list[HolderScan] = []
+        client_socket_resolutions: dict[
+            ProcessIdentity, tuple[bool, Optional[str]]
+        ] = {}
+        shared_darwin_snapshot = None
         for profile_id, profile_paths in grouped.items():
             profile = self._codex_profile(profile_id)
             native_paths: dict[str, str] = {}
@@ -6461,42 +6505,65 @@ class WrapperMachine:
                 wire_by_native[native_sid] = wire_sid
             if not native_paths:
                 continue
-            if (
+            scan_kwargs = {}
+            if not (
                 not self._codex_profiles_explicit
                 and profile_id == self._codex_profiles.default.id
             ):
-                scan = await asyncio.to_thread(
-                    writable_rollout_holders,
-                    native_paths,
-                    initial_own,
-                )
-                tui_tracker = self._codex_tui_log_tracker
-            else:
-                scan = await asyncio.to_thread(
-                    writable_rollout_holders,
-                    native_paths,
-                    initial_own,
-                    shell_snapshot_root=str(
-                        profile.home / "shell_snapshots"),
-                )
-                tui_tracker = self._codex_tui_log_trackers[profile_id]
+                scan_kwargs["shell_snapshot_root"] = str(
+                    profile.home / "shell_snapshots")
+            if shared_darwin_snapshot is not None:
+                scan_kwargs["darwin_snapshot"] = shared_darwin_snapshot
+            scan = await asyncio.to_thread(
+                writable_rollout_holders,
+                native_paths,
+                initial_own,
+                **scan_kwargs,
+            )
+            if shared_darwin_snapshot is None:
+                shared_darwin_snapshot = scan.darwin_snapshot
+            tui_tracker = (
+                self._codex_tui_log_tracker
+                if not self._codex_profiles_explicit
+                and profile_id == self._codex_profiles.default.id
+                else self._codex_tui_log_trackers[profile_id]
+            )
 
             profile_proxies = scan.client_proxies
+            profile_resolution_complete = True
             if self._codex_profiles.is_multi_profile and scan.client_proxies:
                 daemon = self._codex_daemon_for_profile(profile)
                 info = daemon.info
                 expected_socket = daemon.socket_path or (
                     info.socket_path if info is not None else None)
-                expected_socket = (
-                    os.path.realpath(expected_socket)
-                    if expected_socket else None
-                )
+                # A cold profile has not started its daemon yet, but its
+                # official implicit socket is still deterministic. Resolving
+                # that path lets us reject sibling clients without turning an
+                # otherwise complete ownership scan into a permanent unknown.
+                if expected_socket is None:
+                    expected_socket = str(
+                        profile.home
+                        / "app-server-control"
+                        / "app-server-control.sock"
+                    )
+                expected_socket = os.path.realpath(expected_socket)
                 profile_proxies = {}
-                if expected_socket is not None:
-                    for identity, started_at in scan.client_proxies.items():
-                        socket_path = codex_app_server_proxy_socket(identity)
-                        if socket_path == expected_socket:
-                            profile_proxies[identity] = started_at
+                for identity, started_at in scan.client_proxies.items():
+                    resolution = client_socket_resolutions.get(identity)
+                    if resolution is None:
+                        resolution = await asyncio.to_thread(
+                            codex_app_server_client_socket,
+                            identity,
+                            default_codex_home=str(
+                                (Path.home() / ".codex").resolve()),
+                        )
+                        client_socket_resolutions[identity] = resolution
+                    resolved, socket_path = resolution
+                    if not resolved:
+                        profile_resolution_complete = False
+                        continue
+                    if socket_path == expected_socket:
+                        profile_proxies[identity] = started_at
             tui_bindings, log_complete = await asyncio.to_thread(
                 tui_tracker.bindings,
                 native_paths,
@@ -6518,6 +6585,7 @@ class WrapperMachine:
                 holders=wire_bucket(scan.holders),
                 complete=(
                     scan.complete
+                    and profile_resolution_complete
                     and (log_complete or not profile_proxies)
                 ),
                 passive_holders=wire_bucket(scan.passive_holders),
@@ -6695,7 +6763,7 @@ class WrapperMachine:
                 sid, w, holders, time.time(), writers=writers,
                 private_holders=private_holders,
                 ownership_scan_complete=scan.complete)
-            return bool(w.get("external"))
+            return self._is_external(sid)
 
     @classmethod
     def _codex_tail_snapshot(
@@ -6835,6 +6903,10 @@ class WrapperMachine:
             writers = set(holders)
         if private_holders is None:
             private_holders = set()
+        # Unknown ownership is a write barrier, not evidence of a foreign turn.
+        # Keep it separate from ``external`` so recovery cannot manufacture a
+        # transcript mutation while _sync_external_control still fails closed.
+        w["scan_complete"] = ownership_scan_complete
         was_external = bool(w.get("external"))
         was_sidebar_running = bool(w.get("active_external_turns"))
         was_desktop_active = bool(w.get("desktop_active"))
@@ -9867,6 +9939,7 @@ class WrapperMachine:
                     images=images,
                     files=file_meta,
                 )
+                self._remember_codex_published_steer(ctx, event)
                 try:
                     await self._emit(ctx, event)
                 except Exception as exc:
@@ -10094,6 +10167,7 @@ class WrapperMachine:
         # reconciled and cannot emit a second terminal or overwrite newer state.
         ctx.codex_spontaneous_turn_id = None
         ctx.codex_spontaneous_task = None
+        ctx.codex_spontaneous_anchor_id = None
         if spontaneous_task is not None and not spontaneous_task.done():
             spontaneous_task.cancel()
         if fence is not None:
@@ -11696,9 +11770,16 @@ class WrapperMachine:
                     # turn/started may win the stdout race and publish its empty
                     # anchor first. Reusing the native turn id lets every client
                     # fill that anchor instead of creating a duplicate turn.
-                    await self._emit(
-                        ctx, UserMsg(msg_id=turn_id, prompt=prompt)
-                    )
+                    anchor_id = ctx.codex_spontaneous_anchor_id
+                    if anchor_id is None:
+                        # Claim before relay I/O so the spontaneous consumer
+                        # cannot insert an empty anchor in the same event-loop gap.
+                        ctx.codex_spontaneous_anchor_id = turn_id
+                        ctx.active_msg_id = turn_id
+                    if anchor_id in {None, turn_id}:
+                        await self._emit(
+                            ctx, UserMsg(msg_id=turn_id, prompt=prompt)
+                        )
         await self._emit(ctx, GoalState(goal=goal))
 
     async def _on_codex_runtime_event(
@@ -11782,6 +11863,11 @@ class WrapperMachine:
                 else None
             )
             ctx.codex_spontaneous_turn_id = turn_id
+            if (
+                not ctx.codex_account_handoff
+                or ctx.codex_spontaneous_anchor_id is None
+            ):
+                ctx.codex_spontaneous_anchor_id = recovered_msg_id
             self._claim_codex_turn(
                 ctx,
                 turn_id,
@@ -11848,6 +11934,7 @@ class WrapperMachine:
         if mutation is not None and mutation.turn_id == turn_id:
             ctx.codex_goal_mutation = None
         ctx.codex_spontaneous_turn_id = None
+        ctx.codex_spontaneous_anchor_id = None
         self._release_codex_turn(ctx, turn_id)
         current = asyncio.current_task()
         if (ctx.codex_spontaneous_task is current
@@ -11879,6 +11966,8 @@ class WrapperMachine:
         translator = CodexStreamTranslator(self.cfg.tool_result_max)
         current_turn_id = turn_id
         logical_msg_id = recovered_msg_id or turn_id
+        if recovered_msg_id and ctx.codex_spontaneous_anchor_id is None:
+            ctx.codex_spontaneous_anchor_id = recovered_msg_id
         stream = coalesce_codex_live_notifications(
             ctx.sdk.receive_spontaneous_response(turn_id),
         ).__aiter__()
@@ -11887,6 +11976,7 @@ class WrapperMachine:
         terminal_seen = False
         stream_closed = False
         repair_history = False
+        seen_user_item_ids: set[str] = set()
 
         def start_restart_watch() -> None:
             nonlocal restart_watch_task
@@ -11908,6 +11998,111 @@ class WrapperMachine:
                 await asyncio.gather(
                     restart_watch_task, return_exceptions=True)
             restart_watch_task = None
+
+        async def ensure_automatic_anchor() -> None:
+            """Anchor only after output proves this turn has no earlier user item."""
+            if ctx.codex_spontaneous_anchor_id is not None:
+                return
+            ctx.codex_spontaneous_anchor_id = logical_msg_id
+            ctx.active_msg_id = logical_msg_id
+            await self._emit(ctx, UserMsg(
+                msg_id=logical_msg_id,
+                prompt="",
+            ))
+
+        async def publish_live_user(raw: dict) -> bool:
+            """Publish one official CLI user item and its native turn binding."""
+            nonlocal logical_msg_id
+            user = codex_live_user_message(raw)
+            if user is None or user.turn_id != current_turn_id:
+                return False
+            if user.message_id in seen_user_item_ids:
+                return True
+            if len(seen_user_item_ids) >= self.CODEX_LIVE_USER_ITEM_IDS:
+                return True
+            seen_user_item_ids.add(user.message_id)
+
+            anchor_id = ctx.codex_spontaneous_anchor_id
+            reconciles_recovered = bool(
+                anchor_id is not None
+                and user.client_id is not None
+                and user.client_id == anchor_id
+            )
+            if anchor_id is None or reconciles_recovered:
+                # Claim the official item identity before relay I/O. History uses
+                # this same id, while TurnBinding preserves the enclosing native
+                # task for terminal routing and fork actions.
+                ctx.codex_spontaneous_anchor_id = user.message_id
+                logical_msg_id = user.message_id
+                ctx.active_msg_id = user.message_id
+                await self._emit(ctx, UserMsg(
+                    msg_id=user.message_id,
+                    client_msg_id=user.client_id,
+                    prompt=user.prompt,
+                ))
+                await self._emit(ctx, TurnBinding(
+                    msg_id=user.message_id,
+                    turn_id=current_turn_id,
+                ))
+                return True
+            if anchor_id == user.message_id:
+                return True
+
+            published_remote_turn = (
+                ctx.codex_published_steers.get(user.client_id)
+                if user.client_id is not None
+                else None
+            )
+            if published_remote_turn == current_turn_id:
+                # _handle_steer already published the visible boundary using the
+                # browser id. Reconcile the official item as an alias instead of
+                # emitting a second TurnSteered with a different id. UserMsg's
+                # client_msg_id is understood by both live reducer and History.
+                ctx.codex_published_steers.pop(user.client_id, None)
+                logical_msg_id = user.client_id
+                ctx.active_msg_id = user.client_id
+                await self._emit(ctx, UserMsg(
+                    msg_id=user.message_id,
+                    client_msg_id=user.client_id,
+                    prompt=user.prompt,
+                ))
+                await self._emit(ctx, TurnBinding(
+                    msg_id=user.client_id,
+                    turn_id=current_turn_id,
+                ))
+                return True
+
+            # A native Codex task may accept multiple CLI inputs. The first owns
+            # the live turn; later user items are steering boundaries rather than
+            # replacements for its prompt.
+            logical_msg_id = user.message_id
+            ctx.active_msg_id = user.message_id
+            await self._emit(ctx, TurnSteered(
+                msg_id=user.message_id,
+                turn_id=current_turn_id,
+                prompt=user.prompt,
+            ))
+            return True
+
+        def raw_is_user_item(raw: dict) -> bool:
+            if raw.get("method") not in {"item/started", "item/completed"}:
+                return False
+            params = raw.get("params")
+            item = params.get("item") if isinstance(params, dict) else None
+            return isinstance(item, dict) and item.get("type") == "userMessage"
+
+        def raw_proves_automatic_output(raw: dict) -> bool:
+            method = raw.get("method")
+            return bool(
+                isinstance(method, str)
+                and (
+                    method.startswith(("item/", "hook/"))
+                    or method in {
+                        "error", "thread/compacted", "turn/completed",
+                        "turn/plan/updated", "turn/diff/updated",
+                    }
+                )
+            )
 
         async def next_stream_item():
             """Race the live stream against an intentional daemon generation."""
@@ -11937,6 +12132,7 @@ class WrapperMachine:
             nonlocal translator, current_turn_id, stream
             nonlocal overflowed, terminal_seen, stream_closed
 
+            await ensure_automatic_anchor()
             ctx.codex_account_handoff = True
             await self._emit(ctx, StateEvent(
                 state="running",
@@ -12153,13 +12349,16 @@ class WrapperMachine:
                     ),
                 )
 
-            # Ordinary automatic continuations have no user prompt. A newly-set
-            # or modified Goal objective is different: it is the user's durable
-            # request and must survive dismissal of the Goal status panel.
-            if recovered_msg_id is None:
+            # A newly-set or modified Goal objective is the user's durable
+            # request. Ordinary automatic turns remain unanchored until the first
+            # output frame proves no official CLI user item preceded it.
+            if recovered_msg_id is None and goal_prompt:
+                ctx.codex_spontaneous_anchor_id = turn_id
+                logical_msg_id = turn_id
+                ctx.active_msg_id = turn_id
                 await self._emit(ctx, UserMsg(
                     msg_id=turn_id,
-                    prompt=goal_prompt or "",
+                    prompt=goal_prompt,
                 ))
 
             if pending_switch is not None:
@@ -12224,6 +12423,13 @@ class WrapperMachine:
 
                 await ctx.codex_steer_gate.wait()
                 await self._confirm_uncertain_codex_steer(ctx, raw)
+                published_user = await publish_live_user(raw)
+                if (
+                    not published_user
+                    and not raw_is_user_item(raw)
+                    and raw_proves_automatic_output(raw)
+                ):
+                    await ensure_automatic_anchor()
                 events = translator.feed(raw)
                 terminal = is_turn_terminal(raw)
                 completed_after_overflow = (
@@ -12488,6 +12694,7 @@ class WrapperMachine:
     ) -> None:
         """Remove accepted Code steer attachments after the native terminal."""
         ctx.codex_uncertain_steer = None
+        ctx.codex_published_steers.clear()
         directories = ctx.codex_steer_attachment_dirs
         if not directories:
             return
@@ -12504,6 +12711,16 @@ class WrapperMachine:
                     error_type=type(exc).__name__,
                 )
 
+    def _remember_codex_published_steer(
+        self, ctx: SessionContext, event: TurnSteered,
+    ) -> None:
+        """Bound official-echo aliases for Remote steers in the active task."""
+        published = ctx.codex_published_steers
+        published.pop(event.msg_id, None)
+        published[event.msg_id] = event.turn_id
+        while len(published) > self.CODEX_PUBLISHED_STEER_IDS:
+            published.pop(next(iter(published)))
+
     async def _confirm_uncertain_codex_steer(
         self, ctx: SessionContext, raw: dict,
     ) -> bool:
@@ -12518,6 +12735,7 @@ class WrapperMachine:
         # two boundaries if the first live send loses its socket.
         ctx.codex_uncertain_steer = None
         ctx.active_msg_id = pending.msg_id
+        self._remember_codex_published_steer(ctx, pending)
         try:
             await self._emit(ctx, pending)
         except Exception as exc:
@@ -13691,6 +13909,14 @@ class WrapperMachine:
             if not future.done():
                 future.set_exception(AskCancelled())
 
+    @staticmethod
+    def _mark_claude_activity(ctx: SessionContext) -> None:
+        """Restart Claude's neutral silence clock without changing lifecycle."""
+        if ctx.engine != "claude":
+            return
+        ctx.claude_last_activity_at = asyncio.get_running_loop().time()
+        ctx.claude_activity_event.set()
+
     async def _on_mcp_ask(
         self,
         ctx: SessionContext,
@@ -13773,6 +13999,7 @@ class WrapperMachine:
         }
         reason = "cancelled"
         try:
+            self._mark_claude_activity(ctx)
             await self._emit(ctx, event)
             log.info(
                 "ask_user emitted",
@@ -13798,6 +14025,7 @@ class WrapperMachine:
             if ctx.pending_asks.get(ask_id) is fut:
                 ctx.pending_asks.pop(ask_id, None)
                 ctx.pending_ask_specs.pop(ask_id, None)
+            self._mark_claude_activity(ctx)
             try:
                 await self._emit(
                     ctx,
@@ -14032,6 +14260,16 @@ class WrapperMachine:
         except AskUnavailable:
             return PermissionResultDeny(
                 message="用户未完成 Claude 的确认问题")
+
+        self._mark_claude_activity(ctx)
+        if ctx.state == "running":
+            await self._emit(ctx, StateEvent(
+                state="running",
+                phase="waiting",
+                detail="回答已收到，正在等待 Claude 继续。",
+                msg_id=ctx.active_msg_id,
+            ))
+            ctx.claude_progress_notice_active = True
 
         return PermissionResultAllow(updated_input={
             **tool_input,
@@ -14916,6 +15154,76 @@ class WrapperMachine:
     def _invalidate_codex_session_catalog(self) -> None:
         self._codex_session_list_cache = None
         self._codex_session_list_epoch += 1
+
+    def _on_codex_thread_started_hint(
+        self, ctx: SessionContext, native_thread_id: str,
+    ) -> None:
+        """Turn a foreign CLI thread notification into one async list hint."""
+        if ctx.engine != "codex" or ctx.space != "code":
+            return
+        try:
+            profile = self._codex_profile_for_ctx(ctx)
+            wire_sid = self._codex_wire_sid(profile, native_thread_id)
+        except (RuntimeError, ValueError):
+            return
+        if any(
+            candidate.engine == "codex"
+            and self._codex_profile_for_ctx(candidate).id == profile.id
+            and (
+                candidate.session_id == native_thread_id
+                or getattr(candidate.sdk, "thread_id", None) == native_thread_id
+                or candidate.key == wire_sid
+            )
+            for candidate in self.sessions.values()
+        ):
+            return
+
+        now = time.monotonic()
+        cutoff = now - self.CODEX_THREAD_STARTED_HINT_TTL_SECONDS
+        while self._codex_thread_started_hints:
+            first_key = next(iter(self._codex_thread_started_hints))
+            if self._codex_thread_started_hints[first_key] > cutoff:
+                break
+            self._codex_thread_started_hints.popitem(last=False)
+        key = (profile.id, native_thread_id)
+        if key in self._codex_thread_started_hints:
+            self._codex_thread_started_hints.move_to_end(key)
+            return
+        self._codex_thread_started_hints[key] = now
+        while (
+            len(self._codex_thread_started_hints)
+            > self.CODEX_THREAD_STARTED_HINTS
+        ):
+            self._codex_thread_started_hints.popitem(last=False)
+
+        self._codex_catalog_hint_dirty = True
+        self._codex_catalog_hint_last = (profile.id, native_thread_id)
+        for completed in tuple(self._codex_catalog_hint_tasks):
+            if completed.done():
+                self._codex_catalog_hint_tasks.discard(completed)
+        if any(not task.done() for task in self._codex_catalog_hint_tasks):
+            return
+        task = asyncio.create_task(self._publish_codex_thread_started_hints())
+        self._codex_catalog_hint_tasks.add(task)
+        task.add_done_callback(self._codex_catalog_hint_tasks.discard)
+
+    async def _publish_codex_thread_started_hints(self) -> None:
+        """Drain any number of daemon callbacks through one bounded task."""
+        while self._codex_catalog_hint_dirty:
+            self._codex_catalog_hint_dirty = False
+            profile_id, native_thread_id = (
+                self._codex_catalog_hint_last or ("unknown", "unknown")
+            )
+            self._invalidate_codex_session_catalog()
+            try:
+                await self._invalidate_session_list("codex", "code")
+            except Exception as exc:
+                log.warning(
+                    "Codex CLI thread catalog hint could not be published",
+                    profile_id=profile_id,
+                    thread_id=native_thread_id,
+                    error_type=type(exc).__name__,
+                )
 
     async def _refresh_codex_session_catalog(self) -> list[dict]:
         """Share one cold app-server catalog read across concurrent clients."""
@@ -20085,6 +20393,9 @@ class WrapperMachine:
             ctx.sdk.turn_lifecycle_callback = (
                 lambda phase, turn_id: self._on_codex_turn_lifecycle(
                     ctx, phase, turn_id))
+            ctx.sdk.thread_started_callback = (
+                lambda thread_id: self._on_codex_thread_started_hint(
+                    ctx, thread_id))
             ctx.sdk.runtime_event_callback = (
                 lambda event: self._on_codex_runtime_event(ctx, event))
 
@@ -20419,6 +20730,9 @@ class WrapperMachine:
             ctx.sdk.turn_lifecycle_callback = (
                 lambda phase, turn_id: self._on_codex_turn_lifecycle(
                     ctx, phase, turn_id))
+            ctx.sdk.thread_started_callback = (
+                lambda thread_id: self._on_codex_thread_started_hint(
+                    ctx, thread_id))
             ctx.sdk.runtime_event_callback = (
                 lambda event: self._on_codex_runtime_event(ctx, event))
         try:
@@ -20928,6 +21242,10 @@ class WrapperMachine:
         codex_restart_watch_task: Optional[asyncio.Task] = None
         codex_handoff_to_spontaneous = False
         native_turn_id: Optional[str] = None
+        if not is_codex:
+            ctx.claude_last_activity_at = asyncio.get_running_loop().time()
+            ctx.claude_activity_event.clear()
+            ctx.claude_progress_notice_active = False
 
         async def reader(
             target_queue: asyncio.Queue, target_reader_exc: list,
@@ -20951,13 +21269,111 @@ class WrapperMachine:
         async def next_turn_message():
             """Wait for one raw engine event or an intentional daemon restart.
 
-            Silence is valid while Codex reasons or runs a long tool, so it is
-            never translated into a user-facing warning. Authoritative retry,
-            provider-error and managed-overflow events still flow through the
-            normal translator paths below.
+            Silence is valid for both engines and never terminates a turn.
+            Codex therefore keeps its unbounded raw wait. Claude adds only two
+            neutral progress notices; neither notice reconnects, retries, nor
+            bypasses the mandatory terminal ResultMessage drain.
             """
+            nonlocal notice_active
             wait_task = asyncio.create_task(self._next_from_queue(ctx, queue))
             try:
+                if not is_codex:
+                    silence_stage = 0
+                    while True:
+                        activity_task = asyncio.create_task(
+                            ctx.claude_activity_event.wait())
+                        timer_task = None
+                        if silence_stage < 2 and not ctx.pending_asks:
+                            threshold = (
+                                self.CLAUDE_SILENCE_NOTICE_SECONDS
+                                if silence_stage == 0
+                                else self.CLAUDE_SILENCE_WARNING_SECONDS
+                            )
+                            elapsed = (
+                                asyncio.get_running_loop().time()
+                                - ctx.claude_last_activity_at
+                            )
+                            timer_task = asyncio.create_task(asyncio.sleep(
+                                max(0.0, threshold - elapsed)))
+                        candidates = {wait_task, activity_task}
+                        if timer_task is not None:
+                            candidates.add(timer_task)
+                        done, _ = await asyncio.wait(
+                            candidates,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        auxiliaries = [activity_task]
+                        if timer_task is not None:
+                            auxiliaries.append(timer_task)
+
+                        # A real engine frame always wins a same-tick timer. It
+                        # is fresh activity even if the translator skips it.
+                        if wait_task in done:
+                            for task in auxiliaries:
+                                if not task.done():
+                                    task.cancel()
+                            await asyncio.gather(
+                                *auxiliaries, return_exceptions=True)
+                            ctx.claude_last_activity_at = (
+                                asyncio.get_running_loop().time())
+                            ctx.claude_activity_event.clear()
+                            return wait_task.result()
+
+                        if activity_task in done:
+                            ctx.claude_activity_event.clear()
+                            silence_stage = 0
+                        elif timer_task is not None and timer_task in done:
+                            if ctx.pending_asks:
+                                # The question card is already the precise wait
+                                # state. Its close path wakes us and resets time.
+                                pass
+                            elif (
+                                ctx.state == "running"
+                                and not ctx.interrupt_event.is_set()
+                            ):
+                                elapsed = max(0.0, (
+                                    asyncio.get_running_loop().time()
+                                    - ctx.claude_last_activity_at
+                                ))
+                                detail = (
+                                    "Claude 暂无新事件，可能仍在思考、"
+                                    "执行工具或等待上游响应。"
+                                    if silence_stage == 0 else
+                                    "Claude 已较长时间没有新事件；"
+                                    "可以继续等待，或停止本回合后重试。"
+                                )
+                                await self._emit(ctx, StateEvent(
+                                    state="running",
+                                    phase="waiting",
+                                    detail=detail,
+                                    msg_id=ctx.active_msg_id,
+                                ))
+                                notice_active = True
+                                ctx.claude_progress_notice_active = True
+                                silence_stage += 1
+                                log_method = (
+                                    log.info if silence_stage == 1
+                                    else log.warning
+                                )
+                                log_method(
+                                    "Claude turn has no new stream event",
+                                    sid=ctx.session_id,
+                                    msg_id=ctx.active_msg_id,
+                                    elapsed_seconds=round(elapsed, 1),
+                                    notice_stage=silence_stage,
+                                )
+                            else:
+                                # Interrupt/drain owns the lifecycle now. Stop
+                                # scheduling notices while its bounded wait runs.
+                                silence_stage = 2
+
+                        for task in auxiliaries:
+                            if not task.done():
+                                task.cancel()
+                        await asyncio.gather(
+                            *auxiliaries, return_exceptions=True)
+                    # The loop returns only after wait_task completes.
+
                 candidates = {wait_task}
                 if codex_restart_watch_task is not None:
                     candidates.add(codex_restart_watch_task)
@@ -21598,11 +22014,10 @@ class WrapperMachine:
                     msg.reached.set()
                     await msg.release.wait()
                     continue
-                if notice_active:
-                    # Any raw app-server frame is fresh activity, even when the
-                    # translator intentionally skips it (reasoning/token usage).
-                    # Clear the stale wait/retry label before handling the frame;
-                    # a new retry notification below can immediately replace it.
+                if notice_active or ctx.claude_progress_notice_active:
+                    # Any raw engine frame is fresh activity, even when the
+                    # translator intentionally skips it. Clear a stale
+                    # wait/retry/answer-received label before handling it.
                     await self._emit(ctx, StateEvent(
                         state=ctx.state,
                         phase=None,
@@ -21610,6 +22025,7 @@ class WrapperMachine:
                         msg_id=ctx.active_msg_id,
                     ))
                     notice_active = False
+                    ctx.claude_progress_notice_active = False
                 if msg is None:
                     if reader_exc:
                         raise reader_exc[0]
@@ -21755,6 +22171,7 @@ class WrapperMachine:
             # different id delivered by the new generation while it connected.
             if ctx.codex_spontaneous_turn_id == timed_out_spontaneous_turn:
                 ctx.codex_spontaneous_turn_id = None
+                ctx.codex_spontaneous_anchor_id = None
             await self._set_idle_after_managed_turn(ctx)
         except Exception as e:
             log.exception("turn failed", error=str(e))
@@ -21770,6 +22187,8 @@ class WrapperMachine:
                 if release_background is not None:
                     release_background()
                 self._clear_claude_client_alias_probe(ctx)
+                ctx.claude_activity_event.clear()
+                ctx.claude_progress_notice_active = False
             ctx.codex_account_handoff = False
             ctx.translator = None
             ctx.turn_task = None

@@ -34,7 +34,12 @@ const SCHEMA = 1;
 // Code generates promptId internally, so it is not the browser Query.msg_id.
 // v12 discards both older shapes; only wrapper-observed native UUID aliases may
 // reconcile a canonical History turn with its optimistic browser row.
-const CACHE_VER = 12;
+// v13 discards projections written by the delayed completed-message replay bug.
+// The cache is only a rebuildable local projection; canonical History restores
+// the same conversations without guessing whether repeated prose was pollution.
+// v14 discards completed prompt-less replay orphans which an older matcher kept
+// when several tool blocks legitimately shared one assistant message id.
+const CACHE_VER = 14;
 const MAX_CACHE_SESSIONS = 64;
 const MAX_CACHE_TURNS = 100;
 const MAX_CACHE_BYTES = 2 * 1024 * 1024;

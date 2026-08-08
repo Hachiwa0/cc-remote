@@ -20,13 +20,16 @@ from pathlib import Path
 from typing import Iterable, Mapping
 
 from cc_remote.wrapper.process_scan import (
+    DarwinProcessInfo,
     MAX_PROC_SCAN,
     ProcessIdentity,
     _darwin_process_info,
     _process_cmdline,
     _process_start_ticks,
     _process_stat,
+    darwin_process_snapshot,
     process_command,
+    process_command_environment_value,
 )
 
 MAX_FDS_PER_PROCESS = 8192
@@ -42,6 +45,10 @@ _THREAD_ID_RE = re.compile(
 )
 _ROLLOUT_SID_RE = re.compile(
     r"rollout-[^\s\"']*-([0-9a-fA-F-]{36})\.jsonl"
+)
+_LOADED_THREAD_RESUME_SID_RE = re.compile(
+    r"\bthread/resume overrides ignored for loaded thread "
+    r"([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})\b"
 )
 _TERMINAL_EVENTS = frozenset({
     "task_complete", "turn_aborted", "task_failed", "task_cancelled",
@@ -64,6 +71,23 @@ class TurnMarkers:
 
 
 @dataclass(frozen=True)
+class CodexRolloutUserMessage:
+    """One normalized user boundary from a persisted Codex rollout.
+
+    Older Codex releases persisted ``event_msg/user_message`` while 0.147
+    persists ``event_msg/item_completed`` with a ``UserMessage`` item.  Keep
+    the source identities separate from the visible prompt so callers can use
+    the official item id without treating internal envelopes as user input.
+    """
+
+    raw_text: str
+    prompt: str | None
+    message_id: str | None = None
+    client_id: str | None = None
+    turn_id: str | None = None
+
+
+@dataclass(frozen=True)
 class HolderScan:
     holders: dict[str, set[ProcessIdentity]]
     complete: bool
@@ -80,6 +104,10 @@ class HolderScan:
     # foreign active turn to App; merely opening/subscribing to a rollout is not
     # ownership and must not make an idle Remote session read-only.
     private_holders: dict[str, set[ProcessIdentity]] = field(default_factory=dict)
+    # Transient, probe-local Darwin snapshot. The machine reuses it across
+    # profile buckets so 12 accounts do not perform 12 kernel-wide PID scans.
+    darwin_snapshot: tuple[list[DarwinProcessInfo], bool] | None = field(
+        default=None, repr=False, compare=False)
 
 
 class CodexTuiLogTracker:
@@ -107,7 +135,11 @@ class CodexTuiLogTracker:
 
     @staticmethod
     def _thread_id(body: str) -> str | None:
-        match = _THREAD_ID_RE.search(body) or _ROLLOUT_SID_RE.search(body)
+        match = (
+            _THREAD_ID_RE.search(body)
+            or _ROLLOUT_SID_RE.search(body)
+            or _LOADED_THREAD_RESUME_SID_RE.search(body)
+        )
         return match.group(1).lower() if match is not None else None
 
     def bindings(
@@ -241,17 +273,9 @@ def _is_app_server_proxy(
     )
 
 
-def codex_app_server_proxy_socket(
-    identity: ProcessIdentity,
+def _codex_app_server_proxy_socket_from_args(
+    args: tuple[bytes, ...] | None,
 ) -> str | None:
-    """Return the exact proxy socket without weakening process identity.
-
-    Multiple CODEX_HOME profiles run independent app-server daemons. A proxy
-    whose socket is missing or ambiguous cannot be assigned to any account's
-    TUI log tracker; doing so would make one account appear to own a sibling
-    account's thread.
-    """
-    args = process_command(identity)
     if not args or b"app-server" not in args or b"proxy" not in args:
         return None
     sockets: list[bytes] = []
@@ -275,6 +299,62 @@ def codex_app_server_proxy_socket(
     ):
         return None
     return os.path.realpath(socket_path)
+
+
+def codex_app_server_proxy_socket(
+    identity: ProcessIdentity,
+) -> str | None:
+    """Return the exact proxy socket without weakening process identity.
+
+    Multiple CODEX_HOME profiles run independent app-server daemons. A proxy
+    whose socket is missing or ambiguous cannot be assigned to any account's
+    TUI log tracker; doing so would make one account appear to own a sibling
+    account's thread.
+    """
+    return _codex_app_server_proxy_socket_from_args(process_command(identity))
+
+
+def codex_app_server_client_socket(
+    identity: ProcessIdentity,
+    *,
+    default_codex_home: str,
+) -> tuple[bool, str | None]:
+    """Resolve the daemon socket used by one exact TUI/proxy process.
+
+    Official local TUIs and remote proxies may omit ``--sock`` and select the
+    daemon through ``CODEX_HOME`` (or the invoking user's standard ``~/.codex``
+    when that variable is absent). ``default_codex_home`` is that process-level
+    default, not the registry's designated default Profile. Multi-profile
+    ownership must recover the client's real selection instead of dropping it
+    or assigning it to every account. The boolean distinguishes a successful
+    non-match from an unreadable/ambiguous candidate, which must make the owner
+    scan incomplete.
+    """
+    environment_complete, args, home = process_command_environment_value(
+        identity, "CODEX_HOME")
+    if args is None:
+        return False, None
+    is_proxy = bool(b"app-server" in args and b"proxy" in args)
+    if is_proxy and any(
+        arg == b"--sock" or arg.startswith(b"--sock=") for arg in args
+    ):
+        socket_path = _codex_app_server_proxy_socket_from_args(args)
+        return socket_path is not None, socket_path
+    if not is_proxy and not _is_interactive_codex_tui(args, 1):
+        return True, None
+    if not environment_complete:
+        return False, None
+    if home is None:
+        home = default_codex_home
+    if (
+        not isinstance(home, str)
+        or not os.path.isabs(home)
+        or "\x00" in home
+        or len(os.fsencode(home)) > 4096
+    ):
+        return False, None
+    return True, os.path.realpath(os.path.join(
+        home, "app-server-control", "app-server-control.sock"))
 
 
 def _codex_resume_sids(
@@ -424,6 +504,8 @@ def _fd_is_writable(proc_dir: Path, fd_name: str) -> bool | None:
 def _darwin_writable_rollout_holders(
     paths: Mapping[str, str],
     own_processes: Iterable[ProcessIdentity],
+    *,
+    process_snapshot: tuple[list[DarwinProcessInfo], bool] | None = None,
 ) -> HolderScan:
     """Use lsof to detect exact rollout writers on macOS.
 
@@ -462,36 +544,22 @@ def _darwin_writable_rollout_holders(
     if completed.returncode not in (0, 1):
         return HolderScan(result, False, passive, client_proxies, private)
 
-    # Native Codex TUIs connect through a short headless proxy which does not
-    # open the rollout. Preserve the existing log-based exact thread binding on
-    # macOS instead of regressing the terminal-attached indicator.
-    try:
-        proxies = subprocess.run(
-            ["/usr/bin/pgrep", "-f", "codex.*app-server.*proxy"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=1.0,
-        )
-    except (OSError, subprocess.SubprocessError):
-        proxies = None
-        complete = False
-    else:
-        complete = proxies.returncode in (0, 1)
-    if proxies is not None and proxies.returncode == 0:
-        for value in proxies.stdout.split():
-            try:
-                proxy_pid = int(value)
-            except ValueError:
-                complete = False
-                continue
-            info = _darwin_process_info(proxy_pid)
-            if info is None:
-                complete = False
-                continue
-            identity, _ppid, tty_nr, args = info
-            if _is_app_server_proxy(args, tty_nr):
-                client_proxies[identity] = identity.start_ticks * 1_000_000_000
+    own = set(own_processes)
+    # Shared-daemon TUIs do not open the rollout. Include both their local
+    # interactive process and remote/headless proxies in the structured log
+    # binding pool; the caller then filters each identity to its CODEX_HOME.
+    snapshot = process_snapshot or darwin_process_snapshot()
+    processes, process_scan_complete = snapshot
+    complete = process_scan_complete
+    for identity, _ppid, tty_nr, args in processes:
+        if identity in own:
+            continue
+        if (
+            _is_app_server_proxy(args, tty_nr)
+            or _is_interactive_codex_tui(args, tty_nr)
+        ):
+            client_proxies[identity] = (
+                identity.start_ticks)
 
     pid: int | None = None
     access = ""
@@ -528,7 +596,6 @@ def _darwin_writable_rollout_holders(
                 matches.setdefault(pid, set()).update(
                     by_inode.get((device, inode), ()))
 
-    own = set(own_processes)
     for holder_pid, sids in matches.items():
         before = _darwin_process_info(holder_pid)
         if before is None:
@@ -547,7 +614,10 @@ def _darwin_writable_rollout_holders(
                 passive[sid].add(identity)
                 if not _is_managed_shared_app_server(args):
                     private[sid].add(identity)
-    return HolderScan(result, complete, passive, client_proxies, private)
+    return HolderScan(
+        result, complete, passive, client_proxies, private,
+        darwin_snapshot=snapshot,
+    )
 
 
 def writable_rollout_holders(
@@ -556,6 +626,7 @@ def writable_rollout_holders(
     *,
     proc_root: str = "/proc",
     shell_snapshot_root: str | None = None,
+    darwin_snapshot: tuple[list[DarwinProcessInfo], bool] | None = None,
 ) -> HolderScan:
     """Return writable holders of each rollout, excluding exact wrapper children.
 
@@ -564,7 +635,8 @@ def writable_rollout_holders(
     before and after the FD walk to reject PID/FD reuse races.
     """
     if sys.platform == "darwin" and proc_root == "/proc":
-        return _darwin_writable_rollout_holders(paths, own_processes)
+        return _darwin_writable_rollout_holders(
+            paths, own_processes, process_snapshot=darwin_snapshot)
 
     by_inode: dict[tuple[int, int], set[str]] = {}
     result = {sid: set() for sid in paths}
@@ -719,10 +791,9 @@ def parse_turn_markers(data: bytes, partial: bytes = b"") -> TurnMarkers:
         if not isinstance(payload, dict):
             continue
         kind = payload.get("type")
-        if kind == "user_message":
-            message = payload.get("message")
-            if visible_codex_user_message(message):
-                has_visible_user_message = True
+        user = codex_rollout_user_message(payload)
+        if user is not None and user.prompt:
+            has_visible_user_message = True
         turn_id = payload.get("turn_id")
         if not isinstance(turn_id, str) or not turn_id or len(turn_id) > 128:
             continue
@@ -782,3 +853,60 @@ def visible_codex_user_message(message: object) -> str | None:
     if lowered.startswith(_INTERNAL_CODEX_USER_PREFIXES):
         return None
     return text
+
+
+def codex_user_item_text(item: object) -> str | None:
+    """Extract text from an official Codex user item without interpreting it."""
+    if not isinstance(item, dict):
+        return None
+    direct = item.get("text")
+    if isinstance(direct, str):
+        return direct
+    content = item.get("content")
+    if not isinstance(content, list):
+        return None
+    parts = [
+        part.get("text")
+        for part in content
+        if (
+            isinstance(part, dict)
+            and part.get("type") == "text"
+            and isinstance(part.get("text"), str)
+        )
+    ]
+    return "".join(parts) if parts else None
+
+
+def codex_rollout_user_message(
+    payload: object,
+) -> CodexRolloutUserMessage | None:
+    """Normalize legacy and 0.147 persisted user-message records."""
+    if not isinstance(payload, dict):
+        return None
+    payload_type = payload.get("type")
+    message_id: str | None = None
+    client_id = payload.get("client_id")
+    turn_id = payload.get("turn_id")
+    if payload_type == "user_message":
+        raw_text = payload.get("message")
+    elif payload_type == "item_completed":
+        item = payload.get("item")
+        if (
+            not isinstance(item, dict)
+            or str(item.get("type") or "").lower() != "usermessage"
+        ):
+            return None
+        raw_text = codex_user_item_text(item)
+        message_id = item.get("id")
+        client_id = item.get("clientId", client_id)
+    else:
+        return None
+    if not isinstance(raw_text, str):
+        return None
+    return CodexRolloutUserMessage(
+        raw_text=raw_text,
+        prompt=visible_codex_user_message(raw_text),
+        message_id=message_id if isinstance(message_id, str) else None,
+        client_id=client_id if isinstance(client_id, str) else None,
+        turn_id=turn_id if isinstance(turn_id, str) else None,
+    )

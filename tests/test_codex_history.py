@@ -1045,6 +1045,71 @@ def test_rollout_user_recovery_is_bound_to_the_native_turn(tmp_path):
         str(rollout), "missing-turn", "user-image") is None
 
 
+def test_codex_0147_rollout_uses_official_user_item_identity(tmp_path):
+    rollout = tmp_path / "rollout-modern-user.jsonl"
+    rollout.write_text("".join(json.dumps(row) + "\n" for row in [
+        {
+            "type": "event_msg",
+            "payload": {"type": "task_started", "turn_id": "native-modern"},
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_image",
+                    "image_url": f"data:image/png;base64,{_PNG_1X1}",
+                }],
+            },
+        },
+        {
+            "timestamp": "2026-01-01T00:00:02Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "turn_id": "native-modern",
+                "item": {
+                    "id": "user-modern",
+                    "clientId": "cli-message-modern",
+                    "type": "UserMessage",
+                    "content": [{"type": "text", "text": "inspect modern"}],
+                },
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "agent_message",
+                "phase": "final_answer",
+                "message": "done",
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {"type": "task_complete", "turn_id": "native-modern"},
+        },
+    ]), encoding="utf-8")
+
+    recovered = codex_history_turn_user(
+        str(rollout), "native-modern", "user-modern")
+    assert recovered is not None
+    assert recovered.msg_id == "user-modern"
+    assert recovered.client_msg_id == "cli-message-modern"
+    assert recovered.prompt == "inspect modern"
+    assert recovered.images == [{
+        "media_type": "image/png",
+        "data": _PNG_1X1,
+    }]
+
+    events, _model = codex_translate_history(
+        str(rollout), tool_result_max=4096)
+    users = [event for event in events if isinstance(event, UserMsg)]
+    assert [(event.msg_id, event.client_msg_id, event.prompt) for event in users] == [
+        ("user-modern", "cli-message-modern", "inspect modern"),
+    ]
+
+
 def test_rollout_user_recovery_restores_only_a_changed_goal_objective(tmp_path):
     rollout = tmp_path / "rollout-goal.jsonl"
     goal = {

@@ -22,7 +22,7 @@ from cc_remote.wrapper import machine as machine_module
 from cc_remote.wrapper.machine import WrapperMachine
 from cc_remote.wrapper.codex_sessions import codex_session_settings
 from cc_remote.wrapper.codex_stream import (
-    codex_native_rollback_turns,
+    codex_history_window, codex_native_rollback_turns,
     codex_translate_history,
 )
 from cc_remote.wrapper.sanitize import bounded_text, bounded_tool_input
@@ -60,6 +60,20 @@ class _StalledSdk:
 
     async def force_reconnect(self, resume_id, cwd):
         self.reconnects += 1
+
+
+class _ClaudeStalledSdk(_StalledSdk):
+    model = None
+    next_turn_id = None
+
+    def observe_goal_message(self, _message, _thread_id):
+        return False, None
+
+    async def refresh_goal(self, _session_id):
+        return None
+
+    def release_background_messages(self):
+        return None
 
 
 def test_claude_replayed_user_id_excludes_tool_protocol_envelopes():
@@ -848,6 +862,132 @@ def test_codex_silence_emits_no_synthetic_waiting_notice_and_later_completes(
         assert sdk.reconnects == 0
         assert [msg.text for msg in transport.sent
                 if getattr(msg, "type", None) == "delta"] == ["done"]
+
+    asyncio.run(run())
+
+
+def test_claude_silence_emits_neutral_notices_without_ending_or_reconnecting(
+        monkeypatch):
+    async def run():
+        machine, transport = _mk_machine()
+        machine.CLAUDE_SILENCE_NOTICE_SECONDS = 0.015
+        machine.CLAUDE_SILENCE_WARNING_SECONDS = 0.04
+        sdk = _ClaudeStalledSdk()
+        sdk.responses = [ResultMessage(
+            subtype="success",
+            duration_ms=50,
+            duration_api_ms=50,
+            is_error=False,
+            num_turns=1,
+            session_id="claude-stalled",
+        )]
+        ctx = _mk_ctx("claude-stalled", "claude-stalled")
+        ctx.sdk = sdk
+        ctx.state = "running"
+        ctx.active_msg_id = "message-stalled"
+        machine.sessions[ctx.key] = ctx
+
+        async def no_external_owner(_sid):
+            return False
+
+        monkeypatch.setattr(
+            machine, "_prime_claude_ownership", no_external_owner)
+
+        async def wait_for_notices(count: int):
+            while len([
+                message for message in transport.sent
+                if isinstance(message, StateEvent)
+                and message.phase == "waiting"
+            ]) < count:
+                await asyncio.sleep(0.002)
+
+        turn = asyncio.create_task(machine._run_turn(ctx, "hello"))
+        await asyncio.wait_for(sdk.reader_started.wait(), timeout=0.2)
+        await asyncio.wait_for(wait_for_notices(2), timeout=0.3)
+
+        notices = [
+            message for message in transport.sent
+            if isinstance(message, StateEvent) and message.phase == "waiting"
+        ]
+        assert [message.msg_id for message in notices] == [
+            "message-stalled", "message-stalled",
+        ]
+        assert "思考" in notices[0].detail
+        assert "等待上游响应" in notices[0].detail
+        assert "停止本回合后重试" in notices[1].detail
+        assert ctx.state == "running"
+        assert sdk.reconnects == 0
+
+        sdk.release.set()
+        await asyncio.wait_for(turn, timeout=0.5)
+
+        assert ctx.state == "idle"
+        assert sdk.reconnects == 0
+        assert not [
+            message for message in transport.sent
+            if isinstance(message, Error)
+        ]
+        assert any(
+            isinstance(message, StateEvent) and message.detail is None
+            for message in transport.sent
+        )
+
+    asyncio.run(run())
+
+
+def test_claude_silence_notice_is_suppressed_while_question_is_open(
+        monkeypatch):
+    async def run():
+        machine, transport = _mk_machine()
+        machine.CLAUDE_SILENCE_NOTICE_SECONDS = 0.01
+        machine.CLAUDE_SILENCE_WARNING_SECONDS = 0.025
+        sdk = _ClaudeStalledSdk()
+        sdk.responses = [ResultMessage(
+            subtype="success",
+            duration_ms=50,
+            duration_api_ms=50,
+            is_error=False,
+            num_turns=1,
+            session_id="claude-question-wait",
+        )]
+        ctx = _mk_ctx("claude-question-wait", "claude-question-wait")
+        ctx.sdk = sdk
+        ctx.state = "running"
+        ctx.active_msg_id = "message-question-wait"
+        pending = asyncio.get_running_loop().create_future()
+        ctx.pending_asks["open-question"] = pending
+        machine.sessions[ctx.key] = ctx
+
+        async def no_external_owner(_sid):
+            return False
+
+        monkeypatch.setattr(
+            machine, "_prime_claude_ownership", no_external_owner)
+        turn = asyncio.create_task(machine._run_turn(ctx, "hello"))
+        await asyncio.wait_for(sdk.reader_started.wait(), timeout=0.2)
+        await asyncio.sleep(0.05)
+        assert not [
+            message for message in transport.sent
+            if isinstance(message, StateEvent) and message.phase == "waiting"
+        ]
+
+        ctx.pending_asks.pop("open-question")
+        pending.cancel()
+        machine._mark_claude_activity(ctx)
+
+        async def wait_for_notice():
+            while not any(
+                isinstance(message, StateEvent)
+                and message.phase == "waiting"
+                for message in transport.sent
+            ):
+                await asyncio.sleep(0.002)
+
+        await asyncio.wait_for(wait_for_notice(), timeout=0.2)
+        sdk.release.set()
+        await asyncio.wait_for(turn, timeout=0.5)
+        assert ctx.state == "idle"
+        assert sdk.reconnects == 0
 
     asyncio.run(run())
 
@@ -1663,8 +1803,9 @@ def test_codex_history_skips_one_oversized_record_and_continues(
     ]
 
 
+@pytest.mark.parametrize("modern_marker", [False, True])
 def test_account_switch_continuation_is_one_history_and_rollback_turn(
-    tmp_path,
+    tmp_path, modern_marker,
 ):
     rollout = tmp_path / "rollout-account-switch.jsonl"
     internal = machine_module.CODEX_ACCOUNT_SWITCH_CONTINUATION
@@ -1689,10 +1830,21 @@ def test_account_switch_continuation_is_one_history_and_rollback_turn(
         {"type": "event_msg", "payload": {
             "type": "task_started", "turn_id": "turn-new",
         }},
-        {"type": "event_msg", "payload": {
-            "type": "user_message", "turn_id": "turn-new",
-            "message": internal,
-        }},
+        {"type": "event_msg", "payload": (
+            {
+                "type": "item_completed", "turn_id": "turn-new",
+                "item": {
+                    "id": "account-switch-continuation",
+                    "type": "UserMessage",
+                    "content": [{"type": "text", "text": internal}],
+                },
+            }
+            if modern_marker else
+            {
+                "type": "user_message", "turn_id": "turn-new",
+                "message": internal,
+            }
+        )},
         {"type": "event_msg", "payload": {
             "type": "agent_message", "turn_id": "turn-new",
             "message": "task A complete",
@@ -1737,5 +1889,13 @@ def test_account_switch_continuation_is_one_history_and_rollback_turn(
         for _offset, cursor in codex_stream_module._history_boundaries(
             str(rollout), use_turns=True)
     ] == ["turn-b", "turn-old"]
+    start, end, has_more, forced, forced_offset = codex_history_window(
+        str(rollout), before="turn-b", limit=1)
+    assert (has_more, forced, forced_offset) == (False, None, None)
+    previous_page, _ = codex_translate_history(
+        str(rollout), 10_000, start_offset=start, end_offset=end)
+    assert [
+        event.prompt for event in previous_page if isinstance(event, UserMsg)
+    ] == ["finish task A"]
     assert codex_native_rollback_turns(str(rollout), 1) == 1
     assert codex_native_rollback_turns(str(rollout), 2) == 3

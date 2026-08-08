@@ -4,7 +4,7 @@ const NEW_CHAT_CONTROL_TESTS = /new-chat controls|256-character profile id/;
 const WEBKIT_LIVE_INTERACTION_TESTS =
   /live append follows|returning to a background-grown live turn|multi-line IME growth|multi-line composer growth|composer action growth|Codex controls stay on one row|queued messages expand|migration picker/;
 const WEBKIT_RENDERING_TESTS =
-  /mounted message image|two visible images|HTML preview|artifact-(?:svg|markdown-svg)|Codex settings|Claude settings|history page cache|instant session cache|session cache rejects|canonical image reference|fallback image preview|streaming rerenders|expanded tool batches|Mermaid|chat formulas|real wide Robot|pending composer image/;
+  /mounted message image|two visible images|HTML preview|artifact-(?:svg|markdown-svg)|Codex settings|Claude settings|history page cache|instant session cache|session cache rejects|canonical image reference|fallback image preview|streaming rerenders|expanded tool batches|Mermaid|chat formulas|real wide Robot|pending composer image|profile keycaps|profile session card edges/;
 
 export default defineConfig({
   testDir: "./tests",

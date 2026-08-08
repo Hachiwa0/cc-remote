@@ -144,11 +144,13 @@ _HTTP_PROVIDER_PERSISTING_NOTIFICATIONS = frozenset({
     "turn/completed",
     "turn/started",
 })
+_EXTERNAL_THREAD_STARTED_SOURCES = frozenset({"cli", "vscode", "exec"})
 
 ApprovalCallback = Callable[[str, dict], Awaitable[str]]
 InteractionCallback = Callable[[str, dict], Awaitable[dict[str, Any]]]
 GoalCallback = Callable[[Optional[dict[str, Any]]], Awaitable[None]]
 TurnLifecycleCallback = Callable[[str, str], Awaitable[None]]
+ThreadStartedCallback = Callable[[str], None]
 RuntimeEvent = Notice | RateLimitUpdate
 RuntimeEventCallback = Callable[[RuntimeEvent], Awaitable[None]]
 
@@ -1074,6 +1076,7 @@ class CodexHandle:
                  interaction_callback: Optional[InteractionCallback] = None,
                  goal_callback: Optional[GoalCallback] = None,
                  turn_lifecycle_callback: Optional[TurnLifecycleCallback] = None,
+                 thread_started_callback: Optional[ThreadStartedCallback] = None,
                  runtime_event_callback: Optional[RuntimeEventCallback] = None,
                  daemon_mode: Optional[str] = None,
                  daemon_manager: Optional[CodexDaemonManager] = None,
@@ -1165,6 +1168,7 @@ class CodexHandle:
         self.interaction_callback = interaction_callback
         self.goal_callback = goal_callback
         self.turn_lifecycle_callback = turn_lifecycle_callback
+        self.thread_started_callback = thread_started_callback
         # App-server can emit initialize/config warnings before thread/start has
         # returned.  Machine binds this callback immediately but activates it only
         # after the SessionContext has a non-null routing key.  Until then, keep a
@@ -3672,6 +3676,19 @@ class CodexHandle:
                 error_type=type(exc).__name__,
             )
 
+    def _publish_thread_started_hint(self, thread_id: str) -> None:
+        """Schedule-only catalog hint; never await relay work on stdout reader."""
+        callback = self.thread_started_callback
+        if callback is None:
+            return
+        try:
+            callback(thread_id)
+        except Exception as exc:
+            log.warning(
+                "codex thread catalog callback failed",
+                error_type=type(exc).__name__,
+            )
+
     async def get_context_usage(self) -> dict:
         # Real shape (verified, gpt-5.5): tokenUsage = {last:{totalTokens,…},
         # total:{totalTokens,…}, modelContextWindow}. `last.totalTokens` is the most
@@ -4702,6 +4719,25 @@ class CodexHandle:
             return
         # notification
         method = m.get("method")
+        if method == "thread/started" and self._using_daemon_proxy:
+            target_thread_id = _notification_thread_id(m)
+            params = m.get("params")
+            thread = params.get("thread") if isinstance(params, dict) else None
+            source = thread.get("source") if isinstance(thread, dict) else None
+            current_thread_id = (
+                self._shared_resume_binding_thread_id or self.thread_id
+            )
+            if (
+                isinstance(target_thread_id, str)
+                and _STATUS_WIRE_ID.fullmatch(target_thread_id)
+                and source in _EXTERNAL_THREAD_STARTED_SOURCES
+                and isinstance(current_thread_id, str)
+                and target_thread_id != current_thread_id
+            ):
+                # A shared daemon publishes sibling thread creation to every
+                # subscribed handle. Preserve the strict foreign-frame drop below;
+                # expose only this content-free catalog hint to Machine.
+                self._publish_thread_started_hint(target_thread_id)
         if method == "serverRequest/resolved":
             params = m.get("params")
             request_id = _server_request_key(

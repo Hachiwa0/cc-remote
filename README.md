@@ -185,8 +185,8 @@ Profile id 调整、单账号与多账号切换会按 `CODEX_HOME` 的真实路�
 账号状态串写，迁移完成前 Codex 会 fail-closed，Claude 不受影响。
 
 只有多账号时，侧栏才会给会话卡加斜向彩色 ribbon：默认账号显示 `default`，其余
-账号按配置顺序使用 `luna`、`sol`、`aurora`、`vesper`、`caelus`、`terra`、
-`mercurius`、`venus`、`mars`、`jupiter`、`saturnus`、`neptunus`，再多则显示
+账号按配置顺序使用 `nyx`、`iris`、`echo`、`gaia`、`metis`、`themis`、
+`hestia`、`athena`、`hermes`、`atlas`、`orpheus`、`asteria`，再多则显示
 `more`；账号选择器和提示仍保留配置中的真实标签。为次账号配置切号 hook 时要让
 marker 与 Profile 对齐，例如：
 

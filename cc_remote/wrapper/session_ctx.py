@@ -138,6 +138,11 @@ class SessionContext:
     # managed turn stream so the session remains single-writer and interruptible.
     codex_spontaneous_turn_id: Optional[str] = None
     codex_spontaneous_task: Optional[asyncio.Task] = None
+    # Do not invent an empty native-turn anchor before the app-server reveals
+    # whether a spontaneous turn came from a real CLI user item. The official
+    # user item id is also History's durable identity; Goal/automatic turns keep
+    # the native turn id only when no such user boundary exists.
+    codex_spontaneous_anchor_id: Optional[str] = None
     # A matching cached Goal is not proof that the current command applied it.
     # Keep the exact command scope and the automatic turn claimed while its RPC
     # was in flight; retries are idempotent only while that turn remains live.
@@ -151,6 +156,12 @@ class SessionContext:
     # with the same clientId confirms it, or the enclosing turn terminates.
     # ``Any`` avoids coupling this shared context module to a v21 wire class.
     codex_uncertain_steer: Any = None
+    # Successful Remote steers are published before app-server releases their
+    # official userMessage items. Preserve that client id until the live consumer
+    # can reconcile the official item without rendering a second steer boundary.
+    # The machine keeps this insertion-ordered mapping bounded and clears it at
+    # the enclosing native terminal.
+    codex_published_steers: dict[str, str] = field(default_factory=dict)
     # A shared-daemon turn started by Remote is leased on disk so a replacement
     # wrapper can safely reattach without classifying it as Codex App ownership.
     codex_owned_turn_id: Optional[str] = None
@@ -190,6 +201,15 @@ class SessionContext:
     # the transcript. ``state=running`` starts earlier, during reconnect and
     # final ownership checks, so it is not sufficient write attribution.
     claude_write_active: bool = False
+    # Claude may legitimately remain silent while reasoning, running a tool, or
+    # waiting on its provider. Keep a turn-local activity clock so the wrapper
+    # can explain that silence without treating it as a timeout or breaking the
+    # mandatory ResultMessage drain. AskUser callbacks run beside the response
+    # iterator, so an Event wakes that iterator's wait when a question opens or
+    # closes and restarts the neutral notice clock from the right boundary.
+    claude_last_activity_at: float = 0.0
+    claude_activity_event: asyncio.Event = field(default_factory=asyncio.Event)
+    claude_progress_notice_active: bool = False
     # Claude assigns transcript UUIDs inside its child. A turn-local append
     # boundary learns the first real sdk-py user row without waiting for the
     # later --replay-user-messages echo; replay remains the exact fallback.

@@ -18,6 +18,7 @@ import {
   reduceTargetedRuntime,
 } from "../src/runtime-drain.ts";
 import {
+  mergeAuthoritativeTurnDetail,
   mergeDetailWithLiveTail,
   mergeInitialHistory,
   restoreCachedTurnDetails,
@@ -217,12 +218,12 @@ assert.deepEqual(
 assert.equal(
   codexProfilePresentation(
     presentationProfiles, "primary", "secondary-0")?.name,
-  "luna",
+  "nyx",
 );
 assert.equal(
   codexProfilePresentation(
     presentationProfiles, "primary", "secondary-11")?.name,
-  "neptunus",
+  "asteria",
 );
 assert.equal(
   codexProfilePresentation(
@@ -1099,8 +1100,8 @@ assert.match(historyAppSource,
 assert.match(historyAppSource,
   /onLoadHistoryImage=\{historyView\.recovering\s*\? undefined/,
   "display-only recovery turns must not issue history-image reads");
-assert.match(cacheSource, /const CACHE_VER = 12/,
-  "Claude prompt aliases must invalidate v10 rows which can paint twice");
+assert.match(cacheSource, /const CACHE_VER = 14/,
+  "completed replay-orphan pollution must invalidate older cache rows");
 assert.match(cacheSource, /objectStore\(STORE\)\.delete\(sessionId\)/);
 assert.match(cacheSource, /job\.epoch !== sessionEpoch\(job\.sid\)/,
   "a debounced pre-marker write must not recreate the deleted cache row");
@@ -1285,6 +1286,20 @@ assert.doesNotMatch(layoutCss, /transition\s*:\s*grid-template-columns/);
 assert.match(layoutCss, /\.shell\.sidebar-open \.pane\s*\{[^}]*margin-left\s*:\s*352px/s);
 assert.match(layoutCss, /\.pane\s*\{[^}]*transition\s*:[^}]*margin-left[^}]*width/s);
 assert.match(layoutCss, /\.sessions\s*\{[^}]*position\s*:\s*fixed[^}]*width\s*:\s*352px/s);
+assert.doesNotMatch(layoutCss, /\.scard\.has-profile-ribbon\s*\{[^}]*padding-top/,
+  "profile stamps must not add a second row to every session card");
+assert.doesNotMatch(layoutCss,
+  /\.scard\.has-profile-ribbon \.scard-top\s*\{[^}]*padding-left/s,
+  "profile keycaps must not push session titles into a second column");
+assert.match(layoutCss,
+  /\.scard\.has-profile-ribbon\s*\{[^}]*border-color\s*:\s*color-mix\([^}]*background\s*:\s*color-mix\(/s,
+  "every profile keycap needs a quiet card edge to hang from");
+assert.match(layoutCss,
+  /:root\[data-engine="codex"\]\[data-theme="dark"\] \.scard\.has-profile-ribbon\s*\{[^}]*background\s*:\s*color-mix\([^}]*border-color\s*:\s*var\(--border-strong\)/s,
+  "dark profile cards need an opaque edge that survives the dark sidebar");
+assert.match(layoutCss,
+  /\.scard-profile-ribbon\s*\{[^}]*top\s*:\s*-6px[^}]*height\s*:\s*16px[^}]*max-width\s*:\s*64px[^}]*font-family\s*:\s*var\(--mono\)[^}]*font-size\s*:\s*8\.5px/s,
+  "profile keycaps must hang compactly from the card edge");
 assert.match(layoutCss,
   /@media \(max-width:980px\)\{\s*\.artifact-panel\{[^}]*top:calc\(var\(--app-offset-top,0px\) \+ 10px\)[^}]*bottom:auto[^}]*height:calc\(var\(--app-height,100dvh\) - 20px\)[^}]*max-height:none/s,
   "mobile artifact previews must fill the visual viewport instead of shrink-wrapping iframe or Markdown content");
@@ -2695,6 +2710,90 @@ assert.deepEqual(
     .map((block) => block.text),
   ["one authoritative answer"],
 );
+
+const sharedReplayMessageId = "msg-replayed-tool-batch";
+const replayTool = (toolUseId: string) => ({
+  kind: "tool" as const,
+  message_id: sharedReplayMessageId,
+  tool_use_id: toolUseId,
+  tool: "Command",
+  input: {},
+  done: true,
+});
+const replayToolBatch = [
+  replayTool("replayed-tool-a"), replayTool("replayed-tool-b"),
+];
+const multiToolReplayMerged = mergeInitialHistory(
+  [{
+    id: "native-history-tool-turn",
+    prompt: "deploy",
+    done: true,
+    blocks: replayToolBatch,
+  }],
+  [{
+    id: sharedReplayMessageId,
+    prompt: "",
+    done: true,
+    blocks: replayToolBatch.map((block) => ({ ...block })),
+  }],
+  { reconcileReplayOrphans: true },
+);
+assert.equal(multiToolReplayMerged.length, 1,
+  "tool calls sharing one assistant message must not leave a prompt-less turn");
+assert.deepEqual(
+  multiToolReplayMerged[0].blocks.flatMap((block) =>
+    block.kind === "tool" ? [block.tool_use_id] : []),
+  ["replayed-tool-a", "replayed-tool-b"],
+);
+
+const mixedReplayMerged = mergeInitialHistory(
+  [{
+    id: "native-history-mixed-turn",
+    prompt: "inspect",
+    done: true,
+    blocks: [{
+      kind: "text" as const,
+      message_id: sharedReplayMessageId,
+      channel: "commentary" as const,
+      text: "checking",
+      done: true,
+    }, replayTool("replayed-tool-c")],
+  }],
+  [{
+    id: sharedReplayMessageId,
+    prompt: "",
+    done: true,
+    blocks: [{
+      kind: "text" as const,
+      message_id: sharedReplayMessageId,
+      channel: "commentary" as const,
+      text: "checking",
+      done: true,
+    }, replayTool("replayed-tool-c")],
+  }],
+  { reconcileReplayOrphans: true },
+);
+assert.equal(mixedReplayMerged.length, 1,
+  "text and tools from one assistant message are one replay projection");
+
+const duplicatedPrimaryReplay = mergeInitialHistory(
+  [{
+    id: "native-history-duplicate-tool-turn",
+    prompt: "inspect",
+    done: true,
+    blocks: [replayTool("duplicated-tool")],
+  }],
+  [{
+    id: sharedReplayMessageId,
+    prompt: "",
+    done: true,
+    blocks: [replayTool("duplicated-tool"), replayTool("duplicated-tool")],
+  }],
+  { reconcileReplayOrphans: true },
+);
+assert.equal(duplicatedPrimaryReplay.length, 2,
+  "a genuinely duplicated primary block identity remains unsafe to absorb");
+
 assert.equal(mergeInitialHistory(
   replayOrphanMerged,
   [{
@@ -4458,6 +4557,63 @@ try {
       (turn: Turn) => turn.id),
     ["browser-alias-steer"],
     "a native History alias reconciles into the optimistic steer exactly once",
+  );
+
+  const liveSteerAliasSid = "live-steer-official-alias";
+  let liveSteerAliasState = {
+    ...initialState,
+    focusedSid: liveSteerAliasSid,
+    runtimes: {
+      [liveSteerAliasSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+      },
+    },
+  };
+  liveSteerAliasState = reduce(liveSteerAliasState, {
+    type: "event", event: event({
+      type: "turn_steered",
+      session_id: liveSteerAliasSid,
+      msg_id: "browser-live-steer",
+      turn_id: "native-live-task",
+      prompt: "guide from Remote",
+    }),
+  });
+  liveSteerAliasState = reduce(liveSteerAliasState, {
+    type: "event", event: event({
+      type: "user_msg",
+      session_id: liveSteerAliasSid,
+      msg_id: "official-live-steer",
+      client_msg_id: "browser-live-steer",
+      prompt: "guide from Remote",
+    }),
+  });
+  liveSteerAliasState = reduce(liveSteerAliasState, {
+    type: "event", event: event({
+      type: "turn_binding",
+      session_id: liveSteerAliasSid,
+      msg_id: "browser-live-steer",
+      turn_id: "native-live-task",
+    }),
+  });
+  assert.deepEqual(
+    liveSteerAliasState.runtimes[liveSteerAliasSid].turns.map(
+      (turn: Turn) => ({
+        id: turn.id,
+        clientMsgId: turn.clientMsgId,
+        historyTurnId: turn.historyTurnId,
+        forkPointId: turn.forkPointId,
+        liveTaskId: turn.liveTaskId,
+      })),
+    [{
+      id: "browser-live-steer",
+      clientMsgId: "browser-live-steer",
+      historyTurnId: "official-live-steer",
+      forkPointId: "native-live-task",
+      liveTaskId: "native-live-task",
+    }],
+    "an app-server userMessage echo aliases the published Remote steer once",
   );
 
   const claudeSwitchAliasSid = "claude-switch-history-alias";
@@ -8663,7 +8819,7 @@ try {
     "the historical cwd pill keeps its own centering rule");
   assert.match(multiProfileNewChatMarkup, /class="newchat-context"/);
   assert.match(multiProfileNewChatMarkup, /aria-label="选择 Codex 账号"/);
-  assert.match(multiProfileNewChatMarkup, />luna · Stack</);
+  assert.match(multiProfileNewChatMarkup, />nyx · Stack</);
   const artifactsMarkup = renderToStaticMarkup(createElement(WorkArtifactsSheet, {
     open: true,
     artifacts: [
@@ -8739,8 +8895,8 @@ try {
   assert.match(profileSidebarMarkup,
     /class="scard-profile-ribbon tone-0"[^>]*>default</);
   assert.match(profileSidebarMarkup,
-    /class="scard-profile-ribbon tone-1"[^>]*>luna</);
-  assert.match(profileSidebarMarkup, /Codex 账号：luna · Stack/);
+    /class="scard-profile-ribbon tone-1"[^>]*>nyx</);
+  assert.match(profileSidebarMarkup, /Codex 账号：nyx · Stack/);
   const singleProfileSidebarMarkup = renderToStaticMarkup(createElement(
     SessionsSidebar,
     {
@@ -10359,6 +10515,264 @@ try {
         && block.message_id === "shared-active-commentary").length,
     1,
     "the bound active commentary renders once",
+  );
+
+  // A native TUI/App turn can reach the browser through both the authoritative
+  // rollout History and a delayed app-server replay. The stable message id
+  // proves these are two projections of one completed item; replaying the full
+  // delta after History must not append the same paragraph a second time.
+  const delayedReplaySid = "history-before-delayed-live-replay";
+  const delayedReplayText = "one completed commentary";
+  let delayedReplayState = reduce({
+    ...initialState,
+    focusedSid: delayedReplaySid,
+    runtimes: {
+      [delayedReplaySid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+      },
+    },
+  }, {
+    type: "event",
+    event: event({
+      type: "history",
+      sid: delayedReplaySid,
+      session_id: delayedReplaySid,
+      revision: "delayed-replay-r1",
+      generation: "delayed-replay-g1",
+      build_seq: 1,
+      live_seq: 10,
+      detail: "summary",
+      authoritative: true,
+      has_more: true,
+      oldest_id: "delayed-replay-user",
+      newest_id: "delayed-replay-user",
+      in_progress: true,
+      events: [],
+      turns: [{
+        id: "delayed-replay-user",
+        prompt: "inspect",
+        forkPointId: "delayed-replay-task",
+        done: false,
+        blocks: [{
+          kind: "text",
+          message_id: "delayed-replay-commentary",
+          channel: "commentary",
+          text: delayedReplayText,
+          done: true,
+        }],
+      }],
+    }),
+  });
+  for (const replayed of [
+    event({
+      type: "assistant_msg_start",
+      sid: delayedReplaySid,
+      seq: 11,
+      message_id: "delayed-replay-commentary",
+      channel: "commentary",
+    }),
+    event({
+      type: "delta",
+      sid: delayedReplaySid,
+      seq: 12,
+      message_id: "delayed-replay-commentary",
+      channel: "commentary",
+      text: "one completed ",
+    }),
+    event({
+      type: "delta",
+      sid: delayedReplaySid,
+      seq: 13,
+      message_id: "delayed-replay-commentary",
+      channel: "commentary",
+      text: "commentary",
+    }),
+    event({
+      type: "assistant_msg_end",
+      sid: delayedReplaySid,
+      seq: 14,
+      message_id: "delayed-replay-commentary",
+      channel: "commentary",
+    }),
+  ]) {
+    delayedReplayState = reduce(delayedReplayState, {
+      type: "event",
+      event: replayed,
+    });
+  }
+  const delayedReplayBlock = delayedReplayState.runtimes[
+    delayedReplaySid
+  ].turns[0].blocks[0];
+  assert.equal(
+    delayedReplayBlock.kind === "text" ? delayedReplayBlock.text : null,
+    delayedReplayText,
+    "a completed authoritative item absorbs its delayed live replay",
+  );
+
+  // Existing installations may already have persisted the polluted projection
+  // in IndexedDB. A later authoritative page for the same stable native item
+  // must heal the old duplicate instead of preserving the longer cached text.
+  const delayedReplayRuntime = delayedReplayState.runtimes[delayedReplaySid];
+  delayedReplayState = {
+    ...delayedReplayState,
+    runtimes: {
+      ...delayedReplayState.runtimes,
+      [delayedReplaySid]: {
+        ...delayedReplayRuntime,
+        turns: delayedReplayRuntime.turns.map((turn: Turn) => ({
+          ...turn,
+          blocks: turn.blocks.map((block: Block) => block.kind === "text"
+            && block.message_id === "delayed-replay-commentary"
+            ? { ...block, text: delayedReplayText + delayedReplayText }
+            : { ...block }),
+        })),
+      },
+    },
+  };
+  delayedReplayState = reduce(delayedReplayState, {
+    type: "event",
+    event: event({
+      type: "history",
+      sid: delayedReplaySid,
+      session_id: delayedReplaySid,
+      revision: "delayed-replay-r1",
+      generation: "delayed-replay-g1",
+      build_seq: 2,
+      live_seq: 14,
+      detail: "summary",
+      authoritative: true,
+      has_more: true,
+      oldest_id: "delayed-replay-user",
+      newest_id: "delayed-replay-user",
+      in_progress: false,
+      events: [],
+      turns: [{
+        id: "delayed-replay-user",
+        prompt: "inspect",
+        forkPointId: "delayed-replay-task",
+        done: true,
+        blocks: [{
+          kind: "text",
+          message_id: "delayed-replay-commentary",
+          channel: "commentary",
+          text: delayedReplayText,
+          done: true,
+        }],
+      }],
+    }),
+  });
+  const repairedReplayBlock = delayedReplayState.runtimes[
+    delayedReplaySid
+  ].turns[0].blocks[0];
+  assert.equal(
+    repairedReplayBlock.kind === "text" ? repairedReplayBlock.text : null,
+    delayedReplayText,
+    "authoritative History heals a previously persisted duplicate",
+  );
+
+  const completeDetailText = "complete detail payload after the summary prefix";
+  const refreshedLoadedDetail = mergeAuthoritativeTurnDetail({
+    id: "loaded-detail-refresh",
+    prompt: "inspect a long answer",
+    done: true,
+    blocks: [{
+      kind: "text",
+      message_id: "loaded-detail-final",
+      channel: "final",
+      text: "complete detail…（完整内容请展开本轮过程）",
+      done: true,
+    }],
+  }, {
+    id: "loaded-detail-refresh",
+    prompt: "inspect a long answer",
+    done: true,
+    detailLoaded: true,
+    blocks: [{
+      kind: "text",
+      message_id: "loaded-detail-final",
+      channel: "final",
+      text: completeDetailText,
+      done: true,
+    }],
+  });
+  assert.equal(
+    refreshedLoadedDetail.blocks[0]?.kind === "text"
+      ? refreshedLoadedDetail.blocks[0].text : null,
+    completeDetailText,
+    "a later summary refresh must preserve an already-loaded complete answer",
+  );
+
+  const repeatedCanonicalText = "echoecho";
+  const repeatedCanonical = mergeInitialHistory([{
+    id: "repeated-prose-turn",
+    prompt: "repeat naturally",
+    done: true,
+    blocks: [{
+      kind: "text",
+      message_id: "repeated-prose-message",
+      channel: "commentary",
+      text: repeatedCanonicalText,
+      done: true,
+    }],
+  }], [{
+    id: "repeated-prose-turn",
+    prompt: "repeat naturally",
+    done: true,
+    blocks: [{
+      kind: "text",
+      message_id: "repeated-prose-message",
+      channel: "commentary",
+      text: repeatedCanonicalText + repeatedCanonicalText,
+      done: true,
+    }],
+  }]);
+  assert.equal(
+    (repeatedCanonical[0].blocks[0] as Block & { kind: "text" }).text,
+    repeatedCanonicalText,
+    "completed exact ids use History authority without inspecting prose shape",
+  );
+
+  const unfinishedProjection = mergeInitialHistory([{
+    id: "unfinished-replay-turn",
+    prompt: "keep streaming",
+    done: false,
+    blocks: [{
+      kind: "text",
+      message_id: "unfinished-replay-message",
+      channel: "commentary",
+      text: "first ",
+      done: false,
+    }],
+  }], [{
+    id: "unfinished-replay-turn",
+    prompt: "keep streaming",
+    done: false,
+    blocks: [{
+      kind: "text",
+      message_id: "unfinished-replay-message",
+      channel: "commentary",
+      text: "second",
+      done: false,
+    }, {
+      kind: "text",
+      message_id: "different-native-message",
+      channel: "commentary",
+      text: "separate",
+      done: false,
+    }],
+  }]);
+  assert.deepEqual(
+    unfinishedProjection[0].blocks
+      .filter((block): block is Block & { kind: "text" } =>
+        block.kind === "text")
+      .map((block) => [block.message_id, block.text]),
+    [
+      ["unfinished-replay-message", "first second"],
+      ["different-native-message", "separate"],
+    ],
+    "unfinished exact ids still append while different ids remain distinct",
   );
 
   // The first running summary can race ahead of every visible item. With no

@@ -1,18 +1,18 @@
 import type { CodexProfileInfo } from "./protocol";
 
 const SECONDARY_NAMES = [
-  "luna",
-  "sol",
-  "aurora",
-  "vesper",
-  "caelus",
-  "terra",
-  "mercurius",
-  "venus",
-  "mars",
-  "jupiter",
-  "saturnus",
-  "neptunus",
+  "nyx",
+  "iris",
+  "echo",
+  "gaia",
+  "metis",
+  "themis",
+  "hestia",
+  "athena",
+  "hermes",
+  "atlas",
+  "orpheus",
+  "asteria",
 ] as const;
 
 export interface CodexProfilePresentation {

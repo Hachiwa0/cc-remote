@@ -274,6 +274,7 @@ export function SessionsSidebar({ open, engine, space,
           <span
             className={`scard-profile-ribbon tone-${profilePresentation.tone}`}
             title={`Codex 账号：${profilePresentation.fullLabel}`}
+            aria-label={`Codex 账号：${profilePresentation.fullLabel}`}
           >
             {profilePresentation.name}
           </span>

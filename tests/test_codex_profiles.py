@@ -14,6 +14,7 @@ from cc_remote.protocol import (
     CodexProfileInfo,
     Error,
     SessionList,
+    SessionListInvalidated,
     WorkArtifacts,
     deserialize,
     serialize,
@@ -78,6 +79,32 @@ def _context(
         engine="codex",
         codex_profile_id=profile_id,
     )
+
+
+def test_cli_thread_catalog_hint_dedupe_is_profile_scoped(tmp_path: Path) -> None:
+    async def run() -> None:
+        machine, transport = _machine(tmp_path)
+        primary = _context("primary@current-primary", "current-primary", "primary")
+        stack = _context("stack@current-stack", "current-stack", "stack")
+        machine.sessions[primary.key] = primary
+        machine.sessions[stack.key] = stack
+
+        machine._on_codex_thread_started_hint(primary, "same-native-new")
+        machine._on_codex_thread_started_hint(stack, "same-native-new")
+        tasks = tuple(machine._codex_catalog_hint_tasks)
+        assert len(tasks) == 1
+        await asyncio.gather(*tasks)
+
+        assert set(machine._codex_thread_started_hints) == {
+            ("primary", "same-native-new"),
+            ("stack", "same-native-new"),
+        }
+        assert len([
+            event for event in transport.sent
+            if isinstance(event, SessionListInvalidated)
+        ]) == 1
+
+    asyncio.run(run())
 
 
 def test_empty_configuration_preserves_single_profile_compatibility(
@@ -616,13 +643,24 @@ def test_profile_tui_trackers_receive_only_their_daemon_proxy(
     machine._codex_daemons["stack"]._ready = SimpleNamespace(
         socket_path="/tmp/stack.sock")
     sockets = {
-        primary_proxy: str(Path("/tmp/primary.sock").resolve()),
-        stack_proxy: str(Path("/tmp/stack.sock").resolve()),
-        unknown_proxy: None,
+        primary_proxy: (
+            True, str(Path("/tmp/primary.sock").resolve())),
+        stack_proxy: (
+            True, str(Path("/tmp/stack.sock").resolve())),
+        unknown_proxy: (True, str(Path("/tmp/unregistered.sock").resolve())),
     }
+    default_homes: list[str] = []
+
+    def client_socket(identity, *, default_codex_home):
+        default_homes.append(default_codex_home)
+        return sockets.get(identity)
+
     monkeypatch.setattr(machine_module, "writable_rollout_holders", holders)
     monkeypatch.setattr(
-        machine_module, "codex_app_server_proxy_socket", sockets.get)
+        machine_module,
+        "codex_app_server_client_socket",
+        client_socket,
+    )
     machine._codex_tui_log_trackers = {
         "primary": Tracker("primary"),
         "stack": Tracker("stack"),
@@ -641,6 +679,9 @@ def test_profile_tui_trackers_receive_only_their_daemon_proxy(
         "primary": {primary_proxy},
         "stack": {stack_proxy},
     }
+    assert default_homes == [
+        str((Path.home() / ".codex").resolve()),
+    ] * len(all_proxies)
 
 
 def test_cold_profile_ignores_sibling_proxy_without_blocking_scan(
@@ -685,10 +726,10 @@ def test_cold_profile_ignores_sibling_proxy_without_blocking_scan(
     monkeypatch.setattr(machine_module, "writable_rollout_holders", holders)
     monkeypatch.setattr(
         machine_module,
-        "codex_app_server_proxy_socket",
-        lambda identity: (
-            str(Path("/tmp/primary.sock").resolve())
-            if identity == primary_proxy else None
+        "codex_app_server_client_socket",
+        lambda identity, **_kwargs: (
+            (True, str(Path("/tmp/primary.sock").resolve()))
+            if identity == primary_proxy else (True, None)
         ),
     )
     machine._codex_tui_log_trackers = {
@@ -706,6 +747,53 @@ def test_cold_profile_ignores_sibling_proxy_without_blocking_scan(
         "primary": {primary_proxy},
         "stack": set(),
     }
+
+
+def test_unreadable_client_profile_keeps_owner_scan_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    machine, _transport = _machine(tmp_path)
+    sid = "primary@primary-native"
+    machine._watch = {
+        sid: {
+            "path": "/tmp/primary-rollout.jsonl",
+            "engine": "codex",
+            "codex_profile_id": "primary",
+        },
+    }
+    client = ProcessIdentity(315, 13)
+
+    def holders(paths, _own, *, shell_snapshot_root=None):
+        return HolderScan(
+            holders={native_sid: set() for native_sid in paths},
+            complete=True,
+            passive_holders={native_sid: set() for native_sid in paths},
+            client_proxies={client: 10},
+            private_holders={native_sid: set() for native_sid in paths},
+        )
+
+    class Tracker:
+        def bindings(self, paths, proxies):
+            assert proxies == {}
+            return {native_sid: set() for native_sid in paths}, True
+
+    monkeypatch.setattr(machine_module, "writable_rollout_holders", holders)
+    monkeypatch.setattr(
+        machine_module,
+        "codex_app_server_client_socket",
+        lambda _identity, **_kwargs: (False, None),
+    )
+    machine._codex_tui_log_trackers = {
+        "primary": Tracker(),
+        "stack": Tracker(),
+    }
+
+    scan = asyncio.run(machine._probe_codex_holders({
+        sid: machine._watch[sid]["path"],
+    }))
+
+    assert scan.complete is False
+    assert scan.client_proxies == {}
 
 
 def test_cold_profile_does_not_preserve_sibling_stale_holder(
@@ -758,10 +846,10 @@ def test_cold_profile_does_not_preserve_sibling_stale_holder(
     monkeypatch.setattr(machine_module, "writable_rollout_holders", holders)
     monkeypatch.setattr(
         machine_module,
-        "codex_app_server_proxy_socket",
-        lambda identity: (
-            str(Path("/tmp/primary.sock").resolve())
-            if identity == primary_proxy else None
+        "codex_app_server_client_socket",
+        lambda identity, **_kwargs: (
+            (True, str(Path("/tmp/primary.sock").resolve()))
+            if identity == primary_proxy else (True, None)
         ),
     )
     machine._codex_tui_log_trackers = {

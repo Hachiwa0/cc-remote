@@ -1330,6 +1330,7 @@ def test_shared_code_query_refreshes_activity_without_locking_cli(
         watch = _watch(path)
         watch.update({
             "external": True,
+            "scan_complete": True,
             "holders": {ProcessIdentity(111, 1101)},
             "writers": {ProcessIdentity(111, 1101)},
         })
@@ -1381,6 +1382,7 @@ def test_interrupted_shared_query_reconnects_and_refreshes_activity(
         watch = _watch(path)
         watch.update({
             "external": True,
+            "scan_complete": True,
             "holders": {ProcessIdentity(111, 1101)},
             "writers": {ProcessIdentity(111, 1101)},
         })
@@ -2134,6 +2136,7 @@ def test_shared_takeover_is_an_idempotent_noop(monkeypatch, tmp_path):
         path.write_bytes(b"")
         holder = ProcessIdentity(303, 3003)
         watch = _watch(path)
+        watch["scan_complete"] = True
         watch["holders"] = {holder}
         watch["writers"] = {holder}
         machine._watch["sid"] = watch
