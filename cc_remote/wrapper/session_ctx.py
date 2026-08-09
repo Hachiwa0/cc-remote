@@ -51,6 +51,24 @@ class ClaudeClientAliasProbe:
     partial: bytes = b""
 
 
+@dataclass(frozen=True)
+class ActiveTurnBinding:
+    """Exact logical/native owner of the currently live turn segment.
+
+    Browser runtimes intentionally do not persist reducer ownership metadata.
+    A reconnect cursor may therefore sit after the original TurnBinding even
+    though the rebuilt page still needs that identity before replaying tail
+    frames.  Keep the authoritative wire identity and its original ordering
+    boundary beside the resident session; never infer it from output text or a
+    generic process turn id.
+    """
+
+    msg_id: str
+    turn_id: str
+    seq: int
+    generation: str
+
+
 @dataclass
 class SessionContext:
     # None until the first ResultMessage/init SystemMessage captures the real id
@@ -102,6 +120,11 @@ class SessionContext:
     # Correlates asynchronous turn crashes/drain failures with the optimistic
     # client turn. Control-command errors must never terminate an unrelated turn.
     active_msg_id: Optional[str] = None
+    # Latest exact TurnBinding/TurnSteered owner in this wrapper generation.
+    # It is client-reseeded on hello when the reconnect cursor has already
+    # consumed the original binding frame. It never survives a terminal/idle
+    # boundary and is not a substitute for the engine's native lifecycle.
+    active_turn_binding: Optional[ActiveTurnBinding] = None
     # Interrupt must wake a consumer that is already blocked in queue.get().  The
     # absolute monotonic deadline prevents each subsequent queue item from
     # restarting the drain timeout.

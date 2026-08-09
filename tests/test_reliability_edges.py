@@ -5,21 +5,27 @@ import asyncio
 import threading
 
 from cc_remote.protocol import (
+    AssistantMsgStart,
     CommandAck,
     Delta,
     Hello,
     ListSessions,
     NewSession,
+    ReplayEnd,
+    ReplayStart,
     SessionFocus,
     SessionList,
     SessionListInvalidated,
+    TurnBinding,
     TurnEnd,
     TurnResult,
+    TurnSteered,
     UserMsg,
     deserialize,
     is_downstream,
     serialize,
 )
+from cc_remote.wrapper.ringbuffer import RingBuffer
 from cc_remote.wrapper import machine as mm
 from tests.test_multisession import _mk_ctx, _mk_machine
 
@@ -73,6 +79,192 @@ def test_client_hello_replays_only_cursor_sessions_and_routes_every_frame():
         # Routed copies must not contaminate the shared ring event.
         assert delta.to is None and delta.route_id is None
         assert end.to is None and end.route_id is None
+
+    asyncio.run(run())
+
+
+def test_client_hello_reseeds_binding_before_tail_after_cursor_passed_owner():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("s-replay", "s-replay")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        ctx.active_msg_id = "item-51"
+        machine.sessions = {"s-replay": ctx}
+
+        await machine._emit_locked(
+            ctx, UserMsg(msg_id="item-51", prompt="continue the task"))
+        await machine._emit_locked(ctx, TurnBinding(
+            msg_id="item-51", turn_id="native-turn"))
+        await machine._emit_locked(ctx, AssistantMsgStart(
+            message_id="msg-after-compact", channel="commentary"))
+        await machine._emit_locked(ctx, Delta(
+            message_id="msg-after-compact", channel="commentary",
+            text="one live tail"))
+        original_tail_seq = ctx.buffer.tail_seq
+        transport.sent.clear()
+
+        await machine._handle_client_hello(Hello(
+            role="client",
+            client_id="client-1",
+            route_id="route-1",
+            cursors={"s-replay": 2},
+            generations={"s-replay": machine.instance_id},
+        ))
+
+        replay = transport.sent[:6]
+        assert [event.type for event in replay] == [
+            "replay_start", "turn_binding", "assistant_msg_start", "delta",
+            "replay_end", "session_control",
+        ]
+        reseed = replay[1]
+        assert reseed.msg_id == "item-51"
+        assert reseed.turn_id == "native-turn"
+        assert reseed.seq is None
+        assert reseed.to == "client-1" and reseed.route_id == "route-1"
+        assert ctx.buffer.tail_seq == original_tail_seq
+        assert [event.type for _, event in ctx.buffer._buf].count(
+            "turn_binding") == 1
+
+    asyncio.run(run())
+
+
+def test_client_hello_does_not_prebind_frames_before_latest_steer():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("s-steer", "s-steer")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        ctx.active_msg_id = "first-user"
+        machine.sessions = {"s-steer": ctx}
+
+        await machine._emit_locked(
+            ctx, UserMsg(msg_id="first-user", prompt="first"))
+        await machine._emit_locked(ctx, TurnBinding(
+            msg_id="first-user", turn_id="native-turn"))
+        await machine._emit_locked(ctx, AssistantMsgStart(
+            message_id="before-steer", channel="commentary"))
+        ctx.active_msg_id = "second-user"
+        await machine._emit_locked(ctx, TurnSteered(
+            msg_id="second-user", turn_id="native-turn", prompt="second"))
+        await machine._emit_locked(ctx, AssistantMsgStart(
+            message_id="after-steer", channel="commentary"))
+        transport.sent.clear()
+
+        await machine._handle_client_hello(Hello(
+            role="client",
+            client_id="client-1",
+            cursors={"s-steer": 2},
+            generations={"s-steer": machine.instance_id},
+        ))
+
+        narrative = [event for event in transport.sent
+                     if event.type in {
+                         "turn_binding", "turn_steered", "assistant_msg_start",
+                     }]
+        assert [(event.type, getattr(event, "msg_id", None),
+                 getattr(event, "message_id", None)) for event in narrative] == [
+            ("assistant_msg_start", None, "before-steer"),
+            ("turn_steered", "second-user", None),
+            ("assistant_msg_start", None, "after-steer"),
+        ]
+
+        transport.sent.clear()
+        await machine._handle_client_hello(Hello(
+            role="client",
+            client_id="client-2",
+            cursors={"s-steer": 4},
+            generations={"s-steer": machine.instance_id},
+        ))
+        narrative = [event for event in transport.sent
+                     if event.type in {
+                         "turn_binding", "turn_steered", "assistant_msg_start",
+                     }]
+        assert [(event.type, getattr(event, "msg_id", None),
+                 getattr(event, "message_id", None)) for event in narrative] == [
+            ("turn_binding", "second-user", None),
+            ("assistant_msg_start", None, "after-steer"),
+        ]
+
+    asyncio.run(run())
+
+
+def test_client_hello_seeds_after_ambiguous_truncated_replay():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("s-truncated", "s-truncated")
+        ctx.buffer = RingBuffer(2, 10_000_000)
+        ctx.engine = "codex"
+        ctx.state = "running"
+        ctx.active_msg_id = "current-user"
+        machine.sessions = {"s-truncated": ctx}
+
+        await machine._emit_locked(
+            ctx, UserMsg(msg_id="current-user", prompt="current"))
+        await machine._emit_locked(ctx, TurnBinding(
+            msg_id="current-user", turn_id="native-turn"))
+        await machine._emit_locked(ctx, AssistantMsgStart(
+            message_id="tail-message", channel="commentary"))
+        await machine._emit_locked(ctx, Delta(
+            message_id="tail-message", channel="commentary", text="tail"))
+        transport.sent.clear()
+
+        await machine._handle_client_hello(Hello(
+            role="client",
+            client_id="client-1",
+            cursors={"s-truncated": 0},
+            generations={"s-truncated": machine.instance_id},
+        ))
+
+        replay_end = next(index for index, event in enumerate(transport.sent)
+                          if isinstance(event, ReplayEnd))
+        reseed = next(index for index, event in enumerate(transport.sent)
+                      if isinstance(event, TurnBinding))
+        assert isinstance(transport.sent[0], ReplayStart)
+        assert transport.sent[0].truncated is True
+        assert reseed == replay_end + 1
+        assert transport.sent[reseed].seq is None
+
+    asyncio.run(run())
+
+
+def test_fresh_hello_reseeds_owner_when_current_boundary_left_ring():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("s-fresh", "s-fresh")
+        ctx.buffer = RingBuffer(2, 10_000_000)
+        ctx.engine = "codex"
+        ctx.state = "running"
+        ctx.active_msg_id = "current-user"
+        machine.sessions = {"s-fresh": ctx}
+
+        await machine._emit_locked(
+            ctx, UserMsg(msg_id="current-user", prompt="current"))
+        await machine._emit_locked(ctx, TurnBinding(
+            msg_id="current-user", turn_id="native-turn"))
+        await machine._emit_locked(ctx, AssistantMsgStart(
+            message_id="tail-message", channel="commentary"))
+        await machine._emit_locked(ctx, Delta(
+            message_id="tail-message", channel="commentary", text="tail"))
+        transport.sent.clear()
+
+        await machine._handle_client_hello(Hello(
+            role="client", client_id="client-1"))
+
+        assert [event.type for event in transport.sent[:2]] == [
+            "snapshot", "turn_binding",
+        ]
+        assert transport.sent[1].seq is None
+
+        await machine._emit_locked(ctx, TurnEnd(
+            turn_id="native-turn",
+            result=TurnResult(
+                subtype="success", duration_ms=1, is_error=False)))
+        transport.sent.clear()
+        await machine._handle_client_hello(Hello(
+            role="client", client_id="client-2"))
+        assert not any(isinstance(event, TurnBinding)
+                       for event in transport.sent)
 
     asyncio.run(run())
 

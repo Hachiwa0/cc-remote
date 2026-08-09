@@ -103,7 +103,8 @@ from cc_remote.protocol import (
     PreviewAuthorizationRequired, PreviewAuthorizationResult,
     ConversationTurn, History, TurnDetail, HistoryImage,
     HistoryInvalidated, ArtifactInvalidated, AskUser, AskUserClosed,
-    GoalState, Snapshot, StateEvent, State, TakeoverState, SessionControl,
+    GoalState, ReplayStart, ReplayEnd, Snapshot, StateEvent, State,
+    TakeoverState, SessionControl,
     UserMsg, TurnSteered,
     ToolUse, ToolResult, ProcessEvent, TurnBinding, TurnEnd, TurnNotificationContext,
     TurnResult, is_downstream,
@@ -169,6 +170,7 @@ from cc_remote.wrapper.rollback_commands import (
 )
 from cc_remote.wrapper.session import load_session_id, save_session_id
 from cc_remote.wrapper.session_ctx import (
+    ActiveTurnBinding,
     ClaudeClientAliasProbe,
     CodexGoalMutation,
     SessionContext,
@@ -5039,6 +5041,25 @@ class WrapperMachine:
             require_write=require_write,
         )
 
+    def _observe_active_turn_binding(
+        self, ctx: SessionContext, msg,
+    ) -> None:
+        """Track only authoritative live owner boundaries emitted on the wire."""
+        if isinstance(msg, (TurnBinding, TurnSteered)):
+            if msg.seq is None:
+                return
+            ctx.active_turn_binding = ActiveTurnBinding(
+                msg_id=msg.msg_id,
+                turn_id=msg.turn_id,
+                seq=msg.seq,
+                generation=self.instance_id,
+            )
+            return
+        if isinstance(msg, TurnEnd) or (
+            isinstance(msg, StateEvent) and msg.state == "idle"
+        ):
+            ctx.active_turn_binding = None
+
     async def _emit_locked(self, ctx: SessionContext, msg) -> None:
         # Stamp routing before buffering so byte accounting includes the final
         # wire shape.  Every live and replayable /btw frame is owner-only; relay
@@ -5058,6 +5079,7 @@ class WrapperMachine:
         if is_downstream(msg):
             msg.seq = ctx.next_seq()
             ctx.buffer.append(msg)
+        self._observe_active_turn_binding(ctx, msg)
         live = (
             msg.model_copy(update={
                 "notification_context": self._notification_context(ctx),
@@ -6121,6 +6143,83 @@ class WrapperMachine:
             return None
         return result
 
+    @staticmethod
+    def _frame_reasserts_active_binding(
+        frame, binding: ActiveTurnBinding,
+    ) -> bool:
+        return isinstance(frame, (TurnBinding, TurnSteered)) and (
+            frame.msg_id == binding.msg_id
+            and frame.turn_id == binding.turn_id
+        )
+
+    def _reseed_active_binding_for_hello(
+        self,
+        ctx: SessionContext,
+        frames: list,
+        *,
+        cursor: Optional[int],
+        same_generation: bool,
+    ) -> list:
+        """Place one client-only owner seed at a proven replay boundary.
+
+        The seed is deliberately unsequenced and never enters the shared ring:
+        it restores reducer ownership which a page reload forgot without moving
+        that client's durable cursor.  If the replay contains frames from an
+        unknown prefix (truncated/rebuild), seed only after ReplayEnd so those
+        old frames cannot be attached to the newest steer segment.
+        """
+        binding = ctx.active_turn_binding
+        if (
+            binding is None
+            or ctx.state == "idle"
+            or binding.generation != self.instance_id
+            or any(self._frame_reasserts_active_binding(frame, binding)
+                   for frame in frames)
+        ):
+            return frames
+
+        seed = TurnBinding(
+            msg_id=binding.msg_id,
+            turn_id=binding.turn_id,
+        )
+        replay_start_index = next((
+            index for index, frame in enumerate(frames)
+            if isinstance(frame, ReplayStart)
+        ), None)
+        replay_end_index = next((
+            index for index in range(len(frames) - 1, -1, -1)
+            if isinstance(frames[index], ReplayEnd)
+        ), None)
+
+        if replay_start_index is None:
+            snapshot_index = next((
+                index for index, frame in enumerate(frames)
+                if isinstance(frame, Snapshot)
+            ), None)
+            insert_at = (snapshot_index + 1
+                         if snapshot_index is not None else 0)
+        else:
+            replay_start = frames[replay_start_index]
+            ambiguous_prefix = (
+                replay_start.truncated
+                or replay_start.rebuild
+                or not same_generation
+            )
+            binding_already_consumed = (
+                cursor is not None and cursor >= binding.seq
+            )
+            if not ambiguous_prefix and (
+                binding_already_consumed or cursor is None
+            ):
+                insert_at = replay_start_index + 1
+            else:
+                # A non-truncated cursor below binding.seq should have replayed
+                # the original binding. If it did not, fail closed just like a
+                # truncated prefix: do not claim earlier narrative as current.
+                insert_at = (replay_end_index + 1
+                             if replay_end_index is not None else len(frames))
+        return [*frames[:insert_at], seed, *frames[insert_at:]]
+
     async def _handle_client_hello(self, cmd) -> None:
         # A fresh client (no cursor for a sid) gets exactly one lightweight
         # Snapshot for that session. A reconnecting client explicitly names the
@@ -6166,10 +6265,13 @@ class WrapperMachine:
             tail = ctx.buffer.latest_tail_text()
             st = ctx.buffer.latest_state() or ctx.state
             async with ctx.emit_lock:
+                replay_cursor: Optional[int] = None
+                same_generation = True
                 if sid in cursors:
                     same_generation = generations.get(sid) == self.instance_id
+                    replay_cursor = cursors[sid] if same_generation else 0
                     frames = ctx.buffer.replay_from(
-                        cursors[sid] if same_generation else 0,
+                        replay_cursor,
                         cc_session_id=sid,
                         state=st,
                         tail_text=tail,
@@ -6190,7 +6292,17 @@ class WrapperMachine:
                     if st != "idle":
                         frames.extend(ctx.buffer.current_turn_replay(
                             generation=self.instance_id,
-                            message_id=ctx.active_msg_id))
+                            message_id=(
+                                ctx.active_turn_binding.msg_id
+                                if ctx.active_turn_binding is not None
+                                else ctx.active_msg_id
+                            )))
+                frames = self._reseed_active_binding_for_hello(
+                    ctx,
+                    frames,
+                    cursor=replay_cursor,
+                    same_generation=same_generation,
+                )
                 for frame in frames:
                     # Never mutate a shared ring event with per-client routing.
                     await self.transport.send(frame.model_copy(

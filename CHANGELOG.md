@@ -4,6 +4,9 @@
 
 ## Unreleased
 
+- Restore the exact active-turn owner before reconnect tail replay and discard
+  the one known malformed Codex compaction projection instead of repainting a
+  duplicate response after refresh.
 - Upgrade the coordinated Wrapper/Relay/Web wire gate to protocol v33 and add
   multi-account Codex Work. New Work sessions and schedules can select any
   configured profile, persist that ownership independently of the current

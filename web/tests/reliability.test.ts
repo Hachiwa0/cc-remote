@@ -64,7 +64,11 @@ import {
   inlineImageAssetCacheSnapshot,
   INLINE_IMAGE_REQUEST_TIMEOUT_MS,
 } from "../src/inline-image-assets.ts";
-import { boundCachedTurns, controlForCachedSession } from "../src/cache.ts";
+import {
+  boundCachedTurns,
+  controlForCachedSession,
+  hasOrphanedActiveCompactionProjection,
+} from "../src/cache.ts";
 import {
   boundRuntimeTurns,
   MAX_RUNTIME_TURNS,
@@ -11020,10 +11024,10 @@ try {
     null,
   );
 
-  // A cold browser can receive the recovery binding before both live content
-  // and History.  The first real content may open an internal empty-prompt
-  // owner, but canonical History must later fill that exact row rather than
-  // painting a second transcript copy.
+  // A cold browser can receive the client-only, unsequenced recovery binding
+  // before both live content and History. The first real content may open an
+  // internal empty-prompt owner, but canonical History must later fill that
+  // exact row rather than painting a second transcript copy.
   const coldRecoveredSid = "cold-recovered-owner-binding";
   let coldRecoveredState = {
     ...initialState,
@@ -11043,7 +11047,6 @@ try {
     event({
       type: "turn_binding",
       sid: coldRecoveredSid,
-      seq: 1,
       msg_id: "cold-client-message",
       turn_id: "cold-native-turn",
     }),
@@ -13967,6 +13970,70 @@ const boundedCache = boundCachedTurns(Array.from(
   { length: 120 }, (_, id) => ({ id, prompt: `turn-${id}` })));
 assert.equal(boundedCache.length, 100);
 assert.equal((boundedCache[0] as { id: number }).id, 20);
+const knownBadCompactionCache = [{
+  id: "item-51",
+  prompt: "continue the task",
+  forkPointId: "native-turn",
+  done: false,
+  blocks: [{
+    kind: "process",
+    item_id: "item-54",
+    processKind: "compaction",
+    phase: "snapshot",
+    status: "succeeded",
+    turn_id: "native-turn",
+    title: "压缩上下文",
+    done: true,
+  }],
+}, {
+  id: "msg-after-compact",
+  prompt: "",
+  done: false,
+  blocks: [{
+    kind: "text",
+    message_id: "msg-after-compact",
+    channel: "commentary",
+    text: "continued output",
+    done: true,
+  }, {
+    kind: "process",
+    item_id: "replayed-compaction",
+    processKind: "compaction",
+    phase: "snapshot",
+    status: "succeeded",
+    turn_id: "native-turn",
+    title: "压缩上下文",
+    done: true,
+  }],
+}];
+assert.equal(
+  hasOrphanedActiveCompactionProjection(knownBadCompactionCache),
+  true,
+  "the exact promptless compact replay projection is rebuildable corruption",
+);
+assert.equal(hasOrphanedActiveCompactionProjection([
+  knownBadCompactionCache[0],
+  {
+    id: "optimistic-steer",
+    clientMsgId: "optimistic-steer",
+    prompt: "a legitimate steer awaiting acceptance",
+    done: false,
+    blocks: [],
+  },
+]), false, "an optimistic steer may legitimately coexist with an active row");
+assert.equal(hasOrphanedActiveCompactionProjection([
+  knownBadCompactionCache[0],
+  knownBadCompactionCache[1],
+  { ...knownBadCompactionCache[1], id: "second-orphan", blocks: [{
+    ...(knownBadCompactionCache[1].blocks[0] as Record<string, unknown>),
+    message_id: "second-orphan",
+  }, knownBadCompactionCache[1].blocks[1]] },
+]), false, "ambiguous promptless rows must not be guessed away");
+assert.equal(hasOrphanedActiveCompactionProjection([{
+  ...knownBadCompactionCache[0],
+  blocks: [],
+}, knownBadCompactionCache[1]]), false,
+"a generic shared native task id is not compaction identity proof");
 const skipsOneOversizedCacheTurn = boundCachedTurns([
   { id: "small", prompt: "keep" },
   { id: "huge", image: "x".repeat(2 * 1024 * 1024 + 1) },

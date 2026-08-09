@@ -1455,6 +1455,8 @@ test("session cache rejects stale Claude and replay-orphan rows", async ({
     await cache.clearCache();
     const legacySid = "legacy-claude-prompt-alias";
     const replayOrphanSid = "completed-replay-orphan";
+    const activeCompactionOrphanSid = "active-compaction-replay-orphan";
+    const optimisticSteerSid = "healthy-optimistic-steer";
     const database = await new Promise<IDBDatabase>((resolve, reject) => {
       const request = indexedDB.open("cc_remote_cache", 1);
       request.onsuccess = () => resolve(request.result);
@@ -1507,13 +1509,86 @@ test("session cache rejects stale Claude and replay-orphan rows", async ({
         generation: "replay-orphan-g1",
         savedAt: Date.now(),
       }, replayOrphanSid);
+      tx.objectStore("sessions").put({
+        v: 15,
+        turns: [{
+          id: "item-51",
+          prompt: "continue the task",
+          forkPointId: "native-turn",
+          blocks: [{
+            kind: "process",
+            item_id: "item-54",
+            processKind: "compaction",
+            phase: "snapshot",
+            status: "succeeded",
+            turn_id: "native-turn",
+            title: "压缩上下文",
+            done: true,
+          }],
+          done: false,
+        }, {
+          id: "msg-after-compact",
+          prompt: "",
+          blocks: [{
+            kind: "text",
+            message_id: "msg-after-compact",
+            text: "continued output",
+            channel: "commentary",
+            done: true,
+          }, {
+            kind: "process",
+            item_id: "replayed-compaction",
+            processKind: "compaction",
+            phase: "snapshot",
+            status: "succeeded",
+            turn_id: "native-turn",
+            title: "压缩上下文",
+            done: true,
+          }],
+          done: false,
+        }],
+        lastSeq: 364,
+        revision: "active-compaction-r1",
+        generation: "active-compaction-g1",
+        savedAt: Date.now(),
+      }, activeCompactionOrphanSid);
+      tx.objectStore("sessions").put({
+        v: 15,
+        turns: [{
+          id: "active-before-steer",
+          prompt: "first prompt",
+          forkPointId: "shared-native-turn",
+          blocks: [],
+          done: false,
+        }, {
+          id: "optimistic-steer",
+          clientMsgId: "optimistic-steer",
+          prompt: "second prompt",
+          blocks: [],
+          done: false,
+        }],
+        lastSeq: 47,
+        revision: "optimistic-steer-r1",
+        generation: "optimistic-steer-g1",
+        savedAt: Date.now(),
+      }, optimisticSteerSid);
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
       tx.onabort = () => reject(tx.error);
     });
     const legacy = await cache.loadSession(legacySid);
     const replayOrphan = await cache.loadSession(replayOrphanSid);
+    const activeCompactionOrphan = await cache.loadSession(
+      activeCompactionOrphanSid);
+    const optimisticSteer = await cache.loadSession(optimisticSteerSid);
     const replay = await cache.loadAllReplayState();
+    await new Promise((resolve) => window.setTimeout(resolve, 100));
+    const prunedCompactionOrphan = await new Promise((resolve, reject) => {
+      const tx = database.transaction("sessions", "readonly");
+      const request = tx.objectStore("sessions").get(activeCompactionOrphanSid);
+      request.onsuccess = () => resolve(request.result ?? null);
+      request.onerror = () => reject(request.error);
+    });
     cache.saveSession("current-claude-prompt-alias", [{
       id: "browser-prompt-id",
       clientMsgId: "browser-prompt-id",
@@ -1530,6 +1605,11 @@ test("session cache rejects stale Claude and replay-orphan rows", async ({
       legacyCursor: replay.cursors[legacySid],
       replayOrphan,
       replayOrphanCursor: replay.cursors[replayOrphanSid],
+      activeCompactionOrphan,
+      activeCompactionCursor: replay.cursors[activeCompactionOrphanSid],
+      prunedCompactionOrphan,
+      optimisticSteerCount: optimisticSteer?.turns.length,
+      optimisticSteerCursor: replay.cursors[optimisticSteerSid],
       currentIds: current?.turns.map((turn: {
         id: string; clientMsgId?: string; historyTurnId?: string;
       }) => [turn.id, turn.clientMsgId, turn.historyTurnId]),
@@ -1539,6 +1619,11 @@ test("session cache rejects stale Claude and replay-orphan rows", async ({
   expect(result.legacyCursor).toBeUndefined();
   expect(result.replayOrphan).toBeNull();
   expect(result.replayOrphanCursor).toBeUndefined();
+  expect(result.activeCompactionOrphan).toBeNull();
+  expect(result.activeCompactionCursor).toBeUndefined();
+  expect(result.prunedCompactionOrphan).toBeNull();
+  expect(result.optimisticSteerCount).toBe(2);
+  expect(result.optimisticSteerCursor).toBe(47);
   expect(result.currentIds).toEqual([[
     "browser-prompt-id", "browser-prompt-id", "claude-transcript-uuid",
   ]]);
