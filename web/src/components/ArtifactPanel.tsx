@@ -666,7 +666,10 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
           aria-label="刷新文件" title="重新读取文件"><Icon name="refresh" size={17} /></button>}
         <button className="iconbtn" onClick={leavePanel} aria-label="收起"><Icon name="chevrons-right" /></button>
       </div>
-      <div className={`artifact-body${renderedArtifact ? " rendered-artifact-body" : ""}`}>
+      <div className={`artifact-body${renderedArtifact ? " rendered-artifact-body" : ""}${
+        artifact.kind === "md" && mode === "source"
+          ? " source-artifact-body" : ""
+      }`}>
         {artifact.authorization ? (
           <PreviewAuthorizationPrompt
             authorization={artifact.authorization}

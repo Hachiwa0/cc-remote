@@ -398,7 +398,20 @@ body{
 .message-code-block .message-code-copy{ position:absolute; z-index:1; top:7px; right:7px;
   padding:5px 7px; background:color-mix(in srgb,var(--raised) 88%,transparent);
   border:1px solid var(--border); backdrop-filter:blur(6px); }
+:root[data-theme="dark"] .message-code-block .message-code-copy{
+  color:var(--text); background:color-mix(in srgb,var(--surface) 68%,var(--raised));
+  border-color:var(--border-strong); }
+:root[data-theme="dark"] .message-code-block .message-code-copy:hover{
+  color:var(--accent-ink); background:var(--accent-weak); border-color:var(--accent-line); }
+:root[data-theme="dark"] .message-code-block .message-code-copy.copied{
+  color:var(--ok); }
 .message-code-block pre{ margin:0; padding-top:38px; }
+@media (min-width:981px){
+  :root[data-theme="dark"] .message-code-block pre{
+    background:color-mix(in srgb,var(--raised) 92%,var(--accent));
+    border-color:color-mix(in srgb,var(--border-strong) 86%,var(--accent));
+  }
+}
 .prose pre code{ background:none; border:none; padding:0; font-size:13px; }
 .mermaid-block{ margin:8px 0; overflow:hidden; border:1px solid var(--border);
   border-radius:9px; background:var(--raised); }
@@ -685,6 +698,9 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
 .artifact-path{ font-family:var(--mono); font-size:11px; color:var(--dim); flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .artifact-body{ flex:1; min-width:0; min-height:0; max-width:100%; overflow-y:auto; overflow-x:hidden; overscroll-behavior:contain; touch-action:pan-y; -webkit-overflow-scrolling:touch; padding:14px 16px; }
 .artifact-body.rendered-artifact-body{ display:flex; overflow:hidden; padding:0; background:var(--raised); }
+.artifact-body.source-artifact-body{ display:flex; min-height:0; flex-direction:column; overflow:hidden; }
+.source-artifact-body .markdown-editor{ flex:1; min-height:0; height:100%; overflow:auto; }
+.source-artifact-body .preview-truncated,.source-artifact-body .markdown-save-error{ flex:none; }
 .artifact-body .diff-pre{ margin:0; }
 .artifact-body .prose{ font-size:14px; }
 .artifact-converted{ flex:none; border:1px solid var(--border); border-radius:7px; padding:3px 6px; color:var(--dim); background:var(--raised); font:9.5px/1.2 var(--mono); white-space:nowrap; }
@@ -753,7 +769,7 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
   .artifact-image-stage img{ width:auto; height:auto; max-width:100%; max-height:100%; }
   .artifact-converted{ display:none; }
   .markdown-preview{ margin:0; }
-  .markdown-editor{ min-height:56vh; font-size:16px; }
+  .markdown-editor{ font-size:16px; }
   .markdown-save-state{ display:none; }
 }
 @media (min-width:981px){ .panel-resizer{ display:block; } }
@@ -1501,9 +1517,14 @@ html.panel-resizing,html.panel-resizing *{ cursor:col-resize !important; user-se
 :root[data-engine="codex"][data-theme="dark"] .scard.has-profile-ribbon:hover{
   background:color-mix(in srgb,var(--surface) 86%,var(--sidebar));
   border-color:color-mix(in srgb,var(--border-strong) 72%,var(--faint)); }
+:root[data-theme="dark"] .scard.active{
+  background:color-mix(in srgb,var(--accent) 11%,var(--surface));
+  border-color:color-mix(in srgb,var(--accent) 45%,var(--border-strong));
+  box-shadow:var(--shadow-sm),inset 3px 0 color-mix(in srgb,var(--accent) 72%,transparent); }
 :root[data-engine="codex"][data-theme="dark"] .scard.has-profile-ribbon.active{
-  background:var(--surface);
-  border-color:color-mix(in srgb,var(--border-strong) 70%,var(--faint)); }
+  background:color-mix(in srgb,var(--accent) 11%,var(--surface));
+  border-color:color-mix(in srgb,var(--accent) 45%,var(--border-strong));
+  box-shadow:var(--shadow-sm),inset 3px 0 color-mix(in srgb,var(--accent) 72%,transparent); }
 /* reserve room on the right for the absolute ⋯ button (top:8/right:8, 28px wide)
    so the "当前"/"运行" pill never sits under it. */
 .scard-top{ display:flex; align-items:center; gap:9px; margin-bottom:3px; padding-right:30px; }

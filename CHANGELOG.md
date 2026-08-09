@@ -4,6 +4,9 @@
 
 ## Unreleased
 
+- Let mobile Markdown source editors fill the available file panel, keep active
+  session cards visibly selected, restore code-copy contrast in dark mode, and
+  keep desktop dark code blocks visually separate from the page background.
 - Restore the exact active-turn owner before reconnect tail replay and discard
   the one known malformed Codex compaction projection instead of repainting a
   duplicate response after refresh.

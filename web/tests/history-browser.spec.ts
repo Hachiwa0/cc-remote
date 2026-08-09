@@ -167,6 +167,131 @@ for (const fixture of ["artifact-svg", "artifact-markdown-svg"] as const) {
   });
 }
 
+test("mobile Markdown source editor fills the available artifact body", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("/tests/history-browser.html?artifact-markdown-source=1");
+  await page.getByRole("button", { name: "源码" }).click();
+  const editor = page.getByRole("textbox", { name: "Markdown 源码编辑器" });
+  await expect(editor).toBeVisible();
+
+  const measure = () => page.locator(".source-artifact-body").evaluate((body) => {
+    const textarea = body.querySelector<HTMLTextAreaElement>(".markdown-editor");
+    if (!textarea) throw new Error("Markdown editor is missing");
+    const bodyRect = body.getBoundingClientRect();
+    const editorRect = textarea.getBoundingClientRect();
+    return {
+      bodyHeight: bodyRect.height,
+      editorHeight: editorRect.height,
+      bottomGap: bodyRect.bottom - editorRect.bottom,
+      scrollHeight: textarea.scrollHeight,
+      clientHeight: textarea.clientHeight,
+    };
+  });
+
+  let geometry = await measure();
+  expect(geometry.editorHeight).toBeGreaterThan(geometry.bodyHeight * 0.8);
+  expect(geometry.bottomGap).toBeLessThanOrEqual(16);
+  expect(geometry.scrollHeight).toBeGreaterThan(geometry.clientHeight);
+
+  await page.setViewportSize({ width: 390, height: 480 });
+  geometry = await measure();
+  expect(geometry.editorHeight).toBeGreaterThan(geometry.bodyHeight * 0.75);
+  expect(geometry.bottomGap).toBeLessThanOrEqual(16);
+});
+
+test("dark desktop code block and copy action stay visually distinct", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await page.goto("/tests/history-browser.html?code-copy-theme=1&theme=dark");
+  await page.waitForFunction(() =>
+    document.documentElement.dataset.theme === "dark"
+  );
+  await page.waitForTimeout(200);
+  const copy = page.getByRole("button", { name: "复制代码" });
+  await expect(copy).toBeVisible();
+
+  const appearance = await copy.evaluate((button) => {
+    const sample = (color: string) => {
+      const canvas = document.createElement("canvas");
+      canvas.width = 1;
+      canvas.height = 1;
+      const context = canvas.getContext("2d");
+      if (!context) throw new Error("canvas context unavailable");
+      context.clearRect(0, 0, 1, 1);
+      context.fillStyle = color;
+      context.fillRect(0, 0, 1, 1);
+      return Array.from(context.getImageData(0, 0, 1, 1).data);
+    };
+    const composite = (front: number[], back: number[]) => {
+      const alpha = front[3] / 255;
+      return front.slice(0, 3).map((value, index) =>
+        value * alpha + back[index] * (1 - alpha)
+      );
+    };
+    const luminance = (color: number[]) => {
+      const channels = color.slice(0, 3).map((value) => {
+        const normalized = value / 255;
+        return normalized <= 0.04045
+          ? normalized / 12.92
+          : ((normalized + 0.055) / 1.055) ** 2.4;
+      });
+      return channels[0] * 0.2126 + channels[1] * 0.7152
+        + channels[2] * 0.0722;
+    };
+    const block = button.closest(".message-code-block");
+    const code = block?.querySelector("pre");
+    const pageSurface = button.closest("main");
+    if (!code || !pageSurface) throw new Error("code block is missing");
+    const foreground = sample(getComputedStyle(button).color);
+    const expectedForeground = sample(
+      getComputedStyle(document.documentElement).getPropertyValue("--text"),
+    );
+    const buttonBackground = sample(getComputedStyle(button).backgroundColor);
+    const codeBackground = sample(getComputedStyle(code).backgroundColor);
+    const pageBackground = sample(getComputedStyle(pageSurface).backgroundColor);
+    const effectiveCodeBackground = composite(codeBackground, pageBackground);
+    const effectiveButtonBackground = composite(
+      buttonBackground,
+      effectiveCodeBackground,
+    );
+    const lighter = Math.max(
+      luminance(foreground),
+      luminance(effectiveButtonBackground),
+    );
+    const darker = Math.min(
+      luminance(foreground),
+      luminance(effectiveButtonBackground),
+    );
+    const codeLighter = Math.max(
+      luminance(effectiveCodeBackground),
+      luminance(pageBackground),
+    );
+    const codeDarker = Math.min(
+      luminance(effectiveCodeBackground),
+      luminance(pageBackground),
+    );
+    const codeBackgroundDelta = effectiveCodeBackground.reduce(
+      (total, value, index) => total + Math.abs(value - pageBackground[index]),
+      0,
+    ) / 3;
+    return {
+      contrast: (lighter + 0.05) / (darker + 0.05),
+      codeBackgroundContrast: (codeLighter + 0.05) / (codeDarker + 0.05),
+      codeBackgroundDelta,
+      foreground,
+      expectedForeground,
+    };
+  });
+
+  expect(appearance.contrast).toBeGreaterThanOrEqual(4.5);
+  expect(appearance.codeBackgroundContrast).toBeGreaterThanOrEqual(1.28);
+  expect(appearance.codeBackgroundDelta).toBeGreaterThanOrEqual(24);
+  expect(appearance.foreground).toEqual(appearance.expectedForeground);
+});
+
 async function pinchThenPanPreview(
   page: import("@playwright/test").Page,
 ): Promise<{
@@ -4253,6 +4378,8 @@ test("profile session card edges remain visible in dark theme", async ({
         borderAlpha: border[3],
         borderCardDelta: channelDelta(border, background),
         borderSidebarDelta: channelDelta(border, sidebar),
+        background: style.backgroundColor,
+        boxShadow: style.boxShadow,
       };
     });
   });
@@ -4265,4 +4392,8 @@ test("profile session card edges remain visible in dark theme", async ({
   }
   expect(appearance.some((card) => card.active)).toBe(true);
   expect(appearance.some((card) => !card.active)).toBe(true);
+  const active = appearance.find((card) => card.active)!;
+  const inactive = appearance.find((card) => !card.active)!;
+  expect(active.background).not.toBe(inactive.background);
+  expect(active.boxShadow).not.toBe("none");
 });
