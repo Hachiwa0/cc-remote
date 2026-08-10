@@ -6,10 +6,12 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type RefObject,
 } from "react";
 import { createPortal } from "react-dom";
 import type { ProcessBlock } from "../domain/conversation";
 import { Icon } from "../icons";
+import { planProgressPresentation } from "../plan-progress";
 import {
   cancelDraggedPointer,
   PointerTapGuard,
@@ -24,46 +26,53 @@ interface PlanPopoverPosition {
   bottom?: number;
 }
 
-export function PlanProgressPopover({ block, openOverride, onOpenChange,
-  detailLoading = false, onNeedDetail }: {
+export function PlanProgressContent({ block, detailLoading = false }: {
   block: ProcessBlock;
-  openOverride?: boolean;
-  onOpenChange?: (open: boolean) => void;
   detailLoading?: boolean;
-  onNeedDetail?: () => void;
 }) {
-  const [uncontrolledOpen, setUncontrolledOpen] = useState(false);
-  const [position, setPosition] = useState<PlanPopoverPosition | null>(null);
-  const open = openOverride ?? uncontrolledOpen;
-  const rootRef = useRef<HTMLDivElement>(null);
-  const cardRef = useRef<HTMLElement>(null);
-  const tapGuard = useRef(new PointerTapGuard());
-  const labelId = useId();
+  const presentation = planProgressPresentation(block, detailLoading);
   const steps = block.plan ?? [];
-  const completed = steps.filter((entry) => entry.status === "completed").length;
-  const current = steps.find((entry) => entry.status === "inProgress");
-  const failed = ["failed", "declined", "cancelled", "interrupted"]
-    .includes(block.status);
-  // A terminal turn closes any still-open process item as `succeeded`; that
-  // says the turn ended cleanly, not that every structured plan step ran.
-  // Structured step state is therefore authoritative whenever it exists.
-  const complete = !failed && steps.length > 0
-    && completed === steps.length;
-  const progress = steps.length > 0
-    ? Math.min(100, completed / steps.length * 100)
-    : 0;
-  const progressLabel = steps.length > 0
-    ? `${completed} / ${steps.length}`
-    : block.done ? "已记录" : "执行中";
-  const description = block.explanation || block.summary;
-  const fallbackDetail = steps.length === 0
-    ? block.detail || block.output || block.progress
-    : null;
+  return <div className="plan-progress-content">
+    <header>
+      <span className={`plan-progress-mark${presentation.complete ? " complete" : ""}${presentation.failed ? " failed" : ""}`}>
+        <Icon name={presentation.complete ? "verify" : "plan"} size={15} />
+      </span>
+      <span>
+        <b>计划</b>
+        <small>{presentation.stateLabel}</small>
+      </span>
+      <strong>{presentation.progressLabel}</strong>
+    </header>
+    {presentation.description && <p>{presentation.description}</p>}
+    {steps.length > 0 ? <ol>
+      {steps.map((entry, index) => (
+        <li key={`${index}-${entry.step}`} className={`plan-step-${entry.status}`}>
+          <span aria-hidden="true">{entry.status === "completed"
+            ? <Icon name="verify" size={14} />
+            : entry.status === "inProgress" ? <i /> : <em>{index + 1}</em>}</span>
+          <span>{entry.step}</span>
+        </li>
+      ))}
+    </ol> : presentation.fallbackDetail
+      ? <pre className="plan-progress-fallback">{presentation.fallbackDetail}</pre>
+      : <div className="plan-progress-empty">
+          {detailLoading ? "正在加载计划…" : "等待计划步骤…"}
+        </div>}
+  </div>;
+}
 
-  const setOpen = useCallback((next: boolean) => {
-    setUncontrolledOpen(next);
-    onOpenChange?.(next);
-  }, [onOpenChange]);
+export function PlanProgressFloatingCard({ anchorRef, block, open,
+  onOpenChange, id, detailLoading = false, compact = false }: {
+  anchorRef: RefObject<HTMLElement | null>;
+  block: ProcessBlock;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  id: string;
+  detailLoading?: boolean;
+  compact?: boolean;
+}) {
+  const [position, setPosition] = useState<PlanPopoverPosition | null>(null);
+  const cardRef = useRef<HTMLElement>(null);
 
   useLayoutEffect(() => {
     if (!open) {
@@ -71,7 +80,7 @@ export function PlanProgressPopover({ block, openOverride, onOpenChange,
       return;
     }
     const place = () => {
-      const trigger = rootRef.current?.getBoundingClientRect();
+      const trigger = anchorRef.current?.getBoundingClientRect();
       if (!trigger) return;
       // WebKit's fixed-position layout viewport can differ from innerWidth by
       // a few CSS pixels around the safe-area. Use the document viewport and a
@@ -81,7 +90,7 @@ export function PlanProgressPopover({ block, openOverride, onOpenChange,
         window.innerWidth,
         document.documentElement.clientWidth,
       );
-      const width = Math.min(360, viewportWidth - gutter * 2);
+      const width = Math.min(compact ? 320 : 360, viewportWidth - gutter * 2);
       const left = Math.min(
         Math.max(gutter, trigger.right - width),
         viewportWidth - width - gutter,
@@ -93,7 +102,7 @@ export function PlanProgressPopover({ block, openOverride, onOpenChange,
       setPosition({
         left,
         width,
-        maxHeight: Math.min(420, available),
+        maxHeight: Math.min(compact ? 360 : 420, available),
         ...(openUp
           ? { bottom: window.innerHeight - trigger.top + 6 }
           : { top: trigger.bottom + 6 }),
@@ -106,18 +115,19 @@ export function PlanProgressPopover({ block, openOverride, onOpenChange,
       window.removeEventListener("resize", place);
       document.removeEventListener("scroll", place, true);
     };
-  }, [open]);
+  }, [anchorRef, compact, open]);
 
   useEffect(() => {
     if (!open) return;
     const closeOutside = (event: PointerEvent) => {
       const target = event.target;
       if (!(target instanceof Node)) return;
-      if (rootRef.current?.contains(target) || cardRef.current?.contains(target)) return;
-      setOpen(false);
+      if (anchorRef.current?.contains(target)
+        || cardRef.current?.contains(target)) return;
+      onOpenChange(false);
     };
     const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setOpen(false);
+      if (event.key === "Escape") onOpenChange(false);
     };
     document.addEventListener("pointerdown", closeOutside, true);
     document.addEventListener("keydown", closeOnEscape);
@@ -125,14 +135,45 @@ export function PlanProgressPopover({ block, openOverride, onOpenChange,
       document.removeEventListener("pointerdown", closeOutside, true);
       document.removeEventListener("keydown", closeOnEscape);
     };
-  }, [open, setOpen]);
+  }, [anchorRef, onOpenChange, open]);
+
+  if (!open || !position) return null;
+  return createPortal(
+    <section ref={cardRef} id={id}
+      className={`plan-progress-popover${compact ? " compact" : ""}`}
+      role="dialog" aria-label="计划进度" style={position}>
+      <PlanProgressContent block={block} detailLoading={detailLoading} />
+    </section>,
+    document.body,
+  );
+}
+
+export function PlanProgressPopover({ block, openOverride, onOpenChange,
+  detailLoading = false, onNeedDetail }: {
+  block: ProcessBlock;
+  openOverride?: boolean;
+  onOpenChange?: (open: boolean) => void;
+  detailLoading?: boolean;
+  onNeedDetail?: () => void;
+}) {
+  const [uncontrolledOpen, setUncontrolledOpen] = useState(false);
+  const open = openOverride ?? uncontrolledOpen;
+  const rootRef = useRef<HTMLDivElement>(null);
+  const tapGuard = useRef(new PointerTapGuard());
+  const labelId = useId();
+  const presentation = planProgressPresentation(block, detailLoading);
+
+  const setOpen = useCallback((next: boolean) => {
+    setUncontrolledOpen(next);
+    onOpenChange?.(next);
+  }, [onOpenChange]);
 
   return <div ref={rootRef} className="plan-progress-control">
     <button type="button"
-      className={`plan-progress-trigger${complete ? " complete" : ""}${failed ? " failed" : ""}`}
+      className={`plan-progress-trigger${presentation.complete ? " complete" : ""}${presentation.failed ? " failed" : ""}`}
       aria-expanded={open} aria-controls={labelId}
-      aria-label={`查看计划进度，${progressLabel}`}
-      title={`计划进度 · ${progressLabel}`}
+      aria-label={`查看计划进度，${presentation.progressLabel}`}
+      title={`计划进度 · ${presentation.progressLabel}`}
       onPointerDown={(event) => {
         tapGuard.current.pointerDown(
           event.pointerId, event.clientX, event.clientY);
@@ -165,42 +206,11 @@ export function PlanProgressPopover({ block, openOverride, onOpenChange,
         setOpen(next);
       }}>
       <span className="plan-progress-ring" aria-hidden="true"
-        style={{ "--plan-progress": `${progress * 3.6}deg` } as CSSProperties}>
-        <Icon name={complete ? "verify" : "plan"} size={12} />
+        style={{ "--plan-progress": `${presentation.progress * 3.6}deg` } as CSSProperties}>
+        <Icon name={presentation.complete ? "verify" : "plan"} size={12} />
       </span>
     </button>
-    {open && position && createPortal(
-      <section ref={cardRef} id={labelId} className="plan-progress-popover"
-        role="dialog" aria-label="计划进度" style={position}>
-        <header>
-          <span className={`plan-progress-mark${complete ? " complete" : ""}${failed ? " failed" : ""}`}>
-            <Icon name={complete ? "verify" : "plan"} size={15} />
-          </span>
-          <span>
-            <b>计划</b>
-            <small>{detailLoading ? "正在同步" : failed ? "执行异常"
-              : complete ? "全部完成" : block.done ? "执行已结束"
-                : current ? "正在执行" : "等待执行"}</small>
-          </span>
-          <strong>{progressLabel}</strong>
-        </header>
-        {description && <p>{description}</p>}
-        {steps.length > 0 ? <ol>
-          {steps.map((entry, index) => (
-            <li key={`${index}-${entry.step}`} className={`plan-step-${entry.status}`}>
-              <span aria-hidden="true">{entry.status === "completed"
-                ? <Icon name="verify" size={14} />
-                : entry.status === "inProgress" ? <i /> : <em>{index + 1}</em>}</span>
-              <span>{entry.step}</span>
-            </li>
-          ))}
-        </ol> : fallbackDetail
-          ? <pre className="plan-progress-fallback">{fallbackDetail}</pre>
-          : <div className="plan-progress-empty">
-              {detailLoading ? "正在加载计划…" : "等待计划步骤…"}
-            </div>}
-      </section>,
-      document.body,
-    )}
+    <PlanProgressFloatingCard anchorRef={rootRef} block={block} open={open}
+      onOpenChange={setOpen} id={labelId} detailLoading={detailLoading} />
   </div>;
 }

@@ -200,6 +200,12 @@ import {
   type SkillCatalogCacheEntry,
   type SkillCatalogRequest,
 } from "./skill-catalog-cache";
+import {
+  completedGoalHasNewerUserTurn,
+  latestPlanProgress,
+  planFollowsCompletedGoal,
+  SessionPlanProgressCache,
+} from "./plan-progress";
 
 const THEME_KEY = "cc_remote_theme";
 const ENGINE_KEY = "cc_remote_engine";  // which backend the NEXT new session uses
@@ -360,6 +366,7 @@ export default function App() {
   const goalUiPreferencesRef = useRef<GoalUiPreferences>(
     readGoalUiPreferences(localStorage));
   const goalRecoveryRequestsRef = useRef<Set<string>>(new Set());
+  const planProgressCacheRef = useRef(new SessionPlanProgressCache());
   const goalRequestScopeByIdRef = useRef<Map<
     string, { scopeKey: string; sid: string }
   >>(new Map());
@@ -678,6 +685,35 @@ export default function App() {
       : rt.ccSessionId);
   const focusedCatalog = catalogForEngineProfile(
     state.catalog, focusedEngine, focusedCodexProfileId);
+  const completedGoalRetired = completedGoalHasNewerUserTurn(
+    rt.goal, rt.turns,
+  ) || completedGoalHasNewerUserTurn(rt.goal, historyView.turns);
+  // A live plan always wins over plans found while browsing older history.
+  // When the runtime's small newest-turn window has no plan, the displayed
+  // history may still reveal the plan which owns this session's long task.
+  const runtimePlanProgress = latestPlanProgress(rt.turns);
+  const historyPlanProgress = historyView.browsing || historyView.recovering
+    ? latestPlanProgress(historyView.turns) : null;
+  let planProgress = focusedSid
+    ? planProgressCacheRef.current.resolve({
+        sid: focusedSid,
+        runtime: runtimePlanProgress,
+        history: historyPlanProgress,
+        runtimeTurns: rt.turns,
+        historyTurns: historyView.turns,
+        recovering: historyView.recovering,
+        runtimeLoading: rt.loading === true,
+      })
+    : null;
+  // An unfinished snapshot from the completed Goal must not briefly become the
+  // standalone monitor for the next task. Keep only a Plan whose owning user
+  // turn starts after the authoritative Goal completion boundary.
+  if (completedGoalRetired && planProgress
+      && !planFollowsCompletedGoal(rt.goal, planProgress)) {
+    planProgressCacheRef.current.clear(focusedSid!);
+    planProgress = null;
+  }
+  const planProgressSource = planProgress?.source ?? null;
   const capabilityCwd = focusedSession?.cwd || currentCwd;
   const focusedComposerDraftKey = composerDraftKey(
     machineId, space, focusedEngine, focusedSid ?? "",
@@ -1524,13 +1560,25 @@ export default function App() {
       const ws = new RelayWs({
         onEvent: (msg, ownership) => {
           if (!acceptsLifecycle()) return;
+          if (msg.type === "history_invalidated") {
+            planProgressCacheRef.current.clear(msg.session_id);
+          } else if (msg.type === "session_rekey") {
+            planProgressCacheRef.current.rekey(msg.old_key, msg.session_id);
+          }
           // SessionList is a scoped response, not a broadcast catalog. Without
           // the exact request ownership it may belong to an older surface or
           // WebSocket generation and must not mutate any sidebar/focus cache.
           if (msg.type === "session_list" && !ownership) return;
           if (msg.type === "goal_state" && msg.sid) {
+            const completedGoalRequest = msg.request_id
+              ? goalRequestScopeByIdRef.current.get(msg.request_id)
+              : undefined;
             if (msg.request_id) {
               goalRequestScopeByIdRef.current.delete(msg.request_id);
+            }
+            if (completedGoalRequest) {
+              goalRecoveryRequestsRef.current.delete(
+                `${lifecycleEpoch}\0${completedGoalRequest.scopeKey}`);
             }
             const key = goalUiScopeForEvent(msg.sid, ownership);
             if (key) {
@@ -2921,15 +2969,16 @@ export default function App() {
   }, [authed, focusedSid, rt.perm, rt.collaborationMode, rt.control,
     rt.external, focusedEngine]);
 
-  const loadHistoryTurnDetail = useCallback((
+  const requestHistoryTurnDetail = useCallback((
     displayTurnId: string, before?: string | null,
     autoLoad = true,
+    includeBrowseProjection = true,
   ): boolean => {
     const current = stateRef.current;
     const sid = current.focusedSid;
     const runtime = sid ? current.runtimes[sid] : null;
     if (!sid || !runtime?.historyRevision) return false;
-    const browse = current.historyBrowse?.sid === sid
+    const browse = includeBrowseProjection && current.historyBrowse?.sid === sid
       ? current.historyBrowse : null;
     const displayed = (browse?.turns ?? runtime.turns).find(
       (turn) => turn.id === displayTurnId
@@ -2986,6 +3035,16 @@ export default function App() {
     }
     return true;
   }, [focusedEngine, historyPageScopeFor, space]);
+  const loadHistoryTurnDetail = useCallback((
+    displayTurnId: string, before?: string | null,
+    autoLoad = true,
+  ) => requestHistoryTurnDetail(
+    displayTurnId, before, autoLoad, true), [requestHistoryTurnDetail]);
+  const loadRuntimeTurnDetail = useCallback((
+    displayTurnId: string, before?: string | null,
+    autoLoad = true,
+  ) => requestHistoryTurnDetail(
+    displayTurnId, before, autoLoad, false), [requestHistoryTurnDetail]);
   useEffect(() => {
     const current = stateRef.current;
     const sid = current.focusedSid;
@@ -4291,15 +4350,33 @@ export default function App() {
               onLoadHistoryImage={historyView.recovering
                 ? undefined : loadHistoryImage}
               onTextSelectionGuardChange={updateTextSelectionGuard}
+              externalPlanProgress={planProgress ? {
+                turnId: planProgress.turnId,
+                itemId: planProgress.block.item_id,
+              } : null}
               onFork={!historyView.recovering && space === "code"
                 ? forkFromTurn : undefined} />
 
-            <Suspense fallback={(goalUi?.revealed || goalUi?.open)
+            <Suspense fallback={((goalUi?.revealed && !completedGoalRetired)
+                || goalUi?.open || planProgress)
               ? <span className="goal-suspense" role="status"
-                  aria-label="正在加载 Goal" /> : null}>
+                  aria-label={planProgress ? "正在加载计划进度" : "正在加载 Goal"} />
+              : null}>
               <GoalPanel engine={focusedEngine} goal={rt.goal}
                 revealed={!!goalUi?.revealed} open={!!goalUi?.open}
                 loading={!!goalUi?.loading}
+                completedGoalRetired={completedGoalRetired}
+                plan={planProgress}
+                onLoadPlanDetail={planProgress?.needsDetail
+                    && !planProgress.detailLoading && !historyView.recovering
+                  ? () => {
+                      if (planProgressSource === "history") {
+                        loadHistoryTurnDetail(planProgress.turnId);
+                      } else {
+                        loadRuntimeTurnDetail(planProgress.turnId);
+                      }
+                    }
+                  : undefined}
                 onOpen={() => {
                   rememberFocusedGoalUi();
                   requestFocusedGoal();

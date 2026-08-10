@@ -30,8 +30,9 @@ from cc_remote.protocol import (
     serialize, deserialize,
     GetHistory, GetHistoryImage, GetTurnDetail, History, HistoryImage,
     TurnDetail, HistoryInvalidated,
-    UserMsg, AssistantMsgStart, AssistantMsgEnd, Delta, ProcessEvent,
-    TurnBinding, TurnEnd, TurnResult, Error, is_downstream,
+    UserMsg, TurnSteered, AssistantMsgStart, AssistantMsgEnd, Delta,
+    ProcessEvent, TurnPlan, TurnBinding, TurnEnd, TurnResult, Error,
+    is_downstream,
 )
 from cc_remote.wrapper import machine as mm
 from cc_remote.wrapper import stream as stream_module
@@ -1219,6 +1220,188 @@ def test_requested_codex_summary_uses_official_turns_without_rollout_parse(
         assert history.has_more is True
         assert all(row["type"] in {"model", "effort"}
                    for row in history.events)
+
+    asyncio.run(run())
+
+
+def test_codex_plan_snapshot_survives_native_summary_omission():
+    """A fresh browser recovers a live plan absent from app-server history."""
+    events = (
+        UserMsg(
+            sid="plan-summary", msg_id="user-1", prompt="implement",
+        ).model_dump(mode="json"),
+        TurnEnd(
+            sid="plan-summary",
+            turn_id="native-1",
+            result=TurnResult(
+                subtype="success", duration_ms=1000, is_error=False),
+        ).model_dump(mode="json"),
+    )
+
+    class Official:
+        async def summary_page(self, _sid, **_kwargs):
+            return CodexHistoryPage(
+                events=events,
+                turns=materialize_history_turns(events),
+                has_more=False,
+                oldest_id="user-1",
+                newest_id="user-1",
+            )
+
+    async def run():
+        machine, transport = _mk_machine()
+        machine._codex_history = Official()
+        ctx = _mk_ctx("plan-summary", "plan-summary")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+
+        await machine._emit_locked(ctx, TurnPlan(
+            item_id="plan:native-1",
+            turn_id="native-1",
+            explanation="current phase",
+            plan=[
+                {"step": "inspect", "status": "completed"},
+                {"step": "implement", "status": "inProgress"},
+            ],
+        ))
+        # Re-open the on-disk store to prove this is not the live ring event.
+        machine._session_plans = type(machine._session_plans)(
+            machine.cfg.state_dir)
+
+        history = await machine._handle_get_history(SimpleNamespace(
+            session_id="plan-summary",
+            client_id="client-1",
+            before=None,
+            limit=4,
+            cwd=ctx.cwd,
+            detail="summary",
+        ))
+
+        plans = [
+            block
+            for turn in history.turns
+            for block in turn.blocks
+            if block.get("kind") == "process"
+            and block.get("processKind") == "plan"
+        ]
+        assert len(plans) == 1
+        assert plans[0]["item_id"] == "plan:native-1"
+        assert plans[0]["plan"][1] == {
+            "step": "implement", "status": "inProgress"}
+        assert history.to == "client-1"
+        assert transport.sent[-1] is history
+
+    asyncio.run(run())
+
+
+def test_codex_next_user_boundary_retires_only_completed_plan_snapshot():
+    async def run():
+        machine, _transport = _mk_machine()
+        ctx = _mk_ctx("plan-lifecycle", "plan-lifecycle")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+
+        await machine._emit_locked(ctx, TurnPlan(
+            item_id="plan:turn-1",
+            turn_id="turn-1",
+            explanation="done",
+            plan=[{"step": "ship", "status": "completed"}],
+        ))
+        assert machine._session_plans.get("plan-lifecycle") is not None
+
+        # Replaying the owning user boundary is not a later message. Codex
+        # carries its native owner separately from the browser/history ids.
+        await machine._emit_locked(ctx, TurnBinding(
+            msg_id="browser-turn-1", turn_id="turn-1"))
+        await machine._emit_locked(ctx, UserMsg(
+            msg_id="history-user-1",
+            client_msg_id="browser-turn-1",
+            prompt="original task",
+        ))
+        assert machine._session_plans.get("plan-lifecycle") is not None
+
+        await machine._emit_locked(ctx, UserMsg(
+            msg_id="turn-2", prompt="next task"))
+        assert machine._session_plans.get("plan-lifecycle") is None
+
+        await machine._emit_locked(ctx, TurnPlan(
+            item_id="plan:turn-3",
+            turn_id="turn-3",
+            explanation="still running",
+            plan=[
+                {"step": "inspect", "status": "completed"},
+                {"step": "fix", "status": "inProgress"},
+            ],
+        ))
+        await machine._emit_locked(ctx, UserMsg(
+            msg_id="turn-4", prompt="clarification"))
+        assert machine._session_plans.get("plan-lifecycle") is not None
+
+        await machine._emit_locked(ctx, TurnPlan(
+            item_id="plan:turn-5",
+            turn_id="turn-5",
+            explanation="done again",
+            plan=[{"step": "verify", "status": "completed"}],
+        ))
+        await machine._emit_locked(ctx, TurnSteered(
+            msg_id="steer-1", turn_id="turn-5", prompt="next request"))
+        assert machine._session_plans.get("plan-lifecycle") is None
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("plan_turn_id", ["native-1", None])
+def test_completed_codex_plan_is_not_rebound_without_matching_owner(
+    plan_turn_id,
+):
+    events = (
+        UserMsg(
+            sid="stale-plan-summary", msg_id="user-2", prompt="next task",
+        ).model_dump(mode="json"),
+        TurnEnd(
+            sid="stale-plan-summary",
+            turn_id="native-2",
+            result=TurnResult(
+                subtype="success", duration_ms=1000, is_error=False),
+        ).model_dump(mode="json"),
+    )
+
+    class Official:
+        async def summary_page(self, _sid, **_kwargs):
+            return CodexHistoryPage(
+                events=events,
+                turns=materialize_history_turns(events),
+                has_more=True,
+                oldest_id="user-2",
+                newest_id="user-2",
+            )
+
+    async def run():
+        machine, _transport = _mk_machine()
+        machine._codex_history = Official()
+        ctx = _mk_ctx("stale-plan-summary", "stale-plan-summary")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+        machine._session_plans.put("stale-plan-summary", TurnPlan(
+            item_id="plan:native-1",
+            turn_id=plan_turn_id,
+            explanation="old completed task",
+            plan=[{"step": "old", "status": "completed"}],
+        ))
+
+        history = await machine._handle_get_history(SimpleNamespace(
+            session_id="stale-plan-summary",
+            client_id="client-1",
+            before=None,
+            limit=4,
+            cwd=ctx.cwd,
+            detail="summary",
+        ))
+        assert all(
+            block.get("processKind") != "plan"
+            for turn in history.turns
+            for block in turn.blocks
+        )
 
     asyncio.run(run())
 

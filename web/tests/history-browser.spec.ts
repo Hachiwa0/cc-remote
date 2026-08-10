@@ -3013,6 +3013,40 @@ test("plan progress uses a compact popover that closes outside", async ({
   await expect(popover).toHaveCount(0);
 });
 
+test("a long active turn keeps its plan beside the composer", async ({ page }) => {
+  await page.goto("/tests/history-browser.html?persistent-plan=1");
+  const thread = page.locator(".thread");
+  await thread.evaluate((node) => { node.scrollTop = node.scrollHeight; });
+  await expect.poll(() => thread.evaluate((node) => node.scrollTop))
+    .toBeGreaterThan(200);
+  await expect(page.locator('[data-turn-id="persistent-plan"]')
+    .getByRole("button", { name: /查看计划进度/ })).toHaveCount(0);
+
+  const chip = page.getByRole("button", { name: /查看计划进度/ });
+  await expect(chip).toBeVisible();
+  await chip.click();
+  await expect(page.getByRole("dialog", { name: "计划进度" }))
+    .toContainText("验证计划弹层");
+});
+
+test("an old session lifts its earlier plan out of the first message", async ({
+  page,
+}, testInfo) => {
+  await page.goto("/tests/history-browser.html?historical-plan=1");
+
+  const chip = page.getByRole("button", { name: /查看计划进度/ });
+  await expect(chip).toBeVisible();
+  await scrollThreadToEdge(page, "start", testInfo.project.name);
+  const planTurn = page.locator('[data-turn-id="historical-plan"]');
+  await expect(planTurn).toBeVisible();
+  await expect(planTurn.getByRole("button", { name: /查看计划进度/ }))
+    .toHaveCount(0);
+
+  await chip.click();
+  await expect(page.getByRole("dialog", { name: "计划进度" }))
+    .toContainText("验证计划弹层");
+});
+
 test("iOS pointercancel releases the plan trigger without opening it", async ({
   page,
 }, testInfo) => {
@@ -3070,6 +3104,128 @@ test("only the selected plan block moves into the compact popover", async ({
   await page.goto("/tests/history-browser.html?plan-ui=mixed");
   await page.locator(".turn-process-head").click();
   await expect(page.getByText("旧版计划", { exact: true })).toBeVisible();
+});
+
+test("a turn plan without a Goal stays in a compact session-level strip", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?goal-ui=1&goal-status=none&plan=1");
+  const chip = page.getByRole("button", { name: /查看计划进度/ });
+  await expect(chip).toBeVisible();
+  await expect(chip).toContainText("实现固定入口");
+  const box = await chip.boundingBox();
+  if (!box) throw new Error("plan strip has no geometry");
+  expect(box.height).toBeLessThanOrEqual(42);
+
+  await chip.click();
+  await expect(page.getByTestId("plan-detail-requests")).toHaveText("1");
+  const dialog = page.getByRole("dialog", { name: "计划进度" });
+  await expect(dialog).toBeVisible();
+  await expect(dialog).toContainText("1 / 3");
+  await expect(dialog).toContainText("完成浏览器回归");
+  await expect(page.locator(".scrim.show")).toHaveCount(0);
+  await expect(page.locator(".plan-sheet")).toHaveCount(0);
+  const dialogBox = await dialog.boundingBox();
+  if (!dialogBox) throw new Error("plan popover has no geometry");
+  // Fractional device scaling can report 320.000015px for a 320px CSS box.
+  expect(dialogBox.width).toBeLessThan(321);
+  expect(await dialog.evaluate((node) =>
+    getComputedStyle(node).animationName)).toBe("panel-in");
+  const openChipBox = await chip.boundingBox();
+  if (!openChipBox) throw new Error("open plan strip has no geometry");
+  expect(Math.abs(openChipBox.x - box.x)).toBeLessThan(1);
+  expect(Math.abs(openChipBox.y - box.y)).toBeLessThan(1);
+
+  await chip.click();
+  await expect(dialog).toHaveCount(0);
+});
+
+test("a completed session Plan disappears when the next message begins", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?plan-lifecycle=1");
+  const chip = page.getByRole("button", { name: /查看计划进度/ });
+  await expect(chip).toBeVisible();
+  await expect(chip.locator(".plan-chip-ring.complete")).toHaveCount(1);
+  await expect(chip).toContainText("2 / 2");
+
+  await page.getByTestId("send-next-plan-message").click();
+  await expect(chip).toHaveCount(0);
+});
+
+test("an existing Goal owns the turn plan in its detail sheet", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?goal-ui=1&plan=1");
+  await expect(page.getByRole("button", { name: /查看计划进度/ }))
+    .toHaveCount(0);
+  await page.getByRole("button", { name: /查看 Goal/ }).click();
+  const dialog = page.getByRole("dialog", { name: "Codex Goal" });
+  const planEntry = dialog.getByRole("button", { name: /查看计划进度/ });
+  await expect(planEntry).toBeVisible();
+  await expect(planEntry).toContainText("实现固定入口");
+  await expect(page.getByTestId("plan-detail-requests")).toHaveText("0");
+  await planEntry.click();
+  await expect(page.getByTestId("plan-detail-requests")).toHaveText("1");
+  await expect(dialog.getByLabel("计划执行状态")).toContainText("1 / 3");
+  await expect(dialog.getByLabel("计划执行状态"))
+    .toContainText("实现固定入口");
+});
+
+test("a completed Goal keeps the Plan from its own final turn", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?goal-ui=1&goal-status=complete&plan=1");
+  await expect(page.getByRole("button", { name: /查看 Goal/ })).toBeVisible();
+  await expect(page.getByRole("button", { name: /查看计划进度/ }))
+    .toHaveCount(0);
+
+  await page.getByRole("button", { name: /查看 Goal/ }).click();
+  await expect(page.getByRole("dialog", { name: "Codex Goal" })
+    .getByRole("button", { name: /查看计划进度/ })).toBeVisible();
+});
+
+test("a new turn retires its completed Goal and owns a standalone Plan", async ({
+  page,
+}) => {
+  await page.goto(
+    "/tests/history-browser.html?goal-ui=1&goal-status=complete&plan=1&goal-next-turn=1",
+  );
+  await expect(page.getByRole("button", { name: /查看 Goal/ })).toHaveCount(0);
+
+  const plan = page.getByRole("button", { name: /查看计划进度/ });
+  await expect(plan).toBeVisible();
+  await expect(plan).toContainText("实现固定入口");
+  await plan.click();
+  await expect(page.getByRole("dialog", { name: "计划进度" }))
+    .toContainText("完成浏览器回归");
+  await expect(page.getByRole("dialog", { name: "Codex Goal" })).toHaveCount(0);
+});
+
+test("a long Goal keeps its merged plan in the detail sheet first viewport", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?goal-ui=1&plan=1&goal-long=1");
+  await page.getByRole("button", { name: /查看 Goal/ }).click();
+
+  const dialog = page.getByRole("dialog", { name: "Codex Goal" });
+  const planEntry = dialog.getByRole("button", { name: /查看计划进度/ });
+  await expect(planEntry).toContainText("实现固定入口");
+  await expect(planEntry).toBeInViewport();
+  await expect(dialog.locator(".goal-sheet-scroll"))
+    .toHaveJSProperty("scrollTop", 0);
+  await planEntry.click();
+  await expect(dialog.getByLabel("计划执行状态"))
+    .toContainText("实现固定入口");
+});
+
+test("a hidden Goal cannot make the current plan inaccessible", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?goal-ui=1&goal-hidden=1&plan=1");
+  await expect(page.getByRole("button", { name: /查看 Goal/ })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /查看计划进度/ }))
+    .toBeVisible();
 });
 
 test("goal entry stays compact and opens its editor", async ({ page }) => {

@@ -111,7 +111,8 @@ from cc_remote.protocol import (
     GoalState, ReplayStart, ReplayEnd, Snapshot, StateEvent, State,
     TakeoverState, SessionControl,
     UserMsg, TurnSteered,
-    ToolUse, ToolResult, ProcessEvent, TurnBinding, TurnEnd, TurnNotificationContext,
+    ToolUse, ToolResult, ProcessEvent, TurnPlan, TurnBinding, TurnEnd,
+    TurnNotificationContext,
     TurnResult, is_downstream,
     is_reliable_command,
     SessionInfo, SessionList, SessionListInvalidated, SessionActivity,
@@ -125,6 +126,10 @@ from cc_remote.protocol import (
 )
 from cc_remote.wrapper.ringbuffer import RingBuffer
 from cc_remote.wrapper.session_pins import SessionPinStore, SessionPinStoreError
+from cc_remote.wrapper.session_plans import (
+    SessionPlanStore,
+    SessionPlanStoreError,
+)
 from cc_remote.wrapper.claude_controls import (
     ClaudeControlStore,
     ClaudeControlStoreError,
@@ -1600,6 +1605,14 @@ class WrapperMachine:
         except SessionPinStoreError:
             self._session_pins = None
             log.exception("session pin store unavailable")
+        try:
+            self._session_plans: SessionPlanStore | None = SessionPlanStore(
+                self.cfg.state_dir)
+        except SessionPlanStoreError:
+            # Codex plan notifications are presentation state. A damaged
+            # private cache must not prevent users from reaching their engine.
+            self._session_plans = None
+            log.exception("session plan store unavailable")
         try:
             self._claude_controls: ClaudeControlStore | None = (
                 ClaudeControlStore(self.cfg.state_dir)
@@ -5688,6 +5701,61 @@ class WrapperMachine:
                           type=getattr(msg, "type", None))
                 return
             msg.to = ctx.owner_client_id
+        if (
+            isinstance(msg, (UserMsg, TurnSteered))
+            and ctx.engine == "codex"
+            and not ctx.btw
+            and self._session_plans is not None
+            and msg.sid
+        ):
+            if isinstance(msg, UserMsg):
+                current_ids = {
+                    value
+                    for value in (msg.msg_id, msg.client_msg_id)
+                    if value
+                }
+                binding = ctx.active_turn_binding
+                if (
+                    binding is not None
+                    and binding.generation == self.instance_id
+                    and binding.msg_id in current_ids
+                ):
+                    current_ids.add(binding.turn_id)
+                current_turn_ids = frozenset(current_ids)
+            else:
+                current_turn_ids = frozenset()
+            try:
+                # Completed Plan state belongs to the task which just ended.
+                # Retire it before broadcasting the next user boundary so a
+                # reconnect cannot recover the old green monitor.
+                await asyncio.to_thread(
+                    self._session_plans.retire_completed,
+                    msg.sid,
+                    current_turn_ids=current_turn_ids,
+                )
+            except SessionPlanStoreError:
+                log.warning(
+                    "Codex completed plan snapshot could not be retired",
+                    session_id=msg.sid,
+                )
+        if (
+            isinstance(msg, TurnPlan)
+            and ctx.engine == "codex"
+            and not ctx.btw
+            and self._session_plans is not None
+            and msg.sid
+        ):
+            try:
+                # Persist before broadcasting: a browser which paints this
+                # update and immediately reconnects must not lose the control.
+                await asyncio.to_thread(self._session_plans.put, msg.sid, msg)
+            except SessionPlanStoreError:
+                # Losing the optional recovery snapshot must not drop the live
+                # plan notification or abort the model turn.
+                log.warning(
+                    "Codex session plan snapshot could not be persisted",
+                    session_id=msg.sid,
+                )
         if isinstance(msg, TurnEnd):
             # The replayable object is deliberately notification-free. Only a
             # copy sent on this live call receives presentation metadata.
@@ -9958,6 +10026,62 @@ class WrapperMachine:
         # Routing and command correlation are requester-specific; never mutate
         # the shared task's History instance in place.
         hist = template.model_copy(deep=True)
+        if (
+            hist.authoritative is not False
+            and hist.detail == "summary"
+            and not hist.before
+            and hist.turns
+            and self._session_plans is not None
+        ):
+            try:
+                snapshot = await asyncio.to_thread(
+                    self._session_plans.get, sid)
+            except SessionPlanStoreError:
+                snapshot = None
+                log.warning(
+                    "Codex session plan snapshot could not be read",
+                    session_id=sid,
+                )
+            if snapshot is not None:
+                turns = list(hist.turns)
+                target_index = None
+                if snapshot.turn_id:
+                    for index in range(len(turns) - 1, -1, -1):
+                        turn = turns[index]
+                        if snapshot.turn_id in {
+                            turn.id,
+                            turn.clientMsgId,
+                            turn.forkPointId,
+                        }:
+                            target_index = index
+                            break
+                # An unfinished Plan may legitimately span several steer turns
+                # after its owner fell off the newest page. A completed Plan
+                # must never be rebound to an unrelated newest turn: that would
+                # resurrect it after the user already started another task.
+                if target_index is None and not snapshot.complete:
+                    target_index = len(turns) - 1
+                if target_index is not None:
+                    target = turns[target_index]
+                    block = snapshot.as_process_block()
+                    blocks = [
+                        dict(existing)
+                        for existing in target.blocks
+                        if not (
+                            existing.get("kind") == "process"
+                            and existing.get("item_id") == snapshot.item_id
+                        )
+                    ]
+                    if len(blocks) >= 32:
+                        drop = next((
+                            index for index, existing in enumerate(blocks)
+                            if existing.get("kind") != "text"
+                        ), 0)
+                        blocks.pop(drop)
+                    blocks.append(block)
+                    turns[target_index] = target.model_copy(
+                        update={"blocks": blocks})
+                    hist.turns = turns
         client_id = getattr(cmd, "client_id", None)
         if client_id:
             hist.to = client_id            # relay routes it to just this client
@@ -17219,6 +17343,16 @@ class WrapperMachine:
                 rekey_goal(sid)
             save_session_id(self.cfg.state_dir, ctx.cwd, sid)
         if old_key and old_key != route_sid:
+            if self._session_plans is not None:
+                try:
+                    await asyncio.to_thread(
+                        self._session_plans.move, old_key, route_sid)
+                except SessionPlanStoreError:
+                    log.warning(
+                        "temporary session plan snapshot rekey failed",
+                        old_key=old_key,
+                        session_id=route_sid,
+                    )
             await self._rekey_preview_session(ctx, old_key, route_sid)
             self._remember_session_alias(old_key, route_sid, ctx.cwd)
             self.sessions.pop(old_key, None)
@@ -17932,6 +18066,12 @@ class WrapperMachine:
             except CodexControlStoreError:
                 log.warning(
                     "stale Codex controls cleanup failed", session_id=sid)
+        if engine == "codex" and self._session_plans is not None:
+            try:
+                await asyncio.to_thread(self._session_plans.delete, sid)
+            except SessionPlanStoreError:
+                log.warning(
+                    "stale Codex plan cleanup failed", session_id=sid)
         if self._session_pins is not None:
             try:
                 await asyncio.to_thread(
@@ -18257,6 +18397,14 @@ class WrapperMachine:
 
         if invalidate_conversation:
             ctx.active_msg_id = None
+            if ctx.engine == "codex" and self._session_plans is not None:
+                try:
+                    await asyncio.to_thread(self._session_plans.delete, sid)
+                except SessionPlanStoreError:
+                    log.warning(
+                        "Codex plan cleanup after rollback failed",
+                        session_id=sid,
+                    )
             try:
                 self._resync_watch(sid)
             except Exception as exc:

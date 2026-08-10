@@ -589,6 +589,7 @@ export function ProcessTimeline({ blocks, done, active, durationMs, startTs, don
   imageAssets, onLoadImage, onAuthorizeImage, onPreviewImage, engine = "claude",
   historyTurnId, historyImageAssets, onLoadHistoryImage,
   onPreviewHistoryImage,
+  externalPlanItemId,
   openOverride, onOpenChange, itemOpen, onItemOpenChange,
   onInteractionStart, onInteractionEnd }: {
   blocks: Block[];
@@ -624,6 +625,8 @@ export function ProcessTimeline({ blocks, done, active, durationMs, startTs, don
   ) => boolean;
   onPreviewHistoryImage?: (turnId: string, imageId: string) => void;
   engine?: "claude" | "codex";
+  /** The session-level progress strip owns this plan instead of this row. */
+  externalPlanItemId?: string | null;
   openOverride?: boolean;
   onOpenChange?: (open: boolean) => void;
   itemOpen?: (key: string) => boolean | undefined;
@@ -663,6 +666,8 @@ export function ProcessTimeline({ blocks, done, active, durationMs, startTs, don
   // transition; otherwise one click makes its own popover disappear briefly.
   if (planBlock) retainedPlanBlock.current = planBlock;
   const visiblePlanBlock = planBlock ?? retainedPlanBlock.current;
+  const inlinePlanBlock = visiblePlanBlock?.item_id === externalPlanItemId
+    ? null : visiblePlanBlock;
   const timelineItems = planBlock
     ? items.filter((block) => block !== planBlock)
     : items;
@@ -717,7 +722,7 @@ export function ProcessTimeline({ blocks, done, active, durationMs, startTs, don
   const showOuterDisclosure = timelineItems.length > 0
     || hasDeferredOnly || waitingForContent || !!visibleDetailError
     || canLoadEarlier || canLoadNewer;
-  if (!visiblePlanBlock && !showOuterDisclosure
+  if (!inlinePlanBlock && !showOuterDisclosure
       && !visibleDetailError) return null;
   // A completed timeline is collapsed. Do not allocate/group hundreds of
   // historical rows until the user actually opens it.
@@ -849,10 +854,10 @@ export function ProcessTimeline({ blocks, done, active, durationMs, startTs, don
           <span className="turn-process-count">{countLabel}</span>
           <Icon name="chev" size={15} />
         </button>}
-        {visiblePlanBlock && <PlanProgressPopover block={visiblePlanBlock}
-          openOverride={itemOpen?.(`plan:${visiblePlanBlock.item_id}`)}
+        {inlinePlanBlock && <PlanProgressPopover block={inlinePlanBlock}
+          openOverride={itemOpen?.(`plan:${inlinePlanBlock.item_id}`)}
           onOpenChange={(next) => onItemOpenChange?.(
-            `plan:${visiblePlanBlock.item_id}`, next)}
+            `plan:${inlinePlanBlock.item_id}`, next)}
           detailLoading={detailLoading}
           onNeedDetail={needsAuthoritativeDetail && !detailLoading
             ? requestDetail : undefined} />}

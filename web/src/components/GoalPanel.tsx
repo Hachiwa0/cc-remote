@@ -1,6 +1,12 @@
-import { useEffect, useState, type CSSProperties } from "react";
+import { useEffect, useId, useRef, useState, type CSSProperties } from "react";
 import type { GoalStatus, ThreadGoal } from "../protocol";
 import { Icon } from "../icons";
+import type { TurnPlanProgress } from "../plan-progress";
+import { planProgressPresentation } from "../plan-progress";
+import {
+  PlanProgressContent,
+  PlanProgressFloatingCard,
+} from "./PlanProgressPopover";
 
 interface Props {
   engine: "claude" | "codex";
@@ -8,6 +14,9 @@ interface Props {
   revealed: boolean;
   open: boolean;
   loading?: boolean;
+  completedGoalRetired?: boolean;
+  plan?: TurnPlanProgress | null;
+  onLoadPlanDetail?: () => void;
   onOpen: () => void;
   onClose: () => void;
   onDismiss: () => void;
@@ -36,25 +45,71 @@ export function GoalPanel(p: Props) {
   const [objective, setObjective] = useState("");
   const [status, setStatus] = useState<GoalStatus>("active");
   const [budget, setBudget] = useState("");
+  const [planOpen, setPlanOpen] = useState(false);
+  const planChipRef = useRef<HTMLButtonElement>(null);
+  const planPopoverId = useId();
   useEffect(() => {
     setObjective(p.goal?.objective ?? "");
     setStatus(p.goal?.status ?? "active");
     setBudget(p.goal?.tokenBudget ? String(p.goal.tokenBudget) : "");
   }, [p.goal, p.open]);
+  // Authoritative detail may replace a provisional plan item id inside the
+  // same turn. Keep the sheet open across that refresh; only a new turn owns a
+  // genuinely different plan entry.
+  useEffect(() => setPlanOpen(false), [p.plan?.turnId]);
 
-  if (!p.revealed && !p.open) return null;
+  const goalRevealed = p.revealed && !p.completedGoalRetired;
+  // An explicit /goal read may still open the completed Goal for inspection,
+  // but a Plan owned by the next task must remain a separate monitor.
+  const planMergedIntoGoal = !!p.plan && !p.completedGoalRetired
+    && (goalRevealed || p.open);
+  const standalonePlan = planMergedIntoGoal ? null : p.plan;
+  useEffect(() => {
+    if (planMergedIntoGoal && !p.open) setPlanOpen(false);
+  }, [planMergedIntoGoal, p.open]);
+  if (!goalRevealed && !p.open && !standalonePlan) return null;
   const goal = p.goal;
   const used = goal?.tokensUsed ?? 0;
   const total = goal?.tokenBudget ?? null;
   const progress = total ? Math.min(100, used / total * 100) : null;
   const visualProgress = goal?.status === "complete" ? 100 : progress;
   const engineName = p.engine === "codex" ? "Codex" : "Claude";
+  const planPresentation = p.plan
+    ? planProgressPresentation(p.plan.block, p.plan.detailLoading) : null;
+  const openGoal = () => p.onOpen();
 
   return <>
-    {p.revealed && !goal &&
+    {standalonePlan && planPresentation && (
+      <div className="goal-chip-wrap plan-chip-wrap">
+        <button ref={planChipRef} type="button" className="goal-chip plan-chip"
+          aria-expanded={planOpen} aria-controls={planPopoverId}
+          onClick={() => {
+            const next = !planOpen;
+            if (next) p.onLoadPlanDetail?.();
+            setPlanOpen(next);
+          }} aria-label={`查看计划进度，${planPresentation.progressLabel}`}>
+          <span className={`goal-chip-ring plan-chip-ring${planPresentation.complete ? " complete" : ""}${planPresentation.failed ? " failed" : ""}`}
+            aria-hidden="true"
+            style={{ "--goal-progress": `${planPresentation.progress * 3.6}deg` } as CSSProperties}>
+            <Icon name={planPresentation.complete ? "verify" : "plan"} size={11} />
+          </span>
+          <span className="goal-chip-label">计划</span>
+          <span className="goal-chip-objective">
+            {planPresentation.currentStep ?? planPresentation.description
+              ?? planPresentation.stateLabel}
+          </span>
+          <span className="goal-chip-status">{planPresentation.progressLabel}</span>
+        </button>
+        <PlanProgressFloatingCard anchorRef={planChipRef}
+          block={standalonePlan.block} open={planOpen}
+          onOpenChange={setPlanOpen} id={planPopoverId}
+          detailLoading={standalonePlan.detailLoading} compact />
+      </div>
+    )}
+    {goalRevealed && !goal &&
       <div className="goal-chip-wrap goal-loading" role="status"
         aria-label={p.loading ? "正在恢复 Goal" : "Goal 暂时不可用，可重试"}>
-        <button className="goal-chip goal-chip-loading" onClick={p.onOpen}>
+        <button className="goal-chip goal-chip-loading" onClick={openGoal}>
           <span className="goal-chip-dot goal-chip-dot-active" aria-hidden="true" />
           <span className="goal-chip-label">Goal</span>
           <span className="goal-chip-objective">
@@ -62,8 +117,8 @@ export function GoalPanel(p: Props) {
           </span>
         </button>
       </div>}
-    {p.revealed && goal && <div className={`goal-chip-wrap goal-${goal.status}`}>
-      <button className="goal-chip" onClick={p.onOpen}
+    {goalRevealed && goal && <div className={`goal-chip-wrap goal-${goal.status}`}>
+      <button className="goal-chip" onClick={openGoal}
         aria-label={`查看 Goal，${statusName[goal.status]}`}>
         {visualProgress != null
           ? <span className={`goal-chip-ring goal-chip-ring-${goal.status}`}
@@ -94,6 +149,37 @@ export function GoalPanel(p: Props) {
         </header>
 
         <div className="goal-sheet-scroll">
+          {p.plan && planPresentation && <section className="goal-plan-section">
+            <button type="button" className="goal-plan-entry"
+              aria-expanded={planOpen}
+              aria-label={`查看计划进度，${planPresentation.progressLabel}`}
+              onClick={() => {
+                const next = !planOpen;
+                if (next) p.onLoadPlanDetail?.();
+                setPlanOpen(next);
+              }}>
+              <span className={`goal-chip-ring plan-chip-ring${planPresentation.complete ? " complete" : ""}${planPresentation.failed ? " failed" : ""}`}
+                aria-hidden="true"
+                style={{ "--goal-progress": `${planPresentation.progress * 3.6}deg` } as CSSProperties}>
+                <Icon name={planPresentation.complete ? "verify" : "plan"} size={11} />
+              </span>
+              <span className="goal-plan-entry-copy">
+                <b>计划</b>
+                <small>{planPresentation.currentStep
+                  ?? planPresentation.description
+                  ?? planPresentation.stateLabel}</small>
+              </span>
+              <strong>{planPresentation.progressLabel}</strong>
+              <span className={`goal-plan-entry-chev${planOpen ? " open" : ""}`}
+                aria-hidden="true"><Icon name="chev" size={15} /></span>
+            </button>
+            {planOpen && <div className="goal-plan-expanded"
+              aria-label="计划执行状态">
+              <PlanProgressContent block={p.plan.block}
+                detailLoading={p.plan.detailLoading} />
+            </div>}
+          </section>}
+
           {goal && <div className="goal-overview">
             <div className="goal-overview-row">
               <span className={`goal-status goal-status-${goal.status}`}>{statusName[goal.status]}</span>
