@@ -42,9 +42,13 @@ import {
 } from "../src/history-browse.ts";
 import {
   acknowledgeCompletion,
+  acknowledgeMatchingCompletion,
+  catalogCompletionProjection,
+  completionAcknowledgementId,
   completionBadgeKind,
   discardBtwCompletionReceipts,
   markCompletionUnread,
+  newestCompletionProjection,
   rekeyCompletionReceipts,
 } from "../src/completion-badges.ts";
 import { imageDimensions } from "../src/img.ts";
@@ -71,6 +75,7 @@ import {
 } from "../src/cache.ts";
 import {
   boundRuntimeTurns,
+  MAX_RUNTIME_SESSIONS,
   MAX_RUNTIME_TURNS,
   pruneRuntimeMap,
 } from "../src/runtime-bounds.ts";
@@ -283,6 +288,15 @@ assert.equal(discoveredGoal.revealed, true,
   "an authoritative Goal must reveal itself on a new browser or device");
 assert.equal(discoveredGoal.preferences[goalScopeA]?.known, true,
   "Goal discovery must survive a refresh without requiring /goal");
+const remotelyDismissedGoal = reconcileGoalUiPreference(
+  {}, goalScopeOtherMachine, persistedGoal, 10, true);
+assert.equal(remotelyDismissedGoal.revealed, false,
+  "a server dismissal must hide the same Goal on a fresh device");
+assert.equal(
+  remotelyDismissedGoal.preferences[goalScopeOtherMachine]?.hiddenGoal,
+  goalStableIdentity(persistedGoal),
+  "the fresh device caches only the opaque local Goal fingerprint",
+);
 let goalPreferences = rememberGoalUi(discoveredGoal.preferences, goalScopeA, 10);
 let reconciledGoal = reconcileGoalUiPreference(
   goalPreferences, goalScopeA, persistedGoal, 11);
@@ -386,13 +400,107 @@ assert.ok(sessionActivityTime("1752746400000") > sessionActivityTime("1752746399
   "millisecond and second timestamps must share one ordering scale");
 
 let completionReceipts = markCompletionUnread(
-  {}, "parent-a", "parent-a", "main");
+  {}, "parent-a", "parent-a", "main", "turn-a");
 completionReceipts = markCompletionUnread(
   completionReceipts, "parent-a", "btw-a", "btw");
 completionReceipts = markCompletionUnread(
   completionReceipts, "parent-b", "btw-b", "btw");
 assert.equal(completionBadgeKind(completionReceipts["parent-a"]), "both");
 assert.equal(completionBadgeKind(completionReceipts["parent-b"]), "btw");
+assert.equal(completionBadgeKind(
+  { main: true, mainCompletionId: "turn-new", mainTurnEndSeq: 10,
+    mainTurnEndGeneration: "generation-1", btwSids: [] }, false), "main",
+  "a newer local completion remains visible while its authoritative frame is delayed");
+assert.equal(completionBadgeKind(
+  { main: false, mainCompletionId: null, mainTurnEndSeq: null,
+    mainTurnEndGeneration: null, btwSids: [] }, true), "main",
+  "an authoritative unread completion remains visible without a local fallback");
+assert.equal(completionAcknowledgementId(
+  completionReceipts["parent-a"], undefined), "turn-a",
+  "a missed completion_state can be acknowledged from its turn_end fallback");
+assert.equal(completionAcknowledgementId(
+  completionReceipts["parent-a"], { id: "turn-new", unread: true }),
+  "turn-new", "a newer authoritative completion wins over the fallback id");
+const newerLocalCompletion = markCompletionUnread(
+  {}, "catalog-race", "catalog-race", "main", "turn-new");
+const staleReadProjection = newestCompletionProjection(undefined, {
+  id: "turn-old", unread: false, revision: 2,
+});
+assert.equal(acknowledgeMatchingCompletion(
+  newerLocalCompletion, "catalog-race", staleReadProjection),
+newerLocalCompletion,
+"a delayed catalog acknowledgement cannot clear a newer local completion");
+assert.equal(acknowledgeMatchingCompletion(
+  newerLocalCompletion, "catalog-race",
+  { id: "turn-new", unread: false, revision: 4 },
+)["catalog-race"], undefined,
+"the matching authoritative read receipt clears its local fallback");
+const newerRuntimeProjection = newestCompletionProjection(
+  { id: "turn-new", unread: true, revision: 5 },
+  { id: "turn-old", unread: false, revision: 4 },
+);
+assert.equal(acknowledgeMatchingCompletion(
+  newerLocalCompletion, "catalog-race", newerRuntimeProjection),
+newerLocalCompletion,
+"runtime revision ordering rejects an older catalog acknowledgement");
+const firstIdentitylessLocalCompletion = markCompletionUnread(
+  {}, "identityless", "identityless", "main", null, 40, "generation-1");
+const identitylessLocalCompletion = markCompletionUnread(
+  firstIdentitylessLocalCompletion,
+  "identityless", "identityless", "main", null, 50, "generation-1",
+);
+assert.equal(
+  identitylessLocalCompletion.identityless.mainTurnEndSeq, 50,
+  "a second null-id completion advances its causal TurnEnd boundary",
+);
+assert.equal(acknowledgeMatchingCompletion(
+  identitylessLocalCompletion, "identityless",
+  { id: "generated-old", unread: false, revision: 3 },
+), identitylessLocalCompletion,
+"an unordered catalog receipt cannot clear a null-id local completion");
+assert.equal(acknowledgeMatchingCompletion(
+  identitylessLocalCompletion, "identityless",
+  { id: "generated-old", unread: false, revision: 3 },
+  { authoritativeSeq: 41, authoritativeGeneration: "generation-1" },
+), identitylessLocalCompletion,
+"an older ordered receipt cannot clear the next null-id completion");
+assert.equal(acknowledgeMatchingCompletion(
+  identitylessLocalCompletion, "identityless",
+  { id: "generated-new", unread: false, revision: 5 },
+  { authoritativeSeq: 51, authoritativeGeneration: "generation-2" },
+), identitylessLocalCompletion,
+"sequence numbers from another wrapper generation are not comparable");
+assert.equal(acknowledgeMatchingCompletion(
+  identitylessLocalCompletion, "identityless",
+  { id: "generated-new", unread: false, revision: 5 },
+  { authoritativeSeq: 51, authoritativeGeneration: "generation-1" },
+)["identityless"], undefined,
+"a causally later CompletionState clears a null-id local fallback");
+const identifiedLocalCompletion = markCompletionUnread(
+  {}, "cleared", "cleared", "main", "turn-cleared", 60, "generation-1");
+assert.equal(acknowledgeMatchingCompletion(
+  identifiedLocalCompletion, "cleared",
+  { id: null, unread: false, revision: 6 },
+), identifiedLocalCompletion,
+"an unordered catalog clear cannot remove an identified local completion");
+assert.equal(acknowledgeMatchingCompletion(
+  identifiedLocalCompletion, "cleared",
+  { id: null, unread: false, revision: 6 },
+  { authoritativeSeq: 59, authoritativeGeneration: "generation-1" },
+), identifiedLocalCompletion,
+"an older clear cannot remove the next identified local completion");
+assert.equal(acknowledgeMatchingCompletion(
+  identifiedLocalCompletion, "cleared",
+  { id: null, unread: false, revision: 6 },
+  { authoritativeSeq: 61, authoritativeGeneration: "generation-2" },
+), identifiedLocalCompletion,
+"a clear from another wrapper generation cannot remove a local completion");
+assert.equal(acknowledgeMatchingCompletion(
+  identifiedLocalCompletion, "cleared",
+  { id: null, unread: false, revision: 6 },
+  { authoritativeSeq: 61, authoritativeGeneration: "generation-1" },
+)["cleared"], undefined,
+"a causally later clear removes an identified local completion");
 completionReceipts = acknowledgeCompletion(
   completionReceipts, "parent-a", { main: true });
 assert.equal(completionBadgeKind(completionReceipts["parent-a"]), "btw",
@@ -405,15 +513,17 @@ completionReceipts = rekeyCompletionReceipts(
   completionReceipts, "parent-b", "parent-real");
 assert.equal(completionReceipts["parent-b"], undefined);
 assert.deepEqual(completionReceipts["parent-real"], {
-  main: false, btwSids: ["btw-b"],
+  main: false, mainCompletionId: null, mainTurnEndSeq: null,
+  mainTurnEndGeneration: null, btwSids: ["btw-b"],
 });
 completionReceipts = markCompletionUnread(
-  completionReceipts, "parent-main", "parent-main", "main");
+  completionReceipts, "parent-main", "parent-main", "main", "turn-main");
 completionReceipts = discardBtwCompletionReceipts(completionReceipts);
 assert.equal(completionReceipts["parent-real"], undefined,
   "a wrapper restart removes receipts for destroyed ephemeral BTW forks");
 assert.deepEqual(completionReceipts["parent-main"], {
-  main: true, btwSids: [],
+  main: true, mainCompletionId: "turn-main", mainTurnEndSeq: null,
+  mainTurnEndGeneration: null, btwSids: [],
 }, "main-session completion receipts survive a wrapper restart");
 
 const processTap = new PointerTapGuard(8);
@@ -1049,6 +1159,12 @@ assert.match(historyAppSource,
 assert.match(historyAppSource,
   /const completedGoalRequest = msg\.request_id[\s\S]{0,300}goalRecoveryRequestsRef\.current\.delete\([\s\S]{0,120}completedGoalRequest\.scopeKey/,
   "a successful Goal recovery must release its focus-scoped dedupe key");
+assert.match(historyAppSource,
+  /legacyDismissed[\s\S]{0,500}sendDismissGoalTo\(/,
+  "a device-local Goal dismissal must migrate into shared wrapper state");
+assert.match(historyAppSource,
+  /completionAcknowledgementId\([\s\S]{0,320}sendAcknowledgeCompletionTo\(/,
+  "viewing a completed session must acknowledge it through the wrapper");
 const codexGoalDescription = commandsFor("codex").flatMap((command) =>
   "slash" in command && command.slash === "goal" ? [command.ds] : [])[0] ?? "";
 assert.match(codexGoalDescription, /\/goal resume/,
@@ -3118,6 +3234,140 @@ try {
   } as ServerEvent);
   assert.equal(createRuntime().sendMode, "steer",
     "Codex running input uses steer mode by default");
+  let desktopCompletion = reduce(initialState, {
+    type: "event",
+    event: event({
+      type: "completion_state",
+      sid: "shared-completion",
+      completion_id: "turn-1",
+      unread: true,
+      revision: 1,
+    }),
+  });
+  let phoneCompletion = reduce(initialState, {
+    type: "event",
+    event: event({
+      type: "completion_state",
+      sid: "shared-completion",
+      completion_id: "turn-1",
+      unread: true,
+      revision: 1,
+    }),
+  });
+  const sharedAcknowledgement = event({
+    type: "completion_state",
+    sid: "shared-completion",
+    completion_id: "turn-1",
+    unread: false,
+    revision: 2,
+  });
+  desktopCompletion = reduce(desktopCompletion, {
+    type: "event", event: sharedAcknowledgement,
+  });
+  phoneCompletion = reduce(phoneCompletion, {
+    type: "event", event: sharedAcknowledgement,
+  });
+  assert.equal(
+    desktopCompletion.runtimes["shared-completion"].completion?.unread,
+    false,
+  );
+  assert.equal(
+    phoneCompletion.runtimes["shared-completion"].completion?.unread,
+    false,
+    "one authoritative acknowledgement clears every browser projection",
+  );
+  const staleCompletion = reduce(phoneCompletion, {
+    type: "event",
+    event: event({
+      type: "completion_state",
+      sid: "shared-completion",
+      completion_id: "turn-1",
+      unread: true,
+      revision: 1,
+    }),
+  });
+  assert.equal(
+    staleCompletion.runtimes["shared-completion"].completion?.unread,
+    false,
+    "a replayed old unread receipt cannot resurrect a cleared badge",
+  );
+  const coldCatalogRepair = reduce(phoneCompletion, {
+    type: "event",
+    event: event({
+      type: "session_list",
+      engine: "codex",
+      space: "code",
+      sessions: [{
+        session_id: "shared-completion",
+        completion_id: "turn-1",
+        completion_unread: false,
+        completion_revision: 3,
+      }],
+    }),
+  });
+  assert.equal(
+    coldCatalogRepair.runtimes["shared-completion"].completion?.revision,
+    3,
+    "a cold catalog repairs a browser which missed the live acknowledgement",
+  );
+  const coldUnreadCatalog = reduce(initialState, {
+    type: "event",
+    event: event({
+      type: "session_list",
+      engine: "claude",
+      space: "code",
+      sessions: [{
+        session_id: "cold-unread",
+        completion_id: "turn-cold",
+        completion_unread: true,
+        completion_revision: 1,
+      }],
+    }),
+  });
+  assert.equal(
+    coldUnreadCatalog.runtimes["cold-unread"],
+    undefined,
+    "a cold receipt must not allocate an otherwise empty runtime",
+  );
+  assert.equal(
+    newestCompletionProjection(
+      undefined,
+      catalogCompletionProjection(coldUnreadCatalog.sessions.find(
+        (session: { session_id: string }) => (
+          session.session_id === "cold-unread"))),
+    )?.unread,
+    true,
+    "an unread cold session must be visible before it is resumed",
+  );
+  const manyColdCatalog = reduce(initialState, {
+    type: "event",
+    event: event({
+      type: "session_list",
+      engine: "claude",
+      space: "code",
+      sessions: Array.from(
+        { length: MAX_RUNTIME_SESSIONS + 5 },
+        (_, index) => ({
+          session_id: `cold-unread-${index}`,
+          completion_id: `turn-cold-${index}`,
+          completion_unread: true,
+          completion_revision: 1,
+        }),
+      ),
+    }),
+  });
+  const prunedColdCatalog = reduce(manyColdCatalog, {
+    type: "prune_runtimes", protectedSids: [],
+  });
+  assert.equal(Object.keys(prunedColdCatalog.runtimes).length, 0);
+  assert.equal(prunedColdCatalog.sessions.filter((session: {
+    completion_id?: string | null;
+    completion_unread?: boolean | null;
+    completion_revision?: number | null;
+  }) => (
+    catalogCompletionProjection(session)?.unread === true
+  )).length, MAX_RUNTIME_SESSIONS + 5,
+    "pruning cannot hide durable cold completion receipts from the sidebar");
   const migrationOwner = {
     scopeKey: "machine:code:codex",
     machineId: "machine",

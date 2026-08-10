@@ -305,6 +305,13 @@ export interface SessionRuntime {
   contextRequestId: string | null;
   contextError: string | null;
   goal: ThreadGoal | null;
+  goalId: string | null;
+  goalDismissed: boolean;
+  completion: {
+    id: string | null;
+    unread: boolean;
+    revision: number;
+  } | null;
   statusReport: StatusReport | null;
   statusRequestId: string | null;
   statusError: string | null;
@@ -415,6 +422,7 @@ export function createRuntime(): SessionRuntime {
     historyNewestId: null,
     pendingQuestion: null, contextReport: null,
     contextRequestId: null, contextError: null, goal: null,
+    goalId: null, goalDismissed: false, completion: null,
     statusReport: null, statusRequestId: null, statusError: null,
     notices: [], sendMode: "steer",
     queue: [], pendingSend: null, failedDeferred: [],
@@ -1489,6 +1497,24 @@ function patch(state: AppState, sid: string | null | undefined,
   }
   fn(rt);
   return { ...state, runtimes: { ...state.runtimes, [key]: rt } };
+}
+
+function applyCompletionProjection(
+  runtime: SessionRuntime,
+  incoming: { id: string | null; unread: boolean; revision: number },
+): void {
+  if (!runtime.completion
+      || incoming.revision > runtime.completion.revision) {
+    runtime.completion = incoming;
+    return;
+  }
+  if (incoming.revision === runtime.completion.revision
+      && incoming.id === runtime.completion.id
+      && incoming.unread === runtime.completion.unread) {
+    return;
+  }
+  // A same-revision conflict is malformed; retain the state already accepted
+  // from this wrapper instead of allowing delivery order to toggle a badge.
 }
 
 /** Install one authoritative control value without allowing an older or
@@ -2913,9 +2939,31 @@ function reduceEvent(
             effort: null,
           }
           : state.newChat;
+      let runtimes = state.runtimes;
+      for (const session of sessions) {
+        if (session.completion_revision == null
+            || session.completion_unread == null) continue;
+        const current = runtimes[session.session_id];
+        // The sidebar reads cold receipts directly from the catalog. Only
+        // merge the revision into an already-resident runtime; allocating one
+        // placeholder per unread row would either defeat the memory bound or
+        // let pruning make durable badges disappear immediately.
+        if (!current) continue;
+        const runtime = { ...current };
+        applyCompletionProjection(runtime, {
+          id: session.completion_id ?? null,
+          unread: session.completion_unread,
+          revision: session.completion_revision,
+        });
+        if (runtime.completion !== current?.completion) {
+          if (runtimes === state.runtimes) runtimes = { ...state.runtimes };
+          runtimes[session.session_id] = runtime;
+        }
+      }
       return {
         ...state,
         sessions,
+        runtimes,
         cwdByScope,
         codexProfiles,
         defaultCodexProfileId,
@@ -4147,7 +4195,19 @@ function reduceEvent(
         }
       });
     case "goal_state":
-      return patch(state, e.sid, (rt) => { rt.goal = e.goal ?? null; });
+      return patch(state, e.sid, (rt) => {
+        rt.goal = e.goal ?? null;
+        rt.goalId = e.goal_id ?? null;
+        rt.goalDismissed = e.dismissed === true;
+      }, true);
+    case "completion_state":
+      return patch(state, e.sid, (rt) => {
+        applyCompletionProjection(rt, {
+          id: e.completion_id ?? null,
+          unread: e.unread === true,
+          revision: e.revision ?? 0,
+        });
+      }, true);
     case "rollback_result": {
       const next = patch(state, e.sid, (rt) => {
         const succeeded = [e.conversation, e.files].filter(

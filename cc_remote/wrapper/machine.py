@@ -108,8 +108,8 @@ from cc_remote.protocol import (
     PreviewAuthorizationRequired, PreviewAuthorizationResult,
     ConversationTurn, History, TurnDetail, HistoryImage,
     HistoryInvalidated, ArtifactInvalidated, AskUser, AskUserClosed,
-    GoalState, ReplayStart, ReplayEnd, Snapshot, StateEvent, State,
-    TakeoverState, SessionControl,
+    GoalState, CompletionState, ReplayStart, ReplayEnd, Snapshot, StateEvent,
+    State, TakeoverState, SessionControl,
     UserMsg, TurnSteered,
     ToolUse, ToolResult, ProcessEvent, TurnPlan, TurnBinding, TurnEnd,
     TurnNotificationContext,
@@ -129,6 +129,11 @@ from cc_remote.wrapper.session_pins import SessionPinStore, SessionPinStoreError
 from cc_remote.wrapper.session_plans import (
     SessionPlanStore,
     SessionPlanStoreError,
+)
+from cc_remote.wrapper.session_presentation import (
+    SessionPresentationSnapshot,
+    SessionPresentationStore,
+    SessionPresentationStoreError,
 )
 from cc_remote.wrapper.claude_controls import (
     ClaudeControlStore,
@@ -1297,7 +1302,9 @@ class WrapperMachine:
         "list_sessions", "get_history", "get_turn_detail", "get_history_image",
         "get_models", "get_permission_profiles", "get_engine_capabilities",
         "get_context", "get_status", "get_diff", "get_file_preview",
-        "get_preview_asset", "get_goal", "get_queued_query", "list_dir",
+        "get_preview_asset", "get_goal", "dismiss_goal",
+        "acknowledge_completion",
+        "get_queued_query", "list_dir",
         "get_work_dashboard",
     })
     # Commands whose target is a runtime ``sid``.  A /btw runtime is private to
@@ -1313,6 +1320,7 @@ class WrapperMachine:
         "get_context", "get_status", "get_diff", "get_file_preview", "save_markdown",
         "get_preview_asset", "authorize_preview",
         "answer_question", "get_goal", "set_goal", "clear_goal",
+        "dismiss_goal", "acknowledge_completion",
     })
     # These commands address a session through ``session_id`` instead.
     BTW_SESSION_COMMANDS = frozenset({
@@ -1613,6 +1621,16 @@ class WrapperMachine:
             # private cache must not prevent users from reaching their engine.
             self._session_plans = None
             log.exception("session plan store unavailable")
+        try:
+            self._session_presentation: SessionPresentationStore | None = (
+                SessionPresentationStore(self.cfg.state_dir)
+            )
+        except SessionPresentationStoreError:
+            # Presentation receipts must never prevent access to the native
+            # engines. Live clients retain their local fallback if this private
+            # cache is damaged.
+            self._session_presentation = None
+            log.exception("session presentation store unavailable")
         try:
             self._claude_controls: ClaudeControlStore | None = (
                 ClaudeControlStore(self.cfg.state_dir)
@@ -1981,6 +1999,81 @@ class WrapperMachine:
             display_name=display_name,
             parent_session_id=ctx.parent_sid if ctx.btw else None,
         )
+
+    @staticmethod
+    def _goal_identity(goal: object) -> Optional[str]:
+        """Return one opaque identity for a stable Goal generation."""
+        if goal is None:
+            return None
+        if hasattr(goal, "model_dump"):
+            raw = goal.model_dump(mode="json")
+        elif isinstance(goal, dict):
+            raw = goal
+        else:
+            return None
+        if not isinstance(raw, dict):
+            return None
+        thread_id = raw.get("threadId")
+        objective = raw.get("objective")
+        engine = raw.get("engine")
+        if (
+            not isinstance(thread_id, str)
+            or not isinstance(objective, str)
+            or engine not in {"claude", "codex"}
+        ):
+            return None
+        marker = raw.get("createdAt")
+        if marker is None:
+            marker = raw.get("setAt")
+        if (
+            isinstance(marker, bool)
+            or not isinstance(marker, (int, float))
+            or (isinstance(marker, float) and not math.isfinite(marker))
+            or marker < 0
+        ):
+            # Without a native generation marker a repeated objective cannot
+            # be distinguished safely. Keep that rare legacy Goal page-local
+            # instead of allowing a delayed dismissal to hide a replacement.
+            return None
+        payload = json.dumps(
+            [engine, thread_id, marker, objective],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return f"goal-{hashlib.sha256(payload).hexdigest()[:40]}"
+
+    @staticmethod
+    def _completion_state(
+        snapshot: SessionPresentationSnapshot,
+    ) -> CompletionState:
+        return CompletionState(
+            completion_id=snapshot.completion_id,
+            unread=snapshot.completion_unread,
+            revision=snapshot.completion_revision,
+        )
+
+    def _session_presentation_fields(
+        self,
+        session_id: str,
+    ) -> dict[str, object]:
+        """Project a durable completion receipt into one cold catalog row."""
+        if self._session_presentation is None:
+            return {}
+        try:
+            snapshot = self._session_presentation.get(session_id)
+        except SessionPresentationStoreError:
+            log.warning(
+                "session completion receipt could not be listed",
+                session_id=session_id,
+            )
+            return {}
+        if snapshot.completion_revision == 0:
+            return {}
+        return {
+            "completion_id": snapshot.completion_id,
+            "completion_unread": snapshot.completion_unread,
+            "completion_revision": snapshot.completion_revision,
+        }
 
     def _history_revision(self, sid: str) -> str:
         return f"{self.instance_id}-{self._history_revision_epochs.get(sid, 0)}"
@@ -5701,6 +5794,23 @@ class WrapperMachine:
                           type=getattr(msg, "type", None))
                 return
             msg.to = ctx.owner_client_id
+        if isinstance(msg, GoalState) and msg.sid:
+            goal_id = self._goal_identity(msg.goal)
+            dismissed = False
+            if self._session_presentation is not None:
+                try:
+                    dismissed = await asyncio.to_thread(
+                        self._session_presentation.reconcile_goal,
+                        msg.sid,
+                        goal_id,
+                    )
+                except SessionPresentationStoreError:
+                    log.warning(
+                        "Goal presentation receipt could not be reconciled",
+                        session_id=msg.sid,
+                    )
+            msg.goal_id = goal_id
+            msg.dismissed = dismissed
         if (
             isinstance(msg, (UserMsg, TurnSteered))
             and ctx.engine == "codex"
@@ -5778,6 +5888,32 @@ class WrapperMachine:
         await self._observe_preview_path_event(ctx, msg)
         async with ctx.emit_lock:
             await self._emit_locked(ctx, msg)
+            if (
+                isinstance(msg, TurnEnd)
+                and not msg.result.is_error
+                and not ctx.btw
+                and self._session_presentation is not None
+            ):
+                sid = self._ctx_wire_sid(ctx) or ctx.key
+                if sid:
+                    try:
+                        snapshot = await asyncio.to_thread(
+                            self._session_presentation.mark_completion,
+                            sid,
+                            msg.turn_id,
+                        )
+                    except SessionPresentationStoreError:
+                        log.warning(
+                            "session completion receipt could not be persisted",
+                            session_id=sid,
+                        )
+                    else:
+                        # Publish after TurnEnd so every client first observes
+                        # the real terminal boundary, then the shared unread
+                        # receipt which a visible client may acknowledge.
+                        await self._emit_locked(
+                            ctx, self._completion_state(snapshot)
+                        )
 
     async def _emit_focused(self, msg) -> None:
         """For control-path errors with no target ctx (cap reached, bad cwd):
@@ -6744,9 +6880,10 @@ class WrapperMachine:
         if seen:
             if cmd.type in self.SAFE_RETRY_COMMANDS:
                 # The original one-shot response may have died on the same link as
-                # its ACK. Safe reads are intentionally re-run to recreate it.
+                # its ACK. Safe reads and idempotent reconciliations are re-run
+                # to recreate an authoritative response.
                 await self._handle(cmd)
-                log.info("duplicate read command replayed", client_id=client_id,
+                log.info("duplicate safe command replayed", client_id=client_id,
                          cmd_id=cmd_id, type=cmd.type)
             else:
                 switch_ctx = None
@@ -6785,9 +6922,9 @@ class WrapperMachine:
         result = await self._handle(cmd)
 
         if reliable:
-            # Safe reads are recreated on retry, so retaining their potentially
-            # large History/file/image payloads in the command-id LRU buys
-            # nothing and can multiply memory by clients × commands.
+            # Safe commands are recreated on retry, so retaining their response
+            # payloads in the command-id LRU buys nothing and can multiply
+            # memory by clients × commands.
             if cmd.type in self.SAFE_RETRY_COMMANDS:
                 responses = ()
             elif cmd.type == "steer":
@@ -7026,6 +7163,27 @@ class WrapperMachine:
                         "sid": sid,
                         "route_id": getattr(cmd, "route_id", None),
                     }))
+                if not ctx.btw and self._session_presentation is not None:
+                    try:
+                        presentation = await asyncio.to_thread(
+                            self._session_presentation.get, sid
+                        )
+                    except SessionPresentationStoreError:
+                        log.warning(
+                            "session completion receipt could not be seeded",
+                            session_id=sid,
+                        )
+                    else:
+                        await self.transport.send(
+                            self._completion_state(presentation).model_copy(
+                                deep=True,
+                                update={
+                                    "to": cmd.client_id,
+                                    "sid": sid,
+                                    "route_id": getattr(cmd, "route_id", None),
+                                },
+                            )
+                        )
                 # Permission/collaboration modes are live control state, not
                 # transcript history. Always seed them on hello even when the
                 # browser's replay cursor is already at the ring tail.
@@ -14607,6 +14765,105 @@ class WrapperMachine:
             log.warning("get_goal failed", error_type=type(exc).__name__)
             return await self._emit_goal_error(ctx, cmd, "Goal 状态暂不可用")
 
+    async def _handle_dismiss_goal(self, cmd) -> None:
+        ctx = await self._goal_ctx(cmd)
+        if ctx is None:
+            return await self._missing_session_error(cmd, "隐藏 Goal")
+        if self._session_presentation is None:
+            return await self._emit_goal_error(ctx, cmd, "Goal 隐藏状态暂不可用")
+        try:
+            goal = (
+                await ctx.sdk.get_goal()
+                if ctx.engine == "codex"
+                else await ctx.sdk.refresh_goal(ctx.session_id)
+            )
+            goal_id = self._goal_identity(goal)
+            # Treat a delayed click as a harmless reconciliation read. It must
+            # reveal the replacement Goal rather than hiding a generation the
+            # user never saw.
+            if goal_id is not None and goal_id == cmd.goal_id:
+                await asyncio.to_thread(
+                    self._session_presentation.dismiss_goal,
+                    self._ctx_wire_sid(ctx) or ctx.key,
+                    goal_id,
+                )
+            event = GoalState(goal=goal)
+            await self._emit(ctx, event)
+            return event
+        except SessionPresentationStoreError:
+            log.warning(
+                "Goal dismissal receipt could not be persisted",
+                session_id=self._ctx_wire_sid(ctx) or ctx.key,
+            )
+            return await self._emit_goal_error(ctx, cmd, "Goal 隐藏状态保存失败")
+        except Exception as exc:
+            log.warning("dismiss_goal failed", error_type=type(exc).__name__)
+            return await self._emit_goal_error(ctx, cmd, "Goal 状态暂不可用")
+
+    async def _handle_acknowledge_completion(self, cmd) -> None:
+        sid = getattr(cmd, "sid", None)
+        ctx = self._ctx_for(sid)
+        if ctx is None and not isinstance(sid, str):
+            return await self._missing_session_error(cmd, "确认任务完成状态")
+        if ctx is not None and ctx.btw:
+            error = Error(
+                code=ERR_PROTOCOL,
+                message="临时 BTW 完成状态仅属于其创建页面",
+                request_id=getattr(cmd, "cmd_id", None),
+                to=getattr(cmd, "client_id", None),
+            )
+            await self._emit(ctx, error)
+            return error
+        if self._session_presentation is None:
+            error = Error(
+                code=ERR_INTERNAL,
+                message="任务完成状态暂不可用",
+                request_id=getattr(cmd, "cmd_id", None),
+                to=getattr(cmd, "client_id", None),
+            )
+            if ctx is not None:
+                await self._emit(ctx, error)
+            else:
+                await self._emit_to_sid(sid, error)
+            return error
+        try:
+            session_id = (
+                (self._ctx_wire_sid(ctx) or ctx.key)
+                if ctx is not None
+                else sid
+            )
+            snapshot = await asyncio.to_thread(
+                self._session_presentation.acknowledge_completion,
+                session_id,
+                cmd.completion_id,
+            )
+            event = self._completion_state(snapshot)
+            if ctx is not None:
+                await self._emit(ctx, event)
+            else:
+                await self._emit_to_sid(sid, event)
+            return event
+        except SessionPresentationStoreError:
+            log.warning(
+                "session completion acknowledgement could not be persisted",
+                session_id=(
+                    (self._ctx_wire_sid(ctx) or ctx.key)
+                    if ctx is not None
+                    else sid
+                ),
+            )
+            error = Error(
+                code=ERR_INTERNAL,
+                message="任务完成状态保存失败",
+                request_id=getattr(cmd, "cmd_id", None),
+                to=getattr(cmd, "client_id", None),
+            )
+            if ctx is not None:
+                await self._emit(ctx, error)
+            else:
+                await self._emit_to_sid(sid, error)
+            return error
+
     async def _handle_set_goal(self, cmd) -> None:
         ctx = await self._goal_ctx(cmd)
         if ctx is None:
@@ -16516,6 +16773,7 @@ class WrapperMachine:
                     state=resident_state.get(info.session_id),
                     engine="claude", space=space,
                     work_id=record.work_id if record else None,
+                    **self._session_presentation_fields(info.session_id),
                 ))
             if space == "code" and self._claude_broker_enabled:
                 # `claude-remote new` reserves the native session UUID before
@@ -16553,6 +16811,7 @@ class WrapperMachine:
                                 pinned=broker_sid in pinned_ids,
                                 engine="claude",
                                 space="code",
+                                **self._session_presentation_fields(broker_sid),
                             ))
                             known.add(broker_sid)
             for session in sessions:
@@ -17028,6 +17287,7 @@ class WrapperMachine:
                     native_session_id=native_sid,
                     codex_profile_id=row.get("codex_profile_id"),
                     codex_profile_label=row.get("codex_profile_label"),
+                    **self._session_presentation_fields(wire_sid),
                 ))
             for session in sessions:
                 self._remember_notification_title(
@@ -17178,6 +17438,21 @@ class WrapperMachine:
         control_event = self._session_control(ctx)
         await self._emit(ctx, control_event)
         cached_responses.append(control_event)
+        if not ctx.btw and self._session_presentation is not None:
+            try:
+                presentation = await asyncio.to_thread(
+                    self._session_presentation.get,
+                    self._ctx_wire_sid(ctx) or ctx.key,
+                )
+            except SessionPresentationStoreError:
+                log.warning(
+                    "session completion receipt could not be seeded",
+                    session_id=self._ctx_wire_sid(ctx) or ctx.key,
+                )
+            else:
+                completion_event = self._completion_state(presentation)
+                await self._emit(ctx, completion_event)
+                cached_responses.append(completion_event)
         permission_mode = _session_permission_mode(ctx)
         ctx.announced_perm = permission_mode
         permission_event = Perm(mode=permission_mode)
@@ -17350,6 +17625,17 @@ class WrapperMachine:
                 except SessionPlanStoreError:
                     log.warning(
                         "temporary session plan snapshot rekey failed",
+                        old_key=old_key,
+                        session_id=route_sid,
+                    )
+            if self._session_presentation is not None:
+                try:
+                    await asyncio.to_thread(
+                        self._session_presentation.move, old_key, route_sid
+                    )
+                except SessionPresentationStoreError:
+                    log.warning(
+                        "temporary session presentation rekey failed",
                         old_key=old_key,
                         session_id=route_sid,
                     )
@@ -17884,6 +18170,16 @@ class WrapperMachine:
         else:
             await self._delete_codex_client_message_ids(codex_alias_path)
         await self._drop_preview_session(engine, sid)
+        if self._session_presentation is not None:
+            try:
+                await asyncio.to_thread(
+                    self._session_presentation.delete, sid
+                )
+            except SessionPresentationStoreError:
+                log.warning(
+                    "stale Work presentation cleanup failed",
+                    session_id=sid,
+                )
         if self._session_pins is not None:
             try:
                 await asyncio.to_thread(
@@ -18072,6 +18368,16 @@ class WrapperMachine:
             except SessionPlanStoreError:
                 log.warning(
                     "stale Codex plan cleanup failed", session_id=sid)
+        if self._session_presentation is not None:
+            try:
+                await asyncio.to_thread(
+                    self._session_presentation.delete, sid
+                )
+            except SessionPresentationStoreError:
+                log.warning(
+                    "stale Code presentation cleanup failed",
+                    session_id=sid,
+                )
         if self._session_pins is not None:
             try:
                 await asyncio.to_thread(
@@ -18403,6 +18709,20 @@ class WrapperMachine:
                 except SessionPlanStoreError:
                     log.warning(
                         "Codex plan cleanup after rollback failed",
+                        session_id=sid,
+                    )
+            if self._session_presentation is not None:
+                try:
+                    presentation = await asyncio.to_thread(
+                        self._session_presentation.clear_completion, sid
+                    )
+                    if presentation.completion_revision > 0:
+                        await self._emit(
+                            ctx, self._completion_state(presentation)
+                        )
+                except SessionPresentationStoreError:
+                    log.warning(
+                        "completion receipt cleanup after rollback failed",
                         session_id=sid,
                     )
             try:

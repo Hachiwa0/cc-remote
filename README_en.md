@@ -4,7 +4,7 @@
 
 Self-hosted · Dual-engine · Multi-session · Live process · Responsive Web
 
-**Current release: v3.0.0** · Wire protocol v33
+**Current release: v3.0.0** · Wire protocol v34
 
 [中文](README.md) ·
 [5-minute quick start](#quick-start-local-one-machine-5-min) ·
@@ -548,17 +548,17 @@ npm --prefix web run build   # produces web/dist/
 
 > The web client no longer bakes any token into the JS: login POSTs the password to the relay for a short-lived session token. So the build needs no `VITE_*` variables.
 
-> **Upgrading to protocol v33:** the wire gate rejects mixed versions. Deploy
+> **Upgrading to protocol v34:** the wire gate rejects mixed versions. Deploy
 > `cc_remote/` and the new `web/dist/` in one maintenance window, then restart the
 > relay and wrapper; do not run a rolling mixture. Existing sockets reconnect
 > briefly, and a relay restart intentionally requires browsers to log in again.
 > Any already-open older page also needs one **hard refresh** to load the new hashed
 > assets; logging in again inside the old JavaScript bundle isn't sufficient.
 > For a manual release, stop the local wrapper first, stop and update relay + web,
-> then start the v33 relay and v33 wrapper so the old wrapper cannot occupy the
-> slot for the same `machine_id`. v33 migrates provider-local Work SQLite data;
+> then start the v34 relay and v34 wrapper so the old wrapper cannot occupy the
+> slot for the same `machine_id`. v34 migrates provider-local Work SQLite data;
 > a manual release must also run `deploy/work_registry_snapshot.py snapshot`
-> before v33 starts. To roll back, stop v33, restore that snapshot, then switch
+> before v34 starts. To roll back, stop v34, restore that snapshot, then switch
 > to the old code. Do not copy only the main `.sqlite3` file while the wrapper is
 > live because committed pages may still be in WAL.
 
@@ -617,7 +617,7 @@ The script installs `python3-venv` + Caddy, creates the `ccremote` service user,
 builds an immutable release and its venv, merges Caddy configuration, atomically
 switches `current`, and restarts the relay. If restart/readiness fails, `current`,
 the Caddyfile, and the systemd unit roll back as one transaction and the previous
-release's `/healthz` is verified. Start the v33 wrapper after success.
+release's `/healthz` is verified. Start the v34 wrapper after success.
 
 Verify:
 
