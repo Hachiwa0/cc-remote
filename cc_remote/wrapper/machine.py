@@ -54,6 +54,7 @@ import tempfile
 import time
 import unicodedata
 from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
@@ -90,7 +91,11 @@ from cc_remote.codex_daemon_restart import (
     restart_state_path,
 )
 from cc_remote.log import logger
-from cc_remote.workspaces import WorkStores
+from cc_remote.workspaces import (
+    WORK_UPLOADS_MARKER,
+    WORK_UPLOADS_MARKER_PAYLOAD,
+    WorkStores,
+)
 from cc_remote.protocol import (
     ASK_OPTION_MAX_COUNT, ARTIFACT_PREVIEW_MAX_BYTES, FILE_PREVIEW_MAX_BYTES,
     MAX_QUERY_QUEUE_BYTES, MAX_QUERY_QUEUE_ITEMS, PREVIEW_ASSET_MAX_BYTES,
@@ -10287,21 +10292,28 @@ class WrapperMachine:
                 ctx.codex_steer_attachment_dirs.append(temp_dir)
 
         try:
+            image_paths: list[str] = []
             if files or images:
                 if ctx.space == "work":
-                    upload_root = Path(ctx.cwd).parent / "uploads"
-                    upload_dir = upload_root / cmd.msg_id
-                    upload_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
-                    temp_dir = str(upload_dir)
+                    prompt, image_paths, temp_dir = (
+                        self._stash_work_attachments(
+                            prompt,
+                            files,
+                            images,
+                            ctx.cwd,
+                            cmd.msg_id,
+                            ctx.engine,
+                        )
+                    )
                     persistent_attachments = True
                 else:
                     temp_dir = tempfile.mkdtemp(prefix="cc-remote-turn-")
                     os.chmod(temp_dir, 0o700)
-            if files:
-                prompt = self._stash_files(
-                    prompt, files, temp_dir, ctx.engine)
-            image_paths = (
-                self._stash_images(images, temp_dir) if images else [])
+                    if files:
+                        prompt = self._stash_files(
+                            prompt, files, temp_dir, ctx.engine)
+                    if images:
+                        image_paths = self._stash_images(images, temp_dir)
 
             # Multiple clients may steer concurrently. Serialize steer requests
             # per session, but do not take launch_lock: Stop must be able to send
@@ -10437,7 +10449,11 @@ class WrapperMachine:
         finally:
             if steer_fence is not None:
                 steer_fence.release_now()
-            if temp_dir is not None and not accepted:
+            if (
+                temp_dir is not None
+                and not accepted
+                and not persistent_attachments
+            ):
                 try:
                     shutil.rmtree(temp_dir)
                 except FileNotFoundError:
@@ -21405,8 +21421,15 @@ class WrapperMachine:
                     task.cancel()
             await asyncio.gather(get_task, interrupt_task, return_exceptions=True)
 
-    def _stash_files(self, prompt: str, files: list, temp_dir: str,
-                     engine: str = "claude") -> str:
+    def _stash_files(
+        self,
+        prompt: str,
+        files: list,
+        temp_dir: str,
+        engine: str = "claude",
+        *,
+        dir_fd: int | None = None,
+    ) -> str:
         """Write validated files to a private per-turn directory. cc reads
         the `@path` convention; codex has no `@` layer over the app-server and
         ignores `mention` items (verified), but reads a plain path via its tools —
@@ -21416,11 +21439,10 @@ class WrapperMachine:
             fn = f.get("filename") or f"file-{i}"
             safe = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(fn))
             safe = safe.strip(".") or f"file-{i}"
-            path = os.path.join(temp_dir, f"{i:02d}-{safe}")
+            name = f"{i:02d}-{safe}"
+            path = os.path.join(temp_dir, name)
             data = decode_attachment(f.get("data", ""))
-            with open(path, "xb") as fp:
-                fp.write(data)
-            os.chmod(path, 0o600)
+            self._write_staged_attachment(path, name, data, dir_fd=dir_fd)
             paths.append(path)
             log.info("attachment stashed", index=i, bytes=len(data))
         if engine == "codex":
@@ -21430,11 +21452,161 @@ class WrapperMachine:
         return (prompt + "\n\n" if prompt else "") + block
 
     @staticmethod
+    def _write_staged_attachment(
+        path: str,
+        name: str,
+        data: bytes,
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = (
+            os.open(name, flags, 0o600, dir_fd=dir_fd)
+            if dir_fd is not None
+            else os.open(path, flags, 0o600)
+        )
+        try:
+            info = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.geteuid()
+                or info.st_nlink != 1
+            ):
+                raise RuntimeError("attachment target is not a private file")
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "wb", closefd=False) as stream:
+                stream.write(data)
+                stream.flush()
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    @contextmanager
+    def _open_work_upload_dir(cwd: str, msg_id: str):
+        """Bind a Work upload directory without following mutable path links."""
+        if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+            raise RuntimeError("secure Work upload directories are unsupported")
+        flags = (
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        workspace_fd = uploads_fd = message_fd = -1
+        try:
+            try:
+                workspace_fd = os.open(cwd, flags)
+                workspace_info = os.fstat(workspace_fd)
+                if (
+                    not stat.S_ISDIR(workspace_info.st_mode)
+                    or workspace_info.st_uid != os.geteuid()
+                ):
+                    raise RuntimeError(
+                        "Work workspace is not a private directory")
+
+                created_uploads = False
+                try:
+                    os.mkdir("uploads", mode=0o700, dir_fd=workspace_fd)
+                    created_uploads = True
+                except FileExistsError:
+                    pass
+                uploads_fd = os.open("uploads", flags, dir_fd=workspace_fd)
+                uploads_info = os.fstat(uploads_fd)
+                if (
+                    not stat.S_ISDIR(uploads_info.st_mode)
+                    or uploads_info.st_uid != os.geteuid()
+                ):
+                    raise RuntimeError(
+                        "Work uploads path is not a private directory")
+                if created_uploads:
+                    marker_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                    marker_flags |= (
+                        os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+                    marker_fd = os.open(
+                        WORK_UPLOADS_MARKER,
+                        marker_flags,
+                        0o600,
+                        dir_fd=uploads_fd,
+                    )
+                    try:
+                        with os.fdopen(
+                            marker_fd, "wb", closefd=False,
+                        ) as stream:
+                            stream.write(WORK_UPLOADS_MARKER_PAYLOAD)
+                            stream.flush()
+                    finally:
+                        os.close(marker_fd)
+
+                marker_fd = os.open(
+                    WORK_UPLOADS_MARKER,
+                    os.O_RDONLY
+                    | os.O_NOFOLLOW
+                    | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=uploads_fd,
+                )
+                try:
+                    marker_info = os.fstat(marker_fd)
+                    with os.fdopen(
+                        marker_fd, "rb", closefd=False,
+                    ) as stream:
+                        marker_payload = stream.read(
+                            len(WORK_UPLOADS_MARKER_PAYLOAD) + 1)
+                    if (
+                        not stat.S_ISREG(marker_info.st_mode)
+                        or marker_info.st_uid != os.geteuid()
+                        or marker_info.st_nlink != 1
+                        or marker_payload != WORK_UPLOADS_MARKER_PAYLOAD
+                    ):
+                        raise RuntimeError(
+                            "Work uploads path conflicts with workspace content")
+                finally:
+                    os.close(marker_fd)
+                os.fchmod(uploads_fd, 0o700)
+
+                os.mkdir(msg_id, mode=0o700, dir_fd=uploads_fd)
+                message_fd = os.open(msg_id, flags, dir_fd=uploads_fd)
+                message_info = os.fstat(message_fd)
+                if (
+                    not stat.S_ISDIR(message_info.st_mode)
+                    or message_info.st_uid != os.geteuid()
+                ):
+                    raise RuntimeError("Work message upload path is unsafe")
+                os.fchmod(message_fd, 0o700)
+            except OSError as exc:
+                raise RuntimeError("Work upload directory is unsafe") from exc
+            yield str(Path(cwd) / "uploads" / msg_id), message_fd
+        finally:
+            for descriptor in (message_fd, uploads_fd, workspace_fd):
+                if descriptor >= 0:
+                    os.close(descriptor)
+
+    def _stash_work_attachments(
+        self,
+        prompt: str,
+        files: list | None,
+        images: list | None,
+        cwd: str,
+        msg_id: str,
+        engine: str,
+    ) -> tuple[str, list[str], str]:
+        with self._open_work_upload_dir(cwd, msg_id) as (directory, dir_fd):
+            if files:
+                prompt = self._stash_files(
+                    prompt, files, directory, engine, dir_fd=dir_fd)
+            image_paths = (
+                self._stash_images(images, directory, dir_fd=dir_fd)
+                if images else [])
+        return prompt, image_paths, directory
+
+    @staticmethod
     def _strip_attachment_paths(prompt: str) -> tuple[str, list[dict[str, str]]]:
-        """Remove expired private temp paths from transcript-facing history."""
+        """Remove private attachment paths from transcript-facing history."""
         path_re = re.compile(
             r"(?:/\S*cc-remote-turn-[A-Za-z0-9_-]+|"
-            r"/\S*/cc-remote/work/chats/work-[0-9a-f]+/uploads/[A-Za-z0-9._:@-]+)"
+            r"/\S*/cc-remote/work/chats/work-[0-9a-f]+/"
+            r"(?:workspace/)?uploads/[A-Za-z0-9._:@-]+)"
             r"/\d{2}-([^\s]+)")
         marker = "\n\n[用户附件,请用工具读取以下文件]:\n"
         if marker in prompt:
@@ -21445,7 +21617,8 @@ class WrapperMachine:
 
         matches = list(re.finditer(
             r"@(?P<path>(?:/\S*cc-remote-turn-[A-Za-z0-9_-]+|"
-            r"/\S*/cc-remote/work/chats/work-[0-9a-f]+/uploads/[A-Za-z0-9._:@-]+)"
+            r"/\S*/cc-remote/work/chats/work-[0-9a-f]+/"
+            r"(?:workspace/)?uploads/[A-Za-z0-9._:@-]+)"
             r"/\d{2}-(?P<name>[^\s]+))",
             prompt,
         ))
@@ -21459,18 +21632,23 @@ class WrapperMachine:
                 )
         return prompt, []
 
-    def _stash_images(self, images: list, temp_dir: str) -> list:
+    def _stash_images(
+        self,
+        images: list,
+        temp_dir: str,
+        *,
+        dir_fd: int | None = None,
+    ) -> list:
         """Write validated images to the private turn directory for Codex."""
         _ext = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg",
                 "image/webp": ".webp"}
         paths = []
         for i, img in enumerate(images or []):
             mt = img.get("media_type", "image/png")
-            path = os.path.join(temp_dir, f"image-{i:02d}{_ext[mt]}")
+            name = f"image-{i:02d}{_ext[mt]}"
+            path = os.path.join(temp_dir, name)
             data = decode_attachment(img.get("data", ""))
-            with open(path, "xb") as fp:
-                fp.write(data)
-            os.chmod(path, 0o600)
+            self._write_staged_attachment(path, name, data, dir_fd=dir_fd)
             paths.append(path)
             log.info("image stashed", index=i, bytes=len(data))
         return paths
@@ -22265,19 +22443,30 @@ class WrapperMachine:
                     images=images,
                     files=file_meta,
                 ))
-                if files or (is_codex and images):
-                    if ctx.space == "work":
-                        upload_root = Path(ctx.cwd).parent / "uploads"
-                        upload_dir = upload_root / (
-                            ctx.active_msg_id or uuid4().hex)
-                        upload_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
-                        temp_dir = str(upload_dir)
-                        persistent_attachments = True
-                    else:
+                stage_images = bool(images and (
+                    is_codex or ctx.space == "work"))
+                staged_image_paths: list[str] = []
+                if ctx.space == "work" and (files or stage_images):
+                    prompt, staged_image_paths, temp_dir = (
+                        self._stash_work_attachments(
+                            prompt,
+                            files,
+                            images if stage_images else None,
+                            ctx.cwd,
+                            ctx.active_msg_id or uuid4().hex,
+                            ctx.engine,
+                        )
+                    )
+                    persistent_attachments = True
+                else:
+                    if files or stage_images:
                         temp_dir = tempfile.mkdtemp(prefix="cc-remote-turn-")
                         os.chmod(temp_dir, 0o700)
-                if files:
-                    prompt = self._stash_files(prompt, files, temp_dir, ctx.engine)
+                    if files:
+                        prompt = self._stash_files(
+                            prompt, files, temp_dir, ctx.engine)
+                    if stage_images:
+                        staged_image_paths = self._stash_images(images, temp_dir)
                 if ctx.interrupt_event.is_set() or ctx.state == "interrupting":
                     await self._emit(ctx, TurnEnd(result=TurnResult(
                         subtype="error_during_execution",
@@ -22362,7 +22551,7 @@ class WrapperMachine:
                 if is_codex:
                     # codex: images -> private temp dir -> localImage items; files already
                     # referenced by path in the prompt text above.
-                    img_paths = self._stash_images(images, temp_dir) if images else []
+                    img_paths = staged_image_paths
                     # Keep the final ownership check adjacent to turn/start. A
                     # short native turn can finish between the earlier reload and
                     # this probe: no holder remains, but consuming its markers sets

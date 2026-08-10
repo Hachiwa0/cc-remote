@@ -29,6 +29,8 @@ Engine = Literal["claude", "codex"]
 _MAX_WORK_ARTIFACTS = 200
 _MAX_WORK_ARTIFACT_SCAN = 4096
 _WORK_CONTEXT_MANIFEST = ".cc-remote-context.json"
+WORK_UPLOADS_MARKER = ".cc-remote-upload-root"
+WORK_UPLOADS_MARKER_PAYLOAD = b"cc-remote Work uploads v1\n"
 _WORK_SCHEDULE_MAX_ATTEMPTS = 3
 _CODEX_PROFILE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
 _WORK_ARTIFACT_PREVIEW_SUFFIXES = frozenset({
@@ -405,9 +407,13 @@ class WorkRegistry:
         chat_root = self.chats_root / work_id
         workspace = chat_root / "workspace"
         for directory in (
-            chat_root, workspace, chat_root / "uploads",
+            chat_root, workspace, workspace / "uploads",
         ):
             self._mkdir_private(directory)
+        self._atomic_write_private(
+            workspace / "uploads" / WORK_UPLOADS_MARKER,
+            WORK_UPLOADS_MARKER_PAYLOAD,
+        )
         cwd = str(workspace)
         with self._connect() as db:
             db.execute(
@@ -512,13 +518,17 @@ class WorkRegistry:
         if record is None or not self.contains_cwd(record.cwd):
             raise LookupError(f"unknown Work session: {session_id}")
         root = os.path.realpath(record.cwd)
+        managed_uploads = self._is_managed_upload_root(
+            Path(root) / "uploads")
         artifacts: list[dict[str, object]] = []
         scanned = 0
         for current, dirs, files in os.walk(root, topdown=True, followlinks=False):
             relative_dir = os.path.relpath(current, root)
             if relative_dir == ".":
                 dirs[:] = [name for name in dirs
-                           if not name.startswith(".") and name != "资料库"]
+                           if not name.startswith(".")
+                           and name != "资料库"
+                           and not (name == "uploads" and managed_uploads)]
             else:
                 dirs[:] = [name for name in dirs if not name.startswith(".")]
             for name in files:
@@ -1739,6 +1749,40 @@ class WorkRegistry:
             return
         if stat.S_ISREG(mode):
             path.chmod(0o600)
+
+    @staticmethod
+    def _is_managed_upload_root(path: Path) -> bool:
+        if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+            return False
+        flags = (
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        directory_fd = marker_fd = -1
+        try:
+            directory_fd = os.open(path, flags)
+            directory = os.fstat(directory_fd)
+            marker_fd = os.open(
+                WORK_UPLOADS_MARKER,
+                os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=directory_fd,
+            )
+            marker = os.fstat(marker_fd)
+            with os.fdopen(marker_fd, "rb", closefd=False) as stream:
+                payload = stream.read(len(WORK_UPLOADS_MARKER_PAYLOAD) + 1)
+        except OSError:
+            return False
+        finally:
+            for descriptor in (marker_fd, directory_fd):
+                if descriptor >= 0:
+                    os.close(descriptor)
+        return (stat.S_ISDIR(directory.st_mode)
+                and stat.S_ISREG(marker.st_mode)
+                and marker.st_uid == os.geteuid()
+                and marker.st_nlink == 1
+                and payload == WORK_UPLOADS_MARKER_PAYLOAD)
 
     def _require_owned_chat_root(self, path: Path, work_id: str) -> None:
         expected = self.chats_root / work_id

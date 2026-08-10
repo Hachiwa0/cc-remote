@@ -9,6 +9,7 @@ import re
 import struct
 import time
 import zlib
+from pathlib import Path
 
 from cc_remote.attachments import (
     MAX_ATTACHMENT_COUNT,
@@ -163,6 +164,173 @@ def test_turn_temp_directory_is_removed_when_query_fails():
         assert ctx.state == "idle"
         assert sdk.path is not None
         assert not os.path.exists(os.path.dirname(sdk.path))
+
+    asyncio.run(run())
+
+
+def test_work_turn_persists_files_and_images_inside_private_workspace(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(mode=0o700)
+
+    class FailingSdk:
+        effort = "high"
+        applied_effort = "high"
+
+        async def query(self, messages):
+            payloads = [item async for item in messages]
+            text = payloads[0]["message"]["content"][0]["text"]
+            assert f"@{workspace}/uploads/work-message/00-note.txt" in text
+            assert (workspace / "uploads" / "work-message" /
+                    "image-00.png").is_file()
+            raise RuntimeError("synthetic failure")
+
+    async def run():
+        machine, _ = _mk_machine()
+        ctx = _mk_ctx("tmp-work", None)
+        ctx.cwd = str(workspace)
+        ctx.space = "work"
+        ctx.sdk = FailingSdk()
+        ctx.state = "running"
+        ctx.active_msg_id = "work-message"
+
+        await machine._run_turn(
+            ctx,
+            "inspect both",
+            images=[{"media_type": "image/png", "data": _png()}],
+            files=[{"filename": "note.txt", "data": _b64(8)}],
+        )
+
+        upload_dir = workspace / "uploads" / "work-message"
+        assert (upload_dir / "00-note.txt").read_bytes() == b"x" * 8
+        assert (upload_dir / "image-00.png").read_bytes().startswith(b"\x89PNG")
+        assert upload_dir.stat().st_mode & 0o777 == 0o700
+        assert not (workspace.parent / "uploads").exists()
+
+    asyncio.run(run())
+
+
+def test_history_strips_legacy_and_workspace_work_attachment_paths():
+    machine, _ = _mk_machine()
+    roots = (
+        "/Users/test/.codex/cc-remote/work/chats/work-a1b2/uploads/message-1",
+        "/Users/test/.codex/cc-remote/work/chats/work-a1b2/"
+        "workspace/uploads/message-1",
+    )
+
+    for root in roots:
+        codex_prompt = (
+            "inspect\n\n[用户附件,请用工具读取以下文件]:\n"
+            f"{root}/00-report.md"
+        )
+        assert machine._strip_attachment_paths(codex_prompt) == (
+            "inspect", [{"filename": "report.md"}],
+        )
+        claude_prompt = f"inspect\n\n@{root}/00-report.md"
+        assert machine._strip_attachment_paths(claude_prompt) == (
+            "inspect", [{"filename": "report.md"}],
+        )
+
+
+def test_work_attachment_write_stays_bound_after_directory_symlink_swap(
+        monkeypatch, tmp_path):
+    machine, _ = _mk_machine()
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    relocated = workspace / "relocated-message"
+    workspace.mkdir(mode=0o700)
+    outside.mkdir(mode=0o700)
+    original = machine._stash_files
+
+    def swap_then_stash(
+        prompt, files, temp_dir, engine="claude", *, dir_fd=None,
+    ):
+        Path(temp_dir).rename(relocated)
+        Path(temp_dir).symlink_to(outside, target_is_directory=True)
+        return original(
+            prompt, files, temp_dir, engine, dir_fd=dir_fd)
+
+    monkeypatch.setattr(machine, "_stash_files", swap_then_stash)
+
+    machine._stash_work_attachments(
+        "inspect",
+        [{"filename": "note.txt", "data": _b64(8)}],
+        None,
+        str(workspace),
+        "message-1",
+        "claude",
+    )
+
+    assert not (outside / "00-note.txt").exists()
+    assert (relocated / "00-note.txt").read_bytes() == b"x" * 8
+
+
+def test_work_upload_refuses_symlinked_or_unmanaged_root(tmp_path):
+    machine, _ = _mk_machine()
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    workspace.mkdir(mode=0o700)
+    outside.mkdir(mode=0o700)
+    uploads = workspace / "uploads"
+    uploads.symlink_to(outside, target_is_directory=True)
+
+    for setup in ("symlink", "unmanaged"):
+        try:
+            machine._stash_work_attachments(
+                "inspect",
+                [{"filename": "note.txt", "data": _b64(8)}],
+                None,
+                str(workspace),
+                f"message-{setup}",
+                "claude",
+            )
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("unsafe Work upload root was accepted")
+        if setup == "symlink":
+            uploads.unlink()
+            uploads.mkdir(mode=0o700)
+            (uploads / "user-file.txt").write_text(
+                "must remain user-owned", encoding="utf-8")
+
+    assert (uploads / "user-file.txt").read_text(encoding="utf-8") == (
+        "must remain user-owned")
+    assert not list(outside.iterdir())
+
+
+def test_rejected_work_steer_keeps_persistent_uploads(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(mode=0o700)
+
+    class RejectingSdk:
+        turn_id = "turn-1"
+        turn_active = True
+
+        async def steer(self, *_args, **_kwargs):
+            raise RuntimeError("synthetic rejection")
+
+    async def run():
+        machine, _ = _mk_machine()
+        ctx = _mk_ctx("work-session", "work-session")
+        ctx.cwd = str(workspace)
+        ctx.space = "work"
+        ctx.engine = "codex"
+        ctx.sdk = RejectingSdk()
+        ctx.state = "running"
+        machine.sessions[ctx.key] = ctx
+
+        command = Steer(
+            sid=ctx.key,
+            cmd_id="steer-command",
+            client_id="client-1",
+            msg_id="steer-message",
+            prompt="inspect this",
+            files=[{"filename": "note.txt", "data": _b64(8)}],
+        )
+        await machine._handle_steer(command)
+
+        upload = workspace / "uploads" / "steer-message" / "00-note.txt"
+        assert upload.read_bytes() == b"x" * 8
 
     asyncio.run(run())
 

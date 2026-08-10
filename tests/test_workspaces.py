@@ -461,6 +461,9 @@ class WorkRegistryTests(unittest.TestCase):
         record = self.store.create_session()
         self.store.bind_session(record.work_id, "session-1")
         workspace = Path(record.cwd)
+        upload = workspace / "uploads" / "message-1" / "00-source.txt"
+        upload.parent.mkdir()
+        upload.write_text("user input", encoding="utf-8")
         (workspace / "report.md").write_text("# result", encoding="utf-8")
         slides = workspace / "output" / "deck.pptx"
         slides.parent.mkdir()
@@ -482,6 +485,29 @@ class WorkRegistryTests(unittest.TestCase):
         self.assertEqual(by_path["report.md"]["kind"], "document")
         self.assertTrue(by_path["output/deck.pptx"]["previewable"])
         self.assertEqual(by_path["output/deck.pptx"]["kind"], "presentation")
+
+    def test_new_session_creates_private_uploads_inside_workspace(self):
+        record = self.store.create_session()
+        workspace = Path(record.cwd)
+
+        self.assertTrue((workspace / "uploads").is_dir())
+        self.assertEqual((workspace / "uploads").stat().st_mode & 0o777, 0o700)
+        self.assertTrue(
+            (workspace / "uploads" / ".cc-remote-upload-root").is_file())
+        self.assertFalse((workspace.parent / "uploads").exists())
+
+    def test_unmanaged_uploads_directory_remains_a_user_artifact(self):
+        record = self.store.create_session()
+        self.store.bind_session(record.work_id, "session-1")
+        workspace = Path(record.cwd)
+        (workspace / "uploads" / ".cc-remote-upload-root").unlink()
+        (workspace / "uploads" / "report.md").write_text(
+            "user directory", encoding="utf-8")
+
+        artifacts = self.store.artifacts("session-1")
+
+        self.assertIn("uploads/report.md", {
+            item["path"] for item in artifacts})
 
     def test_claude_policy_copies_only_runtime_provider_settings(self):
         config_dir = Path(self.tmp.name) / "claude-config"
