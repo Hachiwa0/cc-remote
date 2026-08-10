@@ -2381,6 +2381,14 @@ function CodeCopyThemeFixture({ theme }: { theme: "light" | "dark" }) {
   </main>;
 }
 
+function LocalFileLinkFixture() {
+  return <main style={{ minHeight: "100dvh", padding: 24 }}>
+    <MessageBlock
+      text="[release-test](/tmp/qwen3-tts-v017-release-test:42)"
+      done onOpenFile={() => {}} />
+  </main>;
+}
+
 const rootParams = new URLSearchParams(window.location.search);
 createRoot(document.getElementById("root")!).render(
   rootParams.has("artifact-html")
@@ -2394,6 +2402,8 @@ createRoot(document.getElementById("root")!).render(
     : rootParams.has("code-copy-theme")
     ? <CodeCopyThemeFixture
         theme={rootParams.get("theme") === "light" ? "light" : "dark"} />
+    : rootParams.has("local-file-link")
+    ? <LocalFileLinkFixture />
     : rootParams.has("inline-image-capacity")
     ? <InlineImageCapacityFixture />
     : rootParams.has("inline-image-eviction")

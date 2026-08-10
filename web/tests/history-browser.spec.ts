@@ -292,6 +292,36 @@ test("dark desktop code block and copy action stay visually distinct", async ({
   expect(appearance.foreground).toEqual(appearance.expectedForeground);
 });
 
+test("local Markdown file link reveals its complete path without native title", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 720, height: 480 });
+  await page.goto("/tests/history-browser.html?local-file-link=1");
+  const link = page.getByRole("button", {
+    name: "在 Remote 中打开 /tmp/qwen3-tts-v017-release-test:42",
+  });
+  await expect(link).not.toHaveAttribute("title");
+
+  await link.hover();
+  const tooltip = page.getByRole("tooltip");
+  await expect(tooltip).toContainText("/tmp/qwen3-tts-v017-release-test:42");
+  await expect(tooltip).toBeInViewport();
+
+  await tooltip.hover();
+  await page.waitForTimeout(260);
+  await expect(tooltip).toBeVisible();
+  const path = tooltip.locator(".message-file-tooltip-path");
+  await path.dblclick();
+  await expect.poll(() => page.evaluate(() => getSelection()?.toString()))
+    .toBe("/tmp/qwen3-tts-v017-release-test:42");
+  await expect(tooltip.getByRole("button")).toHaveCount(0);
+
+  await page.mouse.move(700, 460);
+  await expect(tooltip).toHaveCount(0, { timeout: 1000 });
+  await link.focus();
+  await expect(page.getByRole("tooltip")).toBeVisible();
+});
+
 async function pinchThenPanPreview(
   page: import("@playwright/test").Page,
 ): Promise<{
