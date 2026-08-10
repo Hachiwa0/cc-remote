@@ -26,6 +26,7 @@ from cc_remote.protocol import (
     serialize,
 )
 from cc_remote.wrapper.ringbuffer import RingBuffer
+from cc_remote.wrapper.session_ctx import ActiveTurnBinding
 from cc_remote.wrapper import machine as mm
 from tests.test_multisession import _mk_ctx, _mk_machine
 
@@ -189,7 +190,7 @@ def test_client_hello_does_not_prebind_frames_before_latest_steer():
     asyncio.run(run())
 
 
-def test_client_hello_seeds_after_ambiguous_truncated_replay():
+def test_client_hello_preseeds_proven_current_suffix_after_binding_eviction():
     async def run():
         machine, transport = _mk_machine()
         ctx = _mk_ctx("s-truncated", "s-truncated")
@@ -216,16 +217,48 @@ def test_client_hello_seeds_after_ambiguous_truncated_replay():
             generations={"s-truncated": machine.instance_id},
         ))
 
-        replay_end = next(index for index, event in enumerate(transport.sent)
-                          if isinstance(event, ReplayEnd))
         reseed = next(index for index, event in enumerate(transport.sent)
                       if isinstance(event, TurnBinding))
         assert isinstance(transport.sent[0], ReplayStart)
         assert transport.sent[0].truncated is True
-        assert reseed == replay_end + 1
+        # The retained head is strictly newer than the evicted binding. Every
+        # replayed narrative frame is therefore a proven suffix of that exact
+        # logical turn and must see the owner seed before it is reduced.
+        assert transport.sent[0].from_seq > ctx.active_turn_binding.seq
+        assert reseed == 1
         assert transport.sent[reseed].seq is None
 
     asyncio.run(run())
+
+
+def test_client_hello_keeps_unproven_replay_prefix_before_owner_seed():
+    machine, _transport = _mk_machine()
+    ctx = _mk_ctx("s-ambiguous", "s-ambiguous")
+    ctx.engine = "codex"
+    ctx.state = "running"
+    ctx.active_turn_binding = ActiveTurnBinding(
+        msg_id="current-user",
+        turn_id="current-native-turn",
+        seq=50,
+        generation=machine.instance_id,
+    )
+    frames = [
+        ReplayStart(
+            from_seq=40, to_seq=41, truncated=True,
+            generation=machine.instance_id,
+        ),
+        AssistantMsgStart(
+            seq=40, message_id="unproven-prefix", channel="commentary"),
+        ReplayEnd(to_seq=41, truncated=True),
+    ]
+
+    seeded = machine._reseed_active_binding_for_hello(
+        ctx, frames, cursor=0, same_generation=True)
+
+    assert [frame.type for frame in seeded] == [
+        "replay_start", "assistant_msg_start", "replay_end", "turn_binding",
+    ]
+    assert seeded[-1].seq is None
 
 
 def test_fresh_hello_reseeds_owner_when_current_boundary_left_ring():

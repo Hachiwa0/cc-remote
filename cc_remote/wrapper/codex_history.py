@@ -482,6 +482,13 @@ class CodexOfficialHistory:
         self._terminal_refresh_fallbacks: OrderedDict[
             tuple[str, str], None
         ] = OrderedDict()
+        # Full/summary official items can expose the exact native user id and
+        # Remote clientId even when a moving active head later forces rollout
+        # fallback. Keep only these bounded ids so Machine can strengthen its
+        # source-bound durable alias without retaining another history copy.
+        self._client_message_identities: OrderedDict[
+            tuple[str, str], tuple[str, str]
+        ] = OrderedDict()
         self._detail_events: OrderedDict[
             tuple[str, str], tuple[dict[str, Any], ...]
         ] = OrderedDict()
@@ -513,6 +520,42 @@ class CodexOfficialHistory:
     ) -> bool:
         """Return whether a live or recovered Goal prompt is authoritative."""
         return (thread_id, native_turn_id) in self._automatic_users
+
+    def _remember_client_message_identities(
+        self,
+        thread_id: str,
+        native_turn_id: str,
+        items: list[dict[str, Any]],
+    ) -> None:
+        for item in items:
+            if item.get("type") != "userMessage":
+                continue
+            client_message_id = _optional_wire_id(
+                item.get("clientId"), "client-message")
+            if client_message_id is None:
+                continue
+            native_message_id = _wire_id(item.get("id"), "user")
+            key = (thread_id, native_message_id)
+            value = (native_turn_id, client_message_id)
+            previous = self._client_message_identities.get(key)
+            if previous is not None and previous != value:
+                raise CodexHistoryInvalidResponse(
+                    "Codex client-message identity changed")
+            self._remember(self._client_message_identities, key, value)
+
+    def take_client_message_identities(
+        self,
+        thread_id: str,
+    ) -> tuple[tuple[str, str, str], ...]:
+        """Drain exact official ids observed during the latest page reads."""
+        identities: list[tuple[str, str, str]] = []
+        for key in list(self._client_message_identities):
+            if key[0] != thread_id:
+                continue
+            native_turn_id, client_message_id = (
+                self._client_message_identities.pop(key))
+            identities.append((native_turn_id, key[1], client_message_id))
+        return tuple(identities)
 
     async def _call(self, method: str, params: dict[str, Any]) -> Any:
         return await self._rpc(method, params, None)
@@ -549,6 +592,10 @@ class CodexOfficialHistory:
         include_live_detail: bool = False,
         active_turn_ids: set[str] | frozenset[str] = frozenset(),
         hydrate_recent: int = 0,
+        client_message_ids: dict[str, str] | None = None,
+        segment_client_message_ids: (
+            dict[tuple[str, int], str] | None
+        ) = None,
     ) -> CodexHistoryPage:
         if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 200:
             raise ValueError("Codex history limit must be between 1 and 200")
@@ -869,6 +916,11 @@ class CodexOfficialHistory:
                                 dict(image) for image in recovered.images or []
                             ],
                         }, *turn["items"]]
+            self._remember_client_message_identities(
+                thread_id,
+                native_id,
+                turn["items"],
+            )
             projected_rows.append(turn)
             segments = _translate_turn(
                 thread_id, turn, tool_result_max=self.tool_result_max)
@@ -921,6 +973,28 @@ class CodexOfficialHistory:
             for native_group in reversed(grouped)
             for segment in native_group
         ]
+
+        native_aliases = client_message_ids or {}
+        segment_aliases = segment_client_message_ids or {}
+        for segment_events, locator in ordered:
+            user = next((
+                event for event in segment_events
+                if event.get("type") == "user_msg"
+            ), None)
+            if user is None or user.get("client_msg_id") is not None:
+                continue
+            native_message_id = user.get("msg_id")
+            alias = (
+                native_aliases.get(native_message_id)
+                if isinstance(native_message_id, str) else None
+            )
+            if alias is None:
+                alias = segment_aliases.get((
+                    locator.native_turn_id,
+                    locator.segment_index,
+                ))
+            if alias is not None:
+                user["client_msg_id"] = alias
 
         events = tuple(
             event

@@ -20,8 +20,10 @@ from cc_remote.wrapper.codex_rpc import (
 from cc_remote.wrapper.codex_stream import (
     codex_history_native_witness,
     codex_history_image_views,
+    codex_rollout_task_bindings,
     codex_history_turn_user,
     codex_history_turn_users,
+    codex_history_window,
     codex_translate_history,
 )
 from cc_remote.protocol import UserMsg
@@ -81,6 +83,76 @@ def _turn(
             else None
         ),
     }
+
+
+def test_rollout_task_binding_requires_exact_native_user_item(tmp_path):
+    path = tmp_path / "rollout.jsonl"
+    rows = [
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "id": "unrelated-user-item",
+                "content": [{"type": "input_text", "text": "same prompt"}],
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": "wrong-task",
+                },
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "message": "same prompt",
+                "turn_id": "text-only-task",
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "id": "official-user-item",
+                "content": [{"type": "input_text", "text": "same prompt"}],
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": "rollout-task",
+                },
+            },
+        },
+    ]
+    path.write_bytes(b"".join(
+        json.dumps(row).encode() + b"\n" for row in rows
+    ))
+
+    assert codex_rollout_task_bindings(
+        str(path), {"official-user-item", "missing-user-item"},
+    ) == {"official-user-item": "rollout-task"}
+    assert codex_rollout_task_bindings(
+        str(path), {"missing-user-item"},
+    ) == {}
+
+
+def test_rollout_task_binding_is_bounded_to_recent_source_tail(tmp_path):
+    path = tmp_path / "rollout.jsonl"
+    witness = {
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": "user",
+            "id": "official-user-item",
+            "internal_chat_message_metadata_passthrough": {
+                "turn_id": "old-rollout-task",
+            },
+        },
+    }
+    path.write_bytes(
+        json.dumps(witness).encode() + b"\n" + b'{}\n' * 1024
+    )
+
+    assert codex_rollout_task_bindings(
+        str(path), {"official-user-item"}, max_scan_bytes=1024,
+    ) == {}
 
 
 def test_rollout_image_view_supplement_is_turn_bound_and_binary_free(
@@ -569,6 +641,49 @@ def test_summary_supports_assistant_only_and_multiple_steer_segments():
     asyncio.run(run())
 
 
+def test_summary_applies_exact_durable_aliases_without_overriding_upstream():
+    async def rpc(_method, _params, cwd=None):
+        assert cwd is None
+        return {
+            "data": [_turn(
+                "native-multi",
+                [
+                    _user("user-first", "first"),
+                    _agent("answer-first", "first answer"),
+                    _user(
+                        "user-steer",
+                        "steer",
+                        client_id="upstream-steer",
+                    ),
+                    _agent("answer-last", "last answer"),
+                ],
+            )],
+            "nextCursor": None,
+        }
+
+    async def run():
+        history = CodexOfficialHistory(64 * 1024, rpc=rpc)
+        page = await history.summary_page(
+            "thread-1",
+            before=None,
+            limit=1,
+            client_message_ids={
+                "user-first": "browser-first",
+                "user-steer": "stale-steer",
+            },
+            segment_client_message_ids={
+                ("native-multi", 0): "segment-first",
+                ("native-multi", 1): "segment-steer",
+            },
+        )
+
+        first, steer = page.turns
+        assert first["clientMsgId"] == "browser-first"
+        assert steer["clientMsgId"] == "upstream-steer"
+
+    asyncio.run(run())
+
+
 def test_active_summary_hydrates_exact_full_turn_and_preserves_steers():
     calls = []
     summary = _turn(
@@ -1027,6 +1142,41 @@ def test_active_turn_missing_from_official_head_requests_rollout_fallback():
     asyncio.run(run())
 
 
+def test_active_head_fallback_retains_exact_official_client_identity():
+    async def rpc(_method, _params, cwd=None):
+        return {
+            "data": [_turn(
+                "native-cli-turn",
+                [_user(
+                    "native-delayed-user",
+                    "guide from Remote",
+                    client_id="browser-steer-id",
+                )],
+            )],
+            "nextCursor": None,
+        }
+
+    async def run():
+        history = CodexOfficialHistory(64 * 1024, rpc=rpc)
+        with pytest.raises(CodexHistoryUnsupported):
+            await history.summary_page(
+                "thread-active",
+                before=None,
+                limit=1,
+                active_turn_ids={"native-active-turn"},
+            )
+        assert history.take_client_message_identities("thread-active") == (
+            (
+                "native-cli-turn",
+                "native-delayed-user",
+                "browser-steer-id",
+            ),
+        )
+        assert history.take_client_message_identities("thread-active") == ()
+
+    asyncio.run(run())
+
+
 def test_summary_recovers_expired_local_image_from_rollout():
     recovered_calls = []
 
@@ -1394,6 +1544,235 @@ def test_rollout_user_recovery_selects_later_steer_images(tmp_path):
     assert recovered.prompt == "steer"
     assert recovered.images is not None
     assert len(recovered.images) == 1
+
+
+def test_legacy_rollout_user_pair_reuses_live_item_identity(tmp_path):
+    rollout = tmp_path / "rollout-legacy-user-item-id.jsonl"
+    rows = [
+        {
+            "type": "event_msg",
+            "payload": {"type": "task_started", "turn_id": "native-turn"},
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "id": "msg-native-first",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "first"}],
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "first"},
+        },
+        # An internal user envelope must not lend its id across an intervening
+        # record to the next visible user event.
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "id": "msg-internal-envelope",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "internal"}],
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "id": "developer-envelope",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "policy"}],
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "id": "msg-native-steer",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "steer"}],
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "steer"},
+        },
+        {
+            "type": "event_msg",
+            "payload": {"type": "task_complete", "turn_id": "native-turn"},
+        },
+    ]
+    encoded_rows = [json.dumps(row) + "\n" for row in rows]
+    rollout.write_text("".join(encoded_rows), encoding="utf-8")
+
+    events, _model = codex_translate_history(str(rollout), 64 * 1024)
+    users = [event for event in events if isinstance(event, UserMsg)]
+    assert [(user.msg_id, user.prompt) for user in users] == [
+        ("msg-native-first", "first"),
+        ("msg-native-steer", "steer"),
+    ]
+
+    steer_offset = sum(len(row.encode()) for row in encoded_rows[:5])
+    window_events, _model = codex_translate_history(
+        str(rollout), 64 * 1024, start_offset=steer_offset,
+    )
+    window_users = [
+        event for event in window_events if isinstance(event, UserMsg)
+    ]
+    assert [(user.msg_id, user.prompt) for user in window_users] == [
+        ("msg-native-steer", "steer"),
+    ]
+
+    # If a bounded window starts after the response item, identity is unknown;
+    # fail closed instead of guessing the live id from text or timestamps.
+    event_offset = steer_offset + len(encoded_rows[5].encode())
+    unpaired_events, _model = codex_translate_history(
+        str(rollout), 64 * 1024, start_offset=event_offset,
+    )
+    unpaired_user = next(
+        event for event in unpaired_events if isinstance(event, UserMsg)
+    )
+    assert unpaired_user.prompt == "steer"
+    assert unpaired_user.msg_id != "msg-native-steer"
+
+    first = codex_history_turn_user(
+        str(rollout), "native-turn", "native-turn", 0,
+    )
+    steer = codex_history_turn_user(
+        str(rollout), "native-turn", "msg-native-steer", 1,
+    )
+    assert first is not None and first.msg_id == "msg-native-first"
+    assert steer is not None and steer.msg_id == "msg-native-steer"
+
+    start, _end, has_more, _cursor, _boundary = codex_history_window(
+        str(rollout), before=None, limit=1, max_bytes=1024 * 1024,
+    )
+    assert has_more is True
+    assert start == steer_offset
+
+
+def test_native_user_page_cursor_accepts_previous_task_cursor(tmp_path):
+    rollout = tmp_path / "rollout-user-cursor-compat.jsonl"
+    rows = [
+        {
+            "type": "event_msg",
+            "payload": {"type": "task_started", "turn_id": "turn-old"},
+        },
+        {
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "old"},
+        },
+        {
+            "type": "event_msg",
+            "payload": {"type": "task_complete", "turn_id": "turn-old"},
+        },
+        {
+            "type": "event_msg",
+            "payload": {"type": "task_started", "turn_id": "turn-current"},
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "id": "msg-native-current",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "current"}],
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "current"},
+        },
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "task_complete",
+                "turn_id": "turn-current",
+            },
+        },
+    ]
+    encoded_rows = [json.dumps(row) + "\n" for row in rows]
+    rollout.write_text("".join(encoded_rows), encoding="utf-8")
+    current_offset = sum(len(row.encode()) for row in encoded_rows[:3])
+
+    native_page = codex_history_window(
+        str(rollout), before="msg-native-current", limit=1,
+        max_bytes=1024 * 1024,
+    )
+    compatibility_page = codex_history_window(
+        str(rollout), before="turn-current", limit=1,
+        max_bytes=1024 * 1024,
+    )
+    assert native_page == compatibility_page
+    assert native_page[1] == current_offset
+
+
+def test_rollout_history_applies_segment_and_native_message_aliases(tmp_path):
+    rollout = tmp_path / "rollout-client-aliases.jsonl"
+    rows = [
+        {
+            "type": "event_msg",
+            "payload": {"type": "task_started", "turn_id": "native-turn"},
+        },
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "turn_id": "native-turn",
+                "message": "first",
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "turn_id": "native-turn",
+                "item": {
+                    "type": "userMessage",
+                    "id": "native-steer-item",
+                    "content": [{"type": "text", "text": "steer"}],
+                },
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {"type": "task_complete", "turn_id": "native-turn"},
+        },
+    ]
+    encoded_rows = [json.dumps(row) + "\n" for row in rows]
+    rollout.write_text("".join(encoded_rows), encoding="utf-8")
+
+    events, _model = codex_translate_history(
+        str(rollout),
+        64 * 1024,
+        segment_client_message_ids={
+            ("native-turn", 0): "browser-first",
+        },
+        client_message_ids={
+            "native-steer-item": "browser-steer",
+        },
+    )
+    users = [event for event in events if isinstance(event, UserMsg)]
+    assert [user.prompt for user in users] == ["first", "steer"]
+    assert [user.client_msg_id for user in users] == [
+        "browser-first", "browser-steer",
+    ]
+
+    window_events, _model = codex_translate_history(
+        str(rollout),
+        64 * 1024,
+        start_offset=len(encoded_rows[0].encode("utf-8")),
+        segment_client_message_ids={
+            ("native-turn", 0): "browser-first",
+        },
+    )
+    window_users = [
+        event for event in window_events if isinstance(event, UserMsg)
+    ]
+    assert window_users
+    assert all(user.client_msg_id is None for user in window_users)
 
 
 def test_summary_recovers_images_for_each_visible_steer_segment():

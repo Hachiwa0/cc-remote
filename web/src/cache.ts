@@ -41,7 +41,16 @@ const SCHEMA = 1;
 // when several tool blocks legitimately shared one assistant message id.
 // v15 discards projections written when a wrapper restart recovered the tail of
 // an active Codex turn without re-announcing its exact logical message owner.
-const CACHE_VER = 15;
+// v16 discards completed Codex projections written before canonical History
+// persisted that exact owner. Hard refresh keeps IndexedDB, so a version fence
+// is required to remove already-polluted duplicate layers once.
+// v17 also discards legacy CLI projections whose historical user row did not
+// yet reuse the adjacent native app-server item id emitted by the live stream.
+// v18 discards active projections written while an evicted TurnBinding was
+// seeded after (instead of before) its proven replay suffix. Those rows can
+// contain a canonical History owner plus a second prompt-less live layer; the
+// cache is rebuildable, so one clean reload is safer than shape-based guessing.
+const CACHE_VER = 18;
 const MAX_CACHE_SESSIONS = 64;
 const MAX_CACHE_TURNS = 100;
 const MAX_CACHE_BYTES = 2 * 1024 * 1024;

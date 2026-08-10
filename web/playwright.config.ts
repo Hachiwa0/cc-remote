@@ -1,6 +1,7 @@
 import { defineConfig, devices } from "@playwright/test";
 
-const NEW_CHAT_CONTROL_TESTS = /new-chat controls|256-character profile id/;
+const NEW_CHAT_CONTROL_TESTS =
+  /new-chat controls|256-character profile id|Work multi-account controls/;
 const WEBKIT_LIVE_INTERACTION_TESTS =
   /live append follows|returning to a background-grown live turn|multi-line IME growth|multi-line composer growth|composer action growth|Codex controls stay on one row|queued messages expand|migration picker/;
 const WEBKIT_RENDERING_TESTS =

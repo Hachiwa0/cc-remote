@@ -931,6 +931,9 @@ export function mergeInitialHistory(
      * canonical turn. Disabled for cache, pagination, re-key and detail merges. */
     reconcileReplayOrphans?: boolean;
   } = {},
+  /** A settled Codex app-server History row owns the terminal lifecycle.
+   * This positional internal flag avoids shipping another merge-option key. */
+  settledCodex = false,
 ): Turn[] {
   const merged = history.map((turn) => ({ ...turn, blocks: turn.blocks.map((b) => ({ ...b })) }));
   const matches = new Array<number>(live.length).fill(-1);
@@ -959,6 +962,7 @@ export function mergeInitialHistory(
   // compaction fallback can consume a row belonging to another live segment.
   reserveMatches((historyTurn, liveTurn) => historyTurn.id === liveTurn.id);
   reserveMatches(sharesExactTurnAlias);
+
   reserveMatches(sameTurn);
 
   const replayOrphanMatches = new Set<number>();
@@ -1156,7 +1160,12 @@ export function mergeInitialHistory(
         // matching newest history row may inherit an unfinished live state.
         && index === merged.length - 1
         && !liveTurn.done;
-      merged[index] = mergeTurn(merged[index], liveTurn, isOpenLiveTail);
+      const historyTurn = merged[index];
+      const bound = mergeTurn(historyTurn, liveTurn, isOpenLiveTail);
+      merged[index] = settledCodex
+          && sharesExactTurnAlias(historyTurn, liveTurn)
+        ? restoreAuthoritativeLifecycle(bound, historyTurn)
+        : bound;
     } else {
       unmatched.push({ ...liveTurn, blocks: liveTurn.blocks.map((b) => ({ ...b })) });
     }
@@ -1192,11 +1201,20 @@ export function mergeInitialHistory(
     }
     return a.order - b.order;
   });
-  const seenAliases = new Set<string>();
-  return rows.map((row) => row.turn).filter((turn) => {
-    const aliases = exactTurnAliases(turn);
-    if ([...aliases].some((alias) => seenAliases.has(alias))) return false;
-    aliases.forEach((alias) => seenAliases.add(alias));
-    return true;
-  });
+  const result: Turn[] = [];
+  for (const { turn } of rows) {
+    const duplicate = result.findIndex((row) =>
+      sharesExactTurnAlias(row, turn));
+    if (duplicate < 0) {
+      result.push(turn);
+      continue;
+    }
+    // The old one-to-one matcher could leave both local ids until this final
+    // exact-alias pass. Do not merely discard the later canonical native row:
+    // merge it into the optimistic browser row so History blocks/detail survive.
+    if (turn.clientMsgId && turn.id !== turn.clientMsgId) {
+      result[duplicate] = mergeTurn(turn, result[duplicate]);
+    }
+  }
+  return result;
 }

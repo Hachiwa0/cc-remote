@@ -29,7 +29,9 @@ from cc_remote.attachments import (
 from cc_remote.protocol import ConversationTurn
 
 
-_SCHEMA_VERSION = 15
+# v17 also discards Codex pages whose legacy rollout user rows were materialized
+# without the adjacent native app-server item id used by the live stream.
+_SCHEMA_VERSION = 17
 _FINGERPRINT_SAMPLE_BYTES = 64 * 1024
 _DEFAULT_MAX_ENTRIES = 128
 _DEFAULT_MAX_BYTES = 64 * 1024 * 1024
@@ -890,6 +892,18 @@ class HistoryIndexStore:
                 ):
                     connection.execute(
                         f"DELETE FROM {table} WHERE engine='claude'")
+            if current in (10, 11, 12, 13, 14, 15, 16):
+                # v16 makes browser/native ownership durable; v17 reuses the
+                # adjacent native response-item id for legacy Codex user rows.
+                # Source fingerprints reveal neither projection change, so
+                # rebuild pages and source-complete details once. Image assets
+                # contain no turn-owner identity and remain valid/source-bound.
+                for table in (
+                    "history_pages",
+                    "history_turn_details",
+                ):
+                    connection.execute(
+                        f"DELETE FROM {table} WHERE engine='codex'")
             elif current not in (0, _SCHEMA_VERSION):
                 # v9 changes the invariant of history_turn_details: those rows
                 # must contain the source-complete translated turn, never the

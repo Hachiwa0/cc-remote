@@ -1306,6 +1306,63 @@ def test_requested_codex_summary_binds_exact_active_native_turn_ids(
     asyncio.run(run())
 
 
+def test_requested_codex_summary_passes_source_bound_client_aliases(
+    monkeypatch, tmp_path,
+):
+    rollout = tmp_path / "aliased-summary.jsonl"
+    rollout.write_text(
+        '{"type":"session_meta","payload":{"id":"aliased-summary"}}\n')
+    monkeypatch.setattr(
+        mm, "codex_rollout_path", lambda _sid: str(rollout))
+    seen = []
+
+    class Official:
+        async def summary_page(self, sid, **kwargs):
+            seen.append((sid, kwargs))
+            return CodexHistoryPage(
+                events=(),
+                turns=(),
+                has_more=False,
+                oldest_id=None,
+                newest_id=None,
+            )
+
+    async def run():
+        machine, _transport = _mk_machine()
+        machine._codex_history = Official()
+        machine._codex_client_messages.put(
+            rollout,
+            "native-turn",
+            "browser-message",
+            segment_index=0,
+        )
+        ctx = _mk_ctx("aliased-summary", "aliased-summary")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+
+        await machine._build_requested_history(
+            "aliased-summary",
+            before=None,
+            limit=4,
+            cwd=ctx.cwd,
+            detail="summary",
+        )
+
+        assert seen == [("aliased-summary", {
+            "before": None,
+            "limit": 4,
+            "include_live_detail": False,
+            "active_turn_ids": set(),
+            "hydrate_recent": 2,
+            "client_message_ids": {},
+            "segment_client_message_ids": {
+                ("native-turn", 0): "browser-message",
+            },
+        })]
+
+    asyncio.run(run())
+
+
 def test_requested_codex_summary_falls_back_only_for_unsupported_capability(
     monkeypatch, tmp_path,
 ):
@@ -4880,6 +4937,61 @@ def test_oversized_codex_rollout_reads_recent_turn_window(monkeypatch, tmp_path)
         assert newest.has_more is True
         assert not any("HISTORY_SOURCE_MAX_BYTES" in row.get("message", "")
                        for row in newest.events)
+
+    asyncio.run(go())
+
+
+def test_oversized_active_codex_steer_keeps_live_user_item_id(
+    monkeypatch, tmp_path,
+):
+    source = tmp_path / "huge-active-steer.jsonl"
+    with source.open("wb") as rollout:
+        for row in (
+            {"timestamp": "2026-01-01T00:00:00Z", "type": "event_msg",
+             "payload": {"type": "task_started", "turn_id": "turn-long"}},
+            {"timestamp": "2026-01-01T00:00:01Z", "type": "response_item",
+             "payload": {"type": "message", "id": "msg-native-first",
+                         "role": "user", "content": [{
+                             "type": "input_text", "text": "first prompt",
+                         }]}},
+            {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg",
+             "payload": {"type": "user_message",
+                         "message": "first prompt"}},
+        ):
+            rollout.write((json.dumps(row) + "\n").encode())
+        # One still-running CLI task can grow beyond the bounded history window.
+        # Keep the fixture sparse while retaining the same skipped-record shape.
+        rollout.seek(2 * 1024 * 1024, os.SEEK_CUR)
+        rollout.write(b"\n")
+        for row in (
+            {"timestamp": "2026-01-01T00:10:00Z", "type": "response_item",
+             "payload": {"type": "message", "id": "msg-native-steer",
+                         "role": "user", "content": [{
+                             "type": "input_text", "text": "latest steer",
+                         }]}},
+            {"timestamp": "2026-01-01T00:10:00Z", "type": "event_msg",
+             "payload": {"type": "user_message",
+                         "message": "latest steer"}},
+        ):
+            rollout.write((json.dumps(row) + "\n").encode())
+
+    monkeypatch.setattr(mm, "codex_rollout_path", lambda _sid: str(source))
+
+    async def go():
+        machine, _ = _mk_machine()
+        machine.cfg.codex_history_window_max_bytes = 1024 * 1024
+        ctx = _mk_ctx("codex-active-steer", "codex-active-steer")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+
+        newest = await machine._build_history("codex-active-steer", limit=60)
+        users = [
+            (row["msg_id"], row["prompt"])
+            for row in newest.events if row["type"] == "user_msg"
+        ]
+        assert users == [("msg-native-steer", "latest steer")]
+        assert newest.oldest_id == "msg-native-steer"
+        assert newest.has_more is True
 
     asyncio.run(go())
 

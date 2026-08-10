@@ -1218,6 +1218,134 @@ def test_codex_recover_owned_turn_arms_stream_before_status_read():
     asyncio.run(run())
 
 
+def test_codex_owned_turn_probe_exposes_only_native_user_item_ids():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "recovered-thread"
+
+        async def request(method, params=None):
+            if method == "thread/read":
+                return {
+                    "thread": {
+                        "status": {"type": "active", "activeFlags": []},
+                    },
+                }
+            assert method == "thread/turns/list"
+            assert params["itemsView"] == "summary"
+            return {
+                "data": [{
+                    "id": "control-turn",
+                    "status": "inProgress",
+                    "items": [
+                        {
+                            "id": "native-user-item",
+                            "type": "userMessage",
+                            "content": [{"type": "text", "text": "secret"}],
+                        },
+                        {
+                            "id": "assistant-item",
+                            "type": "agentMessage",
+                            "text": "private answer",
+                        },
+                    ],
+                }],
+            }
+
+        handle._request = request
+        proof = await handle.probe_owned_turn("control-turn")
+        assert proof is not None
+        assert proof.turn_id == "control-turn"
+        assert proof.native_user_message_ids == ("native-user-item",)
+        assert handle.turn_id is None
+        assert handle.turn_active is False
+
+    asyncio.run(run())
+
+
+def test_codex_recovered_control_turn_accepts_only_bound_stream_task():
+    async def run():
+        lifecycle = []
+
+        async def on_lifecycle(phase, turn_id):
+            lifecycle.append((phase, turn_id))
+
+        handle = CodexHandle(
+            _Cfg(), turn_lifecycle_callback=on_lifecycle)
+        handle.thread_id = "recovered-thread"
+
+        async def request(method, _params=None):
+            if method == "thread/read":
+                return {
+                    "thread": {
+                        "status": {"type": "active", "activeFlags": []},
+                    },
+                }
+            assert method == "thread/turns/list"
+            return {
+                "data": [{
+                    "id": "control-turn",
+                    "status": "inProgress",
+                    "items": [],
+                    "itemsView": "notLoaded",
+                }],
+            }
+
+        handle._request = request
+        assert await handle.recover_owned_turn(
+            "control-turn", stream_turn_ids=("rollout-task",),
+        ) is True
+        assert handle.owned_turn_ids.issuperset({
+            "control-turn", "rollout-task",
+        })
+        assert handle.compaction_continuation_turn_ids == {
+            "control-turn", "rollout-task",
+        }
+
+        await handle._dispatch({
+            "method": "item/completed",
+            "params": {
+                "threadId": "recovered-thread",
+                "turnId": "rollout-task",
+                "item": {
+                    "type": "agentMessage",
+                    "id": "answer",
+                    "text": "still running",
+                },
+            },
+        })
+        await handle._dispatch({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "recovered-thread",
+                "turn": {
+                    "id": "rollout-task",
+                    "status": "completed",
+                },
+            },
+        })
+        frames = [
+            frame async for frame in
+            handle.receive_spontaneous_response("control-turn")
+        ]
+        assert [frame["method"] for frame in frames] == [
+            "item/completed", "turn/completed",
+        ]
+        assert [
+            frame["params"].get("turnId")
+            or frame["params"].get("turn", {}).get("id")
+            for frame in frames
+        ] == ["control-turn", "control-turn"]
+        assert lifecycle == [
+            ("started", "control-turn"),
+            ("completed", "control-turn"),
+        ]
+        assert handle.turn_active is False
+        assert handle.turn_id is None
+        assert handle.compaction_continuation_turn_ids == set()
+
+    asyncio.run(run())
+
+
 def test_codex_recover_owned_turn_rejects_a_different_active_turn():
     async def run():
         lifecycle = []
@@ -1558,7 +1686,9 @@ def test_managed_codex_overflow_preserves_authoritative_success_terminal():
             collaboration_mode = "default"
             service_tier = None
 
-            async def query(self, _prompt, images=None):
+            async def query(
+                self, _prompt, images=None, *, client_user_message_id=None,
+            ):
                 return "managed-overflow-turn"
 
             async def receive_response(self):
@@ -1637,7 +1767,9 @@ def test_managed_codex_overflow_reports_live_delay_without_idle_warning():
             collaboration_mode = "default"
             service_tier = None
 
-            async def query(self, _prompt, images=None):
+            async def query(
+                self, _prompt, images=None, *, client_user_message_id=None,
+            ):
                 return "managed-overflow-wait-turn"
 
             async def receive_response(self):
@@ -1710,7 +1842,9 @@ def test_managed_codex_overflow_keeps_authoritative_failure_terminal():
             collaboration_mode = "default"
             service_tier = None
 
-            async def query(self, _prompt, images=None):
+            async def query(
+                self, _prompt, images=None, *, client_user_message_id=None,
+            ):
                 return "managed-overflow-failed-turn"
 
             async def receive_response(self):
@@ -5144,7 +5278,9 @@ def test_managed_turn_exception_does_not_unlock_live_auto_turn():
             model = None
             effort = None
 
-            async def query(self, _prompt, images=None):
+            async def query(
+                self, _prompt, images=None, *, client_user_message_id=None,
+            ):
                 raise RuntimeError("managed launch failed")
 
         ctx.sdk = FailingSdk()
@@ -5176,7 +5312,9 @@ def test_managed_codex_turn_emits_authoritative_browser_turn_binding():
             collaboration_mode = "default"
             service_tier = None
 
-            async def query(self, _prompt, images=None):
+            async def query(
+                self, _prompt, images=None, *, client_user_message_id=None,
+            ):
                 return "native-turn"
 
             async def receive_response(self):
@@ -6301,11 +6439,22 @@ def test_codex_handle_inserts_steer_fence_at_response_before_provider_repair(
         assert handle._pending_response_boundaries == {}
 
         # A later live-detail overflow may shed frames, never the ordering
-        # control. The gap belongs before the retained user boundary.
+        # or identity controls. The gap belongs before the retained user
+        # boundary.
+        proof = codex_handle_module.CodexSteerUserIdentityProof(
+            thread_id="thread-1",
+            expected_turn_id="turn-1",
+            native_turn_id="native-turn-1",
+            native_message_id="native-message-2",
+            client_message_id="message-2",
+            generation=0,
+        )
         assert queue.put_nowait(before)
         queue.put_control_nowait(acceptance.fence)
+        queue.put_control_first_nowait(proof)
         queue.begin_gap(CodexManagedOverflow("turn-1"))
         assert isinstance(await queue.get(), CodexManagedOverflow)
+        assert await queue.get() is proof
         assert await queue.get() is acceptance.fence
         acceptance.fence.release_now()
 

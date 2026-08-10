@@ -276,7 +276,7 @@ def test_legacy_migration_rebuilds_all_derived_history_rows(
 
     migrated = HistoryIndexStore(state_dir)
     with sqlite3.connect(migrated.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
         for table in (
             "history_pages",
             "history_turn_details",
@@ -300,7 +300,7 @@ def test_legacy_migration_rebuilds_all_derived_history_rows(
         ) is None
 
 
-def test_v10_migration_invalidates_only_claude_translation_rows(tmp_path):
+def test_v10_migration_invalidates_changed_projection_rows(tmp_path):
     source_path = tmp_path / "transcript.jsonl"
     source_path.write_text("{}\n")
     source = HistorySourceFingerprint.capture(source_path)
@@ -323,7 +323,7 @@ def test_v10_migration_invalidates_only_claude_translation_rows(tmp_path):
 
     migrated = HistoryIndexStore(state_dir)
     with sqlite3.connect(migrated.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
         for table in (
             "history_pages", "history_turn_details", "history_image_assets",
         ):
@@ -332,14 +332,19 @@ def test_v10_migration_invalidates_only_claude_translation_rows(tmp_path):
             ).fetchone()[0] == 0
             assert connection.execute(
                 f"SELECT COUNT(*) FROM {table} WHERE engine='codex'"
-            ).fetchone()[0] == 1
+            ).fetchone()[0] == (
+                1 if table == "history_image_assets" else 0)
 
     assert migrated.get_page(
         "claude-session", "claude", source, before=None, limit=4,
     ) is None
     assert migrated.get_page(
         "codex-session", "codex", source, before=None, limit=4,
-    ) == _page("codex-session")
+    ) is None
+    assert migrated.get_image_asset(
+        "codex-session", "codex", source,
+        "codex-session", "codex-image", "thumbnail",
+    ) == ("image/png", 1, 1, b"codex")
 
 
 def test_v11_migration_invalidates_claude_pages_and_adds_compact_index(
@@ -369,7 +374,7 @@ def test_v11_migration_invalidates_claude_pages_and_adds_compact_index(
         "claude-session", "claude", source, before=None, limit=4,
     ) is None
     with sqlite3.connect(migrated.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
         tables = {
             row[0] for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'"
@@ -383,7 +388,7 @@ def test_v11_migration_invalidates_claude_pages_and_adds_compact_index(
 
 
 @pytest.mark.parametrize("old_version", [12, 13, 14])
-def test_recent_migration_invalidates_only_claude_projection_rows(
+def test_recent_migration_invalidates_changed_projection_rows(
     tmp_path, old_version,
 ):
     source_path = tmp_path / "transcript.jsonl"
@@ -415,7 +420,7 @@ def test_recent_migration_invalidates_only_claude_projection_rows(
 
     migrated = HistoryIndexStore(state_dir)
     with sqlite3.connect(migrated.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
         for table in (
             "history_pages", "history_turn_details", "history_image_assets",
         ):
@@ -424,10 +429,63 @@ def test_recent_migration_invalidates_only_claude_projection_rows(
             ).fetchone()[0] == 0
             assert connection.execute(
                 f"SELECT COUNT(*) FROM {table} WHERE engine='codex'"
-            ).fetchone()[0] == 1
+            ).fetchone()[0] == (
+                1 if table == "history_image_assets" else 0)
         assert connection.execute(
             "SELECT COUNT(*) FROM claude_compact_sources"
         ).fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("old_version", [15, 16])
+def test_owner_migration_invalidates_only_codex_projections(
+    tmp_path, old_version,
+):
+    source_path = tmp_path / "transcript.jsonl"
+    source_path.write_text("{}\n")
+    source = HistorySourceFingerprint.capture(source_path)
+    state_dir = tmp_path / "state"
+    store = HistoryIndexStore(state_dir)
+
+    for engine in ("claude", "codex"):
+        session_id = f"{engine}-session"
+        assert store.put_page(
+            session_id, engine, source, before=None, limit=4,
+            page=_page(session_id),
+        )
+        store.put_image_asset(
+            session_id, engine, source, session_id, f"{engine}-image",
+            "thumbnail", "image/png", 1, 1, engine.encode(),
+        )
+
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(f"PRAGMA user_version={old_version}")
+
+    migrated = HistoryIndexStore(state_dir)
+    with sqlite3.connect(migrated.path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 17
+        for table in ("history_pages", "history_turn_details"):
+            assert connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE engine='claude'"
+            ).fetchone()[0] == 1
+            assert connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE engine='codex'"
+            ).fetchone()[0] == 0
+        for engine in ("claude", "codex"):
+            assert connection.execute(
+                "SELECT COUNT(*) FROM history_image_assets WHERE engine=?",
+                (engine,),
+            ).fetchone()[0] == 1
+
+    assert migrated.get_page(
+        "claude-session", "claude", source, before=None, limit=4,
+    ) == _page("claude-session")
+    assert migrated.get_page(
+        "codex-session", "codex", source, before=None, limit=4,
+    ) is None
+    assert migrated.get_image_asset(
+        "codex-session", "codex", source,
+        "codex-session", "codex-image", "thumbnail",
+    ) == ("image/png", 1, 1, b"codex")
 
 
 def test_history_index_rejects_one_page_larger_than_total_budget(tmp_path):

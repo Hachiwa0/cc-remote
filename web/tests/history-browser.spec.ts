@@ -1581,6 +1581,8 @@ test("session cache rejects stale Claude and replay-orphan rows", async ({
     const legacySid = "legacy-claude-prompt-alias";
     const replayOrphanSid = "completed-replay-orphan";
     const activeCompactionOrphanSid = "active-compaction-replay-orphan";
+    const recoveredOwnerV16Sid = "completed-recovery-owner-v16";
+    const lateSeedV17Sid = "active-late-binding-seed-v17";
     const optimisticSteerSid = "healthy-optimistic-steer";
     const database = await new Promise<IDBDatabase>((resolve, reject) => {
       const request = indexedDB.open("cc_remote_cache", 1);
@@ -1635,6 +1637,32 @@ test("session cache rejects stale Claude and replay-orphan rows", async ({
         savedAt: Date.now(),
       }, replayOrphanSid);
       tx.objectStore("sessions").put({
+        v: 16,
+        turns: [{
+          id: "browser-owner",
+          clientMsgId: "browser-owner",
+          forkPointId: "native-owner",
+          prompt: "deploy",
+          blocks: [],
+          done: true,
+        }, {
+          id: "recovered-tail",
+          prompt: "",
+          blocks: [{
+            kind: "text",
+            message_id: "recovered-answer",
+            text: "done",
+            channel: "final",
+            done: true,
+          }],
+          done: true,
+        }],
+        lastSeq: 365,
+        revision: "recovered-owner-r1",
+        generation: "recovered-owner-g1",
+        savedAt: Date.now(),
+      }, recoveredOwnerV16Sid);
+      tx.objectStore("sessions").put({
         v: 15,
         turns: [{
           id: "item-51",
@@ -1678,7 +1706,33 @@ test("session cache rejects stale Claude and replay-orphan rows", async ({
         savedAt: Date.now(),
       }, activeCompactionOrphanSid);
       tx.objectStore("sessions").put({
-        v: 15,
+        v: 17,
+        turns: [{
+          id: "canonical-current-owner",
+          clientMsgId: "canonical-current-owner",
+          forkPointId: "shared-current-native-turn",
+          prompt: "current prompt",
+          blocks: [],
+          done: false,
+        }, {
+          id: "late-seeded-live-tail",
+          prompt: "",
+          blocks: [{
+            kind: "text",
+            message_id: "late-seeded-live-tail",
+            text: "duplicated current suffix",
+            channel: "commentary",
+            done: false,
+          }],
+          done: false,
+        }],
+        lastSeq: 46,
+        revision: "late-seed-r1",
+        generation: "late-seed-g1",
+        savedAt: Date.now(),
+      }, lateSeedV17Sid);
+      tx.objectStore("sessions").put({
+        v: 18,
         turns: [{
           id: "active-before-steer",
           prompt: "first prompt",
@@ -1703,8 +1757,10 @@ test("session cache rejects stale Claude and replay-orphan rows", async ({
     });
     const legacy = await cache.loadSession(legacySid);
     const replayOrphan = await cache.loadSession(replayOrphanSid);
+    const recoveredOwnerV16 = await cache.loadSession(recoveredOwnerV16Sid);
     const activeCompactionOrphan = await cache.loadSession(
       activeCompactionOrphanSid);
+    const lateSeedV17 = await cache.loadSession(lateSeedV17Sid);
     const optimisticSteer = await cache.loadSession(optimisticSteerSid);
     const replay = await cache.loadAllReplayState();
     await new Promise((resolve) => window.setTimeout(resolve, 100));
@@ -1730,9 +1786,13 @@ test("session cache rejects stale Claude and replay-orphan rows", async ({
       legacyCursor: replay.cursors[legacySid],
       replayOrphan,
       replayOrphanCursor: replay.cursors[replayOrphanSid],
+      recoveredOwnerV16,
+      recoveredOwnerV16Cursor: replay.cursors[recoveredOwnerV16Sid],
       activeCompactionOrphan,
       activeCompactionCursor: replay.cursors[activeCompactionOrphanSid],
       prunedCompactionOrphan,
+      lateSeedV17,
+      lateSeedV17Cursor: replay.cursors[lateSeedV17Sid],
       optimisticSteerCount: optimisticSteer?.turns.length,
       optimisticSteerCursor: replay.cursors[optimisticSteerSid],
       currentIds: current?.turns.map((turn: {
@@ -1744,9 +1804,13 @@ test("session cache rejects stale Claude and replay-orphan rows", async ({
   expect(result.legacyCursor).toBeUndefined();
   expect(result.replayOrphan).toBeNull();
   expect(result.replayOrphanCursor).toBeUndefined();
+  expect(result.recoveredOwnerV16).toBeNull();
+  expect(result.recoveredOwnerV16Cursor).toBeUndefined();
   expect(result.activeCompactionOrphan).toBeNull();
   expect(result.activeCompactionCursor).toBeUndefined();
   expect(result.prunedCompactionOrphan).toBeNull();
+  expect(result.lateSeedV17).toBeNull();
+  expect(result.lateSeedV17Cursor).toBeUndefined();
   expect(result.optimisticSteerCount).toBe(2);
   expect(result.optimisticSteerCursor).toBe(47);
   expect(result.currentIds).toEqual([[

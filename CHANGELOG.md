@@ -4,12 +4,34 @@
 
 ## Unreleased
 
+- Store files and images attached to Work messages under that conversation's
+  private `workspace/uploads` directory, where the Work sandbox can actually
+  read them, while keeping uploaded source material out of generated Artifacts
+  and retaining history compatibility with the earlier sibling layout.
 - Let mobile Markdown source editors fill the available file panel, keep active
   session cards visibly selected, restore code-copy contrast in dark mode, and
   keep desktop dark code blocks visually separate from the page background.
-- Restore the exact active-turn owner before reconnect tail replay and discard
-  the one known malformed Codex compaction projection instead of repainting a
-  duplicate response after refresh.
+- Restore the exact active-turn owner before reconnect tail replay, persist its
+  source-bound browser/native identity into completed Codex History, and expire
+  projections written before that identity was durable instead of repainting a
+  duplicate response after refresh. Legacy CLI rollout user rows now reuse the
+  adjacent native app-server item id as well, so a history refresh cannot paint
+  one terminal prompt and its live mirror as two separate turns.
+  Remote steers flushed under a concurrent CLI turn now retain their exact
+  official `clientId` without admitting foreign CLI content, so delayed native
+  History rows collapse into the original optimistic message instead of
+  repainting it. Live rollout and official History item ids may coexist as
+  exact aliases of that one browser message instead of conflicting with each
+  other. Initial `turn/start` inputs now carry the same exact identity;
+  restart recovery can reattach an officially active split control/rollout turn
+  even after an oversized task's lifecycle marker has fallen outside the
+  bounded tail, preventing false interruption and duplicate prompt projections.
+  When that bounded tail has also evicted the active `TurnBinding`, its original
+  sequence now proves and pre-binds the retained current-turn suffix before Web
+  reduces it; projections cached with the old reversed order are expired once.
+  Once an unraced official Codex History page reports the thread idle, its
+  exact persisted success or failure also replaces a provisional live terminal
+  without discarding live detail or weakening Claude SDK terminal authority.
 - Upgrade the coordinated Wrapper/Relay/Web wire gate to protocol v33 and add
   multi-account Codex Work. New Work sessions and schedules can select any
   configured profile, persist that ownership independently of the current

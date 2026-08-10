@@ -1104,8 +1104,8 @@ assert.match(historyAppSource,
 assert.match(historyAppSource,
   /onLoadHistoryImage=\{historyView\.recovering\s*\? undefined/,
   "display-only recovery turns must not issue history-image reads");
-assert.match(cacheSource, /const CACHE_VER = 15/,
-  "ambiguous recovery-owner projections must invalidate older cache rows");
+assert.match(cacheSource, /const CACHE_VER = 18/,
+  "legacy native-user projections must invalidate older cache rows");
 assert.match(cacheSource, /objectStore\(STORE\)\.delete\(sessionId\)/);
 assert.match(cacheSource, /job\.epoch !== sessionEpoch\(job\.sid\)/,
   "a debounced pre-marker write must not recreate the deleted cache row");
@@ -4582,6 +4582,58 @@ try {
       (turn: Turn) => turn.id),
     ["browser-alias-steer"],
     "a native History alias reconciles into the optimistic steer exactly once",
+  );
+
+  const delayedNativeAlias = mergeInitialHistory(
+    [{
+      id: "native-delayed-user",
+      clientMsgId: "browser-delayed-steer",
+      prompt: "guide from Remote",
+      ts: 22_200,
+      done: true,
+      blocks: [{
+        kind: "text" as const,
+        message_id: "native-delayed-answer",
+        text: "native answer",
+        done: true,
+      }],
+    }],
+    [
+      {
+        id: "browser-delayed-steer",
+        clientMsgId: "browser-delayed-steer",
+        prompt: "guide from Remote",
+        ts: 22_100,
+        done: false,
+        blocks: [],
+      },
+      {
+        id: "native-delayed-user",
+        prompt: "guide from Remote",
+        ts: 22_200,
+        done: true,
+        blocks: [{
+          kind: "text" as const,
+          message_id: "native-delayed-answer",
+          text: "native answer",
+          done: true,
+        }],
+      },
+    ],
+  );
+  assert.deepEqual(
+    delayedNativeAlias.map((turn) => ({
+      id: turn.id,
+      historyTurnId: turn.historyTurnId,
+      messages: turn.blocks.map((block) => block.kind === "text"
+        ? block.message_id : null),
+    })),
+    [{
+      id: "browser-delayed-steer",
+      historyTurnId: "native-delayed-user",
+      messages: ["native-delayed-answer"],
+    }],
+    "one canonical alias must absorb both live ids without dropping native history",
   );
 
   const liveSteerAliasSid = "live-steer-official-alias";
@@ -8673,6 +8725,123 @@ try {
     /older reasoning replayed without its user boundary/,
   );
 
+  // Command+R can reconnect after the current TurnBinding itself has fallen
+  // out of the bounded ring. The wrapper still has its original sequence and
+  // therefore seeds that exact owner before a retained suffix whose from_seq
+  // is newer. History must merge the suffix into its canonical row rather
+  // than rendering a second prompt-less running group.
+  const boundSuffixSid = "truncated-current-suffix-keeps-one-owner";
+  const boundSuffixMsg = "browser-current-message";
+  const boundSuffixNativeTurn = "native-current-turn";
+  let boundSuffixState = reduce({
+    ...initialState, focusedSid: boundSuffixSid,
+  }, { type: "event", event: event({
+    type: "replay_start", sid: boundSuffixSid, from_seq: 101, to_seq: 103,
+    truncated: true, rebuild: false, generation: "wrapper-one",
+  }) });
+  for (const replayEvent of [
+    event({
+      type: "turn_binding", sid: boundSuffixSid,
+      msg_id: boundSuffixMsg, turn_id: boundSuffixNativeTurn,
+    }),
+    event({
+      type: "assistant_msg_start", sid: boundSuffixSid, seq: 101, ts: 11,
+      message_id: "current-live-commentary", channel: "commentary",
+    }),
+    event({
+      type: "delta", sid: boundSuffixSid, seq: 102, ts: 11.1,
+      message_id: "current-live-commentary",
+      text: "one current replay suffix", channel: "commentary",
+    }),
+    event({
+      type: "process", sid: boundSuffixSid, seq: 103, ts: 11.2,
+      item_id: "current-live-command", kind: "command", phase: "end",
+      status: "succeeded", turn_id: boundSuffixNativeTurn,
+      title: "checked current tree",
+    }),
+    event({
+      type: "replay_end", sid: boundSuffixSid, to_seq: 103,
+      truncated: true,
+    }),
+  ]) {
+    boundSuffixState = reduce(boundSuffixState, {
+      type: "event", event: replayEvent,
+    });
+  }
+  assert.equal(
+    boundSuffixState.runtimes[boundSuffixSid].state,
+    "idle",
+    "an owner seed routes replay but does not manufacture lifecycle state",
+  );
+  assert.deepEqual(
+    boundSuffixState.runtimes[boundSuffixSid].turns.map(
+      (turn: Turn) => turn.id),
+    [boundSuffixMsg],
+    "the replay suffix attaches to the client-only owner seed immediately",
+  );
+  const boundSuffixHistory = event({
+    type: "history", sid: boundSuffixSid,
+    session_id: boundSuffixSid, revision: "bound-suffix-rev",
+    generation: "wrapper-one", build_seq: 1, live_seq: 103,
+    has_more: true, oldest_id: "official-current-item",
+    newest_id: "official-current-item", in_progress: true,
+    detail: "summary", events: [],
+    turns: [{
+      id: "official-current-item",
+      clientMsgId: boundSuffixMsg,
+      forkPointId: boundSuffixNativeTurn,
+      prompt: "是否可以收敛 commit？",
+      blocks: [{
+        kind: "text", message_id: "official-current-commentary",
+        text: "authoritative current summary", done: false,
+        channel: "commentary",
+      }],
+      done: false, detailEventCount: 2, detailLoaded: false, ts: 10_000,
+    }],
+  }) as History;
+  boundSuffixState = reduce(boundSuffixState, {
+    type: "event", event: boundSuffixHistory,
+  });
+  boundSuffixState = reduce(boundSuffixState, {
+    type: "event", event: event({
+      ...boundSuffixHistory, build_seq: 2,
+    }) as History,
+  });
+  assert.equal(
+    boundSuffixState.runtimes[boundSuffixSid].turns.length,
+    1,
+    "a proven current replay suffix and authoritative History share one row",
+  );
+  const boundSuffixTurn = boundSuffixState.runtimes[boundSuffixSid].turns[0];
+  assert.equal(boundSuffixTurn.clientMsgId, boundSuffixMsg);
+  assert.equal(boundSuffixTurn.prompt, "是否可以收敛 commit？");
+  assert.match(JSON.stringify(boundSuffixTurn), /one current replay suffix/);
+  assert.match(JSON.stringify(boundSuffixTurn), /checked current tree/);
+
+  // The exception above is deliberately limited to the wrapper's unsequenced
+  // client-only seed. A normal sequenced binding replayed while idle can be
+  // stale and must not claim later unbound narrative.
+  const staleSequencedBindingSid = "sequenced-idle-binding-stays-closed";
+  let staleSequencedBindingState = reduce({
+    ...initialState, focusedSid: staleSequencedBindingSid,
+    runtimes: { [staleSequencedBindingSid]: createRuntime() },
+  }, { type: "event", event: event({
+    type: "turn_binding", sid: staleSequencedBindingSid, seq: 40,
+    msg_id: "completed-browser-message", turn_id: "completed-native-turn",
+  }) });
+  staleSequencedBindingState = reduce(staleSequencedBindingState, {
+    type: "event", event: event({
+      type: "assistant_msg_start", sid: staleSequencedBindingSid, seq: 41,
+      message_id: "unbound-later-output", channel: "commentary",
+    }),
+  });
+  assert.deepEqual(
+    staleSequencedBindingState.runtimes[staleSequencedBindingSid].turns.map(
+      (turn: Turn) => turn.id),
+    ["unbound-later-output"],
+    "a sequenced idle binding remains ineligible for narrative ownership",
+  );
+
   // The inverse race is valid: the newest running UserMsg may have replayed
   // before its transcript row was flushed into History. Keep exactly that
   // newest unfinished tail while still removing an older orphaned prefix.
@@ -9722,6 +9891,167 @@ try {
     },
     { done: true, terminalSource: undefined },
     "an authoritative terminal History settles compact metadata without a State frame",
+  );
+
+  const settledAuthoritySid = "settled-codex-lifecycle-authority";
+  const settledBrowserId = "settled-codex-browser-message";
+  const settledNativeId = "settled-codex-native-turn";
+  const settledLiveBlock = {
+    kind: "text" as const,
+    message_id: "settled-live-final",
+    channel: "final" as const,
+    text: "the completed answer",
+    done: true,
+  };
+  const settledAuthorityBase = {
+    ...initialState,
+    focusedSid: settledAuthoritySid,
+    sessions: [{
+      session_id: settledAuthoritySid,
+      engine: "codex" as const,
+      space: "code" as const,
+    }],
+    runtimes: {
+      [settledAuthoritySid]: {
+        ...createRuntime(),
+        state: "idle" as const,
+        syncReady: true,
+        historyRevision: "settled-codex-r1",
+        historyGeneration: "settled-codex-g1",
+        historyBuildSeq: 1,
+        historyLiveSeq: 40,
+        lastLiveSeq: 40,
+        turns: [{
+          id: settledBrowserId,
+          clientMsgId: settledBrowserId,
+          forkPointId: settledNativeId,
+          prompt: "finish a large compacted task",
+          done: true,
+          interrupted: true,
+          error: "该轮未正常结束",
+          terminalSource: "failed" as const,
+          blocks: [settledLiveBlock],
+        }],
+      },
+    },
+  };
+  const settledAuthorityHistory = (
+    overrides: Record<string, unknown> = {},
+  ) => event({
+    type: "history",
+    sid: settledAuthoritySid,
+    session_id: settledAuthoritySid,
+    revision: "settled-codex-r1",
+    generation: "settled-codex-g1",
+    build_seq: 2,
+    live_seq: 40,
+    detail: "summary",
+    authoritative: true,
+    has_more: true,
+    newest_id: "settled-codex-history-message",
+    in_progress: false,
+    events: [],
+    turns: [{
+      id: "settled-codex-history-message",
+      clientMsgId: settledBrowserId,
+      prompt: "finish a large compacted task",
+      forkPointId: settledNativeId,
+      done: true,
+      blocks: [],
+      detailEventCount: 300,
+      detailLoaded: false,
+    }],
+    ...overrides,
+  });
+  const settledCodexState = reduce(settledAuthorityBase, {
+    type: "event",
+    event: settledAuthorityHistory(),
+  });
+  assert.deepEqual({
+    turns: settledCodexState.runtimes[settledAuthoritySid].turns.length,
+    done: settledCodexState.runtimes[settledAuthoritySid].turns[0].done,
+    interrupted: settledCodexState.runtimes[settledAuthoritySid].turns[0]
+      .interrupted,
+    error: settledCodexState.runtimes[settledAuthoritySid].turns[0].error,
+    terminalSource: settledCodexState.runtimes[settledAuthoritySid].turns[0]
+      .terminalSource,
+    blocks: settledCodexState.runtimes[settledAuthoritySid].turns[0].blocks,
+  }, {
+    turns: 1,
+    done: true,
+    interrupted: undefined,
+    error: undefined,
+    terminalSource: undefined,
+    blocks: [settledLiveBlock],
+  }, "settled Codex History repairs a stale live failure without losing its live detail");
+
+  const genuineCodexFailure = reduce(settledAuthorityBase, {
+    type: "event",
+    event: settledAuthorityHistory({
+      turns: [{
+        id: "settled-codex-history-message",
+        clientMsgId: settledBrowserId,
+        prompt: "finish a large compacted task",
+        forkPointId: settledNativeId,
+        done: true,
+        error: "official provider failure",
+        blocks: [],
+        detailEventCount: 1,
+        detailLoaded: false,
+      }],
+    }),
+  });
+  assert.equal(
+    genuineCodexFailure.runtimes[settledAuthoritySid].turns[0].error,
+    "official provider failure",
+    "settled Codex History replaces only a provisional terminal, not an official failure",
+  );
+
+  const racedCodexHistory = reduce(settledAuthorityBase, {
+    type: "event",
+    event: settledAuthorityHistory({ live_seq: 39 }),
+  });
+  assert.equal(
+    racedCodexHistory.runtimes[settledAuthoritySid].turns[0].error,
+    "该轮未正常结束",
+    "History captured before a newer live terminal cannot erase that terminal",
+  );
+
+  const sharedTaskOnlyHistory = reduce(settledAuthorityBase, {
+    type: "event",
+    event: settledAuthorityHistory({
+      newest_id: "another-steer-message",
+      turns: [{
+        id: "another-steer-message",
+        prompt: "another steer in the same native task",
+        forkPointId: settledNativeId,
+        done: true,
+        blocks: [],
+        detailEventCount: 1,
+        detailLoaded: false,
+      }],
+    }),
+  });
+  assert.equal(
+    sharedTaskOnlyHistory.runtimes[settledAuthoritySid].turns[0].error,
+    "该轮未正常结束",
+    "a shared native task alone cannot let another steer clear this terminal",
+  );
+
+  const settledClaudeState = reduce({
+    ...settledAuthorityBase,
+    sessions: [{
+      ...settledAuthorityBase.sessions[0],
+      engine: "claude" as const,
+    }],
+  }, {
+    type: "event",
+    event: settledAuthorityHistory(),
+  });
+  assert.equal(
+    settledClaudeState.runtimes[settledAuthoritySid].turns[0].error,
+    "该轮未正常结束",
+    "Claude transcript History cannot erase its SDK terminal lifecycle",
   );
 
   for (const [label, recovered] of [
@@ -11023,6 +11353,224 @@ try {
     recoveredOwnerState.runtimes[recoveredOwnerSid].pendingLiveBinding,
     null,
   );
+  recoveredOwnerState = reduce(recoveredOwnerState, {
+    type: "event",
+    event: event({
+      type: "history",
+      sid: recoveredOwnerSid,
+      session_id: recoveredOwnerSid,
+      revision: "recovered-owner-r1",
+      generation: "recovered-new-generation",
+      build_seq: 1,
+      live_seq: 6,
+      detail: "summary",
+      authoritative: true,
+      has_more: false,
+      newest_id: "recovered-official-user",
+      in_progress: false,
+      events: [],
+      turns: [{
+        id: "recovered-official-user",
+        clientMsgId: recoveredOwnerMsg,
+        prompt: "执行收紧后的计划。",
+        forkPointId: recoveredNativeTurn,
+        done: true,
+        blocks: [{
+          kind: "text",
+          message_id: "recovered-final",
+          channel: "final",
+          text: "one recovered answer",
+          done: true,
+        }],
+      }],
+    }),
+  });
+  assert.equal(
+    recoveredOwnerState.runtimes[recoveredOwnerSid].turns.length,
+    1,
+    "terminal canonical History keeps one exact recovered owner",
+  );
+  assert.equal(
+    recoveredOwnerState.runtimes[recoveredOwnerSid].turns[0].clientMsgId,
+    recoveredOwnerMsg,
+  );
+  assert.deepEqual(
+    recoveredOwnerState.runtimes[recoveredOwnerSid].turns[0].blocks.map(
+      (block: Block) => block.kind === "text" ? block.text : null,
+    ),
+    ["one recovered answer"],
+    "terminal reconciliation does not retain a second recovered layer",
+  );
+
+  // A replacement wrapper can prove that its official control turn and the
+  // rollout stream task are two exact ids for one still-active turn. History
+  // remains keyed by the rollout task, while live notifications are normalized
+  // to the control turn. Only the bounded continuation proof may bridge them;
+  // otherwise a real interrupted row must remain terminal.
+  const splitRecoverySid = "recovered-split-control-stream-binding";
+  const splitRecoveryMsg = "recovered-split-client-message";
+  const splitRecoveryControl = "recovered-split-control-turn";
+  const splitRecoveryStream = "recovered-split-stream-task";
+  const splitRecoveryHistory = "recovered-split-native-user";
+  const splitRecoveryBase = {
+    ...initialState,
+    focusedSid: splitRecoverySid,
+    runtimes: {
+      [splitRecoverySid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        controlGeneration: "recovered-split-generation",
+        historyGeneration: "recovered-split-generation",
+        legacyLiveFallbackBlocked: true,
+      },
+    },
+  };
+  const splitRecoveryBinding = event({
+    type: "turn_binding",
+    sid: splitRecoverySid,
+    seq: 1,
+    msg_id: splitRecoveryMsg,
+    turn_id: splitRecoveryControl,
+  });
+  const splitRecoveryPage = (
+    continuationIds: string[],
+  ) => event({
+    type: "history",
+    sid: splitRecoverySid,
+    session_id: splitRecoverySid,
+    revision: "recovered-split-r1",
+    generation: "recovered-split-generation",
+    build_seq: 1,
+    live_seq: 1,
+    detail: "summary",
+    authoritative: true,
+    has_more: true,
+    newest_id: splitRecoveryHistory,
+    in_progress: true,
+    compaction_continuation_turn_ids: continuationIds,
+    events: [],
+    turns: [{
+      id: splitRecoveryHistory,
+      clientMsgId: splitRecoveryMsg,
+      prompt: "continue the oversized active task",
+      forkPointId: splitRecoveryStream,
+      done: true,
+      interrupted: true,
+      error: "本次回复已打断。",
+      blocks: [],
+    }],
+  });
+  let splitRecoveryState = reduce(splitRecoveryBase, {
+    type: "event", event: splitRecoveryBinding,
+  });
+  splitRecoveryState = reduce(splitRecoveryState, {
+    type: "event",
+    event: splitRecoveryPage([
+      splitRecoveryControl,
+      splitRecoveryStream,
+    ]),
+  });
+  assert.deepEqual({
+    turnCount: splitRecoveryState.runtimes[splitRecoverySid].turns.length,
+    done: splitRecoveryState.runtimes[splitRecoverySid].turns[0].done,
+    interrupted: splitRecoveryState.runtimes[splitRecoverySid].turns[0]
+      .interrupted,
+    error: splitRecoveryState.runtimes[splitRecoverySid].turns[0].error,
+    forkPointId: splitRecoveryState.runtimes[splitRecoverySid].turns[0]
+      .forkPointId,
+    liveTaskId: splitRecoveryState.runtimes[splitRecoverySid].turns[0]
+      .liveTaskId,
+  }, {
+    turnCount: 1,
+    done: false,
+    interrupted: undefined,
+    error: undefined,
+    forkPointId: splitRecoveryStream,
+    liveTaskId: splitRecoveryControl,
+  }, "exact control/stream proof reopens one History row without replacing its stream identity");
+  for (const recoveredEvent of [
+    event({
+      type: "process",
+      sid: splitRecoverySid,
+      seq: 2,
+      item_id: "recovered-split-process",
+      kind: "command",
+      phase: "end",
+      status: "succeeded",
+      turn_id: splitRecoveryControl,
+      title: "continued after wrapper restart",
+    }),
+    event({
+      type: "assistant_msg_start",
+      sid: splitRecoverySid,
+      seq: 3,
+      message_id: "recovered-split-answer",
+      channel: "commentary",
+    }),
+    event({
+      type: "delta",
+      sid: splitRecoverySid,
+      seq: 4,
+      message_id: "recovered-split-answer",
+      channel: "commentary",
+      text: "still working",
+    }),
+  ]) {
+    splitRecoveryState = reduce(splitRecoveryState, {
+      type: "event", event: recoveredEvent,
+    });
+  }
+  assert.equal(
+    splitRecoveryState.runtimes[splitRecoverySid].turns.length,
+    1,
+    "normalized control-id output stays on the exact rollout History row",
+  );
+  assert.deepEqual(
+    splitRecoveryState.runtimes[splitRecoverySid].turns[0].blocks.map(
+      (block: Block) => block.kind === "process"
+        ? block.item_id : block.kind === "text" ? block.message_id : null,
+    ),
+    ["recovered-split-process", "recovered-split-answer"],
+  );
+
+  let unprovenSplitState = reduce(splitRecoveryBase, {
+    type: "event", event: splitRecoveryBinding,
+  });
+  unprovenSplitState = reduce(unprovenSplitState, {
+    type: "event",
+    event: splitRecoveryPage([]),
+  });
+  assert.deepEqual({
+    done: unprovenSplitState.runtimes[splitRecoverySid].turns[0].done,
+    interrupted: unprovenSplitState.runtimes[splitRecoverySid].turns[0]
+      .interrupted,
+    liveTaskId: unprovenSplitState.runtimes[splitRecoverySid].turns[0]
+      .liveTaskId,
+  }, {
+    done: true,
+    interrupted: true,
+    liveTaskId: undefined,
+  }, "missing continuation evidence cannot reopen or alias a real interrupted turn");
+
+  let streamOnlySplitState = reduce(splitRecoveryBase, {
+    type: "event", event: splitRecoveryBinding,
+  });
+  streamOnlySplitState = reduce(streamOnlySplitState, {
+    type: "event",
+    event: splitRecoveryPage([splitRecoveryStream]),
+  });
+  assert.deepEqual({
+    done: streamOnlySplitState.runtimes[splitRecoverySid].turns[0].done,
+    interrupted: streamOnlySplitState.runtimes[splitRecoverySid].turns[0]
+      .interrupted,
+    liveTaskId: streamOnlySplitState.runtimes[splitRecoverySid].turns[0]
+      .liveTaskId,
+  }, {
+    done: false,
+    interrupted: undefined,
+    liveTaskId: undefined,
+  }, "a stream-only compaction proof cannot manufacture the control/stream alias");
 
   // A cold browser can receive the client-only, unsequenced recovery binding
   // before both live content and History. The first real content may open an

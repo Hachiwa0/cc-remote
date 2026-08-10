@@ -731,9 +731,14 @@ function activatePendingLiveBinding(
   }
   if (typeof eventSeq === "number" && eventSeq < binding.seq) return undefined;
   if (nativeTurnId && nativeTurnId !== binding.turnId) return undefined;
-  // A delayed binding/replay from a completed turn may still be in the ring.
-  // Only a current running lifecycle may reopen its exact logical segment.
-  if (runtime.state !== "running") return undefined;
+  // A delayed sequenced binding/replay from a completed turn may still be in
+  // the ring, so only a current running lifecycle may reopen it. Sequence zero
+  // is reserved for the wrapper's client-only reconnect seed: the wrapper emits
+  // that frame only while the resident context is non-idle, and it may arrive
+  // before a freshly loaded reducer has recovered its lifecycle state. Use it
+  // solely for narrative ownership; later State/History remains authoritative
+  // for whether the UI itself is running.
+  if (runtime.state !== "running" && binding.seq !== 0) return undefined;
 
   const matches = turns.filter((turn) =>
     turnHasIdentityAlias(turn, binding.msgId));
@@ -777,22 +782,27 @@ function bindAuthoritativeActiveHistoryHead(
   seq: number,
   newestId: string | null = runtime.historyNewestId,
   assumeRunning = false,
+  continuationTurnIds?: string[] | null,
 ): Turn | undefined {
   if ((!assumeRunning && runtime.state !== "running") || !newestId) {
     return undefined;
   }
   const heads = turns.filter((turn) =>
     !turn.done
-    && (canonicalTurnId(turn) === newestId
-      || turnHasIdentityAlias(turn, newestId))
-    && findTurnByEngineId([turn], nativeTurnId) === turn);
+    && turnHasIdentityAlias(turn, newestId));
   if (heads.length !== 1) return undefined;
   const head = heads[0];
-  if (head.clientMsgId && head.clientMsgId !== msgId
-      && !turnHasIdentityAlias(head, msgId)) return undefined;
+  const historyStreamId = head.forkPointId;
+  if (head.clientMsgId && !turnHasIdentityAlias(head, msgId)) return undefined;
   const logicalOwners = turns.filter((turn) =>
     turnHasIdentityAlias(turn, msgId));
   if (logicalOwners.length > 1) return undefined;
+  if (findTurnByEngineId([head], nativeTurnId) !== head) {
+    if (!historyStreamId
+        || !continuationTurnIds?.includes(nativeTurnId)
+        || !continuationTurnIds.includes(historyStreamId)) return undefined;
+    head.liveTaskId = nativeTurnId;
+  }
   head.clientMsgId ??= msgId;
   const logical = logicalOwners[0];
   if (logical && logical !== head) {
@@ -802,7 +812,12 @@ function bindAuthoritativeActiveHistoryHead(
       [head], [logical], { preserveLiveTailOpen: true });
     if (mergedTurns.length !== 1) return undefined;
     const merged = mergedTurns[0];
-    merged.forkPointId = nativeTurnId;
+    // A recovered Codex control turn can own a distinct rollout stream task.
+    // Keep History's exact stream identity as the canonical branch point and
+    // record the control id only as a routing alias. Both ids must have arrived
+    // in the wrapper's bounded continuation proof above; never infer this from
+    // prompt text, timestamps, running state, or row position.
+    merged.forkPointId ??= nativeTurnId;
     const first = Math.min(headIndex, logicalIndex);
     const second = Math.max(headIndex, logicalIndex);
     turns.splice(second, 1);
@@ -1375,16 +1390,14 @@ function reopenAuthoritativeActiveHistoryHead(
   compactionContinuationTurnIds: string[] | null | undefined,
 ): Turn[] {
   if (!newestId) return turns;
-  const matches = turns.map((turn, index) => ({ turn, index })).filter(
-    ({ turn }) => canonicalTurnId(turn) === newestId
-      || turnHasIdentityAlias(turn, newestId),
-  );
+  const matches = turns.filter((turn) =>
+    turnHasIdentityAlias(turn, newestId));
   if (matches.length !== 1) return turns;
-  const { turn, index } = matches[0];
-  const explicitLiveOwner = findExplicitLiveTaskOwner(
+  const turn = matches[0];
+  const index = turns.indexOf(turn);
+  if (findExplicitLiveTaskOwner(
     runtime, turns, ownerFenceSeq ?? null,
-  );
-  if (explicitLiveOwner) {
+  )) {
     // The active native task is already owned by a newer ordered steer row.
     // Until block identity proves both aliases are the same visible segment,
     // leave this History shell terminal instead of displaying two spinners.
@@ -1394,9 +1407,9 @@ function reopenAuthoritativeActiveHistoryHead(
   // row. ``in_progress``, a native forkPointId, recency, and browser-local
   // terminalSource are all insufficient on a cold refresh: they also describe
   // real user interrupts and crashes.
-  const continuationIds = new Set(compactionContinuationTurnIds ?? []);
-  if (!turn.forkPointId || !continuationIds.has(turn.forkPointId)
-      || !turn.done || turn.interrupted !== true) {
+  if (!turn.forkPointId
+      || !compactionContinuationTurnIds?.includes(turn.forkPointId)
+      || !turn.done || !turn.interrupted) {
     return turns;
   }
   const next = [...turns];
@@ -1420,8 +1433,7 @@ function findAuthoritativeActiveHistoryHead(
       || !runtime.historyNewestId) return undefined;
   const matches = turns.filter((turn) =>
     !turn.done
-    && (canonicalTurnId(turn) === runtime.historyNewestId
-      || turnHasIdentityAlias(turn, runtime.historyNewestId)));
+    && turnHasIdentityAlias(turn, runtime.historyNewestId));
   return matches.length === 1 ? matches[0] : undefined;
 }
 
@@ -3184,9 +3196,9 @@ function reduceEvent(
       }
       const racedLiveEvent = !e.before && e.live_seq != null
         && base.lastLiveSeq > e.live_seq;
-      const resolveUnknownSteerFromIdle = !e.before
-        && e.in_progress === false
-        && !racedLiveEvent
+      const settledHistory = !e.before && !racedLiveEvent
+        && e.in_progress === false;
+      const resolveUnknownSteerFromIdle = settledHistory
         && base.acceptanceKind === "steer_unknown"
         && !!base.acceptancePending
         && !acceptanceConfirmed;
@@ -3249,9 +3261,15 @@ function reduceEvent(
           // wrapper without that field falls back to the local runtime state.
           preserveLiveTailOpen: racedLiveEvent || e.in_progress === true
             || (e.in_progress == null && base.state !== "idle"),
+          // Codex app-server History reports the native turn's persisted
+          // completed/failed status. Once an idle, unraced page arrives it
+          // repairs a provisional live terminal (notably after compaction)
+          // while leaving Claude's transcript-only lifecycle untouched.
           newestHistoryId: e.newest_id ?? null,
           reconcileReplayOrphans: true,
-        });
+        }, settledHistory
+          && state.sessions.find((session) =>
+            session.session_id === sid)?.engine === "codex");
         if (acceptanceConfirmed && base.acceptancePending
             && (base.acceptanceKind === "steer"
               || base.acceptanceKind === "steer_unknown")
@@ -3265,7 +3283,7 @@ function reduceEvent(
         // A current first page which explicitly reports idle is the recovery
         // boundary for a lost TurnEnd. Do not close a merely optimistic local
         // query (base is still idle), or a tail advanced after this History read.
-        if (e.in_progress === false && !racedLiveEvent) {
+        if (settledHistory) {
           const wasInterrupting = base.state === "interrupting"
             || base.state === "draining";
           const doneTs = e.ts ? Math.round(e.ts * 1000) : Date.now();
@@ -3358,6 +3376,7 @@ function reduceEvent(
             binding.seq,
             e.newest_id ?? null,
             true,
+            e.compaction_continuation_turn_ids,
           );
           boundHistoryOwner = bindingRuntime.liveOwner;
         }
@@ -3429,8 +3448,7 @@ function reduceEvent(
           && pendingLiveBinding.generation !== nextOrderingGeneration) {
         pendingLiveBinding = null;
       }
-      if (pendingLiveBinding && acceptsControlState && !racedLiveEvent
-          && e.in_progress === false && e.live_seq != null
+      if (pendingLiveBinding && settledHistory && e.live_seq != null
           && e.live_seq >= pendingLiveBinding.seq) {
         pendingLiveBinding = null;
       }
@@ -3490,9 +3508,8 @@ function reduceEvent(
             state: confirmsWrapperRunning
               ? (base.state === "interrupting" || base.state === "draining"
                   ? base.state : "running")
-              : acceptsControlState && !racedLiveEvent
+              : settledHistory
                   && e.external !== true && !base.external
-                  && e.in_progress === false
                 ? "idle"
                 : base.state,
             mirroredRunning: acceptsControlState && !racedLiveEvent

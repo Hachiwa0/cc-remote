@@ -46,7 +46,9 @@ class _StalledSdk:
         self.reconnects = 0
         self.responses = []
 
-    async def query(self, prompt, images=None):
+    async def query(
+        self, prompt, images=None, *, client_user_message_id=None,
+    ):
         return None
 
     async def receive_response(self):

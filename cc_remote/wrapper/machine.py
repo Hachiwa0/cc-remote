@@ -203,13 +203,20 @@ from cc_remote.wrapper.codex_handle import (
     CodexNoActiveTurnError, CodexNoActiveTurnFence,
     CodexSteerOutcomeUnknown,
     CodexSpontaneousClosed, CodexSpontaneousOverflow, CodexSteerFence,
+    CodexSteerUserIdentityProof,
 )
 from cc_remote.wrapper.codex_turn_leases import CodexTurnLeaseStore
+from cc_remote.wrapper.codex_client_messages import (
+    CodexClientMessageAliases,
+    CodexClientMessageStore,
+    CodexClientMessageStoreError,
+)
 from cc_remote.wrapper.codex_permissions import codex_permission_profiles
 from cc_remote.wrapper.codex_stream import (
     CodexHistoryImageView, CodexHistoryNativeWitness, CodexStreamTranslator,
     coalesce_codex_live_notifications,
     codex_live_user_message,
+    codex_rollout_task_bindings,
     codex_history_image_views, codex_session_id, is_turn_terminal,
     codex_history_boundary_user, codex_history_turn_user,
     codex_history_turn_users,
@@ -1175,6 +1182,10 @@ class _CodexHistoryProfiles:
     async def summary_page(self, thread_id: str, **kwargs):
         return await self._reader(thread_id).summary_page(thread_id, **kwargs)
 
+    def take_client_message_identities(self, thread_id: str):
+        return self._reader(thread_id).take_client_message_identities(
+            thread_id)
+
     async def turn_events(self, thread_id: str, visible_turn_id: str):
         return await self._reader(thread_id).turn_events(
             thread_id, visible_turn_id)
@@ -1367,6 +1378,13 @@ class WrapperMachine:
         self._codex_daemon_restart_path = self._codex_daemon_restart_paths[
             self._codex_profiles.default.id]
         self._codex_turn_leases = CodexTurnLeaseStore(cfg.state_dir)
+        try:
+            self._codex_client_messages: CodexClientMessageStore | None = (
+                CodexClientMessageStore(cfg.state_dir)
+            )
+        except CodexClientMessageStoreError:
+            self._codex_client_messages = None
+            log.exception("Codex client-message identity store unavailable")
         self._claude_broker = BrokerClient(
             getattr(cfg, "claude_broker_socket", None))
         # Claude's official SDK/CLI does not expose a supported multi-writer
@@ -1962,6 +1980,381 @@ class WrapperMachine:
             self._invalidate_codex_history(sid)
         return revision
 
+    def _codex_history_client_message_ids(
+        self,
+        source_path: str | None,
+    ) -> CodexClientMessageAliases:
+        """Load only aliases proven against this exact rollout inode."""
+        store = getattr(self, "_codex_client_messages", None)
+        if store is None or not source_path:
+            return CodexClientMessageAliases({}, {})
+        try:
+            return store.get(source_path)
+        except CodexClientMessageStoreError as exc:
+            log.warning(
+                "Codex client-message aliases unavailable",
+                error_type=type(exc).__name__,
+            )
+            return CodexClientMessageAliases({}, {})
+
+    @staticmethod
+    def _overlay_codex_cached_client_aliases(
+        rows: list[dict],
+        aliases: CodexClientMessageAliases,
+        *,
+        turns: bool,
+    ) -> list[dict]:
+        """Repair only identities still exact after materialization.
+
+        Newly learned aliases invalidate the page before this path is used.
+        This narrow overlay additionally handles a persisted page built by an
+        earlier wrapper release: native user ids remain exact, and legacy first
+        segments use the native turn id as their visible id. No ordinal or text
+        inference is attempted for already-materialized steer rows.
+        """
+        overlaid: list[dict] = []
+        for original in rows:
+            row = dict(original)
+            if turns:
+                native_id = row.get("id")
+                client_field = "clientMsgId"
+            elif row.get("type") == "user_msg":
+                native_id = row.get("msg_id")
+                client_field = "client_msg_id"
+            else:
+                overlaid.append(row)
+                continue
+            if (
+                isinstance(native_id, str)
+                and row.get(client_field) is None
+            ):
+                alias = aliases.native_messages.get(native_id)
+                if alias is None:
+                    alias = aliases.segments.get((native_id, 0))
+                if alias is not None:
+                    row[client_field] = alias
+            overlaid.append(row)
+        return overlaid
+
+    async def _remember_codex_client_message_id(
+        self,
+        ctx: SessionContext,
+        native_turn_id: str,
+        client_message_id: str,
+        *,
+        segment_index: int | None = None,
+        native_message_id: str | None = None,
+        source_path: str | None = None,
+    ) -> bool:
+        """Persist one exact Codex History alias without affecting the turn."""
+        if (
+            ctx.engine != "codex"
+            or ctx.btw
+            or not native_turn_id
+            or not client_message_id
+            or (segment_index is None and native_message_id is None)
+        ):
+            return False
+        session_id = self._ctx_wire_sid(ctx)
+        store = getattr(self, "_codex_client_messages", None)
+        if not session_id or store is None:
+            return False
+        try:
+            path = source_path or await asyncio.to_thread(
+                self._codex_rollout_for_wire, session_id)
+            if not path:
+                return False
+            inserted = await asyncio.to_thread(
+                store.put,
+                path,
+                native_turn_id,
+                client_message_id,
+                segment_index=segment_index,
+                native_message_id=native_message_id,
+            )
+        except (CodexClientMessageStoreError, OSError, ValueError) as exc:
+            # The model mutation and live stream remain authoritative. Losing a
+            # local reconnect hint must not invite the browser to retry input.
+            log.warning(
+                "Codex client-message alias could not be persisted",
+                session_id=session_id,
+                turn_id=native_turn_id,
+                error_type=type(exc).__name__,
+            )
+            return False
+        if inserted:
+            # Source fingerprints do not include metadata learned from the live
+            # app-server. Discard an alias-free materialized page and advance
+            # the browser revision before it can race this identity update.
+            self._bump_history_revision(session_id)
+        return inserted
+
+    async def _remember_codex_initial_turn_alias(
+        self,
+        ctx: SessionContext,
+        native_turn_id: str,
+        *,
+        source_path: str | None = None,
+    ) -> bool:
+        client_message_id = ctx.codex_owned_initial_msg_id
+        if not client_message_id or client_message_id == native_turn_id:
+            return False
+        return await self._remember_codex_client_message_id(
+            ctx,
+            native_turn_id,
+            client_message_id,
+            segment_index=0,
+            source_path=source_path,
+        )
+
+    async def _remember_codex_live_user_alias(
+        self,
+        ctx: SessionContext,
+        user,
+    ) -> bool:
+        """Strengthen a segment alias with an official native user-item id."""
+        client_message_id = getattr(user, "client_id", None)
+        if not client_message_id:
+            return False
+        return await self._remember_codex_client_message_id(
+            ctx,
+            user.turn_id,
+            client_message_id,
+            native_message_id=user.message_id,
+        )
+
+    async def _backfill_official_codex_client_message_ids(
+        self,
+        ctx: SessionContext | None,
+        sid: str,
+        source_path: str | None,
+        source_before: HistorySourceFingerprint | None,
+        known_client_ids: set[str],
+        identities: tuple[tuple[str, str, str], ...],
+    ) -> None:
+        """Persist only official identities tied to an already-known client id."""
+        if (
+            not source_path
+            or source_before is None
+            or not identities
+            or not known_client_ids
+        ):
+            return
+        try:
+            source_after = await asyncio.to_thread(
+                HistorySourceFingerprint.capture, source_path)
+        except OSError:
+            return
+        if (
+            source_after.path != source_before.path
+            or source_after.device != source_before.device
+            or source_after.inode != source_before.inode
+        ):
+            return
+        for native_turn_id, native_message_id, client_message_id in identities:
+            if client_message_id not in known_client_ids:
+                continue
+            if ctx is not None:
+                inserted = await self._remember_codex_client_message_id(
+                    ctx,
+                    native_turn_id,
+                    client_message_id,
+                    native_message_id=native_message_id,
+                    source_path=source_path,
+                )
+                if inserted:
+                    ctx.codex_pending_steer_user_identities.pop(
+                        native_message_id, None)
+                continue
+            store = getattr(self, "_codex_client_messages", None)
+            if store is None:
+                continue
+            try:
+                inserted = await asyncio.to_thread(
+                    store.put,
+                    source_path,
+                    native_turn_id,
+                    client_message_id,
+                    native_message_id=native_message_id,
+                )
+            except (CodexClientMessageStoreError, OSError, ValueError) as exc:
+                log.warning(
+                    "official Codex client-message alias could not be persisted",
+                    session_id=sid,
+                    turn_id=native_turn_id,
+                    error_type=type(exc).__name__,
+                )
+                continue
+            if inserted:
+                self._bump_history_revision(sid)
+
+    async def _apply_codex_steer_user_identity(
+        self,
+        ctx: SessionContext,
+        proof: CodexSteerUserIdentityProof,
+    ) -> bool:
+        """Persist one exact Remote input identity without its foreign frame."""
+        if ctx.engine != "codex" or ctx.btw:
+            return False
+        sdk = ctx.sdk
+        if getattr(sdk, "thread_id", None) != proof.thread_id:
+            return False
+        generation = getattr(sdk, "_generation", None)
+        if isinstance(generation, int) and generation != proof.generation:
+            return False
+        if not isinstance(proof.expected_turn_id, str):
+            return False
+        published_turn = ctx.codex_published_steers.get(
+            proof.client_message_id)
+        pending = ctx.codex_uncertain_steer
+        uncertain_match = bool(
+            isinstance(pending, TurnSteered)
+            and pending.msg_id == proof.client_message_id
+            and pending.turn_id == proof.expected_turn_id
+        )
+        initial_query_match = bool(
+            proof.kind == "query"
+            and ctx.codex_owned_turn_id == proof.expected_turn_id
+            and ctx.codex_owned_initial_msg_id == proof.client_message_id
+        )
+        steer_match = bool(
+            proof.kind == "steer"
+            and (
+                published_turn == proof.expected_turn_id
+                or uncertain_match
+            )
+        )
+        if not (initial_query_match or steer_match):
+            return False
+        if proof.kind == "steer" and uncertain_match:
+            await self._confirm_uncertain_codex_steer_identity(
+                ctx,
+                proof.client_message_id,
+                proof.expected_turn_id,
+            )
+        bind_live = getattr(sdk, "bind_owned_turn_stream", None)
+        if callable(bind_live):
+            bind_live(proof.expected_turn_id, proof.native_turn_id)
+        try:
+            source_path = await asyncio.to_thread(
+                self._codex_rollout_for_wire,
+                self._ctx_wire_sid(ctx) or "",
+            )
+        except (OSError, ValueError):
+            source_path = None
+        await self._persist_codex_stream_binding(
+            ctx,
+            proof.expected_turn_id,
+            proof.native_turn_id,
+            proof.native_message_id,
+            source_path=source_path,
+        )
+        pending_identities = ctx.codex_pending_steer_user_identities
+        previous = pending_identities.get(proof.native_message_id)
+        if (
+            isinstance(previous, CodexSteerUserIdentityProof)
+            and previous.client_message_id != proof.client_message_id
+        ):
+            return False
+        pending_identities[proof.native_message_id] = proof
+        while len(pending_identities) > self.CODEX_PUBLISHED_STEER_IDS:
+            pending_identities.pop(next(iter(pending_identities)))
+        inserted = await self._remember_codex_client_message_id(
+            ctx,
+            proof.native_turn_id,
+            proof.client_message_id,
+            native_message_id=proof.native_message_id,
+            source_path=source_path,
+        )
+        if inserted:
+            pending_identities.pop(proof.native_message_id, None)
+            sid = self._ctx_wire_sid(ctx)
+            if sid:
+                self._schedule_history_refresh(
+                    sid,
+                    before=None,
+                    limit=None,
+                    cwd=ctx.cwd,
+                    detail="summary",
+                )
+        return True
+
+    async def _persist_codex_stream_binding(
+        self,
+        ctx: SessionContext,
+        control_turn_id: str,
+        stream_turn_id: str,
+        native_message_id: str,
+        *,
+        source_path: str | None,
+    ) -> bool:
+        """Persist one exact control/native-task relationship for recovery."""
+        session_id = self._ctx_wire_sid(ctx)
+        if (
+            not self._codex_shared_affinity(ctx)
+            or not session_id
+            or not source_path
+            or ctx.codex_owned_turn_id != control_turn_id
+            or not ctx.codex_owned_msg_id
+        ):
+            return False
+        try:
+            source = await asyncio.to_thread(
+                HistorySourceFingerprint.capture, source_path)
+            bound = await asyncio.to_thread(
+                self._codex_turn_leases.bind_stream,
+                session_id,
+                control_turn_id,
+                stream_turn_id,
+                native_message_id,
+                source_device=source.device,
+                source_inode=source.inode,
+                expected_msg_id=ctx.codex_owned_msg_id,
+                daemon_epoch=(
+                    None
+                    if ctx.codex_daemon_epoch == _CODEX_DAEMON_UNMARKED_EPOCH
+                    else ctx.codex_daemon_epoch
+                ),
+            )
+        except (OSError, ValueError) as exc:
+            log.warning(
+                "Codex stream binding could not be persisted",
+                session_id=session_id,
+                turn_id=control_turn_id,
+                error_type=type(exc).__name__,
+            )
+            return False
+        except Exception as exc:
+            log.warning(
+                "Codex stream binding store unavailable",
+                session_id=session_id,
+                turn_id=control_turn_id,
+                error_type=type(exc).__name__,
+            )
+            return False
+        if not bound:
+            log.warning(
+                "stale Codex stream binding ignored",
+                session_id=session_id,
+                turn_id=control_turn_id,
+            )
+        return bound
+
+    async def _delete_codex_client_message_ids(
+        self,
+        source_path: str | None,
+    ) -> None:
+        store = getattr(self, "_codex_client_messages", None)
+        if store is None or not source_path:
+            return
+        try:
+            await asyncio.to_thread(store.delete_path, source_path)
+        except CodexClientMessageStoreError as exc:
+            log.warning(
+                "Codex client-message alias cleanup failed",
+                error_type=type(exc).__name__,
+            )
+
     def _claude_history_client_message_ids(
         self,
         session_id: str,
@@ -2507,7 +2900,7 @@ class WrapperMachine:
             return
         logical_msg_id = msg_id or turn_id
         try:
-            self._codex_turn_leases.claim(
+            initial_msg_id = self._codex_turn_leases.claim(
                 session_id,
                 turn_id,
                 logical_msg_id,
@@ -2530,6 +2923,7 @@ class WrapperMachine:
             return
         ctx.codex_owned_turn_id = turn_id
         ctx.codex_owned_msg_id = logical_msg_id
+        ctx.codex_owned_initial_msg_id = initial_msg_id
 
     def _rebind_codex_turn(
         self,
@@ -2604,6 +2998,7 @@ class WrapperMachine:
         if released and owned == target:
             ctx.codex_owned_turn_id = None
             ctx.codex_owned_msg_id = None
+            ctx.codex_owned_initial_msg_id = None
 
     async def _recover_codex_owned_turn(
         self, ctx: SessionContext, session_id: str,
@@ -2623,18 +3018,52 @@ class WrapperMachine:
         if lease is None:
             return False
 
-        path = await asyncio.to_thread(
-            self._codex_rollout_for_wire, session_id)
         try:
-            size = (
-                await asyncio.to_thread(os.path.getsize, path)
-                if path else 0
+            path = await asyncio.to_thread(
+                self._codex_rollout_for_wire, session_id)
+        except (OSError, ValueError):
+            path = None
+        source: HistorySourceFingerprint | None = None
+        try:
+            source = (
+                await asyncio.to_thread(
+                    HistorySourceFingerprint.capture, path)
+                if path else None
             )
         except OSError:
-            size = 0
+            source = None
+        size = source.size if source is not None else 0
         active, _partial, last_marker = (
             await asyncio.to_thread(self._codex_tail_snapshot, path, size)
-            if path else (set(), b"", None)
+            if path and source is not None else (set(), b"", None)
+        )
+        persisted_stream_ids = (
+            lease.stream_task_ids(
+                source_device=source.device,
+                source_inode=source.inode,
+            )
+            if source is not None else frozenset()
+        )
+        persisted_stream_by_native = (
+            {
+                binding.native_message_id: binding.task_id
+                for binding in lease.stream_bindings
+                if (
+                    binding.source_device == source.device
+                    and binding.source_inode == source.inode
+                )
+            }
+            if source is not None else {}
+        )
+        active_stream_ids = active.intersection(persisted_stream_ids)
+        active_stream_id = (
+            next(iter(active_stream_ids))
+            if len(active_stream_ids) == 1 and len(active) == 1
+            else None
+        )
+        exact_rollout_owner = bool(
+            active == {lease.turn_id}
+            or active_stream_id is not None
         )
         restart_state = await self._codex_restart_state_for_ctx(
             ctx, wait=False)
@@ -2667,16 +3096,19 @@ class WrapperMachine:
         handoff_after_restart = bool(
             generation_changed
             and (
-                active == {lease.turn_id}
+                exact_rollout_owner
                 or (
                     lease.automatic
                     and resumable_goal
                     and len(active) == 1
                 )
-                or last_marker in {
-                    ("turn_aborted", lease.turn_id),
-                    ("task_failed", lease.turn_id),
-                }
+                or (
+                    last_marker is not None
+                    and last_marker[0] in {"turn_aborted", "task_failed"}
+                    and last_marker[1] in {
+                        lease.turn_id, *persisted_stream_ids,
+                    }
+                )
                 or (
                     lease.automatic
                     and resumable_goal
@@ -2692,6 +3124,7 @@ class WrapperMachine:
             # turn must cross the account handoff instead of becoming idle.
             ctx.codex_owned_turn_id = lease.turn_id
             ctx.codex_owned_msg_id = lease.msg_id
+            ctx.codex_owned_initial_msg_id = lease.initial_msg_id
             ctx.codex_recovered_turn_id = lease.turn_id
             ctx.codex_recovered_msg_id = lease.msg_id
             ctx.codex_recovered_automatic = lease.automatic
@@ -2720,11 +3153,11 @@ class WrapperMachine:
                 turn_id=lease.turn_id,
                 old_epoch=lease.daemon_epoch,
                 new_epoch=restart_state.epoch,
-                old_turn_active=active == {lease.turn_id},
+                old_turn_active=exact_rollout_owner,
             )
             return True
         rollout_matches = bool(
-            active == {lease.turn_id}
+            exact_rollout_owner
             or (
                 lease.automatic
                 and resumable_goal
@@ -2732,28 +3165,156 @@ class WrapperMachine:
             )
         )
         if not rollout_matches:
-            try:
-                self._codex_turn_leases.release(
-                    session_id, turn_id=lease.turn_id)
-            except Exception as exc:
-                log.warning(
-                    "stale Codex turn lease could not be released",
-                    session_id=session_id,
-                    turn_id=lease.turn_id,
-                    error_type=type(exc).__name__,
-                )
-            return False
-
+            # Revalidate a split control/stream turn from exact identities. This
+            # also upgrades legacy leases. A very large active task can append
+            # more than CODEX_TAIL_READ_MAX bytes after its task_started marker,
+            # leaving ``active`` empty; the official inProgress control turn plus
+            # its exact native user item -> rollout task witness remains decisive.
+            probe_owned_turn = getattr(ctx.sdk, "probe_owned_turn", None)
+            if (
+                not lease.automatic
+                and callable(probe_owned_turn)
+                and path
+                and source is not None
+            ):
+                try:
+                    probe = await probe_owned_turn(lease.turn_id)
+                except Exception as exc:
+                    # Transport/parse uncertainty is not evidence that the user
+                    # turn ended. Retain the lease and let the rollout watcher
+                    # mirror the task read-only until a later exact recovery.
+                    log.warning(
+                        "Codex owned turn probe unavailable",
+                        session_id=session_id,
+                        turn_id=lease.turn_id,
+                        error_type=type(exc).__name__,
+                    )
+                    return False
+                if probe is not None:
+                    try:
+                        scanned_task_bindings = await asyncio.to_thread(
+                            codex_rollout_task_bindings,
+                            path,
+                            probe.native_user_message_ids,
+                        )
+                    except Exception as exc:
+                        log.warning(
+                            "Codex rollout stream witness unavailable",
+                            session_id=session_id,
+                            turn_id=lease.turn_id,
+                            error_type=type(exc).__name__,
+                        )
+                        return False
+                    task_bindings = {
+                        **scanned_task_bindings,
+                        **persisted_stream_by_native,
+                    }
+                    witness: tuple[str, str] | None = next((
+                        (native_message_id, task_bindings[native_message_id])
+                        for native_message_id in probe.native_user_message_ids
+                        if (
+                            native_message_id in task_bindings
+                            and (
+                                active == {task_bindings[native_message_id]}
+                                or (not active and last_marker is None)
+                            )
+                        )
+                    ), None)
+                    if witness is None:
+                        log.warning(
+                            "Codex active rollout lacks exact control-turn witness",
+                            session_id=session_id,
+                            turn_id=lease.turn_id,
+                        )
+                        return False
+                    native_message_id, active_stream_id = witness
+                    try:
+                        bound = await asyncio.to_thread(
+                            self._codex_turn_leases.bind_stream,
+                            session_id,
+                            lease.turn_id,
+                            active_stream_id,
+                            native_message_id,
+                            source_device=source.device,
+                            source_inode=source.inode,
+                            expected_msg_id=lease.msg_id,
+                            daemon_epoch=lease.daemon_epoch,
+                        )
+                    except Exception as exc:
+                        log.warning(
+                            "Codex recovered stream binding could not be persisted",
+                            session_id=session_id,
+                            turn_id=lease.turn_id,
+                            error_type=type(exc).__name__,
+                        )
+                        return False
+                    if not bound:
+                        return False
+                    rollout_matches = True
+                    # Only the newest official user item owns the lease's latest
+                    # browser message. An older item may prove task lineage but
+                    # must never be relabelled as the newest Remote steer.
+                    if (
+                        probe.native_user_message_ids
+                        and native_message_id
+                        == probe.native_user_message_ids[0]
+                    ):
+                        await self._remember_codex_client_message_id(
+                            ctx,
+                            active_stream_id,
+                            lease.msg_id,
+                            native_message_id=native_message_id,
+                            source_path=path,
+                        )
+                else:
+                    # The ordered official reads authoritatively show that the
+                    # leased control turn is no longer the active turn.
+                    try:
+                        self._codex_turn_leases.release(
+                            session_id, turn_id=lease.turn_id)
+                    except Exception as exc:
+                        log.warning(
+                            "stale Codex turn lease could not be released",
+                            session_id=session_id,
+                            turn_id=lease.turn_id,
+                            error_type=type(exc).__name__,
+                        )
+                    return False
+            if not rollout_matches:
+                # No official probe was possible (for example an old automatic
+                # task). Preserve the old stale-lease behavior only when the
+                # rollout itself proves the leased id absent without ambiguity.
+                if callable(probe_owned_turn):
+                    return False
+                try:
+                    self._codex_turn_leases.release(
+                        session_id, turn_id=lease.turn_id)
+                except Exception as exc:
+                    log.warning(
+                        "stale Codex turn lease could not be released",
+                        session_id=session_id,
+                        turn_id=lease.turn_id,
+                        error_type=type(exc).__name__,
+                    )
+                return False
         recover = getattr(ctx.sdk, "recover_owned_turn", None)
         if not callable(recover):
             return False
         ctx.codex_owned_turn_id = lease.turn_id
         ctx.codex_owned_msg_id = lease.msg_id
+        ctx.codex_owned_initial_msg_id = lease.initial_msg_id
         ctx.codex_recovered_turn_id = lease.turn_id
         ctx.codex_recovered_msg_id = lease.msg_id
         ctx.codex_recovered_automatic = lease.automatic
         try:
-            recovered = bool(await recover(lease.turn_id))
+            recovered = bool(
+                await recover(
+                    lease.turn_id,
+                    stream_turn_ids=(active_stream_id,),
+                )
+                if active_stream_id is not None
+                else await recover(lease.turn_id)
+            )
         except Exception as exc:
             log.warning(
                 "Codex owned turn recovery failed",
@@ -2777,6 +3338,7 @@ class WrapperMachine:
 
         ctx.codex_owned_turn_id = None
         ctx.codex_owned_msg_id = None
+        ctx.codex_owned_initial_msg_id = None
         ctx.codex_recovered_turn_id = None
         ctx.codex_recovered_msg_id = None
         ctx.codex_recovered_automatic = None
@@ -6211,10 +6773,20 @@ class WrapperMachine:
                 or not same_generation
             )
             binding_already_consumed = (
-                cursor is not None and cursor >= binding.seq
+                same_generation
+                and cursor is not None
+                and cursor >= binding.seq
             )
-            if not ambiguous_prefix and (
-                binding_already_consumed or cursor is None
+            # Even a truncated/rebuild envelope has an exact current-turn
+            # suffix when its first retained sequence is strictly newer than
+            # the resident binding.  The binding may have fallen out of the
+            # bounded ring, but monotonic per-session ordering proves that no
+            # replayed narrative frame can precede this logical owner.
+            retained_suffix_after_binding = (
+                replay_start.from_seq > binding.seq
+            )
+            if binding_already_consumed or retained_suffix_after_binding or (
+                not ambiguous_prefix and cursor is None
             ):
                 insert_at = replay_start_index + 1
             else:
@@ -7809,6 +8381,7 @@ class WrapperMachine:
         source_window_oldest_cursor = None
         source_window_boundary_offset = None
         oversized_compact_page = None
+        codex_client_aliases = CodexClientMessageAliases({}, {})
         try:
             source_path = await asyncio.to_thread(
                 self._codex_rollout_for_wire
@@ -7823,6 +8396,9 @@ class WrapperMachine:
         except OSError:
             source_path = None
         if source_path:
+            if is_codex_hist:
+                codex_client_aliases = await asyncio.to_thread(
+                    self._codex_history_client_message_ids, source_path)
             try:
                 source_fingerprint = await asyncio.to_thread(
                     HistorySourceFingerprint.capture, source_path)
@@ -7862,6 +8438,22 @@ class WrapperMachine:
                     "history index read failed", session_id=sid,
                     error=str(exc),
                 )
+        if (
+            is_codex_hist
+            and codex_client_aliases.has_aliases
+            and (
+                source_fingerprint is None
+                or not codex_client_aliases.matches_source(
+                    source_fingerprint.path,
+                    source_fingerprint.device,
+                    source_fingerprint.inode,
+                )
+            )
+        ):
+            # The rollout was replaced between alias lookup and snapshot
+            # capture. Fail closed instead of applying old browser ownership to
+            # a different native source which reused an id.
+            codex_client_aliases = CodexClientMessageAliases({}, {})
         if (
             indexed_page is not None
             and not is_codex_hist
@@ -7918,6 +8510,12 @@ class WrapperMachine:
             cached_events = cached_full_events or [
                 dict(row) for row in indexed_page.events
             ]
+            if is_codex_hist:
+                cached_events = self._overlay_codex_cached_client_aliases(
+                    cached_events,
+                    codex_client_aliases,
+                    turns=False,
+                )
             if before is None and ctx is not None:
                 live_model = _session_model(ctx)
                 live_effort = _session_effort(ctx)
@@ -7987,9 +8585,16 @@ class WrapperMachine:
                 # paint instead of letting a stale cache hit replace live rows.
                 cached_history.authoritative = False
             if detail == "summary":
+                cached_turns = self._overlay_codex_cached_client_aliases(
+                    [dict(turn) for turn in indexed_page.turns],
+                    codex_client_aliases,
+                    turns=True,
+                ) if is_codex_hist else [
+                    dict(turn) for turn in indexed_page.turns
+                ]
                 cached_history.turns = [
                     ConversationTurn.model_validate(turn)
-                    for turn in indexed_page.turns
+                    for turn in cached_turns
                 ]
                 cached_history.detail = "summary"
                 cached_history.events = [
@@ -8112,6 +8717,10 @@ class WrapperMachine:
                         snapshot_in_progress=(
                             in_progress and before is None
                         ),
+                        client_message_ids=(
+                            codex_client_aliases.native_messages),
+                        segment_client_message_ids=(
+                            codex_client_aliases.segments),
                     )
                     if (source_window_oldest_cursor is not None
                             and source_window_boundary_offset is not None
@@ -8124,6 +8733,14 @@ class WrapperMachine:
                             source_window_oldest_cursor,
                         )
                         if recovered_user is not None:
+                            if recovered_user.client_msg_id is None:
+                                recovered_user.client_msg_id = (
+                                    codex_client_aliases.resolve(
+                                        source_window_oldest_cursor,
+                                        0,
+                                        recovered_user.msg_id,
+                                    )
+                                )
                             events.insert(0, recovered_user)
             except Exception as e:
                 log.warning("codex get_history failed", session_id=sid, error=str(e))
@@ -8815,6 +9432,7 @@ class WrapperMachine:
         *,
         before: str | None,
         limit: int | None,
+        _identity_retry: bool = True,
     ) -> History:
         """Build one summary page from Codex's persisted app-server turns.
 
@@ -8859,26 +9477,105 @@ class WrapperMachine:
         source_path: str | None = None
         source_before: HistorySourceFingerprint | None = None
         source_capture_failed = False
-        if before is None:
-            try:
-                source_path = await asyncio.to_thread(
-                    self._codex_rollout_for_wire, sid)
-                if source_path:
+        try:
+            source_path = await asyncio.to_thread(
+                self._codex_rollout_for_wire, sid)
+            if source_path:
+                try:
                     source_before = await asyncio.to_thread(
                         HistorySourceFingerprint.capture, source_path)
-            except OSError:
-                source_capture_failed = source_path is not None
-        page = await self._codex_history.summary_page(
-            sid,
-            before=before,
-            limit=limit or 4,
-            include_live_detail=in_progress and before is None,
-            active_turn_ids=active_turn_ids if before is None else set(),
-            # The latest row can be the new active turn while the just-finished
-            # previous row is exactly the steered turn being reconciled. Hydrate
-            # both once; later mirrors reuse the generation-local bounded cache.
-            hydrate_recent=2 if before is None else 0,
+                except OSError:
+                    source_capture_failed = before is None
+        except OSError:
+            source_capture_failed = before is None and source_path is not None
+        aliases = await asyncio.to_thread(
+            self._codex_history_client_message_ids, source_path)
+        if aliases.has_aliases and (
+            source_before is None
+            or not aliases.matches_source(
+                source_before.path,
+                source_before.device,
+                source_before.inode,
+            )
+        ):
+            aliases = CodexClientMessageAliases({}, {})
+        alias_kwargs = (
+            {
+                "client_message_ids": aliases.native_messages,
+                "segment_client_message_ids": aliases.segments,
+            }
+            if aliases.has_aliases else {}
         )
+        known_client_ids = {
+            *aliases.native_messages.values(),
+            *aliases.segments.values(),
+        }
+        if ctx is not None:
+            known_client_ids.update(ctx.codex_published_steers)
+            known_client_ids.update(
+                proof.client_message_id
+                for proof in ctx.codex_pending_steer_user_identities.values()
+                if isinstance(proof, CodexSteerUserIdentityProof)
+            )
+            pending_steer = ctx.codex_uncertain_steer
+            if isinstance(pending_steer, TurnSteered):
+                known_client_ids.add(pending_steer.msg_id)
+            if ctx.codex_owned_initial_msg_id:
+                known_client_ids.add(ctx.codex_owned_initial_msg_id)
+        try:
+            page = await self._codex_history.summary_page(
+                sid,
+                before=before,
+                limit=limit or 4,
+                include_live_detail=in_progress and before is None,
+                active_turn_ids=active_turn_ids if before is None else set(),
+                # The latest row can be the new active turn while the
+                # just-finished previous row is exactly the steered turn being
+                # reconciled. Hydrate both once; later mirrors reuse the
+                # generation-local bounded cache.
+                hydrate_recent=2 if before is None else 0,
+                **alias_kwargs,
+            )
+        finally:
+            take_identities = getattr(
+                self._codex_history,
+                "take_client_message_identities",
+                None,
+            )
+            identities = (
+                take_identities(sid) if callable(take_identities) else ()
+            )
+            await self._backfill_official_codex_client_message_ids(
+                ctx,
+                sid,
+                source_path,
+                source_before,
+                known_client_ids,
+                identities,
+            )
+
+        if aliases.has_aliases and source_path:
+            try:
+                source_identity_after = await asyncio.to_thread(
+                    HistorySourceFingerprint.capture, source_path)
+            except OSError:
+                source_identity_changed = True
+            else:
+                source_identity_changed = not aliases.matches_source(
+                    source_identity_after.path,
+                    source_identity_after.device,
+                    source_identity_after.inode,
+                )
+            if source_identity_changed:
+                if _identity_retry:
+                    return await self._build_official_codex_history(
+                        sid,
+                        before=before,
+                        limit=limit,
+                        _identity_retry=False,
+                    )
+                raise OSError(
+                    "Codex rollout identity changed during History read")
 
         projection_outcome = "not-applicable"
         if before is None and source_path:
@@ -8925,7 +9622,7 @@ class WrapperMachine:
             if effort:
                 control_rows.append(
                     Effort(effort=effort, sid=sid).model_dump(mode="json"))
-        return History(
+        history = History(
             session_id=sid,
             revision=revision,
             generation=self.instance_id,
@@ -8949,6 +9646,16 @@ class WrapperMachine:
             compaction_continuation_turn_ids=(
                 compaction_continuation_turn_ids),
         )
+        if self._history_revision(sid) != revision:
+            if _identity_retry:
+                return await self._build_official_codex_history(
+                    sid,
+                    before=before,
+                    limit=limit,
+                    _identity_retry=False,
+                )
+            history.authoritative = False
+        return history
 
     async def _build_requested_history(
         self,
@@ -10389,6 +11096,10 @@ class WrapperMachine:
                 images=images,
                 files=file_meta,
             )
+            mark_unknown = getattr(
+                ctx.sdk, "mark_steer_outcome_unknown", None)
+            if callable(mark_unknown):
+                mark_unknown(cmd.msg_id)
             error = Error(
                 code=ERR_STEER_UNKNOWN,
                 message=(
@@ -12356,6 +13067,9 @@ class WrapperMachine:
         mutation = ctx.codex_goal_mutation
         if mutation is not None and mutation.turn_id == turn_id:
             ctx.codex_goal_mutation = None
+        # query() can win the race with rollout creation. Retry before the
+        # active lease clears the only exact Remote message id we can prove.
+        await self._remember_codex_initial_turn_alias(ctx, turn_id)
         ctx.codex_spontaneous_turn_id = None
         ctx.codex_spontaneous_anchor_id = None
         self._release_codex_turn(ctx, turn_id)
@@ -12444,6 +13158,8 @@ class WrapperMachine:
             if len(seen_user_item_ids) >= self.CODEX_LIVE_USER_ITEM_IDS:
                 return True
             seen_user_item_ids.add(user.message_id)
+            if user.client_id is not None:
+                await self._remember_codex_live_user_alias(ctx, user)
 
             anchor_id = ctx.codex_spontaneous_anchor_id
             reconciles_recovered = bool(
@@ -12728,6 +13444,8 @@ class WrapperMachine:
             current_turn_id = new_turn_id
             self._claim_codex_turn(
                 ctx, current_turn_id, logical_msg_id)
+            await self._remember_codex_initial_turn_alias(
+                ctx, current_turn_id)
             ctx.codex_spontaneous_turn_id = current_turn_id
             ctx.codex_spontaneous_task = current_task
             ctx.active_msg_id = logical_msg_id
@@ -12770,6 +13488,8 @@ class WrapperMachine:
                 return
 
             ctx.active_msg_id = logical_msg_id
+            await self._remember_codex_initial_turn_alias(
+                ctx, current_turn_id)
             if recovered_msg_id is not None:
                 # A replacement wrapper starts a fresh sequence generation.  An
                 # exact logical/native owner must enter that ring before any
@@ -12847,6 +13567,10 @@ class WrapperMachine:
                 if isinstance(raw, CodexNoActiveTurnFence):
                     raw.reached.set()
                     await raw.release.wait()
+                    continue
+                if isinstance(raw, CodexSteerUserIdentityProof):
+                    await ctx.codex_steer_gate.wait()
+                    await self._apply_codex_steer_user_identity(ctx, raw)
                     continue
                 if isinstance(raw, (
                     CodexSpontaneousOverflow, CodexManagedOverflow,
@@ -13049,6 +13773,10 @@ class WrapperMachine:
                     raw.reached.set()
                     await raw.release.wait()
                     continue
+                if isinstance(raw, CodexSteerUserIdentityProof):
+                    await ctx.codex_steer_gate.wait()
+                    await self._apply_codex_steer_user_identity(ctx, raw)
+                    continue
                 if isinstance(raw, CodexManagedOverflow):
                     overflowed = True
                     continue
@@ -13135,6 +13863,10 @@ class WrapperMachine:
         if ctx.engine == "codex" and ctx.codex_spontaneous_turn_id is not None:
             return
         if ctx.engine == "codex":
+            native_turn_id = ctx.codex_owned_turn_id
+            if native_turn_id:
+                await self._remember_codex_initial_turn_alias(
+                    ctx, native_turn_id)
             self._release_codex_turn(ctx)
         await self._set_state(ctx, "idle")
 
@@ -13142,6 +13874,9 @@ class WrapperMachine:
         self, ctx: SessionContext,
     ) -> None:
         """Remove accepted Code steer attachments after the native terminal."""
+        for proof in tuple(ctx.codex_pending_steer_user_identities.values()):
+            if isinstance(proof, CodexSteerUserIdentityProof):
+                await self._apply_codex_steer_user_identity(ctx, proof)
         ctx.codex_uncertain_steer = None
         ctx.codex_published_steers.clear()
         directories = ctx.codex_steer_attachment_dirs
@@ -13174,11 +13909,25 @@ class WrapperMachine:
         self, ctx: SessionContext, raw: dict,
     ) -> bool:
         """Publish a timed-out steer once app-server proves its client identity."""
-        pending = ctx.codex_uncertain_steer
-        if not isinstance(pending, TurnSteered):
-            return False
         identity = _codex_user_message_identity(raw)
-        if identity != (pending.msg_id, pending.turn_id):
+        if identity is None:
+            return False
+        return await self._confirm_uncertain_codex_steer_identity(
+            ctx, identity[0], identity[1])
+
+    async def _confirm_uncertain_codex_steer_identity(
+        self,
+        ctx: SessionContext,
+        client_message_id: str,
+        expected_turn_id: str,
+    ) -> bool:
+        """Publish an uncertain steer from exact registered identity only."""
+        pending = ctx.codex_uncertain_steer
+        if (
+            not isinstance(pending, TurnSteered)
+            or pending.msg_id != client_message_id
+            or pending.turn_id != expected_turn_id
+        ):
             return False
         # Clear before relay I/O so item/started + item/completed cannot create
         # two boundaries if the first live send loses its socket.
@@ -16847,6 +17596,13 @@ class WrapperMachine:
             await self.transport.send(error)
             return error
         ctx = self._ctx_for(sid)
+        codex_alias_path = None
+        if engine == "codex":
+            try:
+                codex_alias_path = await asyncio.to_thread(
+                    self._codex_rollout_for_wire, sid)
+            except (OSError, ValueError):
+                codex_alias_path = None
         if ctx is not None and (
             ctx.state != "idle"
             or ctx.queued_queries
@@ -16889,6 +17645,8 @@ class WrapperMachine:
             return error
         if engine == "claude":
             await self._delete_claude_client_message_ids(sid)
+        else:
+            await self._delete_codex_client_message_ids(codex_alias_path)
         await self._drop_preview_session(engine, sid)
         if self._session_pins is not None:
             try:
@@ -16952,6 +17710,13 @@ class WrapperMachine:
             await self.transport.send(error)
             return error
         cwd = ctx.cwd if ctx is not None else None
+        codex_alias_path = None
+        if engine == "codex":
+            try:
+                codex_alias_path = await asyncio.to_thread(
+                    self._codex_rollout_for_wire, sid)
+            except (OSError, ValueError):
+                codex_alias_path = None
         checkpoint_cleanup_journal = None
         if engine == "codex" and cwd is None:
             try:
@@ -17047,6 +17812,8 @@ class WrapperMachine:
             return error
         if engine == "claude":
             await self._delete_claude_client_message_ids(sid)
+        else:
+            await self._delete_codex_client_message_ids(codex_alias_path)
         await self._drop_preview_session(engine, sid)
         if engine == "codex" and checkpoint_cleanup_journal is not None:
             try:
@@ -22320,14 +23087,16 @@ class WrapperMachine:
                 if ctx.codex_spontaneous_turn_id is not None:
                     return "spontaneous"
                 raise
+            if native_turn_id:
+                self._claim_codex_turn(
+                    ctx, native_turn_id, ctx.active_msg_id)
+                await self._remember_codex_initial_turn_alias(
+                    ctx, native_turn_id)
             if native_turn_id and ctx.active_msg_id:
                 await self._emit(ctx, TurnBinding(
                     msg_id=ctx.active_msg_id,
                     turn_id=native_turn_id,
                 ))
-            if native_turn_id:
-                self._claim_codex_turn(
-                    ctx, native_turn_id, ctx.active_msg_id)
             ctx.codex_account_handoff = False
             if native_turn_id and ctx.codex_daemon_epoch:
                 codex_restart_watch_task = asyncio.create_task(
@@ -22648,19 +23417,24 @@ class WrapperMachine:
                         await self._set_idle_after_managed_turn(ctx)
                         return
                     native_turn_id = await ctx.sdk.query(
-                        prompt, images=img_paths)
+                        prompt,
+                        images=img_paths,
+                        client_user_message_id=ctx.active_msg_id,
+                    )
                     # CodexHandle marks turn/start failure by raising with
                     # turn_active=False. Reaching here is the authoritative
                     # acceptance boundary, including an ultra-fast turn that
                     # already completed before the RPC coroutine resumed.
+                    if native_turn_id:
+                        self._claim_codex_turn(
+                            ctx, native_turn_id, ctx.active_msg_id)
+                        await self._remember_codex_initial_turn_alias(
+                            ctx, native_turn_id)
                     if native_turn_id and ctx.active_msg_id:
                         await self._emit(ctx, TurnBinding(
                             msg_id=ctx.active_msg_id,
                             turn_id=native_turn_id,
                         ))
-                    if native_turn_id:
-                        self._claim_codex_turn(
-                            ctx, native_turn_id, ctx.active_msg_id)
                     if (
                         is_codex_shared
                         and native_turn_id
@@ -22720,6 +23494,11 @@ class WrapperMachine:
                     msg.reached.set()
                     await msg.release.wait()
                     continue
+                if isinstance(msg, CodexSteerUserIdentityProof):
+                    if is_codex:
+                        await ctx.codex_steer_gate.wait()
+                        await self._apply_codex_steer_user_identity(ctx, msg)
+                    continue
                 if notice_active or ctx.claude_progress_notice_active:
                     # Any raw engine frame is fresh activity, even when the
                     # translator intentionally skips it. Clear a stale
@@ -22764,6 +23543,17 @@ class WrapperMachine:
                         continue
                     await ctx.codex_steer_gate.wait()
                     await self._confirm_uncertain_codex_steer(ctx, msg)
+                    live_user = codex_live_user_message(msg)
+                    if (
+                        live_user is not None
+                        and live_user.client_id is not None
+                    ):
+                        # Only an upstream clientId can prove a native user-item
+                        # alias. Initial Query also keeps its source-bound
+                        # segment-0 fallback for older app-server generations;
+                        # never guess from an unlabelled prompt or timestamp.
+                        await self._remember_codex_live_user_alias(
+                            ctx, live_user)
                     sid = codex_session_id(msg)
                     if sid and not ctx.session_id:
                         await self._capture_session_id(ctx, sid)

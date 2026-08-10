@@ -185,6 +185,10 @@ class SessionContext:
     # The machine keeps this insertion-ordered mapping bounded and clears it at
     # the enclosing native terminal.
     codex_published_steers: dict[str, str] = field(default_factory=dict)
+    # The rollout path may lag the official live item. Retain only its bounded
+    # identity proof until it can be attached to that exact rollout inode.
+    codex_pending_steer_user_identities: dict[str, Any] = field(
+        default_factory=dict)
     # A shared-daemon turn started by Remote is leased on disk so a replacement
     # wrapper can safely reattach without classifying it as Codex App ownership.
     codex_owned_turn_id: Optional[str] = None
@@ -192,6 +196,10 @@ class SessionContext:
     # This deliberately differs from active_msg_id after a transient write
     # failure so the next authoritative boundary can retry the same CAS base.
     codex_owned_msg_id: Optional[str] = None
+    # Immutable browser owner of the first visible segment in the leased native
+    # turn. Later steers move ``codex_owned_msg_id`` but must not erase the
+    # identity required to rebuild completed history after a wrapper restart.
+    codex_owned_initial_msg_id: Optional[str] = None
     codex_recovered_turn_id: Optional[str] = None
     codex_recovered_msg_id: Optional[str] = None
     codex_recovered_automatic: Optional[bool] = None

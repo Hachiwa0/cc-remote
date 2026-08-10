@@ -2196,7 +2196,9 @@ class _RunTurnSdk(_CodexSdk):
     async def force_reconnect(self, **_kwargs):
         self.reconnects += 1
 
-    async def query(self, _prompt, images=None):
+    async def query(
+        self, _prompt, images=None, *, client_user_message_id=None,
+    ):
         self.queries += 1
 
     async def receive_response(self):
