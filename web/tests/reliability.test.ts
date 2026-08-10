@@ -2622,6 +2622,47 @@ assert.deepEqual(
   "same prompt and nearby timestamps cannot replace an authoritative alias",
 );
 
+// Command+R can paint an older IndexedDB item id, then reconnect replay paints
+// the same completed item under its canonical app-server id. A settled Codex
+// History page contains the exact canonical item and is authoritative that
+// there was only one source item. Collapse that stale third projection without
+// enabling text-only dedupe for running, cache-only, Claude, or distinct rows.
+const reconnectCanonicalHistory = [{
+  id: "reconnect-browser-turn", historyTurnId: "reconnect-native-user",
+  prompt: "deploy", done: true,
+  blocks: [{
+    kind: "text" as const, message_id: "canonical-final-item",
+    text: "deployed once", done: true, channel: "final" as const,
+  }],
+}];
+const reconnectCachedAndLive = [{
+  id: "reconnect-browser-turn", historyTurnId: "reconnect-native-user",
+  prompt: "deploy", done: true,
+  blocks: [{
+    kind: "text" as const, message_id: "old-cache-final-item",
+    text: "deployed once", done: true, channel: "final" as const,
+  }, {
+    kind: "text" as const, message_id: "canonical-final-item",
+    text: "deployed once", done: true, channel: "final" as const,
+  }],
+}];
+assert.equal(
+  mergeInitialHistory(
+    reconnectCanonicalHistory, reconnectCachedAndLive,
+  )[0].blocks.filter((block) => block.kind === "text").length,
+  2,
+  "an unsettled merge must not infer duplicate native items from equal text",
+);
+const settledReconnectMerge = mergeInitialHistory(
+  reconnectCanonicalHistory, reconnectCachedAndLive, {}, true,
+);
+assert.deepEqual(
+  settledReconnectMerge[0].blocks.flatMap((block) => block.kind === "text"
+    ? [{ id: block.message_id, text: block.text }] : []),
+  [{ id: "canonical-final-item", text: "deployed once" }],
+  "settled Codex History removes the stale cache/replay copy",
+);
+
 // Exact production race at the pure merge boundary: a focus-triggered History
 // synthesizes TurnEnd while the matching live tail is still running. Preserve
 // that open tail, let the live answer finish in place, then reconcile the full
@@ -3990,6 +4031,12 @@ try {
     },
   };
   steeredTurnState = reduce(steeredTurnState, {
+    type: "event", event: event({
+      type: "turn_binding", sid: steeredTurnSid, seq: 20,
+      msg_id: "steered-original", turn_id: steeredNativeTurnId,
+    }),
+  });
+  steeredTurnState = reduce(steeredTurnState, {
     type: "steer_sent",
     sid: steeredTurnSid,
     prompt: "change direction",
@@ -4019,10 +4066,18 @@ try {
     steeredTurnState.runtimes[steeredTurnSid].acceptancePending,
     "steered-follow-up",
   );
+  const preFenceBinding =
+    steeredTurnState.runtimes[steeredTurnSid].pendingLiveBinding;
+  assert.equal(
+    preFenceBinding?.msgId,
+    "steered-original",
+    "the active turn binding remains available until the steer fence",
+  );
   steeredTurnState = reduce(steeredTurnState, {
     type: "event", event: event({
       type: "assistant_msg_start",
       sid: steeredTurnSid,
+      seq: 21,
       message_id: "new-pre-fence-message",
       channel: "commentary",
     }),
@@ -4031,6 +4086,7 @@ try {
     type: "event", event: event({
       type: "delta",
       sid: steeredTurnSid,
+      seq: 22,
       message_id: "new-pre-fence-message",
       channel: "commentary",
       text: "new item admitted before the steer fence",
@@ -8841,6 +8897,55 @@ try {
     ["unbound-later-output"],
     "a sequenced idle binding remains ineligible for narrative ownership",
   );
+
+  // Starting the next browser turn is a lifecycle fence too. A delayed
+  // binding from the completed turn must not become eligible merely because
+  // the new turn changes the runtime back to running before its own binding.
+  const nextQuerySid = "next-query-clears-idle-binding";
+  let nextQueryState = reduce({
+    ...initialState, focusedSid: nextQuerySid,
+    runtimes: { [nextQuerySid]: {
+      ...createRuntime(),
+      turns: [{
+        id: "completed-browser-message", prompt: "old prompt", blocks: [],
+        done: true,
+      }],
+    } },
+  }, { type: "event", event: event({
+    type: "turn_binding", sid: nextQuerySid, seq: 40,
+    msg_id: "completed-browser-message", turn_id: "completed-native-turn",
+  }) });
+  nextQueryState = reduce(nextQueryState, {
+    type: "query_sent", sid: nextQuerySid, prompt: "new prompt",
+    msg_id: "new-browser-message", ts: 10_000,
+  });
+  assert.equal(
+    nextQueryState.runtimes[nextQuerySid].pendingLiveBinding,
+    null,
+    "a new local query discards a delayed binding from the idle lifecycle",
+  );
+  for (const nextEvent of [
+    event({ type: "state", sid: nextQuerySid, seq: 41, state: "running" }),
+    event({
+      type: "assistant_msg_start", sid: nextQuerySid, seq: 42,
+      message_id: "new-unbound-output", channel: "commentary",
+    }),
+    event({
+      type: "delta", sid: nextQuerySid, seq: 43,
+      message_id: "new-unbound-output", text: "new answer",
+    }),
+  ]) {
+    nextQueryState = reduce(nextQueryState, {
+      type: "event", event: nextEvent,
+    });
+  }
+  const nextQueryTurns = nextQueryState.runtimes[nextQuerySid].turns;
+  assert.deepEqual(
+    nextQueryTurns.map((turn: Turn) => turn.id),
+    ["completed-browser-message", "new-browser-message"],
+  );
+  assert.doesNotMatch(JSON.stringify(nextQueryTurns[0]), /new answer/);
+  assert.match(JSON.stringify(nextQueryTurns[1]), /new answer/);
 
   // The inverse race is valid: the newest running UserMsg may have replayed
   // before its transcript row was flushed into History. Keep exactly that

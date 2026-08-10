@@ -116,6 +116,7 @@ function mergeBlocks(
   preferCompletedHistoryPayload = false,
   allowCompatibilityTextMatch = true,
   completedTextAuthority: "first" | "second" | "combine" = "first",
+  settledCanonicalText = false,
 ): Block[] {
   const out = history.map((block) => ({ ...block }));
   const processMatches = processBlockMatches(history, live);
@@ -125,6 +126,18 @@ function mergeBlocks(
   const historyTextIndexes = out.flatMap((block, index) =>
     block.kind === "text" ? [index] : []);
   const matchedTextIndexes = new Set<number>();
+  const exactTextMatches = new Map<number, number>();
+  const reservedExactHistoryIndexes = new Set<number>();
+  for (let liveIndex = live.length - 1; liveIndex >= 0; liveIndex -= 1) {
+    const block = live[liveIndex];
+    if (block.kind !== "text") continue;
+    const historyIndex = historyTextIndexes.find((index) =>
+      !reservedExactHistoryIndexes.has(index)
+      && (out[index] as TextBlock).message_id === block.message_id);
+    if (historyIndex == null) continue;
+    exactTextMatches.set(liveIndex, historyIndex);
+    reservedExactHistoryIndexes.add(historyIndex);
+  }
   for (let liveIndex = 0; liveIndex < live.length; liveIndex += 1) {
     const block = live[liveIndex];
     if (block.kind === "process") {
@@ -174,10 +187,7 @@ function mergeBlocks(
       else out.push({ ...block });
       continue;
     }
-    let existingIndex = historyTextIndexes.find((index) => {
-      const candidate = out[index] as TextBlock;
-      return !matchedTextIndexes.has(index) && candidate.message_id === block.message_id;
-    });
+    let existingIndex = exactTextMatches.get(liveIndex);
     // Only complete history/live turn reconciliation owns this compatibility
     // fallback: those two projections already have an authoritative turn alias.
     // Detail/spill/cache windows do not carry overlap provenance, so equal text
@@ -187,6 +197,7 @@ function mergeBlocks(
       const candidates = historyTextIndexes.filter((index) => {
         const candidate = out[index] as TextBlock;
         return !matchedTextIndexes.has(index)
+          && !reservedExactHistoryIndexes.has(index)
           && textChannel(candidate) === textChannel(block)
           && canCompatibilityMatchText(candidate);
       });
@@ -230,6 +241,22 @@ function mergeBlocks(
       // Keeping the history id here makes the next delta create a second block,
       // which then survives every focus-triggered History reconciliation.
       if (preserveLiveOpen) existing.message_id = block.message_id;
+    } else if (settledCanonicalText && block.done) {
+      // A settled Codex source page is authoritative for completed lightweight
+      // text items. An older IndexedDB projection can carry a regenerated id,
+      // while reconnect replay already carries the exact canonical id. Once
+      // that exact sibling is reserved above, an identical completed local
+      // block is the stale third projection, not a second native item. History
+      // would contain both if both really existed, so this is deliberately
+      // unavailable to running, paged, cache-only and Claude merges.
+      const canonicalDuplicate = historyTextIndexes.some((index) => {
+        if (!reservedExactHistoryIndexes.has(index)) return false;
+        const candidate = out[index] as TextBlock;
+        return candidate.done
+          && textChannel(candidate) === textChannel(block)
+          && candidate.text === block.text;
+      });
+      if (!canonicalDuplicate) out.push({ ...block });
     } else {
       out.push({ ...block });
     }
@@ -630,6 +657,7 @@ function mergeTurn(
   live: Turn,
   preserveLiveOpen = false,
   completedTextAuthority: "first" | "second" | "combine" = "first",
+  settledCanonicalText = false,
 ): Turn {
   const historyImageRefs = history.imageRefs?.length
     ? history.imageRefs : undefined;
@@ -663,6 +691,7 @@ function mergeTurn(
       false,
       true,
       completedTextAuthority,
+      settledCanonicalText,
     ),
     // A transcript has no ResultMessage, so its EOF is represented by a
     // synthetic TurnEnd.  While this same live tail is still running, that
@@ -1161,7 +1190,9 @@ export function mergeInitialHistory(
         && index === merged.length - 1
         && !liveTurn.done;
       const historyTurn = merged[index];
-      const bound = mergeTurn(historyTurn, liveTurn, isOpenLiveTail);
+      const bound = mergeTurn(
+        historyTurn, liveTurn, isOpenLiveTail, "first", settledCodex,
+      );
       merged[index] = settledCodex
           && sharesExactTurnAlias(historyTurn, liveTurn)
         ? restoreAuthoritativeLifecycle(bound, historyTurn)

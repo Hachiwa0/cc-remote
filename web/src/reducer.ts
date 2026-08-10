@@ -1710,12 +1710,23 @@ export function reduce(state: AppState, action: Action): AppState {
       };
       let runtimes = reduceTargetedRuntime(
         state.runtimes, action.sid, { type: "query_sent", turn });
-      if (runtimes[action.sid]?.acceptancePending !== action.msg_id
-          || runtimes[action.sid]?.acceptanceKind == null) {
+      const submittedRuntime = runtimes[action.sid];
+      // A sequenced binding can arrive after the previous lifecycle already
+      // became idle. It is deliberately dormant while idle, but must not wake
+      // up when this newly submitted turn transitions the runtime to running.
+      // Preserve only an early binding for this exact optimistic message.
+      const clearsStaleBinding = action.type === "query_sent"
+        && !!submittedRuntime?.pendingLiveBinding
+        && submittedRuntime.pendingLiveBinding.msgId !== action.msg_id;
+      if (submittedRuntime?.acceptancePending !== action.msg_id
+          || submittedRuntime?.acceptanceKind == null
+          || clearsStaleBinding) {
         runtimes = {
           ...runtimes,
           [action.sid]: {
-            ...runtimes[action.sid],
+            ...submittedRuntime,
+            pendingLiveBinding: clearsStaleBinding
+              ? null : submittedRuntime.pendingLiveBinding,
             acceptancePending: action.msg_id,
             acceptanceKind: action.type === "steer_sent"
               ? "steer" : "query",
