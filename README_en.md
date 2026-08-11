@@ -233,10 +233,10 @@ scripts/codex-auth-daemon-restart \
   --profile-id stack --codex-home /home/youruser/.codex-stack
 ```
 
-For compatibility with the existing single-account hook, invoke the default
-profile's script without `--profile-id`. If its `CODEX_HOME` is not the standard
-`~/.codex`, still pass it explicitly, for example
-`scripts/codex-auth-daemon-restart --codex-home /custom/default/CODEX_HOME`.
+Every account in an explicit Profile configuration, including the default,
+should pass its stable `--profile-id`. A pre-upgrade single-account hook without
+a profile id remains bound to its original account across default reorders;
+new hooks should not rely on that compatibility path.
 
 ### Where artifact preview runs
 

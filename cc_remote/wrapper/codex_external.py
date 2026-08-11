@@ -104,6 +104,14 @@ class HolderScan:
     # foreign active turn to App; merely opening/subscribing to a rollout is not
     # ownership and must not make an idle Remote session read-only.
     private_holders: dict[str, set[ProcessIdentity]] = field(default_factory=dict)
+    # Interactive TUIs may name a resumed thread in argv without holding the
+    # rollout FD.  Keep that weaker evidence separate so multi-profile callers
+    # can attribute the process to its CODEX_HOME/socket before accepting it.
+    logical_holders: dict[str, set[ProcessIdentity]] = field(default_factory=dict)
+    # Machine-level multi-profile aggregation may fail closed for only the
+    # sessions touched by ambiguous weak evidence. Low-level scans leave this
+    # empty and continue to use ``complete`` for their whole input set.
+    incomplete_sids: set[str] = field(default_factory=set)
     # Transient, probe-local Darwin snapshot. The machine reuses it across
     # profile buckets so 12 accounts do not perform 12 kernel-wide PID scans.
     darwin_snapshot: tuple[list[DarwinProcessInfo], bool] | None = field(
@@ -516,7 +524,9 @@ def _darwin_writable_rollout_holders(
     result = {sid: set() for sid in paths}
     passive = {sid: set() for sid in paths}
     private = {sid: set() for sid in paths}
+    logical = {sid: set() for sid in paths}
     client_proxies: dict[ProcessIdentity, int] = {}
+    sid_by_arg = {sid.encode(): sid for sid in paths}
     filenames: list[str] = []
     for sid, path in paths.items():
         try:
@@ -526,7 +536,8 @@ def _darwin_writable_rollout_holders(
         by_inode.setdefault((stat.st_dev, stat.st_ino), set()).add(sid)
         filenames.append(path)
     if not filenames:
-        return HolderScan(result, True, passive, client_proxies, private)
+        return HolderScan(result, True, passive, client_proxies, private,
+                          logical_holders=logical)
     try:
         completed = subprocess.run(
             [
@@ -554,12 +565,14 @@ def _darwin_writable_rollout_holders(
     for identity, _ppid, tty_nr, args in processes:
         if identity in own:
             continue
-        if (
-            _is_app_server_proxy(args, tty_nr)
-            or _is_interactive_codex_tui(args, tty_nr)
-        ):
+        interactive_tui = _is_interactive_codex_tui(args, tty_nr)
+        if _is_app_server_proxy(args, tty_nr) or interactive_tui:
             client_proxies[identity] = (
                 identity.start_ticks)
+        if interactive_tui:
+            for sid in _codex_resume_sids(args, sid_by_arg):
+                result[sid].add(identity)
+                logical[sid].add(identity)
 
     pid: int | None = None
     access = ""
@@ -610,12 +623,16 @@ def _darwin_writable_rollout_holders(
             continue
         for sid in sids:
             result[sid].add(identity)
+            # Match Linux semantics: an exact writable rollout FD is stronger
+            # than argv-only evidence and must survive profile filtering.
+            logical[sid].discard(identity)
             if _is_passive_app_server(Path(), tty_nr, args):
                 passive[sid].add(identity)
                 if not _is_managed_shared_app_server(args):
                     private[sid].add(identity)
     return HolderScan(
         result, complete, passive, client_proxies, private,
+        logical_holders=logical,
         darwin_snapshot=snapshot,
     )
 
@@ -642,6 +659,7 @@ def writable_rollout_holders(
     result = {sid: set() for sid in paths}
     passive = {sid: set() for sid in paths}
     private = {sid: set() for sid in paths}
+    logical = {sid: set() for sid in paths}
     client_proxies: dict[ProcessIdentity, int] = {}
     sid_by_arg = {sid.encode(): sid for sid in paths}
     for sid, path in paths.items():
@@ -690,14 +708,14 @@ def writable_rollout_holders(
             if identity in own:
                 continue
             args = _process_cmdline(proc_dir)
-            if _is_app_server_proxy(args, tty_nr):
+            interactive_tui = _is_interactive_codex_tui(args, tty_nr)
+            if _is_app_server_proxy(args, tty_nr) or interactive_tui:
                 try:
                     client_proxies[identity] = proc_dir.stat().st_ctime_ns
                 except OSError:
                     complete = False
             logical_sids = (
                 _codex_resume_sids(args, sid_by_arg) if tty_nr != 0 else set())
-            interactive_tui = _is_interactive_codex_tui(args, tty_nr)
             matched: set[str] = set()
             try:
                 fds = proc_dir.joinpath("fd").iterdir()
@@ -745,6 +763,8 @@ def writable_rollout_holders(
                     unresolved_tuis.append((identity, started_ns, cwd))
             for sid in logical_sids:
                 result[sid].add(identity)
+                if sid not in matched:
+                    logical[sid].add(identity)
             for sid in matched:
                 result[sid].add(identity)
                 if _is_passive_app_server(proc_dir, tty_nr, args):
@@ -757,7 +777,8 @@ def writable_rollout_holders(
         unresolved_tuis, snapshots,
     ).items():
         result[sid].add(identity)
-    return HolderScan(result, complete, passive, client_proxies, private)
+    return HolderScan(result, complete, passive, client_proxies, private,
+                      logical_holders=logical)
 
 
 def parse_turn_markers(data: bytes, partial: bytes = b"") -> TurnMarkers:

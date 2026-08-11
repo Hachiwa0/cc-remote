@@ -199,9 +199,9 @@ scripts/codex-auth-daemon-restart \
   --profile-id stack --codex-home /home/youruser/.codex-stack
 ```
 
-默认 Profile 为兼容单账号旧 hook，不传 `--profile-id`；但它的 `CODEX_HOME`
-如果不是标准的 `~/.codex`，仍须显式传入，例如
-`scripts/codex-auth-daemon-restart --codex-home /custom/default/CODEX_HOME`。
+显式 Profile 配置中的每个账号（包括默认账号）都应传稳定的 `--profile-id`。
+升级前已经存在的不带 profile id 的单账号 hook 会继续绑定到原账号，不会因默认账号
+重排而漂移；新 hook 不应再依赖这个兼容路径。
 
 ### Artifact 预览在哪里运行
 

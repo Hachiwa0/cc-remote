@@ -220,9 +220,52 @@ def test_darwin_holder_scan_exposes_interactive_tui_as_daemon_client(
     )
 
     assert scan.complete is True
+    assert scan.holders == {"session-id": {identity}}
+    assert scan.logical_holders == {"session-id": {identity}}
     assert scan.client_proxies == {
         identity: identity.start_ticks,
     }
+
+
+def test_darwin_writable_fd_supersedes_resume_argv_evidence(
+    tmp_path, monkeypatch,
+):
+    sid = "session-id"
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_text("", encoding="utf-8")
+    stat = rollout.stat()
+    identity = ProcessIdentity(79, 458)
+    process = (
+        identity,
+        1,
+        1,
+        (b"/usr/local/bin/codex", b"resume", sid.encode()),
+    )
+
+    class Completed:
+        returncode = 0
+        stdout = (
+            f"p{identity.pid}\nf5\naw\nD{stat.st_dev}\n"
+            f"i{stat.st_ino}\nn{rollout}\n"
+        )
+
+    monkeypatch.setattr(
+        "cc_remote.wrapper.codex_external.subprocess.run",
+        lambda *args, **kwargs: Completed(),
+    )
+    monkeypatch.setattr(
+        "cc_remote.wrapper.codex_external._darwin_process_info",
+        lambda _pid: process,
+    )
+
+    scan = _darwin_writable_rollout_holders(
+        {sid: str(rollout)}, set(),
+        process_snapshot=([process], True),
+    )
+
+    assert scan.complete is True
+    assert scan.holders == {sid: {identity}}
+    assert scan.logical_holders == {sid: set()}
 
 
 def test_parse_darwin_procargs_preserves_spaces_unicode_and_equals():
@@ -675,6 +718,8 @@ def test_idle_codex_resume_tui_is_a_logical_interactive_holder(tmp_path):
     assert scan.holders[sid] == {
         ProcessIdentity(221, 2201), ProcessIdentity(222, 2202)}
     assert scan.passive_holders[sid] == {ProcessIdentity(221, 2201)}
+    assert scan.logical_holders[sid] == {ProcessIdentity(222, 2202)}
+    assert ProcessIdentity(222, 2202) in scan.client_proxies
     assert tui.exists()
 
 
@@ -687,7 +732,7 @@ def test_codex_resume_tui_matches_only_explicit_target_sid(tmp_path):
     sibling_rollout.write_bytes(b"")
     proc_root = tmp_path / "proc"
     identity = ProcessIdentity(223, 2203)
-    _fake_process(
+    tui = _fake_process(
         proc_root, identity.pid, identity.start_ticks, tty=34819,
         # The second UUID is the optional PROMPT. It must not make a sibling
         # session appear terminal-attached merely because its text is a SID.
@@ -696,6 +741,7 @@ def test_codex_resume_tui_matches_only_explicit_target_sid(tmp_path):
             target, sibling,
         ),
     )
+    _fake_fd(tui, 5, target_rollout, os.O_WRONLY | os.O_APPEND)
 
     scan = writable_rollout_holders(
         {target: str(target_rollout), sibling: str(sibling_rollout)},
@@ -707,6 +753,8 @@ def test_codex_resume_tui_matches_only_explicit_target_sid(tmp_path):
     assert scan.holders[sibling] == set()
     assert scan.passive_holders[target] == set()
     assert scan.passive_holders[sibling] == set()
+    assert scan.logical_holders[target] == set()
+    assert scan.logical_holders[sibling] == set()
 
 
 def test_codex_resume_last_does_not_treat_uuid_prompt_as_target(tmp_path):

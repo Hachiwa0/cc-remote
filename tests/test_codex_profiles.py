@@ -8,7 +8,11 @@ from types import SimpleNamespace
 import pytest
 
 from cc_remote.config import WrapperConfig
-from cc_remote.codex_profiles import CodexProfileRegistry
+from cc_remote.codex_daemon_restart import write_restart_state
+from cc_remote.codex_profiles import (
+    CodexProfileRegistry,
+    CodexProfileTopologyStore,
+)
 from cc_remote.protocol import (
     ERR_AUTH,
     CodexProfileInfo,
@@ -441,7 +445,7 @@ def test_same_native_uuid_contexts_remain_distinct(tmp_path: Path) -> None:
         machine._codex_daemon_for_profile("stack")
     )
     assert machine._codex_restart_path_for_ctx(primary) == (
-        tmp_path / "state" / "codex-daemon-restart.json"
+        tmp_path / "state" / "codex-daemon-restart-primary.json"
     )
     assert machine._codex_restart_path_for_ctx(stack) == (
         tmp_path / "state" / "codex-daemon-restart-stack.json"
@@ -594,6 +598,181 @@ def test_profile_holder_scan_maps_every_native_bucket_back_to_wire_sid(
     }
     assert scan.passive_holders == scan.holders
     assert scan.private_holders == scan.holders
+
+
+def test_duplicate_native_uuid_logical_tui_stays_in_its_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    machine, _transport = _machine(tmp_path)
+    primary_wire = "primary@same-native-id"
+    stack_wire = "stack@same-native-id"
+    machine._watch = {
+        primary_wire: {
+            "path": "/tmp/primary-rollout.jsonl", "engine": "codex",
+            "codex_profile_id": "primary",
+        },
+        stack_wire: {
+            "path": "/tmp/stack-rollout.jsonl", "engine": "codex",
+            "codex_profile_id": "stack",
+        },
+    }
+    tui = ProcessIdentity(211, 12)
+
+    def holders(paths, _own, *, shell_snapshot_root=None, darwin_snapshot=None):
+        return HolderScan(
+            holders={"same-native-id": {tui}}, complete=True,
+            passive_holders={"same-native-id": set()},
+            client_proxies={tui: 10},
+            private_holders={"same-native-id": set()},
+            logical_holders={"same-native-id": {tui}},
+            darwin_snapshot=darwin_snapshot,
+        )
+
+    class Tracker:
+        def bindings(self, paths, proxies):
+            return {sid: set() for sid in paths}, True
+
+    machine._codex_daemons["primary"]._ready = SimpleNamespace(
+        socket_path="/tmp/primary.sock")
+    machine._codex_daemons["stack"]._ready = SimpleNamespace(
+        socket_path="/tmp/stack.sock")
+    monkeypatch.setattr(machine_module, "writable_rollout_holders", holders)
+    monkeypatch.setattr(
+        machine_module, "codex_app_server_client_socket",
+        lambda identity, **_kwargs: (
+            True, str(Path("/tmp/primary.sock").resolve())
+        ),
+    )
+    machine._codex_tui_log_trackers = {
+        "primary": Tracker(), "stack": Tracker(),
+    }
+
+    scan = asyncio.run(machine._probe_codex_holders({
+        sid: watch["path"] for sid, watch in machine._watch.items()
+    }))
+
+    assert scan.holders[primary_wire] == {tui}
+    assert scan.holders[stack_wire] == set()
+
+
+def test_default_reorder_keeps_restart_markers_bound_to_original_profiles(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    primary_home = tmp_path / "primary"
+    stack_home = tmp_path / "stack"
+    first_cfg = WrapperConfig()
+    first_cfg.state_dir = state
+    first_cfg.codex_profiles_json = _profiles(primary_home, stack_home)
+    WrapperMachine(first_cfg, _StubTransport())
+
+    reordered_cfg = WrapperConfig()
+    reordered_cfg.state_dir = state
+    reordered_cfg.codex_profiles_json = json.dumps({
+        "primary": {"label": "Primary", "home": str(primary_home)},
+        "stack": {
+            "label": "Stack", "home": str(stack_home), "default": True,
+        },
+    })
+    machine = WrapperMachine(reordered_cfg, _StubTransport())
+    primary = _context("primary@sid-a", "sid-a", "primary")
+    stack = _context("stack@sid-b", "sid-b", "stack")
+
+    assert machine._codex_legacy_restart_profile_id == "primary"
+    assert machine._codex_restart_path_for_ctx(primary) == (
+        state / "codex-daemon-restart-primary.json")
+    assert machine._codex_restart_path_for_ctx(stack) == (
+        state / "codex-daemon-restart-stack.json")
+
+    now = time.time()
+    write_restart_state(
+        state / "codex-daemon-restart.json", epoch="a" * 32,
+        phase="ready", deadline_at=now + 60,
+    )
+    write_restart_state(
+        state / "codex-daemon-restart-stack.json", epoch="b" * 32,
+        phase="ready", deadline_at=now + 60,
+    )
+    primary_state = asyncio.run(machine._codex_restart_state_for_ctx(
+        primary, wait=False))
+    stack_state = asyncio.run(machine._codex_restart_state_for_ctx(
+        stack, wait=False))
+    assert primary_state is not None and primary_state.epoch == "a" * 32
+    assert stack_state is not None and stack_state.epoch == "b" * 32
+    assert machine._read_codex_restart_state_for_ctx(primary) == primary_state
+
+    restarted = WrapperMachine(reordered_cfg, _StubTransport())
+    assert restarted._codex_legacy_restart_profile_id == "primary"
+
+
+def test_expired_newest_restart_alias_does_not_resurrect_older_ready(
+    tmp_path: Path,
+) -> None:
+    machine, _transport = _machine(tmp_path)
+    primary = _context("primary@sid-a", "sid-a", "primary")
+    stable = machine._codex_restart_path_for_ctx(primary)
+    legacy = machine._codex_legacy_daemon_restart_path
+    write_restart_state(stable, epoch="c" * 32, phase="ready")
+    write_restart_state(
+        legacy, epoch="d" * 32, phase="failed", deadline_at=time.time())
+    time.sleep(0.01)
+
+    assert machine._read_codex_restart_state_for_ctx(primary) is None
+    assert asyncio.run(machine._codex_restart_state_for_ctx(
+        primary, wait=False)) is None
+
+
+def test_active_restart_alias_is_not_hidden_by_other_ready_marker(
+    tmp_path: Path,
+) -> None:
+    machine, _transport = _machine(tmp_path)
+    primary = _context("primary@sid-a", "sid-a", "primary")
+    legacy = machine._codex_legacy_daemon_restart_path
+    stable = machine._codex_restart_path_for_ctx(primary)
+    restarting = write_restart_state(
+        legacy, epoch="e" * 32, phase="restarting",
+        deadline_at=time.time() + 60,
+    )
+    write_restart_state(stable, epoch="f" * 32, phase="ready")
+
+    assert machine._read_codex_restart_state_for_ctx(primary) == restarting
+
+
+def test_legacy_restart_owner_remap_is_idempotent_during_pending_transition(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    first = CodexProfileRegistry.from_json(json.dumps({
+        "a": {"label": "A", "home": str(tmp_path / "home-a"),
+              "default": True},
+        "b": {"label": "B", "home": str(tmp_path / "home-b")},
+    }))
+    store = CodexProfileTopologyStore(state)
+    first_transition = store.prepare(first)
+    assert first_transition is not None
+    assert store.legacy_restart_profile_id(
+        first, first_transition,
+        profile_revision=first_transition.revision,
+    ) == "a"
+    store.complete(first, first_transition)
+
+    swapped = CodexProfileRegistry.from_json(json.dumps({
+        "a": {"label": "A", "home": str(tmp_path / "home-b")},
+        "b": {"label": "B", "home": str(tmp_path / "home-a"),
+              "default": True},
+    }))
+    pending = store.prepare(swapped)
+    assert pending is not None
+    assert pending.remaps == {"a": "b", "b": "a"}
+    first_owner = store.legacy_restart_profile_id(
+        swapped, pending, profile_revision=pending.revision)
+
+    # Simulate a crash after this store commits but before topology completion.
+    replayed = store.prepare(swapped)
+    assert replayed is not None and replayed.revision == pending.revision
+    second_owner = store.legacy_restart_profile_id(
+        swapped, replayed, profile_revision=replayed.revision)
+    assert first_owner == second_owner == "b"
 
 
 def test_profile_tui_trackers_receive_only_their_daemon_proxy(
@@ -766,16 +945,17 @@ def test_unreadable_client_profile_keeps_owner_scan_incomplete(
 
     def holders(paths, _own, *, shell_snapshot_root=None):
         return HolderScan(
-            holders={native_sid: set() for native_sid in paths},
+            holders={native_sid: {client} for native_sid in paths},
             complete=True,
             passive_holders={native_sid: set() for native_sid in paths},
             client_proxies={client: 10},
             private_holders={native_sid: set() for native_sid in paths},
+            logical_holders={native_sid: {client} for native_sid in paths},
         )
 
     class Tracker:
         def bindings(self, paths, proxies):
-            assert proxies == {}
+            assert proxies == {client: 10}
             return {native_sid: set() for native_sid in paths}, True
 
     monkeypatch.setattr(machine_module, "writable_rollout_holders", holders)
@@ -794,7 +974,119 @@ def test_unreadable_client_profile_keeps_owner_scan_incomplete(
     }))
 
     assert scan.complete is False
+    assert scan.incomplete_sids == {sid}
+    assert scan.holders[sid] == set()
     assert scan.client_proxies == {}
+
+
+def test_unreadable_logical_tui_does_not_freeze_unrelated_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    machine, _transport = _machine(tmp_path)
+    primary_sid = "primary@primary-native"
+    stack_sid = "stack@stack-native"
+    machine._watch = {
+        primary_sid: {
+            "path": "/tmp/primary-rollout.jsonl", "engine": "codex",
+            "codex_profile_id": "primary",
+        },
+        stack_sid: {
+            "path": "/tmp/stack-rollout.jsonl", "engine": "codex",
+            "codex_profile_id": "stack",
+        },
+    }
+    client = ProcessIdentity(316, 14)
+
+    def holders(paths, _own, *, shell_snapshot_root=None, darwin_snapshot=None):
+        logical = {
+            native_sid: ({client} if native_sid == "primary-native" else set())
+            for native_sid in paths
+        }
+        return HolderScan(
+            holders={native_sid: set(value) for native_sid, value in logical.items()},
+            complete=True,
+            passive_holders={native_sid: set() for native_sid in paths},
+            client_proxies={client: 10},
+            private_holders={native_sid: set() for native_sid in paths},
+            logical_holders=logical,
+            darwin_snapshot=darwin_snapshot,
+        )
+
+    class Tracker:
+        def bindings(self, paths, proxies):
+            assert proxies == {client: 10}
+            return {native_sid: set() for native_sid in paths}, True
+
+    monkeypatch.setattr(machine_module, "writable_rollout_holders", holders)
+    monkeypatch.setattr(
+        machine_module, "codex_app_server_client_socket",
+        lambda _identity, **_kwargs: (False, None),
+    )
+    machine._codex_tui_log_trackers = {
+        "primary": Tracker(), "stack": Tracker(),
+    }
+
+    scan = asyncio.run(machine._probe_codex_holders({
+        sid: watch["path"] for sid, watch in machine._watch.items()
+    }))
+
+    assert scan.complete is False
+    assert scan.incomplete_sids == {primary_sid}
+    assert machine._codex_scan_complete_for_sid(scan, primary_sid) is False
+    assert machine._codex_scan_complete_for_sid(scan, stack_sid) is True
+
+
+def test_bound_tui_does_not_depend_on_structured_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    machine, _transport = _machine(tmp_path)
+    sid = "primary@primary-native"
+    machine._watch = {
+        sid: {
+            "path": "/tmp/primary-rollout.jsonl",
+            "engine": "codex",
+            "codex_profile_id": "primary",
+        },
+    }
+    client = ProcessIdentity(317, 15)
+
+    def holders(paths, _own, *, shell_snapshot_root=None):
+        return HolderScan(
+            holders={native_sid: {client} for native_sid in paths},
+            complete=True,
+            passive_holders={native_sid: set() for native_sid in paths},
+            client_proxies={client: 10},
+            private_holders={native_sid: set() for native_sid in paths},
+            logical_holders={native_sid: set() for native_sid in paths},
+        )
+
+    class Tracker:
+        def bindings(self, paths, proxies):
+            assert proxies == {}
+            return {native_sid: set() for native_sid in paths}, False
+
+    monkeypatch.setattr(machine_module, "writable_rollout_holders", holders)
+    expected_socket = str(
+        machine._codex_profiles.get("primary").home
+        / "app-server-control"
+        / "app-server-control.sock"
+    )
+    monkeypatch.setattr(
+        machine_module,
+        "codex_app_server_client_socket",
+        lambda _identity, **_kwargs: (True, expected_socket),
+    )
+    machine._codex_tui_log_trackers = {
+        "primary": Tracker(), "stack": Tracker(),
+    }
+
+    scan = asyncio.run(machine._probe_codex_holders({
+        sid: machine._watch[sid]["path"],
+    }))
+
+    assert scan.complete is True
+    assert scan.incomplete_sids == set()
+    assert scan.holders[sid] == {client}
 
 
 def test_cold_profile_does_not_preserve_sibling_stale_holder(

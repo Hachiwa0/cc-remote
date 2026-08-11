@@ -301,6 +301,74 @@ class CodexProfileTopologyStore:
     def __init__(self, state_dir: str | os.PathLike[str]) -> None:
         self.path = Path(state_dir) / "codex-profile-topology.json"
         self.pending_path = Path(state_dir) / "codex-profile-transition.json"
+        self.legacy_restart_path = (
+            Path(state_dir) / "codex-legacy-restart-profile.json")
+
+    def legacy_restart_profile_id(
+        self,
+        registry: CodexProfileRegistry,
+        transition: CodexProfileTopologyTransition | None,
+        *,
+        profile_revision: int,
+    ) -> str | None:
+        """Return the durable owner of the unprofiled restart marker."""
+        stored: str | None = None
+        stored_revision = 0
+        if self.legacy_restart_path.exists():
+            try:
+                raw = json.loads(self.legacy_restart_path.read_text("utf-8"))
+            except (OSError, UnicodeError, ValueError) as exc:
+                raise ValueError("invalid legacy restart profile file") from exc
+            if (
+                not isinstance(raw, dict)
+                or set(raw) != {"version", "profile_id", "profile_revision"}
+                or raw.get("version") != 1
+                or isinstance(raw.get("profile_revision"), bool)
+                or not isinstance(raw.get("profile_revision"), int)
+                or raw["profile_revision"] < 1
+                or (
+                    raw.get("profile_id") is not None
+                    and (
+                        not isinstance(raw.get("profile_id"), str)
+                        or not _PROFILE_ID.fullmatch(raw["profile_id"])
+                    )
+                )
+            ):
+                raise ValueError("invalid legacy restart profile file")
+            stored = raw.get("profile_id")
+            stored_revision = raw["profile_revision"]
+        elif transition is not None:
+            # legacy_profile_id is already translated into the target registry.
+            stored = transition.legacy_profile_id
+            stored_revision = profile_revision
+        else:
+            stored = registry.default.id
+            stored_revision = profile_revision
+
+        if stored_revision > profile_revision:
+            raise ValueError("legacy restart profile revision is ahead")
+        if stored_revision < profile_revision and transition is None:
+            raise ValueError("legacy restart profile revision is stale")
+        if (
+            transition is not None
+            and stored_revision < profile_revision
+            and stored_revision != profile_revision - 1
+        ):
+            raise ValueError("legacy restart profile missed a transition")
+        if (
+            transition is not None
+            and stored is not None
+            and stored_revision < profile_revision
+        ):
+            stored = transition.remaps.get(stored, stored)
+        active_ids = {profile.id for profile in registry}
+        owner = stored if stored in active_ids else None
+        self._atomic_write(self.legacy_restart_path, {
+            "version": 1,
+            "profile_id": owner,
+            "profile_revision": profile_revision,
+        })
+        return owner
 
     def prepare(
         self, registry: CodexProfileRegistry,

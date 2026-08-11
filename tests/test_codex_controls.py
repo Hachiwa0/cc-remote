@@ -14,7 +14,7 @@ from pydantic import ValidationError
 from cc_remote import __version__
 from cc_remote.protocol import (
     ERR_NOT_STEERABLE, ERR_STEER_UNKNOWN,
-    CollaborationMode, CommandAck, Delta, Error, GoalState, Interrupt, Model,
+    CollaborationMode, CommandAck, Delta, Effort, Error, GoalState, Interrupt, Model,
     NewSession, PinSession, StateEvent, Steer, ThreadGoal, TurnBinding, TurnEnd,
     TurnSteered, UserMsg, PermissionProfile, PermissionProfiles,
     SetPermissionProfile, SetWebSearch, WebSearch,
@@ -5338,6 +5338,67 @@ def test_managed_codex_turn_emits_authoritative_browser_turn_binding():
         assert [event.type for event in transport.sent].index("turn_binding") < [
             event.type for event in transport.sent
         ].index("turn_end")
+
+    asyncio.run(run())
+
+
+def test_managed_codex_turn_clears_stale_effort_when_sdk_has_none():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("no-effort-session", "no-effort-session")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        ctx.active_msg_id = "browser-message"
+        ctx.announced_effort = "ultra"
+        ctx.turn_task = asyncio.current_task()
+
+        class NoEffortSdk:
+            tier_dirty = False
+            model = None
+            effort = None
+            collaboration_mode = "default"
+            service_tier = None
+
+            async def query(
+                self, _prompt, images=None, *, client_user_message_id=None,
+            ):
+                return "native-turn"
+
+            async def receive_response(self):
+                yield {
+                    "method": "item/completed",
+                    "params": {
+                        "turnId": "native-turn",
+                        "item": {
+                            "id": "answer",
+                            "type": "agentMessage",
+                            "text": "done",
+                        },
+                    },
+                }
+                yield {
+                    "method": "turn/completed",
+                    "params": {"turn": {
+                        "id": "native-turn", "status": "completed",
+                    }},
+                }
+
+        ctx.sdk = NoEffortSdk()
+        machine._begin_codex_checkpoint = lambda _ctx: asyncio.sleep(0)
+        machine._accept_codex_checkpoint = lambda _ctx: asyncio.sleep(0)
+        await machine._run_turn(ctx, "hello")
+
+        assert ctx.announced_effort is None
+        assert [
+            event.effort for event in transport.sent
+            if isinstance(event, Effort)
+        ] == [""]
+        assert not [event for event in transport.sent
+                    if isinstance(event, Error)]
+        terminal = [event for event in transport.sent
+                    if isinstance(event, TurnEnd)]
+        assert len(terminal) == 1
+        assert terminal[0].result.is_error is False
 
     asyncio.run(run())
 

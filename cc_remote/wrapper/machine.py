@@ -1367,16 +1367,34 @@ class WrapperMachine:
             self._codex_profiles.default.id]
         default_restart_path = restart_state_path(cfg.state_dir)
         self._codex_daemon_restart_paths = {
-            profile.id: (
-                default_restart_path
-                if profile.id == self._codex_profiles.default.id
-                else default_restart_path.with_name(
-                    f"codex-daemon-restart-{profile.id}.json")
-            )
+            profile.id: restart_state_path(
+                cfg.state_dir, profile_id=profile.id)
             for profile in self._codex_profiles
         }
-        self._codex_daemon_restart_path = self._codex_daemon_restart_paths[
-            self._codex_profiles.default.id]
+        # The unprofiled marker is a compatibility alias owned by the account
+        # that owned legacy state.  It must not follow a later default reorder.
+        try:
+            if not self._codex_profile_migration_ok:
+                raise ValueError("Codex profile topology is unavailable")
+            self._codex_legacy_restart_profile_id = (
+                self._codex_profile_topology.legacy_restart_profile_id(
+                    self._codex_profiles,
+                    self._codex_profile_transition,
+                    profile_revision=self._codex_profile_revision,
+                )
+            )
+        except Exception as exc:
+            self._codex_legacy_restart_profile_id = None
+            log.warning(
+                "Codex legacy restart marker ownership unavailable",
+                error_type=type(exc).__name__,
+            )
+        self._codex_legacy_daemon_restart_path = default_restart_path
+        self._codex_daemon_restart_path = (
+            default_restart_path if not self._codex_profiles_explicit
+            else self._codex_daemon_restart_paths[
+                self._codex_profiles.default.id]
+        )
         self._codex_turn_leases = CodexTurnLeaseStore(cfg.state_dir)
         try:
             self._codex_client_messages: CodexClientMessageStore | None = (
@@ -1790,6 +1808,46 @@ class WrapperMachine:
     def _codex_restart_path_for_ctx(self, ctx: SessionContext) -> Path:
         return self._codex_daemon_restart_paths[
             self._codex_profile_for_ctx(ctx).id]
+
+    def _codex_restart_paths_for_ctx(
+        self, ctx: SessionContext,
+    ) -> tuple[Path, ...]:
+        if not self._codex_profiles_explicit:
+            return (self._codex_legacy_daemon_restart_path,)
+        profile_id = self._codex_profile_for_ctx(ctx).id
+        paths = (self._codex_restart_path_for_ctx(ctx),)
+        if profile_id == self._codex_legacy_restart_profile_id:
+            paths += (self._codex_legacy_daemon_restart_path,)
+        return paths
+
+    @staticmethod
+    def _read_codex_restart_paths(
+        paths: tuple[Path, ...],
+    ) -> Optional[CodexDaemonRestartState]:
+        # Select the newest publication before applying expiry. Falling back to
+        # an older alias after the newest restart failed or expired would move
+        # the observed daemon generation backwards.
+        states = [
+            state for state in (read_restart_state(path) for path in paths)
+            if state is not None
+        ]
+        active_restarts = [
+            state for state in states
+            if state.phase == "restarting" and not restart_state_is_stale(state)
+        ]
+        # Two retained compatibility hooks can overlap. Never let a different
+        # alias's ready publication hide a still-active restart generation.
+        candidates = active_restarts or states
+        state = max(candidates, key=lambda item: item.updated_at, default=None)
+        if state is not None and restart_state_is_stale(state):
+            return None
+        return state
+
+    def _read_codex_restart_state_for_ctx(
+        self, ctx: SessionContext,
+    ) -> Optional[CodexDaemonRestartState]:
+        return self._read_codex_restart_paths(
+            self._codex_restart_paths_for_ctx(ctx))
 
     def _codex_rollout_for_wire(self, wire_sid: str) -> Optional[str]:
         profile, native_sid = self._codex_target(wire_sid)
@@ -2811,23 +2869,18 @@ class WrapperMachine:
         wait: bool,
         interrupt_event: Optional[asyncio.Event] = None,
         ctx: Optional[SessionContext] = None,
+        paths: Optional[tuple[Path, ...]] = None,
     ) -> Optional[CodexDaemonRestartState]:
         """Read the hook barrier, optionally waiting for restart completion."""
-        path = (
+        marker_paths = paths or ((
             self._codex_restart_path_for_ctx(ctx)
             if ctx is not None else self._codex_daemon_restart_path
-        )
+        ),)
         while True:
             # The marker is a bounded (4 KiB), atomically replaced local file.
             # Reading it inline avoids default-executor starvation delaying an
             # active-turn interrupt beyond the daemon's restart window.
-            state = read_restart_state(path)
-            if state is not None and restart_state_is_stale(state):
-                # A failed worker or an abandoned restarting marker is useful
-                # only until its published deadline. Afterwards the currently
-                # reachable daemon becomes the baseline again; a later hook
-                # writes a fresh epoch and remains observable.
-                state = None
+            state = self._read_codex_restart_paths(marker_paths)
             if (
                 state is None
                 or state.phase != "restarting"
@@ -2858,11 +2911,7 @@ class WrapperMachine:
         interrupt_event: Optional[asyncio.Event] = None,
     ) -> Optional[CodexDaemonRestartState]:
         """Read the profile marker while preserving the legacy call shape."""
-        if (
-            not self._codex_profiles_explicit
-            and self._codex_profile_for_ctx(ctx).id
-            == self._codex_profiles.default.id
-        ):
+        if not self._codex_profiles_explicit:
             return await self._codex_restart_state(
                 wait=wait,
                 interrupt_event=interrupt_event,
@@ -2870,7 +2919,7 @@ class WrapperMachine:
         return await self._codex_restart_state(
             wait=wait,
             interrupt_event=interrupt_event,
-            ctx=ctx,
+            paths=self._codex_restart_paths_for_ctx(ctx),
         )
 
     async def _stamp_codex_daemon_epoch(self, ctx: SessionContext) -> None:
@@ -7384,7 +7433,7 @@ class WrapperMachine:
             )
 
             profile_proxies = scan.client_proxies
-            profile_resolution_complete = True
+            incomplete_native = set() if scan.complete else set(native_paths)
             if self._codex_profiles.is_multi_profile and scan.client_proxies:
                 daemon = self._codex_daemon_for_profile(profile)
                 info = daemon.info
@@ -7402,6 +7451,7 @@ class WrapperMachine:
                     )
                 expected_socket = os.path.realpath(expected_socket)
                 profile_proxies = {}
+                unresolved_proxies: dict[ProcessIdentity, int] = {}
                 for identity, started_at in scan.client_proxies.items():
                     resolution = client_socket_resolutions.get(identity)
                     if resolution is None:
@@ -7414,17 +7464,53 @@ class WrapperMachine:
                         client_socket_resolutions[identity] = resolution
                     resolved, socket_path = resolution
                     if not resolved:
-                        profile_resolution_complete = False
+                        unresolved_proxies[identity] = started_at
                         continue
                     if socket_path == expected_socket:
                         profile_proxies[identity] = started_at
+                # UUID-only argv matches are weaker than real rollout FDs.
+                # Accept them only when this exact TUI resolves to this
+                # profile's daemon; never remove an inode-confirmed holder.
+                for native_sid, logical_holders in scan.logical_holders.items():
+                    foreign = logical_holders - set(profile_proxies)
+                    if foreign:
+                        scan.holders.setdefault(native_sid, set()).difference_update(
+                            foreign)
+                for native_sid, holders in scan.logical_holders.items():
+                    if set(holders).intersection(unresolved_proxies):
+                        incomplete_native.add(native_sid)
+            else:
+                unresolved_proxies = {}
+            # Structured TUI logs are only a fallback for clients that the
+            # process scan could not already bind.  A rollout FD, explicit
+            # resume argv, or shell snapshot is sufficient ownership evidence
+            # on its own and must not become unknown merely because
+            # logs_2.sqlite is unavailable.
+            already_bound = {
+                identity
+                for holders in scan.holders.values()
+                for identity in holders
+            }
+            tracker_candidates = {
+                identity: started_at
+                for identity, started_at in {
+                    **profile_proxies,
+                    **unresolved_proxies,
+                }.items()
+                if identity not in already_bound
+            }
             tui_bindings, log_complete = await asyncio.to_thread(
                 tui_tracker.bindings,
                 native_paths,
-                profile_proxies,
+                tracker_candidates,
             )
             for native_sid, holders in tui_bindings.items():
-                scan.holders.setdefault(native_sid, set()).update(holders)
+                accepted = set(holders) - set(unresolved_proxies)
+                scan.holders.setdefault(native_sid, set()).update(accepted)
+                if set(holders).intersection(unresolved_proxies):
+                    incomplete_native.add(native_sid)
+            if tracker_candidates and not log_complete:
+                incomplete_native.update(native_paths)
 
             def wire_bucket(
                 bucket: dict[str, set[ProcessIdentity]],
@@ -7437,22 +7523,29 @@ class WrapperMachine:
 
             scans.append(HolderScan(
                 holders=wire_bucket(scan.holders),
-                complete=(
-                    scan.complete
-                    and profile_resolution_complete
-                    and (log_complete or not profile_proxies)
-                ),
+                complete=not incomplete_native,
                 passive_holders=wire_bucket(scan.passive_holders),
                 client_proxies=profile_proxies,
                 private_holders=wire_bucket(scan.private_holders),
+                incomplete_sids={
+                    wire_by_native[native_sid]
+                    for native_sid in incomplete_native
+                    if native_sid in wire_by_native
+                },
             ))
 
+        incomplete_sids = {
+            sid for item in scans for sid in item.incomplete_sids
+        }
+        if not scans:
+            incomplete_sids.update(paths)
         scan = HolderScan(
             holders={sid: set() for sid in paths},
-            complete=bool(scans) and all(item.complete for item in scans),
+            complete=not incomplete_sids,
             passive_holders={sid: set() for sid in paths},
             client_proxies={},
             private_holders={sid: set() for sid in paths},
+            incomplete_sids=incomplete_sids,
         )
         for item in scans:
             for sid, holders in item.holders.items():
@@ -7569,6 +7662,12 @@ class WrapperMachine:
             return self._is_external(sid)
 
     @staticmethod
+    def _codex_scan_complete_for_sid(scan: HolderScan, sid: str) -> bool:
+        return scan.complete or (
+            bool(scan.incomplete_sids) and sid not in scan.incomplete_sids
+        )
+
+    @staticmethod
     def _codex_holder_sets(
         w: dict, scan, sid: str,
     ) -> tuple[
@@ -7577,7 +7676,8 @@ class WrapperMachine:
         """Return (interactive owners, writers, private app-server writers)."""
         raw = set(scan.holders.get(sid, ()))
         seeded: set[str] = w.setdefault("seeded_external_turns", set())
-        if seeded and scan.complete:
+        scan_complete = WrapperMachine._codex_scan_complete_for_sid(scan, sid)
+        if seeded and scan_complete:
             # A tail marker is only a cold-start candidate. Without any live
             # foreign writer, an unmatched historical task_started is a crashed
             # orphan and must not manufacture a fresh 60-second read-only lock.
@@ -7590,7 +7690,7 @@ class WrapperMachine:
         ignored: set[ProcessIdentity] = w.setdefault("takeover_holders", set())
         ignored_interactive: set[ProcessIdentity] = w.setdefault(
             "takeover_interactive_holders", set())
-        if scan.complete:
+        if scan_complete:
             # Exact start ticks make this safe against PID reuse. Once a captured
             # process exits, a later process with the same PID is a new owner.
             ignored.intersection_update(raw)
@@ -7609,14 +7709,15 @@ class WrapperMachine:
             scan = await self._probe_codex_holders({sid: w["path"]})
             holders, writers, private_holders = self._codex_holder_sets(
                 w, scan, sid)
-            if not scan.complete:
+            scan_complete = self._codex_scan_complete_for_sid(scan, sid)
+            if not scan_complete:
                 holders.update(w.get("holders", ()))
                 writers.update(w.get("writers", ()))
                 private_holders.update(w.get("private_holders", ()))
             await self._poll_codex_watch(
                 sid, w, holders, time.time(), writers=writers,
                 private_holders=private_holders,
-                ownership_scan_complete=scan.complete)
+                ownership_scan_complete=scan_complete)
             return self._is_external(sid)
 
     @classmethod
@@ -8261,14 +8362,15 @@ class WrapperMachine:
                         continue
                     holders, writers, private_holders = self._codex_holder_sets(
                         w, scan, sid)
-                    if not scan.complete:
+                    scan_complete = self._codex_scan_complete_for_sid(scan, sid)
+                    if not scan_complete:
                         holders.update(w.get("holders", ()))
                         writers.update(w.get("writers", ()))
                         private_holders.update(w.get("private_holders", ()))
                     await self._poll_codex_watch(
                         sid, w, holders, now, writers=writers,
                         private_holders=private_holders,
-                        ownership_scan_complete=scan.complete)
+                        ownership_scan_complete=scan_complete)
 
         claude_paths, claude_cwds = self._claude_watch_inputs()
         if claude_paths:
@@ -10608,7 +10710,9 @@ class WrapperMachine:
         if ctx.engine == "codex":
             async with self._codex_watch_lock:
                 scan = await self._probe_codex_holders({resolved_sid: w["path"]})
-                if not scan.complete:
+                scan_complete = self._codex_scan_complete_for_sid(
+                    scan, resolved_sid)
+                if not scan_complete:
                     error = Error(
                         code=ERR_BUSY,
                         message="终端状态扫描暂不完整，未执行接管，请重试",
@@ -10620,7 +10724,7 @@ class WrapperMachine:
                 await self._poll_codex_watch(
                     resolved_sid, w, holders, time.time(), writers=writers,
                     private_holders=private_holders,
-                    ownership_scan_complete=scan.complete)
+                    ownership_scan_complete=scan_complete)
                 if w.get("desktop_active"):
                     error = Error(
                         code=ERR_BUSY,
@@ -13542,8 +13646,7 @@ class WrapperMachine:
                 except StopAsyncIteration:
                     # A graceful daemon close may win the same poll interval as
                     # the marker. Re-read once before treating EOF as failure.
-                    switch_state = read_restart_state(
-                        self._codex_restart_path_for_ctx(ctx))
+                    switch_state = self._read_codex_restart_state_for_ctx(ctx)
                     if (
                         switch_state is not None
                         and ctx.codex_daemon_epoch
@@ -13578,8 +13681,7 @@ class WrapperMachine:
                     overflowed = True
                     continue
                 if isinstance(raw, CodexSpontaneousClosed):
-                    switch_state = read_restart_state(
-                        self._codex_restart_path_for_ctx(ctx))
+                    switch_state = self._read_codex_restart_state_for_ctx(ctx)
                     if (
                         switch_state is not None
                         and ctx.codex_daemon_epoch
@@ -22859,8 +22961,7 @@ class WrapperMachine:
                     # the bounded marker synchronously before accepting EOF or
                     # an old-generation terminal as authoritative.
                     if is_codex_shared and ctx.codex_daemon_epoch:
-                        switch_state = read_restart_state(
-                            self._codex_restart_path_for_ctx(ctx))
+                        switch_state = self._read_codex_restart_state_for_ctx(ctx)
                         if (
                             switch_state is not None
                             and switch_state.epoch != ctx.codex_daemon_epoch
@@ -23478,9 +23579,14 @@ class WrapperMachine:
                 if ctx.announced_model != ctx.sdk.model:
                     ctx.announced_model = ctx.sdk.model
                     await self._emit(ctx, Model(model=ctx.announced_model))
-                if ctx.announced_effort != ctx.sdk.effort:
-                    ctx.announced_effort = ctx.sdk.effort
-                    await self._emit(ctx, Effort(effort=ctx.sdk.effort))
+                effort = getattr(ctx.sdk, "effort", None)
+                if isinstance(effort, str) and effort:
+                    if ctx.announced_effort != effort:
+                        ctx.announced_effort = effort
+                        await self._emit(ctx, Effort(effort=effort))
+                elif ctx.announced_effort is not None:
+                    ctx.announced_effort = None
+                    await self._emit(ctx, Effort(effort=""))
                 if ctx.announced_collaboration_mode != collaboration_mode:
                     ctx.announced_collaboration_mode = collaboration_mode
                     await self._emit(ctx, CollaborationMode(
