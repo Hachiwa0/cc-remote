@@ -41,7 +41,6 @@ import {
   reconcileNewChatSelection,
   resolveNewChatLocalDefaults,
 } from "./components/NewChatView";
-import { BtwPanel } from "./components/BtwPanel";
 import { QuestionSheet } from "./components/QuestionSheet";
 import { StatusSheet } from "./components/StatusSheet";
 import { UsageActivitySheet } from "./components/UsageActivitySheet";
@@ -217,6 +216,9 @@ const SPACE_KEY = "cc_remote_space";
 const MACHINE_KEY = "cc_remote_machine";
 const GoalPanel = lazy(() => import("./components/GoalPanel").then(
   ({ GoalPanel: Panel }) => ({ default: Panel }),
+));
+const BtwPanel = lazy(() => import("./components/BtwPanel").then(
+  ({ BtwPanel: Panel }) => ({ default: Panel }),
 ));
 const ArtifactPanel = lazy(() => import("./components/ArtifactPanel").then(
   ({ ArtifactPanel: Panel }) => ({ default: Panel }),
@@ -4647,7 +4649,8 @@ export default function App() {
         const view = rightView === "btw" && btwShowing ? "btw"
           : state.artifact ? "diff" : btwShowing ? "btw" : null;
         if (view === "btw")
-          return <BtwPanel sid={activeBtwSid ?? undefined} rt={activeBtwSid ? state.runtimes[activeBtwSid] : undefined}
+          return <Suspense fallback={null}>
+            <BtwPanel sid={activeBtwSid ?? undefined} rt={activeBtwSid ? state.runtimes[activeBtwSid] : undefined}
             engine={activeBtw?.engine} opening={btwOpening && !activeBtw}
             active="btw" hasArtifact={!!state.artifact} artifactKind={state.artifact?.kind} onTab={switchRight}
             catalog={focusedCatalog}
@@ -4691,7 +4694,8 @@ export default function App() {
             onAuthorizeImage={authorizeMessageImage}
             onDismissNotice={(noticeId) => {
               if (activeBtwSid) dispatch({ type: "dismiss_notice", sid: activeBtwSid, noticeId });
-            }} />;
+            }} />
+          </Suspense>;
         if (view === "diff" && state.artifact)
           return <Suspense fallback={
             <div className="artifact-panel empty" role="status">

@@ -1,4 +1,6 @@
 import {
+  lazy,
+  Suspense,
   useEffect,
   useRef,
   useState,
@@ -32,7 +34,10 @@ import {
   PointerTapGuard,
   releaseDraggedPointer,
 } from "../pointer-tap";
-import { PlanProgressPopover } from "./PlanProgressPopover";
+
+const PlanProgressPopover = lazy(() => import("./PlanProgressPopover").then(
+  ({ PlanProgressPopover: Popover }) => ({ default: Popover }),
+));
 
 function durationLabel(ms: number): string {
   const seconds = Math.max(0, Math.round(ms / 1000));
@@ -854,13 +859,20 @@ export function ProcessTimeline({ blocks, done, active, durationMs, startTs, don
           <span className="turn-process-count">{countLabel}</span>
           <Icon name="chev" size={15} />
         </button>}
-        {inlinePlanBlock && <PlanProgressPopover block={inlinePlanBlock}
-          openOverride={itemOpen?.(`plan:${inlinePlanBlock.item_id}`)}
-          onOpenChange={(next) => onItemOpenChange?.(
-            `plan:${inlinePlanBlock.item_id}`, next)}
-          detailLoading={detailLoading}
-          onNeedDetail={needsAuthoritativeDetail && !detailLoading
-            ? requestDetail : undefined} />}
+        {inlinePlanBlock && <Suspense fallback={
+          <span className="plan-progress-control" role="status"
+            aria-label="正在加载计划进度">
+            <span className="plan-progress-trigger" aria-hidden="true" />
+          </span>
+        }>
+          <PlanProgressPopover block={inlinePlanBlock}
+            openOverride={itemOpen?.(`plan:${inlinePlanBlock.item_id}`)}
+            onOpenChange={(next) => onItemOpenChange?.(
+              `plan:${inlinePlanBlock.item_id}`, next)}
+            detailLoading={detailLoading}
+            onNeedDetail={needsAuthoritativeDetail && !detailLoading
+              ? requestDetail : undefined} />
+        </Suspense>}
       </div>
       {showOuterDisclosure && open && <div className="process-timeline">
         {visibleDetailError && (
