@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+- Upgrade the coordinated Wrapper/Relay/Web gate to protocol v34. Main-session
+  completion acknowledgements and exact Goal-generation dismissals now live in
+  bounded wrapper-owned state, so reading or hiding them in one browser updates
+  every connected browser and survives reconnects without hiding replacements.
 - Store files and images attached to Work messages under that conversation's
   private `workspace/uploads` directory, where the Work sandbox can actually
   read them, while keeping uploaded source material out of generated Artifacts

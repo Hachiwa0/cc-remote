@@ -260,6 +260,9 @@ export interface SessionInfo {
   native_session_id?: string | null;
   codex_profile_id?: string | null;
   codex_profile_label?: string | null;
+  completion_id?: string | null;
+  completion_unread?: boolean | null;
+  completion_revision?: number | null;
 }
 export interface ListSessions extends Base { type: "list_sessions"; engine?: Engine; space?: Space }
 export interface SwitchSession extends Base { type: "switch_session"; session_id: string; engine?: Engine; space?: Space }
@@ -445,6 +448,8 @@ export interface SetGoal extends Base {
   token_budget?: number | null;
 }
 export interface ClearGoal extends Base { type: "clear_goal" }
+export interface DismissGoal extends Base { type: "dismiss_goal"; goal_id: string }
+export interface AcknowledgeCompletion extends Base { type: "acknowledge_completion"; completion_id: string }
 export interface GetStatus extends Base { type: "get_status" }
 export interface ThreadGoal {
   threadId: string;
@@ -462,7 +467,19 @@ export interface ThreadGoal {
   setAt?: number;
   tokensAtStart?: number;
 }
-export interface GoalState extends Base { type: "goal_state"; goal?: ThreadGoal | null; request_id?: string | null }
+export interface GoalState extends Base {
+  type: "goal_state";
+  goal?: ThreadGoal | null;
+  goal_id?: string | null;
+  dismissed?: boolean;
+  request_id?: string | null;
+}
+export interface CompletionState extends Base {
+  type: "completion_state";
+  completion_id?: string | null;
+  unread?: boolean;
+  revision?: number;
+}
 export interface StatusThread {
   thread_id: string;
   session_id?: string | null;
@@ -551,14 +568,14 @@ export interface ContextReport extends Base {
 
 export type ServerEvent =
   | Pong | CommandAck | ReplayStart | ReplayEnd | Snapshot | StateEvent | QueryQueueState | QueuedQueryDetail | QueuedQueryUpdated | Model | Effort | Fast | CollaborationMode | BtwOpened | Perm | PermissionProfiles | PermissionProfile | WebSearch | ContextReport | DiffReport | FilePreview | FileSaveResult | PreviewAsset | PreviewAuthorizationRequired | PreviewAuthorizationResult | History | TurnDetail | HistoryImage | HistoryInvalidated | ArtifactInvalidated | Models | EngineCapabilities | TakeoverState | SessionControl
-  | AskUser | AskUserClosed | GoalState | StatusReport | Notice | RateLimitUpdate | RollbackResult
+  | AskUser | AskUserClosed | GoalState | CompletionState | StatusReport | Notice | RateLimitUpdate | RollbackResult
   | SessionList | SessionListInvalidated | SessionActivity | SessionFocus | SessionRekey | SessionForked | SessionMigrated | WorkDashboard | WorkArtifacts
   | DirList
   | UserMsg | TurnSteered | AssistantMsgStart | Delta | ToolUse | ToolDelta | ToolResult | AssistantMsgEnd
   | ProcessEvent | TurnPlan | TurnDiff | TurnBinding
   | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
 
-export const PROTOCOL_VERSION = 33;
+export const PROTOCOL_VERSION = 34;
 
 const CONTROL_MODES = new Set<ControlMode>([
   "remote", "codex_shared", "claude_broker", "external_cli", "agent_view", "desktop",

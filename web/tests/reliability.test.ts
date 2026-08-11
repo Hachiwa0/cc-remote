@@ -42,9 +42,13 @@ import {
 } from "../src/history-browse.ts";
 import {
   acknowledgeCompletion,
+  acknowledgeMatchingCompletion,
+  catalogCompletionProjection,
+  completionAcknowledgementId,
   completionBadgeKind,
   discardBtwCompletionReceipts,
   markCompletionUnread,
+  newestCompletionProjection,
   rekeyCompletionReceipts,
 } from "../src/completion-badges.ts";
 import { imageDimensions } from "../src/img.ts";
@@ -71,6 +75,7 @@ import {
 } from "../src/cache.ts";
 import {
   boundRuntimeTurns,
+  MAX_RUNTIME_SESSIONS,
   MAX_RUNTIME_TURNS,
   pruneRuntimeMap,
 } from "../src/runtime-bounds.ts";
@@ -123,6 +128,7 @@ import type {
   ServerEvent,
   SessionList,
   SessionControl,
+  ThreadGoal,
 } from "../src/protocol.ts";
 import type { Block, Turn } from "../src/reducer.ts";
 import { clampPanelWidth, resolveSidebarSwipe } from "../src/responsive-layout.ts";
@@ -157,6 +163,13 @@ import {
 } from "../src/composer-submit.ts";
 import { workContextMetrics } from "../src/work-context.ts";
 import { processBlocks } from "../src/process-blocks.ts";
+import {
+  completedGoalHasNewerUserTurn,
+  latestPlanProgress,
+  planFollowsCompletedGoal,
+  planProgressPresentation,
+  SessionPlanProgressCache,
+} from "../src/plan-progress.ts";
 import { PointerTapGuard } from "../src/pointer-tap.ts";
 import {
   cacheSkillCatalog,
@@ -275,6 +288,15 @@ assert.equal(discoveredGoal.revealed, true,
   "an authoritative Goal must reveal itself on a new browser or device");
 assert.equal(discoveredGoal.preferences[goalScopeA]?.known, true,
   "Goal discovery must survive a refresh without requiring /goal");
+const remotelyDismissedGoal = reconcileGoalUiPreference(
+  {}, goalScopeOtherMachine, persistedGoal, 10, true);
+assert.equal(remotelyDismissedGoal.revealed, false,
+  "a server dismissal must hide the same Goal on a fresh device");
+assert.equal(
+  remotelyDismissedGoal.preferences[goalScopeOtherMachine]?.hiddenGoal,
+  goalStableIdentity(persistedGoal),
+  "the fresh device caches only the opaque local Goal fingerprint",
+);
 let goalPreferences = rememberGoalUi(discoveredGoal.preferences, goalScopeA, 10);
 let reconciledGoal = reconcileGoalUiPreference(
   goalPreferences, goalScopeA, persistedGoal, 11);
@@ -378,13 +400,107 @@ assert.ok(sessionActivityTime("1752746400000") > sessionActivityTime("1752746399
   "millisecond and second timestamps must share one ordering scale");
 
 let completionReceipts = markCompletionUnread(
-  {}, "parent-a", "parent-a", "main");
+  {}, "parent-a", "parent-a", "main", "turn-a");
 completionReceipts = markCompletionUnread(
   completionReceipts, "parent-a", "btw-a", "btw");
 completionReceipts = markCompletionUnread(
   completionReceipts, "parent-b", "btw-b", "btw");
 assert.equal(completionBadgeKind(completionReceipts["parent-a"]), "both");
 assert.equal(completionBadgeKind(completionReceipts["parent-b"]), "btw");
+assert.equal(completionBadgeKind(
+  { main: true, mainCompletionId: "turn-new", mainTurnEndSeq: 10,
+    mainTurnEndGeneration: "generation-1", btwSids: [] }, false), "main",
+  "a newer local completion remains visible while its authoritative frame is delayed");
+assert.equal(completionBadgeKind(
+  { main: false, mainCompletionId: null, mainTurnEndSeq: null,
+    mainTurnEndGeneration: null, btwSids: [] }, true), "main",
+  "an authoritative unread completion remains visible without a local fallback");
+assert.equal(completionAcknowledgementId(
+  completionReceipts["parent-a"], undefined), "turn-a",
+  "a missed completion_state can be acknowledged from its turn_end fallback");
+assert.equal(completionAcknowledgementId(
+  completionReceipts["parent-a"], { id: "turn-new", unread: true }),
+  "turn-new", "a newer authoritative completion wins over the fallback id");
+const newerLocalCompletion = markCompletionUnread(
+  {}, "catalog-race", "catalog-race", "main", "turn-new");
+const staleReadProjection = newestCompletionProjection(undefined, {
+  id: "turn-old", unread: false, revision: 2,
+});
+assert.equal(acknowledgeMatchingCompletion(
+  newerLocalCompletion, "catalog-race", staleReadProjection),
+newerLocalCompletion,
+"a delayed catalog acknowledgement cannot clear a newer local completion");
+assert.equal(acknowledgeMatchingCompletion(
+  newerLocalCompletion, "catalog-race",
+  { id: "turn-new", unread: false, revision: 4 },
+)["catalog-race"], undefined,
+"the matching authoritative read receipt clears its local fallback");
+const newerRuntimeProjection = newestCompletionProjection(
+  { id: "turn-new", unread: true, revision: 5 },
+  { id: "turn-old", unread: false, revision: 4 },
+);
+assert.equal(acknowledgeMatchingCompletion(
+  newerLocalCompletion, "catalog-race", newerRuntimeProjection),
+newerLocalCompletion,
+"runtime revision ordering rejects an older catalog acknowledgement");
+const firstIdentitylessLocalCompletion = markCompletionUnread(
+  {}, "identityless", "identityless", "main", null, 40, "generation-1");
+const identitylessLocalCompletion = markCompletionUnread(
+  firstIdentitylessLocalCompletion,
+  "identityless", "identityless", "main", null, 50, "generation-1",
+);
+assert.equal(
+  identitylessLocalCompletion.identityless.mainTurnEndSeq, 50,
+  "a second null-id completion advances its causal TurnEnd boundary",
+);
+assert.equal(acknowledgeMatchingCompletion(
+  identitylessLocalCompletion, "identityless",
+  { id: "generated-old", unread: false, revision: 3 },
+), identitylessLocalCompletion,
+"an unordered catalog receipt cannot clear a null-id local completion");
+assert.equal(acknowledgeMatchingCompletion(
+  identitylessLocalCompletion, "identityless",
+  { id: "generated-old", unread: false, revision: 3 },
+  { authoritativeSeq: 41, authoritativeGeneration: "generation-1" },
+), identitylessLocalCompletion,
+"an older ordered receipt cannot clear the next null-id completion");
+assert.equal(acknowledgeMatchingCompletion(
+  identitylessLocalCompletion, "identityless",
+  { id: "generated-new", unread: false, revision: 5 },
+  { authoritativeSeq: 51, authoritativeGeneration: "generation-2" },
+), identitylessLocalCompletion,
+"sequence numbers from another wrapper generation are not comparable");
+assert.equal(acknowledgeMatchingCompletion(
+  identitylessLocalCompletion, "identityless",
+  { id: "generated-new", unread: false, revision: 5 },
+  { authoritativeSeq: 51, authoritativeGeneration: "generation-1" },
+)["identityless"], undefined,
+"a causally later CompletionState clears a null-id local fallback");
+const identifiedLocalCompletion = markCompletionUnread(
+  {}, "cleared", "cleared", "main", "turn-cleared", 60, "generation-1");
+assert.equal(acknowledgeMatchingCompletion(
+  identifiedLocalCompletion, "cleared",
+  { id: null, unread: false, revision: 6 },
+), identifiedLocalCompletion,
+"an unordered catalog clear cannot remove an identified local completion");
+assert.equal(acknowledgeMatchingCompletion(
+  identifiedLocalCompletion, "cleared",
+  { id: null, unread: false, revision: 6 },
+  { authoritativeSeq: 59, authoritativeGeneration: "generation-1" },
+), identifiedLocalCompletion,
+"an older clear cannot remove the next identified local completion");
+assert.equal(acknowledgeMatchingCompletion(
+  identifiedLocalCompletion, "cleared",
+  { id: null, unread: false, revision: 6 },
+  { authoritativeSeq: 61, authoritativeGeneration: "generation-2" },
+), identifiedLocalCompletion,
+"a clear from another wrapper generation cannot remove a local completion");
+assert.equal(acknowledgeMatchingCompletion(
+  identifiedLocalCompletion, "cleared",
+  { id: null, unread: false, revision: 6 },
+  { authoritativeSeq: 61, authoritativeGeneration: "generation-1" },
+)["cleared"], undefined,
+"a causally later clear removes an identified local completion");
 completionReceipts = acknowledgeCompletion(
   completionReceipts, "parent-a", { main: true });
 assert.equal(completionBadgeKind(completionReceipts["parent-a"]), "btw",
@@ -397,15 +513,17 @@ completionReceipts = rekeyCompletionReceipts(
   completionReceipts, "parent-b", "parent-real");
 assert.equal(completionReceipts["parent-b"], undefined);
 assert.deepEqual(completionReceipts["parent-real"], {
-  main: false, btwSids: ["btw-b"],
+  main: false, mainCompletionId: null, mainTurnEndSeq: null,
+  mainTurnEndGeneration: null, btwSids: ["btw-b"],
 });
 completionReceipts = markCompletionUnread(
-  completionReceipts, "parent-main", "parent-main", "main");
+  completionReceipts, "parent-main", "parent-main", "main", "turn-main");
 completionReceipts = discardBtwCompletionReceipts(completionReceipts);
 assert.equal(completionReceipts["parent-real"], undefined,
   "a wrapper restart removes receipts for destroyed ephemeral BTW forks");
 assert.deepEqual(completionReceipts["parent-main"], {
-  main: true, btwSids: [],
+  main: true, mainCompletionId: "turn-main", mainTurnEndSeq: null,
+  mainTurnEndGeneration: null, btwSids: [],
 }, "main-session completion receipts survive a wrapper restart");
 
 const processTap = new PointerTapGuard(8);
@@ -1038,6 +1156,15 @@ assert.deepEqual(matchCommands("pla", "codex", "work"), []);
 assert.match(historyAppSource,
   /command\.kind === "resume"[\s\S]{0,300}focusedEngine === "codex"[\s\S]{0,160}sendSetGoal\(null, "active", null\)/,
   "Codex /goal resume must reactivate the existing Goal without replacing its objective");
+assert.match(historyAppSource,
+  /const completedGoalRequest = msg\.request_id[\s\S]{0,300}goalRecoveryRequestsRef\.current\.delete\([\s\S]{0,120}completedGoalRequest\.scopeKey/,
+  "a successful Goal recovery must release its focus-scoped dedupe key");
+assert.match(historyAppSource,
+  /legacyDismissed[\s\S]{0,500}sendDismissGoalTo\(/,
+  "a device-local Goal dismissal must migrate into shared wrapper state");
+assert.match(historyAppSource,
+  /completionAcknowledgementId\([\s\S]{0,320}sendAcknowledgeCompletionTo\(/,
+  "viewing a completed session must acknowledge it through the wrapper");
 const codexGoalDescription = commandsFor("codex").flatMap((command) =>
   "slash" in command && command.slash === "goal" ? [command.ds] : [])[0] ?? "";
 assert.match(codexGoalDescription, /\/goal resume/,
@@ -3107,6 +3234,140 @@ try {
   } as ServerEvent);
   assert.equal(createRuntime().sendMode, "steer",
     "Codex running input uses steer mode by default");
+  let desktopCompletion = reduce(initialState, {
+    type: "event",
+    event: event({
+      type: "completion_state",
+      sid: "shared-completion",
+      completion_id: "turn-1",
+      unread: true,
+      revision: 1,
+    }),
+  });
+  let phoneCompletion = reduce(initialState, {
+    type: "event",
+    event: event({
+      type: "completion_state",
+      sid: "shared-completion",
+      completion_id: "turn-1",
+      unread: true,
+      revision: 1,
+    }),
+  });
+  const sharedAcknowledgement = event({
+    type: "completion_state",
+    sid: "shared-completion",
+    completion_id: "turn-1",
+    unread: false,
+    revision: 2,
+  });
+  desktopCompletion = reduce(desktopCompletion, {
+    type: "event", event: sharedAcknowledgement,
+  });
+  phoneCompletion = reduce(phoneCompletion, {
+    type: "event", event: sharedAcknowledgement,
+  });
+  assert.equal(
+    desktopCompletion.runtimes["shared-completion"].completion?.unread,
+    false,
+  );
+  assert.equal(
+    phoneCompletion.runtimes["shared-completion"].completion?.unread,
+    false,
+    "one authoritative acknowledgement clears every browser projection",
+  );
+  const staleCompletion = reduce(phoneCompletion, {
+    type: "event",
+    event: event({
+      type: "completion_state",
+      sid: "shared-completion",
+      completion_id: "turn-1",
+      unread: true,
+      revision: 1,
+    }),
+  });
+  assert.equal(
+    staleCompletion.runtimes["shared-completion"].completion?.unread,
+    false,
+    "a replayed old unread receipt cannot resurrect a cleared badge",
+  );
+  const coldCatalogRepair = reduce(phoneCompletion, {
+    type: "event",
+    event: event({
+      type: "session_list",
+      engine: "codex",
+      space: "code",
+      sessions: [{
+        session_id: "shared-completion",
+        completion_id: "turn-1",
+        completion_unread: false,
+        completion_revision: 3,
+      }],
+    }),
+  });
+  assert.equal(
+    coldCatalogRepair.runtimes["shared-completion"].completion?.revision,
+    3,
+    "a cold catalog repairs a browser which missed the live acknowledgement",
+  );
+  const coldUnreadCatalog = reduce(initialState, {
+    type: "event",
+    event: event({
+      type: "session_list",
+      engine: "claude",
+      space: "code",
+      sessions: [{
+        session_id: "cold-unread",
+        completion_id: "turn-cold",
+        completion_unread: true,
+        completion_revision: 1,
+      }],
+    }),
+  });
+  assert.equal(
+    coldUnreadCatalog.runtimes["cold-unread"],
+    undefined,
+    "a cold receipt must not allocate an otherwise empty runtime",
+  );
+  assert.equal(
+    newestCompletionProjection(
+      undefined,
+      catalogCompletionProjection(coldUnreadCatalog.sessions.find(
+        (session: { session_id: string }) => (
+          session.session_id === "cold-unread"))),
+    )?.unread,
+    true,
+    "an unread cold session must be visible before it is resumed",
+  );
+  const manyColdCatalog = reduce(initialState, {
+    type: "event",
+    event: event({
+      type: "session_list",
+      engine: "claude",
+      space: "code",
+      sessions: Array.from(
+        { length: MAX_RUNTIME_SESSIONS + 5 },
+        (_, index) => ({
+          session_id: `cold-unread-${index}`,
+          completion_id: `turn-cold-${index}`,
+          completion_unread: true,
+          completion_revision: 1,
+        }),
+      ),
+    }),
+  });
+  const prunedColdCatalog = reduce(manyColdCatalog, {
+    type: "prune_runtimes", protectedSids: [],
+  });
+  assert.equal(Object.keys(prunedColdCatalog.runtimes).length, 0);
+  assert.equal(prunedColdCatalog.sessions.filter((session: {
+    completion_id?: string | null;
+    completion_unread?: boolean | null;
+    completion_revision?: number | null;
+  }) => (
+    catalogCompletionProjection(session)?.unread === true
+  )).length, MAX_RUNTIME_SESSIONS + 5,
+    "pruning cannot hide durable cold completion receipts from the sidebar");
   const migrationOwner = {
     scopeKey: "machine:code:codex",
     machineId: "machine",
@@ -13391,26 +13652,339 @@ try {
   ));
   assert.match(failedLoadedPageMarkup, /role="alert"/,
     "a later detail-page failure remains visible after the first page loaded");
+  const planOnlyBlock: Block = {
+    kind: "process",
+    item_id: "plan-only",
+    processKind: "plan",
+    phase: "end",
+    status: "succeeded",
+    title: "执行计划",
+    plan: [{ step: "检查实现", status: "completed" }],
+    done: true,
+  };
   const planOnlyMarkup = renderToStaticMarkup(createElement(ProcessTimeline, {
     engine: "codex",
     done: true,
     openOverride: true,
-    blocks: [{
-      kind: "process",
-      item_id: "plan-only",
-      processKind: "plan",
-      phase: "end",
-      status: "succeeded",
-      title: "执行计划",
-      plan: [{ step: "检查实现", status: "completed" }],
-      done: true,
-    }],
+    blocks: [planOnlyBlock],
   }));
   assert.match(planOnlyMarkup, /plan-progress-trigger/,
     "a plan-only timeline keeps the compact plan control");
   assert.doesNotMatch(planOnlyMarkup, /turn-process-head/,
     "a plan-only timeline does not advertise an empty outer disclosure");
   assert.doesNotMatch(planOnlyMarkup, />1 项</);
+  const externalPlanOnlyMarkup = renderToStaticMarkup(createElement(
+    ProcessTimeline, {
+      engine: "codex",
+      done: true,
+      blocks: [planOnlyBlock],
+      externalPlanItemId: "plan-only",
+    },
+  ));
+  assert.equal(externalPlanOnlyMarkup, "",
+    "the session-level strip removes its plan control from the message row");
+
+  const restoredPlan = latestPlanProgress([{
+    id: "restored-plan-turn",
+    prompt: "执行任务",
+    done: false,
+    detailEventCount: 4,
+    detailLoaded: false,
+    blocks: [{
+      kind: "process",
+      item_id: "legacy-plan",
+      processKind: "plan",
+      phase: "end",
+      status: "succeeded",
+      title: "旧计划",
+      detail: "旧版自由文本计划",
+      done: true,
+    }],
+    detailProjection: {
+      segments: [], capped: false, hasMore: false,
+      oldestCursor: null, hasNewer: false, newerCursor: null,
+      blocks: [{
+        kind: "process",
+        item_id: "structured-plan",
+        processKind: "plan",
+        phase: "update",
+        status: "running",
+        title: "计划",
+        plan: [
+          { step: "读取状态", status: "completed" },
+          { step: "显示固定入口", status: "inProgress" },
+        ],
+        done: false,
+      }],
+    },
+  }]);
+  assert.equal(restoredPlan?.block.item_id, "structured-plan",
+    "the fixed strip reads the authoritative structured plan projection");
+  assert.equal(restoredPlan?.needsDetail, true,
+    "opening a cached fixed strip still requests authoritative detail");
+  assert.equal(planProgressPresentation(restoredPlan!.block).progressLabel,
+    "1 / 2");
+  assert.equal(latestPlanProgress([{
+    id: "planned-turn", prompt: "先规划", done: true,
+    blocks: [planOnlyBlock],
+  }, {
+    id: "compact-continuation", prompt: "", done: true,
+    terminalSource: "compact_continuation", blocks: [],
+  }])?.block.item_id, "plan-only",
+  "a promptless assistant or compaction continuation preserves a completed Plan");
+  assert.equal(latestPlanProgress([{
+    id: "planned-turn", prompt: "先规划", done: true,
+    blocks: [planOnlyBlock],
+  }, {
+    id: "new-turn", prompt: "新的无计划问题", done: false, blocks: [],
+  }]), null,
+  "the next user turn retires a completed task monitor");
+  const completedGoal: ThreadGoal = {
+    threadId: "completed-goal-thread",
+    objective: "完成旧任务",
+    status: "complete",
+    engine: "codex",
+    tokensUsed: 10,
+    timeUsedSeconds: 20,
+    updatedAt: 1_800_000_000,
+  };
+  const oldGoalPlan = latestPlanProgress([{
+    id: "old-goal-plan-turn",
+    prompt: "执行旧 Goal",
+    done: false,
+    ts: 1_799_999_990_000,
+    blocks: [planOnlyBlock],
+  }]);
+  const nextGoalPlan = latestPlanProgress([{
+    id: "next-plan-turn",
+    prompt: "开始新任务",
+    done: false,
+    ts: 1_800_000_001_000,
+    blocks: [{ ...planOnlyBlock, item_id: "next-plan" }],
+  }]);
+  assert.equal(completedGoalHasNewerUserTurn(completedGoal, [{
+    id: "goal-assistant-continuation", prompt: "", done: true,
+    ts: 1_800_000_001_000, blocks: [],
+  }]), false, "assistant-only Goal continuation cannot retire its Goal");
+  assert.equal(completedGoalHasNewerUserTurn(completedGoal, [{
+    id: "next-goal-user-turn", prompt: "开始新任务", done: false,
+    ts: 1_800_000_001_000, blocks: [],
+  }]), true, "the first later user turn retires a completed Goal");
+  assert.equal(completedGoalHasNewerUserTurn(completedGoal, [{
+    id: "next-goal-image-turn", prompt: "", done: false,
+    ts: 1_800_000_001_000, blocks: [],
+    images: [{ media_type: "image/png", data: "image" }],
+  }]), true, "an image-only user turn retires a completed Goal");
+  assert.equal(completedGoalHasNewerUserTurn(completedGoal, [{
+    id: "next-goal-image-ref-turn", prompt: "", done: false,
+    ts: 1_800_000_001_000, blocks: [],
+    imageRefs: [{
+      image_id: "image-ref", media_type: "image/png",
+      width: 1, height: 1, byte_size: 1,
+    }],
+  }]), true, "a history image-only user turn retires a completed Goal");
+  assert.equal(completedGoalHasNewerUserTurn(completedGoal, [{
+    id: "next-goal-file-turn", prompt: "", done: false,
+    ts: 1_800_000_001_000, blocks: [],
+    files: [{ filename: "task.txt", data: "task" }],
+  }]), true, "a file-only user turn retires a completed Goal");
+  assert.equal(planFollowsCompletedGoal(completedGoal, oldGoalPlan!), false,
+    "the Goal's own Plan stays attached after completion");
+  assert.equal(planFollowsCompletedGoal(completedGoal, nextGoalPlan!), true,
+    "a later user turn's Plan is independent from the completed Goal");
+  const reboundOldGoalPlan = latestPlanProgress([{
+    id: "next-plan-turn",
+    prompt: "开始新任务",
+    done: false,
+    ts: 1_800_000_001_000,
+    blocks: [{
+      ...planOnlyBlock,
+      item_id: "rebound-old-plan",
+      turn_id: "old-goal-plan-turn",
+    }],
+  }]);
+  assert.equal(
+    planFollowsCompletedGoal(completedGoal, reboundOldGoalPlan!), false,
+    "a durable old-Goal snapshot rebound onto the newest turn stays retired",
+  );
+  const activePlanBlock: Block = {
+    ...planOnlyBlock,
+    item_id: "active-plan",
+    phase: "update",
+    status: "running",
+    plan: [
+      { step: "检查实现", status: "completed" },
+      { step: "完成验证", status: "inProgress" },
+    ],
+    done: false,
+  };
+  assert.equal(latestPlanProgress([{
+    id: "active-plan-turn", prompt: "继续任务", done: false,
+    blocks: [activePlanBlock],
+  }, {
+    id: "active-follow-up", prompt: "补充要求", done: false, blocks: [],
+  }])?.turnId, "active-plan-turn",
+  "a follow-up does not hide an unfinished task monitor");
+  assert.equal(latestPlanProgress([{
+    id: "older-plan", prompt: "旧任务", done: true,
+    blocks: [planOnlyBlock],
+  }, {
+    id: "newer-plan", prompt: "新任务", done: false,
+    blocks: [{ ...planOnlyBlock, item_id: "newer-plan-item" }],
+  }])?.turnId, "newer-plan",
+  "the newest plan-bearing turn wins when a session contains several plans");
+  const planCache = new SessionPlanProgressCache(4);
+  const planOwnerAfterDetail: Turn = {
+    id: restoredPlan!.turnId,
+    prompt: "执行任务",
+    done: false,
+    detailEventCount: 4,
+    detailLoaded: true,
+    // The official full-turn projection omits update_plan.
+    blocks: [],
+  };
+  assert.equal(planCache.resolve({
+    sid: "plan-session-a",
+    runtime: restoredPlan,
+    history: null,
+    runtimeTurns: [planOwnerAfterDetail],
+    historyTurns: [planOwnerAfterDetail],
+    recovering: false,
+    runtimeLoading: false,
+  })?.block.item_id, "structured-plan");
+  assert.equal(planCache.resolve({
+    sid: "plan-session-b",
+    runtime: null,
+    history: null,
+    runtimeTurns: [],
+    historyTurns: [],
+    recovering: false,
+    runtimeLoading: false,
+  }), null, "a plan from session A must never leak into session B");
+  const refocusedPlan = planCache.resolve({
+    sid: "plan-session-a",
+    runtime: null,
+    history: null,
+    runtimeTurns: [planOwnerAfterDetail],
+    historyTurns: [planOwnerAfterDetail],
+    recovering: false,
+    runtimeLoading: false,
+  });
+  assert.equal(refocusedPlan?.block.item_id, "structured-plan",
+    "A -> B -> A navigation retains the Plan omitted by full turn detail");
+  assert.equal(planProgressPresentation(refocusedPlan!.block).progressLabel,
+    "1 / 2");
+  assert.equal(refocusedPlan?.needsDetail, false,
+    "the retained Plan follows its owner's current detail state");
+  const completedPlanCache = new SessionPlanProgressCache(2);
+  const completedPlanOwner: Turn = {
+    id: "completed-plan-turn",
+    prompt: "完成计划",
+    done: true,
+    blocks: [planOnlyBlock],
+  };
+  const completedPlan = latestPlanProgress([completedPlanOwner]);
+  assert.ok(completedPlan);
+  assert.equal(completedPlanCache.resolve({
+    sid: "completed-plan-session",
+    runtime: completedPlan,
+    history: null,
+    runtimeTurns: [completedPlanOwner],
+    historyTurns: [completedPlanOwner],
+    recovering: false,
+    runtimeLoading: false,
+  })?.block.item_id, "plan-only",
+  "a completed Plan stays visible before the next user message");
+  const nextUserTurn: Turn = {
+    id: "next-user-turn",
+    prompt: "开始下一个问题",
+    done: false,
+    blocks: [],
+  };
+  assert.equal(completedPlanCache.resolve({
+    sid: "completed-plan-session",
+    runtime: latestPlanProgress([completedPlanOwner, nextUserTurn]),
+    history: null,
+    runtimeTurns: [completedPlanOwner, nextUserTurn],
+    historyTurns: [completedPlanOwner, nextUserTurn],
+    recovering: false,
+    runtimeLoading: false,
+  }), null,
+  "the cache cannot resurrect a completed Plan after the next message");
+  const browsedCompletedPlanCache = new SessionPlanProgressCache(2);
+  assert.equal(browsedCompletedPlanCache.resolve({
+    sid: "browsed-completed-plan",
+    runtime: null,
+    history: completedPlan,
+    runtimeTurns: [{
+      id: "live-next-user-turn",
+      prompt: "实时的新任务",
+      done: false,
+      ts: 2_000,
+      blocks: [],
+    }],
+    historyTurns: [{ ...completedPlanOwner, ts: 1_000 }],
+    recovering: false,
+    runtimeLoading: false,
+  }), null,
+  "a live user turn retires a completed Plan found on an older history page");
+  assert.equal(browsedCompletedPlanCache.resolve({
+    sid: "browsed-promptless-plan",
+    runtime: null,
+    history: completedPlan,
+    runtimeTurns: [{
+      id: "live-promptless-continuation",
+      prompt: "",
+      done: true,
+      ts: 2_000,
+      terminalSource: "compact_continuation",
+      blocks: [],
+    }],
+    historyTurns: [{ ...completedPlanOwner, ts: 1_000 }],
+    recovering: false,
+    runtimeLoading: false,
+  })?.block.item_id, "plan-only",
+  "a live promptless continuation preserves a browsed completed Plan");
+  assert.equal(planCache.resolve({
+    sid: "plan-session-a",
+    runtime: null,
+    history: null,
+    runtimeTurns: [],
+    historyTurns: [],
+    recovering: false,
+    runtimeLoading: true,
+  })?.block.item_id, "structured-plan",
+  "runtime eviction keeps the Plan visible while authoritative history reloads");
+  planCache.clear("plan-session-a");
+  assert.equal(planCache.resolve({
+    sid: "plan-session-a",
+    runtime: null,
+    history: null,
+    runtimeTurns: [planOwnerAfterDetail],
+    historyTurns: [planOwnerAfterDetail],
+    recovering: false,
+    runtimeLoading: false,
+  }), null, "history invalidation clears a stale retained Plan");
+  planCache.resolve({
+    sid: "tmp-plan-session",
+    runtime: restoredPlan,
+    history: null,
+    runtimeTurns: [planOwnerAfterDetail],
+    historyTurns: [planOwnerAfterDetail],
+    recovering: false,
+    runtimeLoading: false,
+  });
+  planCache.rekey("tmp-plan-session", "real-plan-session");
+  assert.equal(planCache.resolve({
+    sid: "real-plan-session",
+    runtime: null,
+    history: null,
+    runtimeTurns: [planOwnerAfterDetail],
+    historyTurns: [planOwnerAfterDetail],
+    recovering: false,
+    runtimeLoading: false,
+  })?.block.item_id, "structured-plan",
+  "capturing a real session id preserves the temporary session's Plan");
   const declinedMarkup = renderToStaticMarkup(createElement(ProcessTimeline, {
     blocks: [{ kind: "process", item_id: "approval-denied", processKind: "hook",
       phase: "end", status: "declined", title: "Hook 已拒绝", done: false }],
@@ -15340,8 +15914,11 @@ assert.equal(
 const appSource = readFileSync(resolve(process.cwd(), "src/App.tsx"), "utf8");
 assert.doesNotMatch(appSource, /<Suspense fallback=\{null\}>[\s\S]{0,120}<GoalPanel/,
   "Goal lazy loading must keep a stable chip placeholder");
-assert.match(appSource, /fallback=\{\(goalUi\?\.revealed \|\| goalUi\?\.open\)[\s\S]{0,160}goal-suspense/,
-  "a remembered Goal entry stays visible while its component chunk loads");
+assert.match(appSource,
+  /fallback=\{\(\(goalUi\?\.revealed && !completedGoalRetired\)[\s\S]{0,120}\|\| goalUi\?\.open \|\| planProgress\)[\s\S]{0,180}goal-suspense/,
+  "a remembered non-retired Goal or current Plan stays visible while its component chunk loads");
+assert.match(appSource, /externalPlanProgress=\{planProgress/,
+  "the session strip must explicitly take ownership from the message row");
 assert.match(appSource, /recoverableReads\.retry\(\["goal", key\]/,
   "a transient Goal read failure must be retried in the same connection");
 assert.doesNotMatch(appSource,

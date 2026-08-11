@@ -61,13 +61,13 @@ machine). The **full step-by-step guide is in the main [README](../README.md#生
   of embedding control credentials in the plist.
 - `work_registry_snapshot.py` — snapshots provider-local Work SQLite databases
   through SQLite's backup API, restores the matching pre-release images before
-  an older wrapper is restarted, and verifies the v33 Codex ownership backfill.
+  an older wrapper is restarted, and verifies the v34 Codex ownership backfill.
 
-Protocol v33 is a coordinated upgrade: publish freshly built Relay/Web and
+Protocol v34 is a coordinated upgrade: publish freshly built Relay/Web and
 Wrapper artifacts from the same tagged commit. The strict protocol gate is
 intentional and mixed protocol versions will not communicate. `setup-vps.sh`
 rejects a missing or mismatched web build manifest. Stop the wrapper first;
-activate the v33 relay/web release; then start the v33 wrapper.
+activate the v34 relay/web release; then start the v34 wrapper.
 
 The wrapper installer treats local Work data as part of the release
 transaction. It stops the existing service, writes a private snapshot below
@@ -78,8 +78,8 @@ restores and starts the previous code. If data restoration fails, it leaves the
 wrapper stopped instead of running old code against a new schema. A manual or
 legacy-layout deployment must use the same order: stop the wrapper, run
 `work_registry_snapshot.py snapshot` from the new staging tree, activate and
-verify v33, and retain that snapshot with the previous release. To roll back,
-stop v33, run `work_registry_snapshot.py restore`, then switch and start the old
+verify v34, and retain that snapshot with the previous release. To roll back,
+stop v34, run `work_registry_snapshot.py restore`, then switch and start the old
 release. Never copy only `registry.sqlite3` while the wrapper is live because
 committed state may still be in its WAL file. Restoring a pre-release snapshot
 also restores pre-release Work metadata: sessions, projects, or schedule state

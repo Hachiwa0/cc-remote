@@ -65,6 +65,11 @@ import { GoalPanel } from "../src/components/GoalPanel";
 import { ProcessTimeline } from "../src/components/ProcessTimeline";
 import { SessionsSidebar } from "../src/components/SessionsSidebar";
 import { useMobileViewport } from "../src/use-mobile-viewport";
+import {
+  completedGoalHasNewerUserTurn,
+  latestPlanProgress,
+  type TurnPlanProgress,
+} from "../src/plan-progress";
 
 const LONG_PERMISSION_PROFILE_ID =
   `custom-profile-${"authorization-boundary-".repeat(12)}`.slice(0, 256);
@@ -218,6 +223,21 @@ function timelineTurn(id: string): Turn {
         done: true,
       },
       ...finalTurn(id, 3).blocks,
+    ],
+  };
+}
+
+function persistentPlanTurn(): Turn {
+  const base = timelineTurn("persistent-plan");
+  const plan = base.blocks[0];
+  return {
+    ...base,
+    done: false,
+    doneTs: undefined,
+    blocks: [
+      plan.kind === "process" ? { ...plan, done: false } : plan,
+      ...base.blocks.slice(1, -1),
+      streamingTurn("persistent-plan-output", 180).blocks[0],
     ],
   };
 }
@@ -1027,6 +1047,8 @@ function HistoryConversationBrowserFixture() {
   const pageCount = Math.max(1, Number(params.get("pages") ?? "1"));
   const large = largeCount > 0;
   const timeline = params.has("timeline");
+  const persistentPlan = params.has("persistent-plan");
+  const historicalPlan = params.has("historical-plan");
   const interactiveTimeline = params.has("interactive-timeline");
   const dualImage = params.has("dual-image");
   const compactTools = params.has("compact-tools");
@@ -1110,6 +1132,14 @@ function HistoryConversationBrowserFixture() {
           finalTurn(`f${index + 1}`, 4)),
       ];
     }
+    if (persistentPlan) return [persistentPlanTurn()];
+    if (historicalPlan) {
+      return [
+        timelineTurn("historical-plan"),
+        ...Array.from({ length: 8 }, (_, index) =>
+          finalTurn(`historical-followup-${index + 1}`, 3)),
+      ];
+    }
     if (interactiveTimeline) {
       return [
         timelineTurn("timeline"),
@@ -1122,7 +1152,7 @@ function HistoryConversationBrowserFixture() {
     detailScrollCancel, dualImage,
     interactiveTimeline, math, streamingMath,
     deepBrowse, invalidMermaid, large, largeCount, mermaid, mermaidHistory,
-    timeline,
+    historicalPlan, persistentPlan, timeline,
   ]);
   const [sid, setSid] = useState("history-browser-session-a");
   const [sessions, setSessions] = useState<Record<string, FixtureSession>>({
@@ -1131,7 +1161,7 @@ function HistoryConversationBrowserFixture() {
       cursor: initialA[0]?.id ?? "",
       hasMore: !compactTools && !detailPaging && !invalidMermaid && !large && !mermaid
         && !mermaidHistory && !math && !streamingMath && !timeline && !deepBrowse
-        && !delayedHistoryAvailability,
+        && !delayedHistoryAvailability && !historicalPlan,
       pagesLoaded: 0,
       hasNewer: deepBrowse,
       newerPagesLoaded: 0,
@@ -1227,6 +1257,8 @@ function HistoryConversationBrowserFixture() {
   const [migrationPickerConfirmed, setMigrationPickerConfirmed] =
     useState<string | null>(null);
   const active = sessions[sid];
+  const fixedPlanProgress = persistentPlan || historicalPlan
+    ? latestPlanProgress(active.turns) : null;
   const revealOlderHistory = useCallback(() => {
     setSessions((current) => ({
       ...current,
@@ -1817,8 +1849,16 @@ function HistoryConversationBrowserFixture() {
           onTextSelectionGuardChange={updateTextSelectionGuard}
           onEdit={() => {}}
           onGetDiff={() => {}}
+          externalPlanProgress={fixedPlanProgress ? {
+            turnId: fixedPlanProgress.turnId,
+            itemId: fixedPlanProgress.block.item_id,
+          } : null}
         />
       )}
+      {fixedPlanProgress && <GoalPanel engine="codex" goal={null}
+        revealed={false} open={false} plan={fixedPlanProgress}
+        onOpen={() => {}} onClose={() => {}} onDismiss={() => {}}
+        onSave={() => {}} onClear={() => {}} />}
       {composerResize && (
         <div data-testid="fixture-composer" style={{
           flex: "none",
@@ -1925,8 +1965,12 @@ export function HistoryBrowserFixture() {
   const planUi = params.get("plan-ui");
   if (params.has("profile-sidebar")) return <ProfileSidebarFixture />;
   if (planUi) return <PlanUiFixture mode={planUi} />;
+  if (params.has("plan-lifecycle")) return <PlanLifecycleFixture />;
   if (params.has("goal-ui")) {
-    return <GoalUiFixture status={params.get("goal-status")} />;
+    return <GoalUiFixture status={params.get("goal-status")}
+      withPlan={params.has("plan")} hidden={params.has("goal-hidden")}
+      longGoal={params.has("goal-long")}
+      newerTurn={params.has("goal-next-turn")} />;
   }
   if (params.has("header-menu")) {
     return <UsageActivityBrowserFixture
@@ -2014,6 +2058,46 @@ function ProfileSidebarFixture() {
   );
 }
 
+function PlanLifecycleFixture() {
+  const [turns, setTurns] = useState<Turn[]>(() => [{
+    id: "completed-plan-turn",
+    prompt: "完成当前任务",
+    done: true,
+    blocks: [{
+      kind: "process",
+      item_id: "completed-plan-item",
+      processKind: "plan",
+      phase: "end",
+      status: "succeeded",
+      title: "计划",
+      plan: [
+        { step: "实现功能", status: "completed" },
+        { step: "完成验证", status: "completed" },
+      ],
+      done: true,
+    }],
+  }]);
+  const plan = latestPlanProgress(turns);
+  return (
+    <main style={{ height: "100dvh", display: "flex", flexDirection: "column" }}>
+      <button type="button" data-testid="send-next-plan-message"
+        onClick={() => setTurns((current) => [...current, {
+          id: "next-user-turn",
+          prompt: "开始下一个问题",
+          done: false,
+          blocks: [],
+        }])}>
+        send next message
+      </button>
+      <div style={{ flex: 1 }} />
+      <GoalPanel engine="codex" goal={null} revealed={false} open={false}
+        plan={plan} onOpen={() => {}} onClose={() => {}}
+        onDismiss={() => {}} onSave={() => {}} onClear={() => {}} />
+      <div className="composer"><div className="composer-in" /></div>
+    </main>
+  );
+}
+
 function MobileViewportHistoryConversationBrowserFixture() {
   useMobileViewport();
   return <HistoryConversationBrowserFixture />;
@@ -2075,33 +2159,78 @@ function PlanUiFixture({ mode }: { mode: string }) {
           window.setTimeout(() => {
             setAuthoritative(true);
             setRefreshing(false);
-          }, 150);
+          // Leave the provisional frame observable even on the slower mobile
+          // WebKit project before replacing it with authoritative detail.
+          }, 800);
           return true;
         } : undefined} />
     </main>
   );
 }
 
-function GoalUiFixture({ status }: { status: string | null }) {
+function GoalUiFixture({ status, withPlan, hidden, longGoal, newerTurn }: {
+  status: string | null;
+  withPlan: boolean;
+  hidden: boolean;
+  longGoal: boolean;
+  newerTurn: boolean;
+}) {
   const [open, setOpen] = useState(false);
-  const [revealed, setRevealed] = useState(true);
+  const [revealed, setRevealed] = useState(!hidden && status !== "none");
+  const [planDetailRequests, setPlanDetailRequests] = useState(0);
   const loading = status === "loading";
-  const goalStatus = status === "blocked" ? "blocked" : "active";
-  const goal: ThreadGoal | null = loading ? null : {
+  const goalStatus = status === "blocked" ? "blocked"
+    : status === "complete" ? "complete" : "active";
+  const goal: ThreadGoal | null = loading || status === "none" ? null : {
     threadId: "goal-fixture-thread",
-    objective: "完成 protocol v30 发布并验证所有终端同步升级",
+    objective: longGoal
+      ? "按照计划完成所有功能模块；每个模块验证无误后分别提交并推送，确保核心行为一致。".repeat(8)
+      : "完成 protocol v30 发布并验证所有终端同步升级",
     status: goalStatus,
     engine: "codex",
     tokenBudget: 100_000,
     tokensUsed: 37_000,
     timeUsedSeconds: 321,
+    updatedAt: 1_800_000_000,
     lastReason: "已完成协议兼容性检查，正在验证三端同步状态。",
   };
+  const plan: TurnPlanProgress | null = withPlan ? {
+    turnId: "goal-fixture-turn",
+    block: {
+      kind: "process",
+      item_id: "goal-fixture-plan",
+      processKind: "plan",
+      phase: "update",
+      status: "running",
+      title: "计划",
+      explanation: "让任务进度始终可以从会话底部查看。",
+      plan: [
+        { step: "定位计划状态", status: "completed" },
+        { step: "实现固定入口", status: "inProgress" },
+        { step: "完成浏览器回归", status: "pending" },
+      ],
+      done: false,
+    },
+    detailLoading: false,
+    needsDetail: true,
+  } : null;
+  const completedGoalRetired = completedGoalHasNewerUserTurn(
+    goal,
+    newerTurn ? [{
+      id: "goal-fixture-next-turn",
+      prompt: "开始 Goal 之后的新任务",
+      blocks: [],
+      done: false,
+      ts: 1_800_000_001_000,
+    }] : [],
+  );
   return (
     <main style={{ height: "100dvh", display: "flex", flexDirection: "column" }}>
       <div data-testid="goal-fixture-content" style={{ flex: 1 }} />
+      <output data-testid="plan-detail-requests">{planDetailRequests}</output>
       <GoalPanel engine="codex" goal={goal} revealed={revealed} open={open}
-        loading={loading}
+        loading={loading} completedGoalRetired={completedGoalRetired} plan={plan}
+        onLoadPlanDetail={() => setPlanDetailRequests((value) => value + 1)}
         onOpen={() => setOpen(true)} onClose={() => setOpen(false)}
         onDismiss={() => setRevealed(false)} onSave={() => setOpen(false)}
         onClear={() => setRevealed(false)} />

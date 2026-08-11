@@ -41,7 +41,6 @@ import {
   reconcileNewChatSelection,
   resolveNewChatLocalDefaults,
 } from "./components/NewChatView";
-import { BtwPanel } from "./components/BtwPanel";
 import { QuestionSheet } from "./components/QuestionSheet";
 import { StatusSheet } from "./components/StatusSheet";
 import { UsageActivitySheet } from "./components/UsageActivitySheet";
@@ -184,9 +183,13 @@ import {
 import { ComposerDraftStore, composerDraftKey } from "./composer-drafts";
 import {
   acknowledgeCompletion,
+  acknowledgeMatchingCompletion,
+  catalogCompletionProjection,
+  completionAcknowledgementId,
   completionBadgeKind,
   discardBtwCompletionReceipts,
   markCompletionUnread,
+  newestCompletionProjection,
   rekeyCompletionReceipts,
   type CompletionBadgeKind,
   type CompletionReceipts,
@@ -200,6 +203,12 @@ import {
   type SkillCatalogCacheEntry,
   type SkillCatalogRequest,
 } from "./skill-catalog-cache";
+import {
+  completedGoalHasNewerUserTurn,
+  latestPlanProgress,
+  planFollowsCompletedGoal,
+  SessionPlanProgressCache,
+} from "./plan-progress";
 
 const THEME_KEY = "cc_remote_theme";
 const ENGINE_KEY = "cc_remote_engine";  // which backend the NEXT new session uses
@@ -207,6 +216,9 @@ const SPACE_KEY = "cc_remote_space";
 const MACHINE_KEY = "cc_remote_machine";
 const GoalPanel = lazy(() => import("./components/GoalPanel").then(
   ({ GoalPanel: Panel }) => ({ default: Panel }),
+));
+const BtwPanel = lazy(() => import("./components/BtwPanel").then(
+  ({ BtwPanel: Panel }) => ({ default: Panel }),
 ));
 const ArtifactPanel = lazy(() => import("./components/ArtifactPanel").then(
   ({ ArtifactPanel: Panel }) => ({ default: Panel }),
@@ -324,6 +336,8 @@ export default function App() {
     useState(machineId);
   const [workArtifactsBySid, setWorkArtifactsBySid] = useState<Record<string, WorkArtifactInfo[]>>({});
   const [completionReceipts, setCompletionReceipts] = useState<CompletionReceipts>({});
+  const completionReceiptsRef = useRef(completionReceipts);
+  completionReceiptsRef.current = completionReceipts;
   const [btwSendModeBySid, setBtwSendModeBySid] = useState<
     Record<string, SendMode>
   >({});
@@ -360,6 +374,8 @@ export default function App() {
   const goalUiPreferencesRef = useRef<GoalUiPreferences>(
     readGoalUiPreferences(localStorage));
   const goalRecoveryRequestsRef = useRef<Set<string>>(new Set());
+  const goalDismissMigrationsRef = useRef<Set<string>>(new Set());
+  const planProgressCacheRef = useRef(new SessionPlanProgressCache());
   const goalRequestScopeByIdRef = useRef<Map<
     string, { scopeKey: string; sid: string }
   >>(new Map());
@@ -547,6 +563,7 @@ export default function App() {
     setQueuedQueryEditor(null);
     btwDraftsRef.current.clear();
     setCompletionReceipts({});
+    goalDismissMigrationsRef.current.clear();
     sessionListsBySurfaceRef.current = {};
     historySessionListsRef.current = {};
     preferredSurfaceFocusRef.current = null;
@@ -602,9 +619,31 @@ export default function App() {
   const activeBtwSid = activeBtw?.sid ?? null;
   const btwOpening = visibleParentSid
     ? !!btwOpeningByParentSid[visibleParentSid] : false;
+  const completionBadgeSids = new Set([
+    ...Object.keys(completionReceipts),
+    ...state.sessions.filter(
+      (session) => session.completion_unread === true,
+    ).map((session) => session.session_id),
+    ...Object.keys(state.runtimes).filter(
+      (sid) => state.runtimes[sid]?.completion?.unread === true),
+  ]);
+  const catalogCompletionBySid = new Map(state.sessions.flatMap((session) => {
+    const completion = catalogCompletionProjection(session);
+    return completion
+      ? [[session.session_id, completion] as const]
+      : [];
+  }));
   const completionBadges = Object.fromEntries(
-    Object.entries(completionReceipts).flatMap(([sid, receipt]) => {
-      const kind = completionBadgeKind(receipt);
+    [...completionBadgeSids].flatMap((sid) => {
+      const local = completionReceipts[sid] ?? {
+        main: false, mainCompletionId: null,
+        mainTurnEndSeq: null, mainTurnEndGeneration: null, btwSids: [],
+      };
+      const authoritative = newestCompletionProjection(
+        state.runtimes[sid]?.completion,
+        catalogCompletionBySid.get(sid),
+      );
+      const kind = completionBadgeKind(local, authoritative?.unread);
       return kind ? [[sid, kind]] : [];
     }),
   ) as Record<string, CompletionBadgeKind>;
@@ -678,6 +717,35 @@ export default function App() {
       : rt.ccSessionId);
   const focusedCatalog = catalogForEngineProfile(
     state.catalog, focusedEngine, focusedCodexProfileId);
+  const completedGoalRetired = completedGoalHasNewerUserTurn(
+    rt.goal, rt.turns,
+  ) || completedGoalHasNewerUserTurn(rt.goal, historyView.turns);
+  // A live plan always wins over plans found while browsing older history.
+  // When the runtime's small newest-turn window has no plan, the displayed
+  // history may still reveal the plan which owns this session's long task.
+  const runtimePlanProgress = latestPlanProgress(rt.turns);
+  const historyPlanProgress = historyView.browsing || historyView.recovering
+    ? latestPlanProgress(historyView.turns) : null;
+  let planProgress = focusedSid
+    ? planProgressCacheRef.current.resolve({
+        sid: focusedSid,
+        runtime: runtimePlanProgress,
+        history: historyPlanProgress,
+        runtimeTurns: rt.turns,
+        historyTurns: historyView.turns,
+        recovering: historyView.recovering,
+        runtimeLoading: rt.loading === true,
+      })
+    : null;
+  // An unfinished snapshot from the completed Goal must not briefly become the
+  // standalone monitor for the next task. Keep only a Plan whose owning user
+  // turn starts after the authoritative Goal completion boundary.
+  if (completedGoalRetired && planProgress
+      && !planFollowsCompletedGoal(rt.goal, planProgress)) {
+    planProgressCacheRef.current.clear(focusedSid!);
+    planProgress = null;
+  }
+  const planProgressSource = planProgress?.source ?? null;
   const capabilityCwd = focusedSession?.cwd || currentCwd;
   const focusedComposerDraftKey = composerDraftKey(
     machineId, space, focusedEngine, focusedSid ?? "",
@@ -724,7 +792,7 @@ export default function App() {
   const goalUi = focusedGoalScopeKey
     ? goalUiByScope[focusedGoalScopeKey] ?? (storedGoalPreference?.known
       ? {
-          revealed: storedGoalPreference.hiddenGoal
+          revealed: rt.goalDismissed ? false : storedGoalPreference.hiddenGoal
             ? !!rt.goal && storedGoalPreference.hiddenGoal !== storedGoalIdentity
             : true,
           open: false,
@@ -764,8 +832,9 @@ export default function App() {
         ...current,
         [focusedGoalScopeKey]: {
           // Discover an existing Goal silently on a new browser/device. The
-          // authoritative non-null response reveals it; an exact local
-          // dismissal remains hidden across refreshes on this device.
+          // authoritative non-null response reveals it unless the wrapper says
+          // this exact generation was dismissed. Legacy local dismissals are
+          // migrated when that response arrives.
           revealed: !!preference?.known && !preference.hiddenGoal,
           open: false,
           loading: true,
@@ -788,9 +857,19 @@ export default function App() {
       const parentSid = current.newChat ? null : current.focusedSid;
       if (!parentSid) return;
       const binding = current.btwByParentSid[parentSid];
+      const completion = newestCompletionProjection(
+        current.runtimes[parentSid]?.completion,
+        catalogCompletionProjection(current.sessions.find(
+          (session) => session.session_id === parentSid)),
+      );
+      const completionId = completionAcknowledgementId(
+        completionReceiptsRef.current[parentSid], completion);
+      const mainAcknowledgementQueued = completionId !== null
+        && wsRef.current?.sendAcknowledgeCompletionTo(
+          parentSid, completionId) !== null;
       setCompletionReceipts((receipts) => {
         let next = acknowledgeCompletion(
-          receipts, parentSid, { main: true });
+          receipts, parentSid, { main: mainAcknowledgementQueued });
         if (binding
             && (rightViewRef.current === "btw" || !current.artifact)) {
           next = acknowledgeCompletion(
@@ -803,7 +882,17 @@ export default function App() {
     document.addEventListener("visibilitychange", acknowledgeVisible);
     return () => document.removeEventListener(
       "visibilitychange", acknowledgeVisible);
-  }, [visibleParentSid, activeBtwSid, rightView, state.artifact]);
+  }, [
+    visibleParentSid,
+    activeBtwSid,
+    rightView,
+    state.artifact,
+    rt.completion?.id,
+    rt.completion?.unread,
+    focusedSession?.completion_id,
+    focusedSession?.completion_revision,
+    focusedSession?.completion_unread,
+  ]);
 
   const storeSkillCatalog = useCallback((
     key: string,
@@ -1524,20 +1613,51 @@ export default function App() {
       const ws = new RelayWs({
         onEvent: (msg, ownership) => {
           if (!acceptsLifecycle()) return;
+          if (msg.type === "history_invalidated") {
+            planProgressCacheRef.current.clear(msg.session_id);
+          } else if (msg.type === "session_rekey") {
+            planProgressCacheRef.current.rekey(msg.old_key, msg.session_id);
+          }
           // SessionList is a scoped response, not a broadcast catalog. Without
           // the exact request ownership it may belong to an older surface or
           // WebSocket generation and must not mutate any sidebar/focus cache.
           if (msg.type === "session_list" && !ownership) return;
           if (msg.type === "goal_state" && msg.sid) {
+            const completedGoalRequest = msg.request_id
+              ? goalRequestScopeByIdRef.current.get(msg.request_id)
+              : undefined;
             if (msg.request_id) {
               goalRequestScopeByIdRef.current.delete(msg.request_id);
             }
+            if (completedGoalRequest) {
+              goalRecoveryRequestsRef.current.delete(
+                `${lifecycleEpoch}\0${completedGoalRequest.scopeKey}`);
+            }
             const key = goalUiScopeForEvent(msg.sid, ownership);
             if (key) {
+              const localGoalIdentity = goalStableIdentity(msg.goal);
+              const localPreference = goalUiPreferencesRef.current[key];
+              const legacyDismissed = !!localGoalIdentity
+                && localPreference?.hiddenGoal === localGoalIdentity;
+              const authoritativeDismissed = msg.dismissed === true;
+              const migrationKey = msg.goal_id
+                ? `${machineId}\0${msg.sid}\0${msg.goal_id}` : null;
+              if (migrationKey && authoritativeDismissed) {
+                goalDismissMigrationsRef.current.delete(migrationKey);
+              } else if (migrationKey && legacyDismissed
+                  && !goalDismissMigrationsRef.current.has(migrationKey)) {
+                const requestId = ws.sendDismissGoalTo(
+                  msg.sid, msg.goal_id!);
+                if (requestId) {
+                  goalDismissMigrationsRef.current.add(migrationKey);
+                }
+              }
               const reconciled = reconcileGoalUiPreference(
                 goalUiPreferencesRef.current,
                 key,
                 msg.goal,
+                Date.now(),
+                authoritativeDismissed,
               );
               persistGoalUiPreferences(reconciled.preferences);
               setGoalUiByScope((current) => {
@@ -1563,6 +1683,46 @@ export default function App() {
               }
               recoverableReads.complete(["goal", key].join("\u0000"));
             }
+          } else if (msg.type === "completion_state" && msg.sid
+              && msg.unread !== true) {
+            // Clear the page-local fallback as soon as the wrapper confirms an
+            // acknowledgement for the same completion from any browser. A
+            // delayed read receipt for an older completion cannot clear a
+            // newer turn_end fallback.
+            const authoritative = newestCompletionProjection(
+              stateRef.current.runtimes[msg.sid]?.completion,
+              {
+                id: msg.completion_id ?? null,
+                unread: msg.unread ?? false,
+                revision: msg.revision ?? 0,
+              },
+            );
+            setCompletionReceipts((receipts) => (
+              acknowledgeMatchingCompletion(
+                receipts, msg.sid!, authoritative,
+                {
+                  authoritativeSeq: msg.seq,
+                  authoritativeGeneration: ws.generationFor(msg.sid!),
+                })));
+          } else if (msg.type === "session_list") {
+            // A sleeping browser can miss the live acknowledgement and later
+            // reconnect after the session was evicted. Its catalog row carries
+            // the same durable receipt, so clear any older page-local fallback
+            // instead of letting it reappear if the runtime is pruned.
+            setCompletionReceipts((receipts) => {
+              let next = receipts;
+              for (const session of msg.sessions) {
+                const catalog = catalogCompletionProjection(session);
+                if (!catalog) continue;
+                const authoritative = newestCompletionProjection(
+                  stateRef.current.runtimes[session.session_id]?.completion,
+                  catalog,
+                );
+                next = acknowledgeMatchingCompletion(
+                  next, session.session_id, authoritative);
+              }
+              return next;
+            });
           } else if (msg.type === "error" && msg.request_id) {
             const request = goalRequestScopeByIdRef.current.get(msg.request_id);
             if (request) {
@@ -1733,6 +1893,9 @@ export default function App() {
                   parentSid,
                   msg.sid!,
                   isBtw ? "btw" : "main",
+                  isBtw ? null : msg.turn_id ?? null,
+                  isBtw ? null : msg.seq ?? null,
+                  isBtw ? null : ws.generationFor(msg.sid!),
                 ));
               }
             }
@@ -2921,15 +3084,16 @@ export default function App() {
   }, [authed, focusedSid, rt.perm, rt.collaborationMode, rt.control,
     rt.external, focusedEngine]);
 
-  const loadHistoryTurnDetail = useCallback((
+  const requestHistoryTurnDetail = useCallback((
     displayTurnId: string, before?: string | null,
     autoLoad = true,
+    includeBrowseProjection = true,
   ): boolean => {
     const current = stateRef.current;
     const sid = current.focusedSid;
     const runtime = sid ? current.runtimes[sid] : null;
     if (!sid || !runtime?.historyRevision) return false;
-    const browse = current.historyBrowse?.sid === sid
+    const browse = includeBrowseProjection && current.historyBrowse?.sid === sid
       ? current.historyBrowse : null;
     const displayed = (browse?.turns ?? runtime.turns).find(
       (turn) => turn.id === displayTurnId
@@ -2986,6 +3150,16 @@ export default function App() {
     }
     return true;
   }, [focusedEngine, historyPageScopeFor, space]);
+  const loadHistoryTurnDetail = useCallback((
+    displayTurnId: string, before?: string | null,
+    autoLoad = true,
+  ) => requestHistoryTurnDetail(
+    displayTurnId, before, autoLoad, true), [requestHistoryTurnDetail]);
+  const loadRuntimeTurnDetail = useCallback((
+    displayTurnId: string, before?: string | null,
+    autoLoad = true,
+  ) => requestHistoryTurnDetail(
+    displayTurnId, before, autoLoad, false), [requestHistoryTurnDetail]);
   useEffect(() => {
     const current = stateRef.current;
     const sid = current.focusedSid;
@@ -4291,15 +4465,33 @@ export default function App() {
               onLoadHistoryImage={historyView.recovering
                 ? undefined : loadHistoryImage}
               onTextSelectionGuardChange={updateTextSelectionGuard}
+              externalPlanProgress={planProgress ? {
+                turnId: planProgress.turnId,
+                itemId: planProgress.block.item_id,
+              } : null}
               onFork={!historyView.recovering && space === "code"
                 ? forkFromTurn : undefined} />
 
-            <Suspense fallback={(goalUi?.revealed || goalUi?.open)
+            <Suspense fallback={((goalUi?.revealed && !completedGoalRetired)
+                || goalUi?.open || planProgress)
               ? <span className="goal-suspense" role="status"
-                  aria-label="正在加载 Goal" /> : null}>
+                  aria-label={planProgress ? "正在加载计划进度" : "正在加载 Goal"} />
+              : null}>
               <GoalPanel engine={focusedEngine} goal={rt.goal}
                 revealed={!!goalUi?.revealed} open={!!goalUi?.open}
                 loading={!!goalUi?.loading}
+                completedGoalRetired={completedGoalRetired}
+                plan={planProgress}
+                onLoadPlanDetail={planProgress?.needsDetail
+                    && !planProgress.detailLoading && !historyView.recovering
+                  ? () => {
+                      if (planProgressSource === "history") {
+                        loadHistoryTurnDetail(planProgress.turnId);
+                      } else {
+                        loadRuntimeTurnDetail(planProgress.turnId);
+                      }
+                    }
+                  : undefined}
                 onOpen={() => {
                   rememberFocusedGoalUi();
                   requestFocusedGoal();
@@ -4307,6 +4499,10 @@ export default function App() {
                 }}
                 onClose={() => setGoalUi({ open: false })}
                 onDismiss={() => {
+                  if (focusedSid && rt.goalId) {
+                    wsRef.current?.sendDismissGoalTo(
+                      focusedSid, rt.goalId);
+                  }
                   if (focusedGoalScopeKey) {
                     persistGoalUiPreferences(dismissGoalUi(
                       goalUiPreferencesRef.current,
@@ -4453,7 +4649,8 @@ export default function App() {
         const view = rightView === "btw" && btwShowing ? "btw"
           : state.artifact ? "diff" : btwShowing ? "btw" : null;
         if (view === "btw")
-          return <BtwPanel sid={activeBtwSid ?? undefined} rt={activeBtwSid ? state.runtimes[activeBtwSid] : undefined}
+          return <Suspense fallback={null}>
+            <BtwPanel sid={activeBtwSid ?? undefined} rt={activeBtwSid ? state.runtimes[activeBtwSid] : undefined}
             engine={activeBtw?.engine} opening={btwOpening && !activeBtw}
             active="btw" hasArtifact={!!state.artifact} artifactKind={state.artifact?.kind} onTab={switchRight}
             catalog={focusedCatalog}
@@ -4497,7 +4694,8 @@ export default function App() {
             onAuthorizeImage={authorizeMessageImage}
             onDismissNotice={(noticeId) => {
               if (activeBtwSid) dispatch({ type: "dismiss_notice", sid: activeBtwSid, noticeId });
-            }} />;
+            }} />
+          </Suspense>;
         if (view === "diff" && state.artifact)
           return <Suspense fallback={
             <div className="artifact-panel empty" role="status">

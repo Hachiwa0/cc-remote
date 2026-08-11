@@ -154,23 +154,27 @@ export function reconcileGoalUiPreference(
   key: string,
   goal: ThreadGoal | null | undefined,
   now = Date.now(),
+  authoritativeDismissed = false,
 ): { preferences: GoalUiPreferences; revealed: boolean } {
   const current = preferences[key];
   if (!current?.known) {
     if (!goal) return { preferences, revealed: false };
     return {
-      preferences: rememberGoalUi(preferences, key, now),
-      revealed: true,
+      preferences: authoritativeDismissed
+        ? dismissGoalUi(preferences, key, goal, now)
+        : rememberGoalUi(preferences, key, now),
+      revealed: !authoritativeDismissed,
     };
   }
   const identity = goalStableIdentity(goal);
-  const hidden = !!identity && current.hiddenGoal === identity;
+  const hidden = authoritativeDismissed
+    || (!!identity && current.hiddenGoal === identity);
   const next = boundPreferences({
     ...preferences,
     [key]: {
       known: true,
       seenAt: now,
-      ...(hidden ? { hiddenGoal: current.hiddenGoal } : {}),
+      ...(hidden && identity ? { hiddenGoal: identity } : {}),
     },
   });
   return { preferences: next, revealed: !!goal && !hidden };

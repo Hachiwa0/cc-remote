@@ -729,12 +729,12 @@ def test_switching_to_resident_claude_reseeds_its_actual_permission():
             session_id="claude-1", engine="claude"))
 
         assert [event.type for event in result] == [
-            "session_focus", "session_control", "perm", "model", "effort",
-            "state"]
-        assert result[2].mode == "default"
-        assert result[3].model == "claude-sonnet-5"
-        assert result[4].effort == "high"
-        assert result[5].state == "idle"
+            "session_focus", "session_control", "completion_state", "perm",
+            "model", "effort", "state"]
+        assert result[3].mode == "default"
+        assert result[4].model == "claude-sonnet-5"
+        assert result[5].effort == "high"
+        assert result[6].state == "idle"
 
     asyncio.run(go())
 

@@ -289,6 +289,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   onAuthorizeImage,
   historyImageAssets, onLoadHistoryImage,
   onTextSelectionGuardChange,
+  externalPlanProgress,
   surface = "code" }: {
   sid: string | null;
   turns: Turn[];
@@ -336,6 +337,10 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     turnId: string, imageId: string, variant: HistoryImageVariant,
   ) => boolean;
   onTextSelectionGuardChange?: (guard: TextSelectionGuard | null) => void;
+  externalPlanProgress?: {
+    turnId: string;
+    itemId: string;
+  } | null;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentSizerRef = useRef<HTMLDivElement>(null);
@@ -2466,6 +2471,11 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
             const processOpenKey =
               `${scrollScope}\u0000turn:${processDisclosureId}`;
             const historyTurnId = t.historyTurnId ?? t.id;
+            const externalPlanItemId = externalPlanProgress
+              && externalPlanProgress.itemId
+              && [t.id, historyTurnId, t.clientMsgId].includes(
+                externalPlanProgress.turnId)
+                ? externalPlanProgress.itemId : null;
             const detailRetryBefore = t.detailRetryBefore;
             const detailRetryDirection = t.detailRetryDirection;
             const historyImagesReady = !!t.imageRefs?.length
@@ -2566,6 +2576,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
                 deferredCount={!t.detailLoaded ? t.detailEventCount : 0}
                 detailLoading={t.detailLoading}
                 detailError={t.detailError}
+                externalPlanItemId={externalPlanItemId}
                 onLoadDetail={onLoadDetail
                   ? () => requestProcessDetail(
                       t.id, undefined, "initial", true)

@@ -4,6 +4,9 @@
 
 ## 未发布
 
+- Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v34。主会话完成回执和精确
+  Goal generation 的隐藏回执改由 wrapper 有界持久化；任一浏览器已读或隐藏后会
+  同步到所有已连接浏览器，重连后仍保持一致，同时不会误隐藏后来替换的新 Goal。
 - Work 消息附带的文件和图片现在会保存到当前会话私有的
   `workspace/uploads` 目录，Work 沙箱可以直接读取；上传的输入资料不会被误列为
   生成的 Artifacts，同时旧版相邻目录中的附件路径仍可兼容历史展示。

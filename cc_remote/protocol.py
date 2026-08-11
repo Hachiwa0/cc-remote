@@ -28,7 +28,7 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 33
+PROTOCOL_VERSION = 34
 
 # Codex Desktop renders a 53-week daily token-activity calendar. Keep the wire
 # payload to that same bounded window so an account response can never turn a
@@ -902,6 +902,11 @@ class SessionInfo(BaseModel):
     native_session_id: Optional[WireId] = None
     codex_profile_id: Optional[WireId] = None
     codex_profile_label: Optional[str] = Field(default=None, max_length=48)
+    # A catalog read also repairs completion receipts for cold/evicted sessions
+    # which have no resident Snapshot on reconnect.
+    completion_id: Optional[WireId] = None
+    completion_unread: Optional[bool] = None
+    completion_revision: Optional[int] = Field(default=None, ge=0)
 
 
 class ListSessions(_Command):
@@ -2166,6 +2171,20 @@ class ClearGoal(_Command):
     type: Literal["clear_goal"] = "clear_goal"
 
 
+class DismissGoal(_Command):
+    """Hide one exact Goal generation on every connected client."""
+
+    type: Literal["dismiss_goal"] = "dismiss_goal"
+    goal_id: WireId
+
+
+class AcknowledgeCompletion(_Command):
+    """Mark one exact main-session completion as seen across clients."""
+
+    type: Literal["acknowledge_completion"] = "acknowledge_completion"
+    completion_id: WireId
+
+
 class ThreadGoal(BaseModel):
     """Display-safe goal state shared by the Codex and Claude engines.
 
@@ -2206,10 +2225,29 @@ class GoalState(_Base):
     """
     type: Literal["goal_state"] = "goal_state"
     goal: Optional[ThreadGoal] = None
+    # Opaque identity for the exact objective generation. DismissGoal echoes it
+    # so a delayed click can never hide a replacement Goal.
+    goal_id: Optional[WireId] = None
+    dismissed: bool = False
     # Present only on the one-shot GetGoal response. Broadcast mutations omit
     # it, so clients can freeze request-time surface ownership without changing
     # the normal per-session Goal stream.
     request_id: Optional[WireId] = None
+
+
+class CompletionState(_Base):
+    """Authoritative cross-client unread state for a main-session turn."""
+
+    type: Literal["completion_state"] = "completion_state"
+    completion_id: Optional[WireId] = None
+    unread: bool = False
+    revision: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def unread_requires_identity(self):
+        if self.unread and self.completion_id is None:
+            raise ValueError("unread completion state requires completion_id")
+        return self
 
 
 AnyMessage = Union[
@@ -2217,7 +2255,8 @@ AnyMessage = Union[
     ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, PermissionProfiles, PermissionProfile, WebSearch, ContextReport, StatusReport, Notice, RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, PreviewAuthorizationRequired, PreviewAuthorizationResult, History, TurnDetail, HistoryImage, HistoryInvalidated, ArtifactInvalidated, Models, EngineCapabilities, AskUser, AskUserClosed, AnswerQuestion,
     SessionList, SessionListInvalidated, SessionActivity, SessionFocus, SessionRekey, RenameSession, ArchiveSession, PinSession, WorkDashboard, WorkArtifacts,
     ForkSession, ForkSessionWorktree, SessionForked, MigrateSession, SessionMigrated, DirList,
-    GetGoal, SetGoal, ClearGoal, GoalState,
+    GetGoal, SetGoal, ClearGoal, DismissGoal, GoalState,
+    AcknowledgeCompletion, CompletionState,
     UserMsg, TurnSteered, AssistantMsgStart, Delta, ToolUse, ToolDelta, ToolResult,
     AssistantMsgEnd, ProcessEvent, TurnPlan, TurnDiff, TurnBinding,
     TurnEnd, Error, WrapperDisconnected, WrapperReconnected,
@@ -2232,7 +2271,7 @@ DOWNSTREAM_TYPES = frozenset({
     "collaboration_mode", "session_control", "query_queue", "btw_opened",
     "assistant_msg_start", "delta", "tool_use", "tool_delta", "tool_result",
     "assistant_msg_end", "process", "turn_plan", "turn_diff", "turn_binding",
-    "turn_end",
+    "turn_end", "completion_state",
     "error", "ask_user", "ask_user_closed", "history_invalidated", "artifact_invalidated",
 })
 
@@ -2344,7 +2383,10 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "get_goal": GetGoal,
     "set_goal": SetGoal,
     "clear_goal": ClearGoal,
+    "dismiss_goal": DismissGoal,
     "goal_state": GoalState,
+    "acknowledge_completion": AcknowledgeCompletion,
+    "completion_state": CompletionState,
     "session_list": SessionList,
     "session_list_invalidated": SessionListInvalidated,
     "session_activity": SessionActivity,

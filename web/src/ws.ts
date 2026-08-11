@@ -1076,6 +1076,31 @@ export class RelayWs {
     this.send({ v: PROTOCOL_VERSION, type: "clear_goal", ts: nowTs(), ...this.sidObj() });
   }
 
+  sendDismissGoalTo(sid: string, goalId: string): string | null {
+    return this.sendTracked({
+      v: PROTOCOL_VERSION,
+      type: "dismiss_goal",
+      sid,
+      goal_id: goalId,
+      client_id: this.clientId,
+      ts: nowTs(),
+    });
+  }
+
+  sendAcknowledgeCompletionTo(
+    sid: string,
+    completionId: string,
+  ): string | null {
+    return this.sendTracked({
+      v: PROTOCOL_VERSION,
+      type: "acknowledge_completion",
+      sid,
+      completion_id: completionId,
+      client_id: this.clientId,
+      ts: nowTs(),
+    });
+  }
+
   sendListSessions(engine?: "claude" | "codex", space: Space = "code"): boolean {
     const targetEngine = engine ?? "claude";
     const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "list_sessions", ts: nowTs() };
