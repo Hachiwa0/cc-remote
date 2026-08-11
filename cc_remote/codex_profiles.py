@@ -444,6 +444,32 @@ class CodexProfileTopologyStore:
                 remaps[tail] = start
         return remaps
 
+    @staticmethod
+    def _validate_home_replacements(
+        previous: tuple[tuple[str, str], ...],
+        registry: CodexProfileRegistry,
+        remaps: dict[str, str],
+    ) -> None:
+        """Reject an id silently changing which account it represents.
+
+        A changed id is safe only when the home-based remap moves its old
+        state to another identity (for example a rename, swap, or displaced
+        rename chain).  Otherwise persisted state under that id would be
+        interpreted as belonging to the replacement CODEX_HOME.
+        """
+        old_by_id = dict(previous)
+        for profile in registry:
+            old_home = old_by_id.get(profile.id)
+            if (
+                old_home is not None
+                and old_home != str(profile.home)
+                and profile.id not in remaps
+            ):
+                raise ValueError(
+                    "Codex profile id cannot replace its CODEX_HOME without "
+                    "preserving the previous account under another id"
+                )
+
     def transition(
         self, registry: CodexProfileRegistry,
     ) -> CodexProfileTopologyTransition | None:
@@ -462,13 +488,15 @@ class CodexProfileTopologyStore:
         old_default = previous.default_id if previous is not None else None
         if old_default is None and len(old_profiles) == 1:
             old_default = old_profiles[0][0]
+        remaps = self._remaps(old_profiles, registry)
+        self._validate_home_replacements(old_profiles, registry, remaps)
         return CodexProfileTopologyTransition(
             revision=(previous.revision + 1 if previous is not None else 1),
             previous=old_profiles,
             previous_default_id=old_default,
             current=current,
             current_default_id=registry.default.id,
-            remaps=self._remaps(old_profiles, registry),
+            remaps=remaps,
         )
 
     def revision(self, registry: CodexProfileRegistry) -> int:

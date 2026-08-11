@@ -775,6 +775,41 @@ def test_legacy_restart_owner_remap_is_idempotent_during_pending_transition(
     assert first_owner == second_owner == "b"
 
 
+def test_profile_id_cannot_silently_replace_its_account_home(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    original_home = tmp_path / "home-a"
+    registry = CodexProfileRegistry.from_json(json.dumps({
+        "a": {
+            "label": "A",
+            "home": str(original_home),
+            "default": True,
+        },
+    }))
+    store = CodexProfileTopologyStore(state)
+    initial = store.prepare(registry)
+    assert initial is not None
+    store.complete(registry, initial)
+
+    replacement = CodexProfileRegistry.from_json(json.dumps({
+        "a": {
+            "label": "Replacement",
+            "home": str(tmp_path / "replacement-home"),
+            "default": True,
+        },
+    }))
+    with pytest.raises(ValueError, match="cannot replace its CODEX_HOME"):
+        store.prepare(replacement)
+
+    assert not (state / "codex-profile-transition.json").exists()
+    persisted = json.loads(
+        (state / "codex-profile-topology.json").read_text(encoding="utf-8"))
+    assert persisted["profiles"] == [{
+        "id": "a", "home": str(original_home.resolve()),
+    }]
+
+
 def test_profile_tui_trackers_receive_only_their_daemon_proxy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1878,6 +1913,61 @@ def test_same_home_profile_id_rename_migrates_persisted_identity(
         "same-native-id", codex_profile_id="luna")
     assert migrated_work is not None
     assert migrated_work.work_id == record.work_id
+
+
+def test_profile_home_replacement_fails_closed_before_state_is_reowned(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    old_home = tmp_path / "old-home"
+    cfg = WrapperConfig()
+    cfg.state_dir = state
+    cfg.codex_work_root = tmp_path / "work"
+    cfg.codex_profiles_json = json.dumps({
+        "a": {
+            "label": "A",
+            "home": str(old_home),
+            "default": True,
+        },
+    })
+    original = WrapperMachine(cfg, _StubTransport())
+    assert original._codex_controls is not None
+    original._codex_controls.update(
+        "native-id", approval_policy="on-request",
+        permission_profile=":old-account", web_search=None)
+    original._codex_turn_leases.claim(
+        "native-id", "turn-old", "message-old")
+    assert original._session_pins is not None
+    original._session_pins.set_pinned("codex", "native-id", True)
+    work = original._work.for_engine("codex")
+    record = work.create_session(codex_profile_id="a")
+    work.bind_session(record.work_id, "native-id", codex_profile_id="a")
+
+    replacement_cfg = WrapperConfig()
+    replacement_cfg.state_dir = state
+    replacement_cfg.codex_work_root = tmp_path / "work"
+    replacement_cfg.codex_profiles_json = json.dumps({
+        "a": {
+            "label": "Replacement",
+            "home": str(tmp_path / "new-home"),
+            "default": True,
+        },
+    })
+    replacement = WrapperMachine(replacement_cfg, _StubTransport())
+
+    assert not replacement._codex_profile_migration_ok
+    assert not replacement._codex_work_profile_migration_ok
+    with pytest.raises(RuntimeError, match="migration is incomplete"):
+        replacement._codex_profile("a")
+    assert replacement._codex_controls is not None
+    assert replacement._codex_controls.get(
+        "native-id").permission_profile == ":old-account"
+    assert replacement._codex_turn_leases.get(
+        "native-id").turn_id == "turn-old"
+    assert replacement._session_pins is not None
+    assert replacement._session_pins.ids("codex") == frozenset({"native-id"})
+    assert replacement._work.for_engine("codex").get_by_session(
+        "native-id", codex_profile_id="a").work_id == record.work_id
 
 
 def test_profile_id_swap_keeps_same_native_uuid_state_with_its_home(
