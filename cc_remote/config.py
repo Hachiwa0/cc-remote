@@ -17,6 +17,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from cc_remote.claude_broker.paths import default_socket_path
+from cc_remote.codex_profiles import CodexProfileRegistry
 
 try:
     from dotenv import load_dotenv
@@ -86,6 +87,28 @@ def _wrapper_value(env_key: str, file_key: str, default: str) -> str:
     if explicit is not None and explicit.strip():
         return explicit
     return _load_device_config().get(file_key, default)
+
+
+def _codex_profiles_json() -> str:
+    inline = _env("CC_REMOTE_CODEX_PROFILES_JSON", "").strip()
+    if inline:
+        return inline
+    configured = _env("CC_REMOTE_CODEX_PROFILES_FILE", "").strip()
+    if not configured:
+        return ""
+    path = Path(configured).expanduser()
+    try:
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 64 * 1024:
+            raise ValueError("profile file is not a bounded regular file")
+        payload = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ""
+    except Exception as exc:
+        raise ValueError(f"invalid Codex profile file: {path}") from exc
+    if len(payload.encode("utf-8")) > 64 * 1024:
+        raise ValueError(f"invalid Codex profile file: {path}")
+    return payload.strip()
 
 
 def _default_device_db_path() -> str:
@@ -199,6 +222,11 @@ class WrapperConfig:
     # user's shell/CLI environment.
     codex_proxy: str = field(
         default_factory=lambda: _env("CC_REMOTE_CODEX_PROXY", "").strip())
+    # Optional account registry. Each entry owns a complete CODEX_HOME and an
+    # independent app-server daemon. Empty preserves the historical single-home
+    # behavior using CODEX_HOME (or ~/.codex).
+    codex_profiles_json: str = field(
+        default_factory=_codex_profiles_json)
     # Optional local PTY broker used only by the explicit `claude-remote`
     # experiment. It is intentionally disabled in the supported product path:
     # direct native Claude owners are mirrored read-only and explicitly taken
@@ -472,6 +500,10 @@ def wrapper_config() -> WrapperConfig:
 def validate_wrapper_config(cfg: WrapperConfig) -> None:
     """Reject credentials or relay URLs that could expose wrapper authority."""
     errors: list[str] = []
+    try:
+        CodexProfileRegistry.from_json(cfg.codex_profiles_json)
+    except ValueError as exc:
+        errors.append(str(exc))
     if _placeholder(cfg.wrapper_token) or len(cfg.wrapper_token) < 32:
         errors.append("WRAPPER_TOKEN must be non-placeholder and at least 32 characters")
     if not valid_machine_id(cfg.machine_id):

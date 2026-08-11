@@ -8,12 +8,15 @@ from types import SimpleNamespace
 import cc_remote.wrapper.codex_handle as codex_handle_module
 import pytest
 from cc_remote.protocol import (
-    Delta, Error, GoalState, ProcessEvent, StateEvent, ToolDelta, ToolResult,
-    ToolUse, TurnDiff, TurnEnd, TurnPlan, UserMsg,
+    Delta, Error, GoalState, ProcessEvent, SessionListInvalidated, StateEvent,
+    Steer, ToolDelta, ToolResult, ToolUse, TurnBinding, TurnDiff, TurnEnd,
+    TurnPlan, TurnSteered, UserMsg,
 )
 from cc_remote.wrapper.codex_handle import (
     CodexHandle, CodexSpontaneousClosed, CodexSpontaneousOverflow,
+    CodexSteerUserIdentityProof,
 )
+from cc_remote.wrapper.history_store import HistorySourceFingerprint
 from tests.test_multisession import _mk_ctx, _mk_machine
 
 
@@ -500,6 +503,484 @@ def test_foreign_user_and_goal_notifications_do_not_release_compaction_fence():
         assert handle.turn_active is True
         assert handle.turn_id == turn_id
         handle._discard_managed_compaction_continuation()
+
+    asyncio.run(run())
+
+
+def test_foreign_turn_keeps_only_registered_remote_steer_identity():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-spontaneous"
+        handle.turn_id = "remote-expected-turn"
+        handle.turn_active = True
+        handle._using_daemon_proxy = True
+        handle.remember_owned_turn_id("remote-expected-turn")
+        handle._open_managed_stream()
+        handle._register_steer_user_identity(
+            "remote-client-message",
+            "thread-spontaneous",
+            "remote-expected-turn",
+        )
+
+        delayed = _notification(
+            "item/started",
+            "foreign-cli-turn",
+            item={
+                "id": "native-delayed-user",
+                "clientId": "remote-client-message",
+                "type": "userMessage",
+                "content": [{"type": "text", "text": "private prompt"}],
+            },
+        )
+        await handle._dispatch(delayed)
+        completed = {
+            **delayed,
+            "method": "item/completed",
+        }
+        await handle._dispatch(completed)
+        assert handle._turn_q.qsize() == 0
+
+        # An exact RPC acceptance releases only the content-free identity proof.
+        # The foreign userMessage frame itself must remain outside the stream.
+        handle._accept_steer_user_identity("remote-client-message")
+        proof = await asyncio.wait_for(handle._turn_q.get(), timeout=0.1)
+        assert isinstance(proof, CodexSteerUserIdentityProof)
+        assert (
+            proof.thread_id,
+            proof.expected_turn_id,
+            proof.native_turn_id,
+            proof.native_message_id,
+            proof.client_message_id,
+        ) == (
+            "thread-spontaneous",
+            "remote-expected-turn",
+            "foreign-cli-turn",
+            "native-delayed-user",
+            "remote-client-message",
+        )
+        assert handle._turn_q.qsize() == 0
+
+        handle._register_steer_user_identity(
+            "post-response-message",
+            "thread-spontaneous",
+            "remote-expected-turn",
+        )
+        handle._accept_steer_user_identity("post-response-message")
+        post_response = _notification(
+            "item/started",
+            "foreign-cli-turn",
+            item={
+                "id": "post-response-native-user",
+                "clientId": "post-response-message",
+                "type": "userMessage",
+                "content": [{"type": "text", "text": "private"}],
+            },
+        )
+        await handle._dispatch(post_response)
+        assert isinstance(
+            await asyncio.wait_for(handle._turn_q.get(), timeout=0.1),
+            CodexSteerUserIdentityProof,
+        )
+        post_response["method"] = "item/completed"
+        await handle._dispatch(post_response)
+        assert "post-response-message" not in (
+            handle._pending_steer_user_identities)
+        assert handle._turn_q.qsize() == 0
+
+        handle._register_steer_user_identity(
+            "known-other-message",
+            "thread-spontaneous",
+            "remote-expected-turn",
+        )
+        sibling = _notification(
+            "item/completed",
+            "foreign-cli-turn",
+            item={
+                "id": "sibling-user",
+                "clientId": "known-other-message",
+                "type": "userMessage",
+                "content": [{"type": "text", "text": "sibling"}],
+            },
+        )
+        sibling["params"]["threadId"] = "thread-sibling"
+        await handle._dispatch(sibling)
+        handle._accept_steer_user_identity("known-other-message")
+        assert handle._turn_q.qsize() == 0
+
+        unknown = _notification(
+            "item/completed",
+            "foreign-cli-turn",
+            item={
+                "id": "unknown-user",
+                "clientId": "unknown-client-message",
+                "type": "userMessage",
+                "content": [{"type": "text", "text": "unknown"}],
+            },
+        )
+        await handle._dispatch(unknown)
+        assert handle._turn_q.qsize() == 0
+
+    asyncio.run(run())
+
+
+def test_turn_start_binds_exact_client_user_to_split_stream_task():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.proc = SimpleNamespace(returncode=None)
+        handle.thread_id = "thread-spontaneous"
+        requests = []
+
+        async def send(request):
+            requests.append(request)
+            await handle._dispatch(_notification(
+                "item/started",
+                "rollout-task",
+                item={
+                    "id": "native-query-user",
+                    "clientId": "browser-query-message",
+                    "type": "userMessage",
+                    "content": [{"type": "text", "text": "private"}],
+                },
+            ))
+            await handle._dispatch(_notification(
+                "item/agentMessage/delta",
+                "rollout-task",
+                itemId="answer",
+                delta="working",
+            ))
+            await handle._dispatch({
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": {"turn": {"id": "control-turn"}},
+            })
+
+        handle._send = send
+        result = await handle.query(
+            "private",
+            client_user_message_id="browser-query-message",
+        )
+
+        assert result == "control-turn"
+        assert requests[0]["params"]["clientUserMessageId"] == (
+            "browser-query-message")
+        proof = await asyncio.wait_for(handle._turn_q.get(), timeout=0.1)
+        assert isinstance(proof, CodexSteerUserIdentityProof)
+        assert proof.kind == "query"
+        assert (
+            proof.expected_turn_id,
+            proof.native_turn_id,
+            proof.native_message_id,
+            proof.client_message_id,
+        ) == (
+            "control-turn",
+            "rollout-task",
+            "native-query-user",
+            "browser-query-message",
+        )
+        streamed = await asyncio.wait_for(handle._turn_q.get(), timeout=0.1)
+        assert streamed["params"]["turnId"] == "control-turn"
+        assert handle.owned_turn_ids.issuperset({
+            "control-turn", "rollout-task",
+        })
+
+    asyncio.run(run())
+
+
+def test_machine_persists_cross_turn_steer_identity_and_refreshes_history(
+    tmp_path,
+):
+    async def run():
+        machine, _transport = _mk_machine()
+        rollout = tmp_path / "rollout.jsonl"
+        rollout.write_text("{}\n", encoding="utf-8")
+        machine._codex_rollout_for_wire = lambda _sid: str(rollout)
+        refreshes = []
+        machine._schedule_history_refresh = lambda *args, **kwargs: (
+            refreshes.append((args, kwargs)))
+
+        ctx = _mk_ctx("thread-spontaneous", "thread-spontaneous")
+        ctx.engine = "codex"
+        handle = CodexHandle(machine.cfg)
+        handle.thread_id = ctx.session_id
+        handle.turn_id = "remote-expected-turn"
+        handle.turn_active = True
+        handle._daemon_proxy_established = True
+        handle.remember_owned_turn_id("remote-expected-turn")
+        ctx.sdk = handle
+        ctx.codex_daemon_epoch = "unmarked"
+        ctx.codex_published_steers["remote-client-message"] = (
+            "remote-expected-turn")
+        machine.sessions[ctx.key] = ctx
+        machine._claim_codex_turn(
+            ctx, "remote-expected-turn", "remote-client-message")
+        revision = machine._history_revision(ctx.session_id)
+
+        proof = CodexSteerUserIdentityProof(
+            thread_id=ctx.session_id,
+            expected_turn_id="remote-expected-turn",
+            native_turn_id="foreign-cli-turn",
+            native_message_id="native-delayed-user",
+            client_message_id="remote-client-message",
+            generation=handle._generation,
+        )
+        assert await machine._apply_codex_steer_user_identity(ctx, proof)
+        aliases = machine._codex_client_messages.get(rollout)
+        assert aliases.native_messages == {
+            "native-delayed-user": "remote-client-message",
+        }
+        lease = machine._codex_turn_leases.get(ctx.session_id)
+        assert lease is not None
+        source = rollout.stat()
+        assert lease.stream_task_ids(
+            source_device=source.st_dev,
+            source_inode=source.st_ino,
+        ) == {"foreign-cli-turn"}
+        assert handle.owned_turn_ids.issuperset({
+            "remote-expected-turn", "foreign-cli-turn",
+        })
+        assert machine._history_revision(ctx.session_id) != revision
+        assert len(refreshes) == 1
+        assert ctx.codex_published_steers == {
+            "remote-client-message": "remote-expected-turn",
+        }
+        assert ctx.codex_pending_steer_user_identities == {}
+
+        unknown = CodexSteerUserIdentityProof(
+            thread_id=ctx.session_id,
+            expected_turn_id="unknown-turn",
+            native_turn_id="foreign-cli-turn",
+            native_message_id="unknown-native-user",
+            client_message_id="unknown-client-message",
+            generation=handle._generation,
+        )
+        assert not await machine._apply_codex_steer_user_identity(ctx, unknown)
+        assert machine._codex_client_messages.get(rollout).native_messages == {
+            "native-delayed-user": "remote-client-message",
+        }
+
+    asyncio.run(run())
+
+
+def test_machine_persists_split_initial_query_identity(tmp_path):
+    async def run():
+        machine, _transport = _mk_machine()
+        rollout = tmp_path / "rollout.jsonl"
+        rollout.write_text("{}\n", encoding="utf-8")
+        machine._codex_rollout_for_wire = lambda _sid: str(rollout)
+        machine._schedule_history_refresh = lambda *args, **kwargs: None
+
+        ctx = _mk_ctx("thread-spontaneous", "thread-spontaneous")
+        ctx.engine = "codex"
+        handle = CodexHandle(machine.cfg)
+        handle.thread_id = ctx.session_id
+        handle.turn_id = "control-turn"
+        handle.turn_active = True
+        handle._daemon_proxy_established = True
+        handle.remember_owned_turn_id("control-turn")
+        ctx.sdk = handle
+        ctx.codex_daemon_epoch = "unmarked"
+        machine.sessions[ctx.key] = ctx
+        machine._claim_codex_turn(
+            ctx, "control-turn", "browser-query-message")
+
+        proof = CodexSteerUserIdentityProof(
+            thread_id=ctx.session_id,
+            expected_turn_id="control-turn",
+            native_turn_id="rollout-task",
+            native_message_id="native-query-user",
+            client_message_id="browser-query-message",
+            generation=handle._generation,
+            kind="query",
+        )
+        assert await machine._apply_codex_steer_user_identity(ctx, proof)
+
+        aliases = machine._codex_client_messages.get(rollout)
+        assert aliases.native_messages == {
+            "native-query-user": "browser-query-message",
+        }
+        lease = machine._codex_turn_leases.get(ctx.session_id)
+        assert lease is not None
+        source = rollout.stat()
+        assert lease.stream_task_ids(
+            source_device=source.st_dev,
+            source_inode=source.st_ino,
+        ) == {"rollout-task"}
+
+    asyncio.run(run())
+
+
+def test_cross_turn_identity_retries_when_rollout_path_appears_late(tmp_path):
+    async def run():
+        machine, _transport = _mk_machine()
+        rollout = tmp_path / "late-rollout.jsonl"
+        machine._codex_rollout_for_wire = lambda _sid: None
+        machine._schedule_history_refresh = lambda *args, **kwargs: None
+        ctx = _mk_ctx("thread-spontaneous", "thread-spontaneous")
+        ctx.engine = "codex"
+        handle = CodexHandle(machine.cfg)
+        handle.thread_id = ctx.session_id
+        ctx.sdk = handle
+        ctx.codex_published_steers["remote-client-message"] = (
+            "remote-expected-turn")
+        machine.sessions[ctx.key] = ctx
+        proof = CodexSteerUserIdentityProof(
+            thread_id=ctx.session_id,
+            expected_turn_id="remote-expected-turn",
+            native_turn_id="foreign-cli-turn",
+            native_message_id="native-delayed-user",
+            client_message_id="remote-client-message",
+            generation=handle._generation,
+        )
+
+        assert await machine._apply_codex_steer_user_identity(ctx, proof)
+        assert ctx.codex_pending_steer_user_identities == {
+            "native-delayed-user": proof,
+        }
+        rollout.write_text("{}\n", encoding="utf-8")
+        machine._codex_rollout_for_wire = lambda _sid: str(rollout)
+        await machine._cleanup_codex_steer_attachments(ctx)
+
+        assert ctx.codex_pending_steer_user_identities == {}
+        assert machine._codex_client_messages.get(rollout).native_messages == {
+            "native-delayed-user": "remote-client-message",
+        }
+
+    asyncio.run(run())
+
+
+def test_official_history_backfills_known_cross_turn_alias_while_cold(tmp_path):
+    async def run():
+        machine, _transport = _mk_machine()
+        rollout = tmp_path / "rollout.jsonl"
+        rollout.write_text("{}\n", encoding="utf-8")
+        machine._codex_client_messages.put(
+            rollout,
+            "remote-expected-turn",
+            "remote-client-message",
+            segment_index=0,
+        )
+        source = HistorySourceFingerprint.capture(rollout)
+        revision = machine._history_revision("thread-cold")
+
+        await machine._backfill_official_codex_client_message_ids(
+            None,
+            "thread-cold",
+            str(rollout),
+            source,
+            {"remote-client-message"},
+            ((
+                "foreign-cli-turn",
+                "native-delayed-user",
+                "remote-client-message",
+            ),),
+        )
+
+        aliases = machine._codex_client_messages.get(rollout)
+        assert aliases.segments == {
+            ("remote-expected-turn", 0): "remote-client-message",
+        }
+        assert aliases.native_messages == {
+            "native-delayed-user": "remote-client-message",
+        }
+        assert machine._history_revision("thread-cold") != revision
+
+    asyncio.run(run())
+
+
+def test_official_history_adds_second_native_alias_for_known_message(tmp_path):
+    async def run():
+        machine, _transport = _mk_machine()
+        rollout = tmp_path / "rollout.jsonl"
+        rollout.write_text("{}\n", encoding="utf-8")
+        machine._codex_client_messages.put(
+            rollout,
+            "native-turn",
+            "remote-client-message",
+            segment_index=0,
+            native_message_id="live-native-user",
+        )
+        source = HistorySourceFingerprint.capture(rollout)
+        revision = machine._history_revision("thread-cold")
+
+        await machine._backfill_official_codex_client_message_ids(
+            None,
+            "thread-cold",
+            str(rollout),
+            source,
+            {"remote-client-message"},
+            ((
+                "native-turn",
+                "msg_official_native_user",
+                "remote-client-message",
+            ),),
+        )
+
+        aliases = machine._codex_client_messages.get(rollout)
+        assert aliases.segments == {
+            ("native-turn", 0): "remote-client-message",
+        }
+        assert aliases.native_messages == {
+            "live-native-user": "remote-client-message",
+            "msg_official_native_user": "remote-client-message",
+        }
+        assert machine._history_revision("thread-cold") != revision
+
+        repeated_revision = machine._history_revision("thread-cold")
+        await machine._backfill_official_codex_client_message_ids(
+            None,
+            "thread-cold",
+            str(rollout),
+            source,
+            {"remote-client-message"},
+            ((
+                "native-turn",
+                "msg_official_native_user",
+                "remote-client-message",
+            ),),
+        )
+        assert machine._history_revision("thread-cold") == repeated_revision
+
+    asyncio.run(run())
+
+
+def test_active_history_adds_official_alias_without_replacing_live_id(tmp_path):
+    async def run():
+        machine, _transport = _mk_machine()
+        rollout = tmp_path / "rollout.jsonl"
+        rollout.write_text("{}\n", encoding="utf-8")
+        machine._codex_client_messages.put(
+            rollout,
+            "native-turn",
+            "remote-client-message",
+            segment_index=0,
+            native_message_id="live-native-user",
+        )
+        ctx = _mk_ctx("thread-active", "thread-active")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+        source = HistorySourceFingerprint.capture(rollout)
+
+        await machine._backfill_official_codex_client_message_ids(
+            ctx,
+            ctx.session_id,
+            str(rollout),
+            source,
+            {"remote-client-message"},
+            ((
+                "native-turn",
+                "msg_official_native_user",
+                "remote-client-message",
+            ),),
+        )
+
+        aliases = machine._codex_client_messages.get(rollout)
+        assert aliases.native_messages == {
+            "live-native-user": "remote-client-message",
+            "msg_official_native_user": "remote-client-message",
+        }
+        assert aliases.segments == {
+            ("native-turn", 0): "remote-client-message",
+        }
 
     asyncio.run(run())
 
@@ -1132,6 +1613,312 @@ def test_machine_streams_rich_spontaneous_turn_and_unlocks_on_matching_terminal(
         assert len(terminal) == 1
         assert terminal[0].turn_id == turn_id
         assert terminal[0].result.subtype == "success"
+
+    asyncio.run(run())
+
+
+def test_machine_uses_live_cli_user_item_as_spontaneous_turn_identity():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("thread-spontaneous", "thread-spontaneous")
+        ctx.engine = "codex"
+        handle = CodexHandle(machine.cfg)
+        handle.thread_id = ctx.session_id
+        handle.proc = SimpleNamespace(returncode=None)
+        ctx.sdk = handle
+        machine.sessions[ctx.key] = ctx
+        handle.turn_lifecycle_callback = (
+            lambda phase, turn_id: machine._on_codex_turn_lifecycle(
+                ctx, phase, turn_id))
+
+        turn_id = "cli-native-turn"
+        user = {
+            "id": "cli-user-item",
+            "type": "userMessage",
+            "content": [{"type": "text", "text": "sent from the CLI"}],
+        }
+        for message in [
+            _notification("turn/started", turn_id, turn={"id": turn_id}),
+            _notification("item/started", turn_id, item=user),
+            _notification("item/completed", turn_id, item=user),
+            _notification("item/completed", turn_id, item={
+                "id": "cli-answer", "type": "agentMessage",
+                "text": "seen remotely", "phase": "final_answer",
+            }),
+            _notification("turn/completed", turn_id, turn={
+                "id": turn_id, "status": "completed",
+            }),
+        ]:
+            await handle._dispatch(message)
+
+        task = ctx.codex_spontaneous_task
+        assert task is not None
+        await asyncio.wait_for(task, timeout=1)
+
+        users = [event for event in transport.sent
+                 if isinstance(event, UserMsg)]
+        assert [(event.msg_id, event.prompt) for event in users] == [
+            ("cli-user-item", "sent from the CLI"),
+        ]
+        bindings = [event for event in transport.sent
+                    if isinstance(event, TurnBinding)]
+        assert [(event.msg_id, event.turn_id) for event in bindings] == [
+            ("cli-user-item", turn_id),
+        ]
+        assert not any(event.prompt == "" for event in users)
+        assert any(isinstance(event, Delta) and event.text == "seen remotely"
+                   for event in transport.sent)
+
+    asyncio.run(run())
+
+
+def test_machine_projects_later_cli_user_item_as_turn_steer():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("thread-spontaneous", "thread-spontaneous")
+        ctx.engine = "codex"
+        handle = CodexHandle(machine.cfg)
+        handle.thread_id = ctx.session_id
+        handle.proc = SimpleNamespace(returncode=None)
+        handle._using_daemon_proxy = True
+        handle._daemon_proxy_established = True
+        ctx.sdk = handle
+        machine.sessions[ctx.key] = ctx
+        handle.turn_lifecycle_callback = (
+            lambda phase, turn_id: machine._on_codex_turn_lifecycle(
+                ctx, phase, turn_id))
+
+        turn_id = "cli-steered-turn"
+        for message in [
+            _notification("turn/started", turn_id, turn={"id": turn_id}),
+            _notification("item/completed", turn_id, item={
+                "id": "cli-first", "type": "userMessage",
+                "text": "first CLI prompt",
+            }),
+            _notification("item/completed", turn_id, item={
+                "id": "answer-before-steer", "type": "agentMessage",
+                "text": "working", "phase": "commentary",
+            }),
+        ]:
+            await handle._dispatch(message)
+
+        await handle._dispatch(_notification(
+            "item/completed", turn_id, item={
+                "id": "cli-second", "type": "userMessage",
+                "text": "second CLI prompt",
+            }))
+
+        async def wait_for_second_user():
+            while not any(
+                isinstance(event, TurnSteered)
+                and event.msg_id == "cli-second"
+                for event in transport.sent
+            ):
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(wait_for_second_user(), timeout=1)
+        lease = machine._codex_turn_leases.get(ctx.key)
+        assert lease is not None
+        assert lease.turn_id == turn_id
+        assert lease.msg_id == "cli-second"
+        assert lease.automatic is True
+
+        await handle._dispatch(_notification(
+            "turn/completed", turn_id, turn={
+                "id": turn_id, "status": "completed",
+            }))
+
+        task = ctx.codex_spontaneous_task
+        assert task is not None
+        await asyncio.wait_for(task, timeout=1)
+
+        users = [event for event in transport.sent
+                 if isinstance(event, UserMsg)]
+        steers = [event for event in transport.sent
+                  if isinstance(event, TurnSteered)]
+        assert [(event.msg_id, event.prompt) for event in users] == [
+            ("cli-first", "first CLI prompt"),
+        ]
+        assert [(event.msg_id, event.turn_id, event.prompt)
+                for event in steers] == [
+            ("cli-second", turn_id, "second CLI prompt"),
+        ]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("outcome_unknown", [False, True])
+def test_machine_reconciles_remote_steer_user_item_without_second_steer(
+    outcome_unknown,
+):
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("thread-spontaneous", "thread-spontaneous")
+        ctx.engine = "codex"
+        handle = CodexHandle(machine.cfg)
+        handle.thread_id = ctx.session_id
+        handle.proc = SimpleNamespace(returncode=None)
+        handle._using_daemon_proxy = True
+        handle._daemon_proxy_established = True
+        ctx.sdk = handle
+        machine.sessions[ctx.key] = ctx
+        handle.turn_lifecycle_callback = (
+            lambda phase, turn_id: machine._on_codex_turn_lifecycle(
+                ctx, phase, turn_id))
+
+        turn_id = "cli-remote-steered-turn"
+        await handle._dispatch(
+            _notification("turn/started", turn_id, turn={"id": turn_id}))
+        await handle._dispatch(_notification(
+            "item/completed", turn_id, item={
+                "id": "cli-first", "type": "userMessage",
+                "text": "first CLI prompt",
+            }))
+
+        async def wait_for_first_user():
+            while not any(
+                isinstance(event, UserMsg) and event.msg_id == "cli-first"
+                for event in transport.sent
+            ):
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(wait_for_first_user(), timeout=1)
+
+        async def steer(
+            prompt, images=None, *, client_user_message_id=None,
+        ):
+            assert prompt == "guide from Remote"
+            assert images == []
+            assert client_user_message_id == "remote-steer"
+            if outcome_unknown:
+                raise codex_handle_module.CodexSteerOutcomeUnknown(
+                    "response lost")
+            return turn_id
+
+        handle.steer = steer
+        result = await machine._handle_steer(Steer(
+            sid=ctx.key,
+            cmd_id="remote-steer-command",
+            client_id="browser-1",
+            msg_id="remote-steer",
+            prompt="guide from Remote",
+        ))
+        assert isinstance(result, Error if outcome_unknown else TurnSteered)
+        lease = machine._codex_turn_leases.get(ctx.key)
+        assert lease is not None
+        assert lease.msg_id == (
+            "cli-first" if outcome_unknown else "remote-steer"
+        )
+
+        official_user = {
+            "id": "official-remote-steer",
+            "clientId": "remote-steer",
+            "type": "userMessage",
+            "content": [{"type": "text", "text": "guide from Remote"}],
+        }
+        await handle._dispatch(
+            _notification("item/started", turn_id, item=official_user))
+
+        async def wait_for_remote_lease():
+            while True:
+                current = machine._codex_turn_leases.get(ctx.key)
+                if current is not None and current.msg_id == "remote-steer":
+                    return
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(wait_for_remote_lease(), timeout=1)
+        for message in [
+            _notification("item/completed", turn_id, item=official_user),
+            _notification("turn/completed", turn_id, turn={
+                "id": turn_id, "status": "completed",
+            }),
+        ]:
+            await handle._dispatch(message)
+
+        task = ctx.codex_spontaneous_task
+        assert task is not None
+        await asyncio.wait_for(task, timeout=1)
+
+        steers = [event for event in transport.sent
+                  if isinstance(event, TurnSteered)]
+        assert [(event.msg_id, event.prompt) for event in steers] == [
+            ("remote-steer", "guide from Remote"),
+        ]
+        aliases = [
+            event for event in transport.sent
+            if isinstance(event, UserMsg)
+            and event.msg_id == "official-remote-steer"
+        ]
+        assert len(aliases) == 1
+        assert aliases[0].client_msg_id == "remote-steer"
+        assert any(
+            isinstance(event, TurnBinding)
+            and event.msg_id == "remote-steer"
+            and event.turn_id == turn_id
+            for event in transport.sent
+        )
+        assert ctx.codex_published_steers == {}
+
+    asyncio.run(run())
+
+
+def test_foreign_cli_thread_started_is_only_a_catalog_hint():
+    async def run():
+        hints = []
+        handle = CodexHandle(
+            _Cfg(), thread_started_callback=hints.append)
+        handle._using_daemon_proxy = True
+        handle.thread_id = "thread-current"
+
+        await handle._dispatch({
+            "method": "thread/started",
+            "params": {"thread": {
+                "id": "thread-new-cli",
+                "source": "cli",
+            }},
+        })
+        await handle._dispatch({
+            "method": "thread/started",
+            "params": {"thread": {
+                "id": "thread-private-app",
+                "source": "appServer",
+            }},
+        })
+
+        assert hints == ["thread-new-cli"]
+        assert handle.thread_id == "thread-current"
+        assert handle.turn_id is None
+        assert handle.turn_active is False
+
+    asyncio.run(run())
+
+
+def test_machine_deduplicates_cli_thread_catalog_hints_across_handles():
+    async def run():
+        machine, transport = _mk_machine()
+        first = _mk_ctx("thread-first", "thread-first")
+        second = _mk_ctx("thread-second", "thread-second")
+        first.engine = second.engine = "codex"
+        machine.sessions[first.key] = first
+        machine.sessions[second.key] = second
+        machine.focused_sid = first.key
+
+        machine._on_codex_thread_started_hint(first, "thread-new-cli")
+        machine._on_codex_thread_started_hint(second, "thread-new-cli")
+        tasks = tuple(machine._codex_catalog_hint_tasks)
+        assert len(tasks) == 1
+        await asyncio.gather(*tasks)
+
+        invalidations = [
+            event for event in transport.sent
+            if isinstance(event, SessionListInvalidated)
+        ]
+        assert [(event.engine, event.space) for event in invalidations] == [
+            ("codex", "code"),
+        ]
+        assert machine._codex_session_list_epoch == 1
+        assert machine.focused_sid == first.key
+        assert first.state == second.state == "idle"
 
     asyncio.run(run())
 

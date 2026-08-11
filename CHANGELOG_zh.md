@@ -4,11 +4,62 @@
 
 ## 未发布
 
+- Work 消息附带的文件和图片现在会保存到当前会话私有的
+  `workspace/uploads` 目录，Work 沙箱可以直接读取；上传的输入资料不会被误列为
+  生成的 Artifacts，同时旧版相邻目录中的附件路径仍可兼容历史展示。
+- 移动端 Markdown 源码编辑器现在会填满可用文件面板；暗色主题下的当前会话卡片
+  会保持清晰选中，代码块复制按钮恢复可读对比度，桌面端代码块也会与页面背景
+  保持清晰层次。
+- 重连补发实时尾部前会恢复当前回合的精确归属，并将与 rollout 源文件绑定的
+  浏览器/原生消息身份持久化到已完成的 Codex History；升级时会淘汰身份尚未持久化
+  的旧投影，避免刷新后把同一回复重复绘制为两层。旧版 CLI rollout 中相邻的
+  user 双记录现在也会复用 app-server 原生 item id，历史刷新不会再把同一次终端输入
+  与其实时镜像画成两个回合。
+  Remote steer 即使被官方 daemon 延迟写入并归到并行 CLI turn，也只会提取精确
+  `clientId`、不会放行外部 CLI 正文；后续原生 History 行会并回原来的乐观消息，
+  不再重复绘制。同一条浏览器消息的 live rollout item id 与官方 History item id
+  现在可作为两个精确别名并存，不再互相冲突。初始 `turn/start` 输入现在也携带
+  同一精确身份；即使超大任务的
+  生命周期标记已经落到有界尾部之外，重启恢复仍可通过官方活跃状态与原生
+  item/rollout 绑定重新接管，避免误报“已打断”及重复显示同一条输入。
+  若有界尾部连当前 `TurnBinding` 也已淘汰，wrapper 现在会用其原始序号严格证明
+  并在 Web 消费正文前绑定余下的当前回合后缀；旧版反向顺序写入的错误缓存会一次性失效。
+  无实时竞态的
+  官方 Codex History 明确报告线程空闲后，其持久化成功或失败终态也会替换临时的
+  live 终态，同时保留实时详情，且不会削弱 Claude SDK 的终态权威。
+- Wrapper、Relay 与 Web 的协同 wire gate 升级到 protocol v33，并为 Codex Work
+  新增多账号支持。新 Work 会话与定时任务都可选择任一已配置 Profile，账号归属会
+  独立于当前默认账号持久化，并在重试和 wrapper 重启后保持不变。即使早期账号拓扑
+  迁移已经完成，升级时仍会幂等地把旧 Work 数据绑定到当时的默认账号。Profile 被
+  移除后既有 Work 仍保持原归属并 fail-closed，不会被改绑；临时目录读取失败会保留
+  对应账号最后一次成功的会话投影，不会触发静默回退。wrapper 发布会先快照两个 Work SQLite 注册表，
+  验证账号归属迁移，并在失败回滚时先恢复匹配数据再启动旧代码。
 - Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v31。wrapper 内部的目录
   变化不再广播无关联会话列表，而是发送不进入重放环的失效提示；当前可见页面会
   将并发提示合并为绑定自身连接 generation 与 surface 的列表读取。流式公式可识别
   跨 delta 拆开的分隔符，暂停 Goal 恢复时会保留一次有界目标锚点，compact 续接也
   不再同时显示运行转圈和真实“已打断”终态。
+- Wrapper、Relay 与 Web 的协同 wire gate 升级到 protocol v32，并新增可同时使用的
+  Codex 多账号 Profile。每个 `CODEX_HOME` 独立拥有官方 daemon、目录、控制状态和
+  历史命名空间；Code 统一展示并提供账号标签/筛选，Work 仍只使用默认 Profile。
+  单账号保持原生 id 与原 UI；多账号卡片使用稳定的彩色 `default`/天体 ribbon。
+  本地 Profile key 迁移支持崩溃续接，并覆盖 alias、fork 恢复、turn lease、控制状态、
+  置顶、Work 归属与 rollback checkpoint。无界面 Profile 现在会为各自账号
+  bootstrap 官方 remote-control daemon，不再静默降级到私有 stdio；只有 OAuth
+  与会话数据的次账号会安全复用已校验的 managed standalone CLI 入口，同时保持
+  登录、rollout、socket 和 daemon 独立，已有自定义目录不会被覆盖。账号控制面
+  不可用时会明确失败，单账号的既有 fallback 语义保持不变。已登录账号若本次额度
+  读取暂时没有返回窗口，也会显示为可刷新重试的读取失败，而不会再误导为缺少账号。
+- Claude 问题在刷新以及 Claude/Codex 页面切换后保持同一条消息。wrapper 不再把
+  Claude Code 内部生成的 `promptId` 误当作浏览器消息 id，只持久化按 turn generation
+  冻结的 Agent SDK transcript 新增边界（SDK replay 作为兜底），或 broker 精确新增
+  边界观察到的原生 user UUID 映射；学习这项 Claude 元数据时也不再误入 Codex
+  账号缓存。升级时仅淘汰旧身份模型生成的 Claude 派生页，不清除 Codex 历史页。
+  Agent SDK 回合仍在运行时，transcript EOF 会保持为开放投影，首次 ownership 扫描
+  也不再重复镜像半成品历史；只有真实 `ResultMessage` 才能完成该回合。满足严格
+  证据的延迟 `request_retry` 分叉不再隐藏已经成功完成的兄弟尾段；进入 resident
+  会话或重试切换命令时，也会使用新序号发布当前生命周期状态，不再重播过期的
+  `running` 帧。
 - 新增 protocol v28 Codex 账户活动。现有的一次性状态读取会携带经过校验、限制
   为最近 53 周的每日 Token 序列；Web 提供仅 Codex 可见、仿 Desktop 的活动
   日历，且这些账户数据不会进入实时重放缓存。五档颜色按当前日历中的单日峰值

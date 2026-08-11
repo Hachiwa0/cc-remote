@@ -7,7 +7,9 @@ import configparser
 import json
 import os
 from pathlib import Path
+import plistlib
 import re
+import sqlite3
 import subprocess
 
 import pytest
@@ -23,6 +25,13 @@ from deploy.caddy_managed_block import (
 from deploy.validate_protocol_bundle import (
     ProtocolBundleError,
     validate_protocol_bundle,
+)
+from deploy.work_registry_snapshot import (
+    WorkRegistrySnapshotError,
+    create_snapshot,
+    resolve_work_roots,
+    restore_snapshot,
+    verify_profile_migration,
 )
 
 
@@ -246,6 +255,112 @@ def test_setup_does_not_make_network_service_owner_of_root_executed_code():
     assert "--hash=sha256:" in lock
     assert "cryptography==" in lock
     assert "Python 3.10 or newer is required" in source
+
+
+def test_work_registry_snapshot_captures_wal_and_restores_absent_database(
+    tmp_path,
+):
+    claude_root = tmp_path / "claude-work"
+    codex_root = tmp_path / "codex-work"
+    codex_root.mkdir()
+    codex_database = codex_root / "registry.sqlite3"
+    writer = sqlite3.connect(codex_database)
+    assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    writer.execute("PRAGMA wal_autocheckpoint=0")
+    writer.execute("CREATE TABLE marker (value TEXT NOT NULL)")
+    writer.execute("INSERT INTO marker VALUES ('before')")
+    writer.commit()
+    assert Path(f"{codex_database}-wal").exists()
+
+    snapshot = tmp_path / "snapshot"
+    create_snapshot(snapshot, {"claude": claude_root, "codex": codex_root})
+
+    writer.execute("ALTER TABLE marker ADD COLUMN migrated INTEGER")
+    writer.execute("INSERT INTO marker VALUES ('after', 1)")
+    writer.commit()
+    writer.close()
+    claude_root.mkdir()
+    with sqlite3.connect(claude_root / "registry.sqlite3") as database:
+        database.execute("CREATE TABLE created_after_snapshot (value INTEGER)")
+
+    restore_snapshot(snapshot)
+
+    with sqlite3.connect(codex_database) as restored:
+        assert restored.execute("SELECT value FROM marker").fetchall() == [
+            ("before",),
+        ]
+        assert [row[1] for row in restored.execute(
+            "PRAGMA table_info(marker)"
+        )] == ["value"]
+    assert not (claude_root / "registry.sqlite3").exists()
+    assert not Path(f"{codex_database}-wal").exists()
+    assert not Path(f"{codex_database}-shm").exists()
+
+
+def test_work_registry_migration_verifier_rejects_unowned_codex_rows(tmp_path):
+    roots = {
+        "claude": tmp_path / "claude-work",
+        "codex": tmp_path / "codex-work",
+    }
+    roots["codex"].mkdir()
+    database_path = roots["codex"] / "registry.sqlite3"
+    with sqlite3.connect(database_path) as database:
+        database.executescript(
+            """
+            CREATE TABLE work_sessions (
+                engine TEXT NOT NULL,
+                codex_profile_id TEXT
+            );
+            CREATE TABLE work_schedules (codex_profile_id TEXT);
+            CREATE TABLE work_schedule_runs (codex_profile_id TEXT);
+            INSERT INTO work_sessions VALUES ('codex', NULL);
+            INSERT INTO work_schedules VALUES (NULL);
+            INSERT INTO work_schedule_runs VALUES (NULL);
+            """
+        )
+    snapshot = tmp_path / "snapshot"
+    create_snapshot(snapshot, roots)
+
+    with pytest.raises(
+        WorkRegistrySnapshotError,
+        match="ownership migration is incomplete",
+    ):
+        verify_profile_migration(snapshot)
+
+    with sqlite3.connect(database_path) as database:
+        database.execute(
+            "UPDATE work_sessions SET codex_profile_id = 'primary'"
+        )
+        database.execute(
+            "UPDATE work_schedules SET codex_profile_id = 'primary'"
+        )
+        database.execute(
+            "UPDATE work_schedule_runs SET codex_profile_id = 'primary'"
+        )
+    verify_profile_migration(snapshot)
+
+
+def test_work_registry_roots_are_read_without_executing_service_config(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    env_file = tmp_path / "wrapper.env"
+    env_file.write_text(
+        f'CLAUDE_WORK_ROOT="{tmp_path / "Claude Work"}"\n'
+        f"CODEX_WORK_ROOT={tmp_path / 'codex-env'}\n"
+    )
+    plist = tmp_path / "wrapper.plist"
+    plist.write_bytes(plistlib.dumps({
+        "EnvironmentVariables": {
+            "CODEX_WORK_ROOT": str(tmp_path / "Codex Work"),
+        },
+    }))
+
+    roots = resolve_work_roots(home, env_file=env_file, plist=plist)
+
+    assert roots == {
+        "claude": (tmp_path / "Claude Work").resolve(),
+        "codex": (tmp_path / "Codex Work").resolve(),
+    }
 
 
 @pytest.mark.parametrize("destination_exists", [False, True])
@@ -546,7 +661,7 @@ def test_setup_protocol_gate_has_no_release_specific_literal():
     assert not re.search(r'"protocol"[^\n]*[0-9]+', source)
 
 
-def test_release_docs_and_examples_describe_one_atomic_v31_layout():
+def test_release_docs_and_examples_describe_one_atomic_v33_layout():
     deploy_readme = (ROOT / "deploy" / "README.md").read_text()
     readme = (ROOT / "README.md").read_text()
     readme_en = (ROOT / "README_en.md").read_text()
@@ -559,10 +674,10 @@ def test_release_docs_and_examples_describe_one_atomic_v31_layout():
     relay_env = (ROOT / "deploy" / "env.relay.example").read_text()
     unit = (ROOT / "deploy" / "cc-remote-relay.service").read_text()
 
-    assert "Protocol v31" in deploy_readme
+    assert "Protocol v33" in deploy_readme
     assert "v14" not in deploy_readme
     for document in (deploy_readme, readme, readme_en):
-        assert "v31" in document
+        assert "v33" in document
         assert "v16" not in document
         assert "v18" not in document
         assert "sudo rsync -a --delete" not in document
@@ -571,13 +686,35 @@ def test_release_docs_and_examples_describe_one_atomic_v31_layout():
     assert "CLAUDE_BIN=/home/youruser/.local/bin/claude" in wrapper_env
     assert "<key>CLAUDE_BIN</key>" in wrapper_plist
     assert "<string>__HOME__/.local/bin/claude</string>" in wrapper_plist
+    assert "CC_REMOTE_CODEX_PROFILES_JSON" in wrapper_env
+    assert "CC_REMOTE_CODEX_PROFILES_FILE" in wrapper_env
+    assert "Codex Work uses only that default" not in wrapper_env
+    assert "Work 只使用默认项" not in readme
+    assert "Work uses only the default" not in readme_en
+    assert "<key>CC_REMOTE_CODEX_PROFILES_FILE</key>" in wrapper_plist
+    assert "__HOME__/.cc-remote/codex-profiles.json" in wrapper_plist
+    assert "<key>CLAUDE_WORK_ROOT</key>" in wrapper_plist
+    assert "<string>__CLAUDE_WORK_ROOT__</string>" in wrapper_plist
+    assert "<key>CODEX_WORK_ROOT</key>" in wrapper_plist
+    assert "<string>__CODEX_WORK_ROOT__</string>" in wrapper_plist
     assert "printf 'CLAUDE_BIN=%s/.local/bin/claude" in wrapper_installer
     assert "daily Claude Code executable is missing" in wrapper_installer
+    snapshot = wrapper_installer.index('"${snapshot_args[@]}"')
+    activate = wrapper_installer.index(
+        '"$target/deploy/atomic_symlink.py" "$target" "$current"'
+    )
+    restore = wrapper_installer.index(
+        '"$target/deploy/work_registry_snapshot.py" restore'
+    )
+    restart = wrapper_installer.index("if ! restart_after_rollback")
+    assert snapshot < activate
+    assert restore < restart
+    assert "Codex Work profile migration did not become ready" in wrapper_installer
     assert "WEB_STATIC_DIR=/opt/cc-remote/current/web/dist" in relay_env
     assert "WorkingDirectory=/opt/cc-remote/current" in unit
     assert "ExecStart=/opt/cc-remote/current/.venv/bin/python" in unit
     assert "claude-agent-sdk==0.2.128" in claude
-    assert "protocol v31" in claude
+    assert "protocol v33" in claude
     assert "0.2.110" not in claude
     assert "protocol v10" not in claude
 

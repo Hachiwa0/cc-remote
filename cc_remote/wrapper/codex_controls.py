@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import stat
 import threading
+from typing import Callable
 from uuid import uuid4
 
 
@@ -85,6 +86,7 @@ class CodexControlStore:
     def __init__(self, state_dir: Path):
         self.path = Path(state_dir) / "codex-session-controls.json"
         self._lock = threading.RLock()
+        self._profile_revision = 0
         self._sessions = self._load()
 
     def get(self, session_id: str) -> CodexControls:
@@ -101,6 +103,107 @@ class CodexControlStore:
                 for session_id, values in self._sessions.items()
                 if (cwd := _controls(values).cwd_override) is not None
             }
+
+    def namespace_legacy_sessions(self, profile_id: str) -> int:
+        """Move pre-multi-account native keys into the default namespace."""
+        if not isinstance(profile_id, str) or not profile_id:
+            raise CodexControlStoreError("Codex profile id is invalid")
+        with self._lock:
+            updated = dict(self._sessions)
+            migrated = 0
+            for session_id in tuple(self._sessions):
+                if "@" in session_id:
+                    continue
+                target = _session_id(f"{profile_id}@{session_id}")
+                if target not in updated:
+                    updated[target] = updated[session_id]
+                updated.pop(session_id, None)
+                migrated += 1
+            if migrated:
+                self._persist(updated)
+                self._sessions = updated
+            return migrated
+
+    def denamespace_profile_sessions(self, profile_id: str) -> int:
+        """Expose one active profile through the legacy single-account keys.
+
+        Other profile-prefixed rows stay dormant so a temporary configuration
+        downgrade cannot erase their controls.
+        """
+        if not isinstance(profile_id, str) or not profile_id or "@" in profile_id:
+            raise CodexControlStoreError("Codex profile id is invalid")
+        prefix = f"{profile_id}@"
+        with self._lock:
+            updated = dict(self._sessions)
+            migrated = 0
+            for session_id in tuple(self._sessions):
+                if not session_id.startswith(prefix):
+                    continue
+                native_id = _session_id(session_id[len(prefix):])
+                updated[native_id] = updated[session_id]
+                updated.pop(session_id, None)
+                migrated += 1
+            if migrated:
+                self._persist(updated)
+                self._sessions = updated
+            return migrated
+
+    def remap_profile_sessions(self, remaps: dict[str, str]) -> int:
+        """Rename persisted profile prefixes after a same-home id rename."""
+        with self._lock:
+            updated = dict(self._sessions)
+            moves: list[tuple[str, str, dict[str, object]]] = []
+            for session_id in tuple(self._sessions):
+                if "@" not in session_id:
+                    continue
+                old_id, native_id = session_id.split("@", 1)
+                new_id = remaps.get(old_id)
+                if not new_id or new_id == old_id:
+                    continue
+                target = _session_id(f"{new_id}@{native_id}")
+                moves.append((session_id, target, updated[session_id]))
+            sources = {source for source, _target, _value in moves}
+            for source in sources:
+                updated.pop(source, None)
+            for _source, target, value in moves:
+                if target not in updated or target in sources:
+                    updated[target] = value
+            migrated = len(moves)
+            if migrated:
+                self._persist(updated)
+                self._sessions = updated
+            return migrated
+
+    def migrate_profile_sessions(
+        self,
+        transform: Callable[[str], str],
+        *,
+        profile_revision: int,
+    ) -> int:
+        """Atomically translate every wire id once for a topology revision."""
+        if (
+            isinstance(profile_revision, bool)
+            or not isinstance(profile_revision, int)
+            or profile_revision < 1
+        ):
+            raise CodexControlStoreError(
+                "Codex profile revision is invalid")
+        with self._lock:
+            if self._profile_revision >= profile_revision:
+                return 0
+            updated: dict[str, dict[str, str]] = {}
+            migrated = 0
+            for session_id, values in self._sessions.items():
+                target = _session_id(transform(session_id))
+                if target in updated and updated[target] != values:
+                    raise CodexControlStoreError(
+                        "Codex profile migration collides")
+                updated[target] = values
+                migrated += target != session_id
+            self._persist(updated, profile_revision=profile_revision)
+            self._sessions = updated
+            self._profile_revision = profile_revision
+            return migrated
 
     def update(
         self,
@@ -304,6 +407,14 @@ class CodexControlStore:
                 or len(sessions) > _MAX_ENTRIES):
             raise CodexControlStoreError(
                 "Codex control store has invalid shape")
+        profile_revision = raw.get("profile_revision", 0)
+        if (
+            isinstance(profile_revision, bool)
+            or not isinstance(profile_revision, int)
+            or profile_revision < 0
+        ):
+            raise CodexControlStoreError(
+                "Codex control store has invalid profile revision")
         loaded: dict[str, dict[str, str]] = {}
         for raw_id, values in sessions.items():
             if not isinstance(values, dict):
@@ -315,14 +426,27 @@ class CodexControlStore:
             controls = _controls(values)
             if controls.as_dict():
                 loaded[session_id] = controls.as_dict()
+        self._profile_revision = profile_revision
         return loaded
 
-    def _persist(self, sessions: dict[str, dict[str, str]]) -> None:
+    def _persist(
+        self,
+        sessions: dict[str, dict[str, str]],
+        *,
+        profile_revision: int | None = None,
+    ) -> None:
         parent = self.path.parent
         parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(parent, 0o700)
         payload = json.dumps(
-            {"version": 1, "sessions": sessions},
+            {
+                "version": 1,
+                "profile_revision": (
+                    self._profile_revision
+                    if profile_revision is None else profile_revision
+                ),
+                "sessions": sessions,
+            },
             ensure_ascii=False,
             separators=(",", ":"),
             sort_keys=True,

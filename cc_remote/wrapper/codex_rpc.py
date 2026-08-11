@@ -17,6 +17,14 @@ _RPC_TIMEOUT = 30.0
 _STREAM_LIMIT = 16 * 1024 * 1024
 
 
+def _child_env(bin_path: str, codex_home: Optional[str]) -> dict[str, str]:
+    # Preserve the one-argument compatibility seam used by existing tests and
+    # embedders when the legacy/default profile is selected.
+    if codex_home is None:
+        return _codex_env(bin_path)
+    return _codex_env(bin_path, codex_home)
+
+
 class CodexRpcRejected(RuntimeError):
     """The app-server returned an explicit JSON-RPC rejection."""
 
@@ -74,6 +82,7 @@ async def _stop_process(proc: asyncio.subprocess.Process) -> None:
 
 async def codex_rpc(
     method: str, params: Optional[dict[str, Any]], cwd: Optional[str] = None,
+    codex_home: Optional[str] = None,
 ) -> Any:
     """Initialize one app-server, issue one request, then always reap it.
 
@@ -97,7 +106,7 @@ async def codex_rpc(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
         cwd=workdir,
-        env=_codex_env(bin_path),
+        env=_child_env(bin_path, codex_home),
         limit=_STREAM_LIMIT,
     )
 
@@ -175,6 +184,7 @@ async def codex_rpc_batch(
     cwd: Optional[str] = None,
     *,
     timeout: float = _RPC_TIMEOUT,
+    codex_home: Optional[str] = None,
 ) -> list[Any | Exception]:
     """Issue a read-only request batch through one initialized app-server.
 
@@ -215,7 +225,7 @@ async def codex_rpc_batch(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
             cwd=workdir,
-            env=_codex_env(bin_path),
+            env=_child_env(bin_path, codex_home),
             limit=_STREAM_LIMIT,
         ),
         timeout=remaining(),

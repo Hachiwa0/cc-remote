@@ -35,6 +35,7 @@ from cc_remote.protocol import (
     SetPerm,
     SessionControl,
     SessionList,
+    StateEvent,
     SwitchSession,
     Takeover,
     TakeoverState,
@@ -215,6 +216,45 @@ def test_duplicate_safe_read_reexecutes_handler_before_ack():
         assert len([
             msg for msg in transport.sent if isinstance(msg, CommandAck)
         ]) == 2
+
+    asyncio.run(run())
+
+
+def test_duplicate_resident_switch_reseeds_current_state_with_new_sequence():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("claude-1", "claude-1")
+        ctx.sdk = SimpleNamespace(
+            permission_mode="default",
+            model="claude-sonnet-5",
+            effort="high",
+        )
+        machine.sessions[ctx.key] = ctx
+        command = SwitchSession(
+            session_id=ctx.key,
+            engine="claude",
+            space="code",
+            cmd_id="switch-1",
+            client_id="client-1",
+        )
+
+        await machine._process_command(command)
+        initial = [
+            event for event in transport.sent if isinstance(event, StateEvent)
+        ]
+        assert [event.state for event in initial] == ["idle"]
+        assert initial[0].seq is not None
+
+        await machine._set_state(ctx, "running")
+        await machine._process_command(command)
+
+        states = [
+            event for event in transport.sent if isinstance(event, StateEvent)
+        ]
+        assert [event.state for event in states] == [
+            "idle", "running", "running"]
+        assert states[-1].seq > states[-2].seq > states[0].seq
+        assert states[-1].sid == ctx.key
 
     asyncio.run(run())
 

@@ -2,16 +2,33 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import json
 import os
 import shutil
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
+
+import pytest
+
 from cc_remote.protocol import History, Query, SessionActivity, Takeover
 from cc_remote.wrapper import machine as machine_module
 from cc_remote.wrapper.codex_external import (
-    CodexTuiLogTracker, HolderScan, ProcessIdentity, parse_turn_markers,
+    CodexTuiLogTracker, HolderScan, ProcessIdentity,
+    _darwin_writable_rollout_holders,
+    codex_app_server_client_socket, codex_app_server_proxy_socket,
+    parse_turn_markers,
     writable_rollout_holders,
+)
+from cc_remote.wrapper.process_scan import (
+    _darwin_needs_engine_argv,
+    _parse_darwin_procargs,
+    process_command,
+    process_command_environment_value,
+    process_environment_value,
+    process_identity,
 )
 from tests.test_multisession import _mk_ctx, _mk_machine
 
@@ -76,6 +93,333 @@ def _watch(path: Path) -> dict:
         "takeover_interactive_holders": set(),
         "partial": b"",
     }
+
+
+def test_codex_app_server_proxy_socket_requires_one_absolute_socket(
+    monkeypatch,
+):
+    identity = ProcessIdentity(99, 123)
+
+    def socket_for(args: tuple[bytes, ...] | None) -> str | None:
+        monkeypatch.setattr(
+            "cc_remote.wrapper.codex_external.process_command",
+            lambda exact_identity: args if exact_identity == identity else None,
+        )
+        return codex_app_server_proxy_socket(identity)
+
+    expected = str(Path("/tmp/codex-stack.sock").resolve())
+    assert socket_for((
+        b"/usr/local/bin/codex", b"app-server", b"proxy",
+        b"--sock", b"/tmp/codex-stack.sock",
+    )) == expected
+    assert socket_for((
+        b"codex", b"app-server", b"proxy",
+        b"--sock=/tmp/codex-stack.sock",
+    )) == expected
+    for args in (
+        None,
+        (b"codex", b"app-server", b"daemon"),
+        (b"codex", b"app-server", b"proxy"),
+        (b"codex", b"app-server", b"proxy", b"--sock"),
+        (b"codex", b"app-server", b"proxy", b"--sock", b"relative.sock"),
+        (
+            b"codex", b"app-server", b"proxy",
+            b"--sock=/tmp/one.sock", b"--sock=/tmp/two.sock",
+        ),
+    ):
+        assert socket_for(args) is None
+
+
+def test_codex_app_server_client_socket_routes_implicit_profile_home(
+    monkeypatch,
+):
+    identity = ProcessIdentity(99, 123)
+    args: tuple[bytes, ...] = (
+        b"/usr/local/bin/codex", b"app-server", b"proxy",
+    )
+    home: str | None = None
+    monkeypatch.setattr(
+        "cc_remote.wrapper.codex_external.process_command_environment_value",
+        lambda exact_identity, key: (
+            (True, args, home)
+            if exact_identity == identity and key == "CODEX_HOME"
+            else (False, None, None)
+        ),
+    )
+
+    default_home = "/Users/test/.codex"
+    assert codex_app_server_client_socket(
+        identity, default_codex_home=default_home,
+    ) == (True, str(Path(default_home, "app-server-control",
+                         "app-server-control.sock").resolve()))
+
+    home = "/Volumes/Stack/.codex"
+    assert codex_app_server_client_socket(
+        identity, default_codex_home=default_home,
+    ) == (True, str(Path(home, "app-server-control",
+                         "app-server-control.sock").resolve()))
+
+    args = (b"/usr/local/bin/codex", b"resume", b"session-id")
+    assert codex_app_server_client_socket(
+        identity, default_codex_home=default_home,
+    ) == (True, str(Path(home, "app-server-control",
+                         "app-server-control.sock").resolve()))
+
+    home = "relative/profile"
+    assert codex_app_server_client_socket(
+        identity, default_codex_home=default_home,
+    ) == (False, None)
+
+    monkeypatch.setattr(
+        "cc_remote.wrapper.codex_external.process_command_environment_value",
+        lambda exact_identity, key: (False, args, None),
+    )
+    assert codex_app_server_client_socket(
+        identity, default_codex_home=default_home,
+    ) == (False, None)
+
+    socket_with_spaces = "/Volumes/Muggle SSD/codex socket.sock"
+    args = (
+        b"/usr/local/bin/codex", b"app-server", b"proxy", b"--sock",
+        os.fsencode(socket_with_spaces),
+    )
+    assert codex_app_server_client_socket(
+        identity, default_codex_home=default_home,
+    ) == (True, os.path.realpath(socket_with_spaces))
+
+
+def test_darwin_holder_scan_exposes_interactive_tui_as_daemon_client(
+    tmp_path, monkeypatch,
+):
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_text("", encoding="utf-8")
+    identity = ProcessIdentity(77, 456)
+
+    class Completed:
+        returncode = 1
+        stdout = ""
+
+    monkeypatch.setattr(
+        "cc_remote.wrapper.codex_external.subprocess.run",
+        lambda *args, **kwargs: Completed(),
+    )
+    monkeypatch.setattr(
+        "cc_remote.wrapper.codex_external.darwin_process_snapshot",
+        lambda: ([
+            (
+                identity,
+                1,
+                1,
+                (b"/usr/local/bin/codex", b"resume", b"session-id"),
+            ),
+        ], True),
+    )
+
+    scan = _darwin_writable_rollout_holders(
+        {"session-id": str(rollout)}, set(),
+    )
+
+    assert scan.complete is True
+    assert scan.holders == {"session-id": {identity}}
+    assert scan.logical_holders == {"session-id": {identity}}
+    assert scan.client_proxies == {
+        identity: identity.start_ticks,
+    }
+
+
+def test_darwin_writable_fd_supersedes_resume_argv_evidence(
+    tmp_path, monkeypatch,
+):
+    sid = "session-id"
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_text("", encoding="utf-8")
+    stat = rollout.stat()
+    identity = ProcessIdentity(79, 458)
+    process = (
+        identity,
+        1,
+        1,
+        (b"/usr/local/bin/codex", b"resume", sid.encode()),
+    )
+
+    class Completed:
+        returncode = 0
+        stdout = (
+            f"p{identity.pid}\nf5\naw\nD{stat.st_dev}\n"
+            f"i{stat.st_ino}\nn{rollout}\n"
+        )
+
+    monkeypatch.setattr(
+        "cc_remote.wrapper.codex_external.subprocess.run",
+        lambda *args, **kwargs: Completed(),
+    )
+    monkeypatch.setattr(
+        "cc_remote.wrapper.codex_external._darwin_process_info",
+        lambda _pid: process,
+    )
+
+    scan = _darwin_writable_rollout_holders(
+        {sid: str(rollout)}, set(),
+        process_snapshot=([process], True),
+    )
+
+    assert scan.complete is True
+    assert scan.holders == {sid: {identity}}
+    assert scan.logical_holders == {sid: set()}
+
+
+def test_parse_darwin_procargs_preserves_spaces_unicode_and_equals():
+    args = (
+        b"/usr/local/bin/codex",
+        b"app-server",
+        b"proxy",
+        "--sock=/Volumes/Muggle SSD/神话.sock".encode(),
+    )
+    environment = (
+        "CODEX_HOME=/Volumes/Muggle SSD/帐号=a".encode(),
+        b"UNCHANGED=value=with=equals",
+    )
+    raw = (
+        len(args).to_bytes(
+            ctypes.sizeof(ctypes.c_int), sys.byteorder, signed=True)
+        + b"/usr/local/bin/codex\0\0"
+        + b"\0".join(args)
+        + b"\0"
+        + b"\0".join(environment)
+        + b"\0\0"
+    )
+
+    assert _parse_darwin_procargs(raw) == (args, environment)
+
+
+def test_darwin_argv_scan_ignores_other_user_node_processes(monkeypatch):
+    identity = ProcessIdentity(78, 457)
+    monkeypatch.setattr(
+        "cc_remote.wrapper.process_scan.os.getuid", lambda: 501)
+
+    assert _darwin_needs_engine_argv(
+        (identity, 1, 0, 501, b"node", b"node")) is True
+    assert _darwin_needs_engine_argv(
+        (identity, 1, 0, 0, b"node", b"node")) is False
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS kernel API")
+def test_darwin_kernel_payload_preserves_spaced_profile_home():
+    profile_home = "/tmp/cc remote/CODEX_HOME=stack"
+    argument = "argument with spaces=value"
+    environment = dict(os.environ)
+    environment["CODEX_HOME"] = profile_home
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import time; time.sleep(30)",
+            argument,
+        ],
+        env=environment,
+    )
+    try:
+        identity = process_identity(child.pid)
+        assert identity is not None
+        complete, args, value = process_command_environment_value(
+            identity, "CODEX_HOME")
+        assert complete is True
+        assert args is not None and args[-1] == os.fsencode(argument)
+        assert value == profile_home
+    finally:
+        child.terminate()
+        try:
+            child.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait(timeout=2)
+
+
+def test_process_command_is_bound_to_exact_process_identity(tmp_path):
+    proc_root = tmp_path / "proc"
+    _fake_process(
+        proc_root,
+        100,
+        456,
+        cmdline=("codex", "app-server", "proxy", "--sock", "/tmp/x.sock"),
+    )
+
+    assert process_command(
+        ProcessIdentity(100, 456), proc_root=str(proc_root),
+    ) == (b"codex", b"app-server", b"proxy", b"--sock", b"/tmp/x.sock")
+    assert process_command(
+        ProcessIdentity(100, 455), proc_root=str(proc_root),
+    ) is None
+
+
+def test_process_environment_value_distinguishes_absent_from_failed_read(
+    tmp_path,
+):
+    proc_root = tmp_path / "proc"
+    proc = _fake_process(
+        proc_root, 101, 457,
+        cmdline=("codex", "resume", "session-id"),
+    )
+    identity = ProcessIdentity(101, 457)
+    (proc / "environ").write_bytes(
+        b"CODEX_HOME=/Volumes/Stack/.codex\0SECRET=not-returned\0")
+
+    assert process_environment_value(
+        identity, "CODEX_HOME", proc_root=str(proc_root),
+    ) == (True, "/Volumes/Stack/.codex")
+    assert process_environment_value(
+        identity, "MISSING", proc_root=str(proc_root),
+    ) == (True, None)
+    assert process_environment_value(
+        ProcessIdentity(101, 458), "CODEX_HOME", proc_root=str(proc_root),
+    ) == (False, None)
+
+    (proc / "environ").write_bytes(
+        b"CODEX_HOME=/one\0CODEX_HOME=/two\0")
+    assert process_environment_value(
+        identity, "CODEX_HOME", proc_root=str(proc_root),
+    ) == (False, None)
+
+
+def test_process_command_environment_value_keeps_exact_argv_and_home(
+    tmp_path,
+):
+    proc_root = tmp_path / "proc"
+    proc = _fake_process(
+        proc_root, 102, 458,
+        cmdline=(
+            "codex", "app-server", "proxy", "--sock",
+            "/Volumes/Muggle SSD/socket=name.sock",
+        ),
+    )
+    (proc / "environ").write_bytes(
+        "CODEX_HOME=/Volumes/Muggle SSD/profile=name\0".encode())
+    identity = ProcessIdentity(102, 458)
+
+    assert process_command_environment_value(
+        identity, "CODEX_HOME", proc_root=str(proc_root),
+    ) == (
+        True,
+        (
+            b"codex", b"app-server", b"proxy", b"--sock",
+            b"/Volumes/Muggle SSD/socket=name.sock",
+        ),
+        "/Volumes/Muggle SSD/profile=name",
+    )
+
+
+def test_incomplete_codex_owner_scan_is_a_write_barrier(tmp_path):
+    machine, _transport = _mk_machine()
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_text("", encoding="utf-8")
+    sid = "codex-sid"
+    watch = _watch(rollout)
+    watch["scan_complete"] = False
+    machine._watch[sid] = watch
+
+    assert machine._is_external(sid) is True
+    watch["scan_complete"] = True
+    assert machine._is_external(sid) is False
 
 
 class _CodexSdk:
@@ -233,6 +577,54 @@ def test_tui_log_tracker_binds_only_exact_resumed_thread(tmp_path):
     assert bindings == {first: {proxy}, second: set()}
 
 
+def test_tui_log_tracker_binds_loaded_thread_then_clears_on_unsubscribe(
+    tmp_path,
+):
+    sid = "019fdcfa-cb1f-7bc0-88d6-913290e49e16"
+    sibling = "019fdcfa-cb1f-7bc0-88d6-913290e49e17"
+    proxy = ProcessIdentity(219, 2109)
+    log_path = tmp_path / "logs.sqlite"
+    db = _codex_log_db(log_path)
+    _log(
+        db,
+        "codex_app_server::request_processors::thread_processor",
+        "app_server.request{otel.name=\"thread/resume\" "
+        "rpc.transport=\"unix_socket\" app_server.connection_id=9 "
+        "app_server.client_name=\"codex-tui\"}:"
+        "resume_running_thread: thread/resume overrides ignored for loaded "
+        f"thread {sid}: permissions override was provided and ignored",
+    )
+    tracker = CodexTuiLogTracker(str(log_path))
+
+    first, complete = tracker.bindings(
+        {sid, sibling}, {proxy: 1_000_000_000})
+
+    assert complete is True
+    assert first == {sid: {proxy}, sibling: set()}
+
+    _log(
+        db,
+        "codex_app_server::message_processor",
+        "app-server request: thread/unsubscribe "
+        "connection_id=ConnectionId(9) request_id=Integer(12)",
+    )
+    db.close()
+    second, complete = tracker.bindings(
+        {sid, sibling}, {proxy: 1_000_000_000})
+
+    assert complete is True
+    assert second == {sid: set(), sibling: set()}
+
+
+def test_tui_loaded_thread_parser_rejects_unscoped_uuid_text():
+    sid = "019fdcfa-cb1f-7bc0-88d6-913290e49e16"
+
+    assert CodexTuiLogTracker._thread_id(f"loaded thread {sid}") is None
+    assert CodexTuiLogTracker._thread_id(
+        f"thread/start overrides ignored for loaded thread {sid}"
+    ) is None
+
+
 def test_tui_log_tracker_clears_binding_on_unsubscribe(tmp_path):
     sid = "019f49bc-f146-70b3-bfcb-1b7f2a50901d"
     proxy = ProcessIdentity(217, 2107)
@@ -326,6 +718,8 @@ def test_idle_codex_resume_tui_is_a_logical_interactive_holder(tmp_path):
     assert scan.holders[sid] == {
         ProcessIdentity(221, 2201), ProcessIdentity(222, 2202)}
     assert scan.passive_holders[sid] == {ProcessIdentity(221, 2201)}
+    assert scan.logical_holders[sid] == {ProcessIdentity(222, 2202)}
+    assert ProcessIdentity(222, 2202) in scan.client_proxies
     assert tui.exists()
 
 
@@ -338,7 +732,7 @@ def test_codex_resume_tui_matches_only_explicit_target_sid(tmp_path):
     sibling_rollout.write_bytes(b"")
     proc_root = tmp_path / "proc"
     identity = ProcessIdentity(223, 2203)
-    _fake_process(
+    tui = _fake_process(
         proc_root, identity.pid, identity.start_ticks, tty=34819,
         # The second UUID is the optional PROMPT. It must not make a sibling
         # session appear terminal-attached merely because its text is a SID.
@@ -347,6 +741,7 @@ def test_codex_resume_tui_matches_only_explicit_target_sid(tmp_path):
             target, sibling,
         ),
     )
+    _fake_fd(tui, 5, target_rollout, os.O_WRONLY | os.O_APPEND)
 
     scan = writable_rollout_holders(
         {target: str(target_rollout), sibling: str(sibling_rollout)},
@@ -358,6 +753,8 @@ def test_codex_resume_tui_matches_only_explicit_target_sid(tmp_path):
     assert scan.holders[sibling] == set()
     assert scan.passive_holders[target] == set()
     assert scan.passive_holders[sibling] == set()
+    assert scan.logical_holders[target] == set()
+    assert scan.logical_holders[sibling] == set()
 
 
 def test_codex_resume_last_does_not_treat_uuid_prompt_as_target(tmp_path):
@@ -545,6 +942,39 @@ def test_turn_marker_parser_reports_visible_user_message_without_turn_id():
     assert parse_turn_markers(visible).has_visible_user_message is True
     assert parse_turn_markers(envelope).has_visible_user_message is False
     assert parse_turn_markers(ambient_request).has_visible_user_message is True
+
+
+def test_turn_marker_parser_accepts_codex_0147_user_items():
+    visible = (json.dumps({
+        "type": "event_msg",
+        "payload": {
+            "type": "item_completed",
+            "turn_id": "turn-modern",
+            "item": {
+                "id": "user-modern",
+                "type": "UserMessage",
+                "content": [{"type": "text", "text": "CLI prompt"}],
+            },
+        },
+    }) + "\n").encode()
+    internal = (json.dumps({
+        "type": "event_msg",
+        "payload": {
+            "type": "item_completed",
+            "turn_id": "turn-modern",
+            "item": {
+                "id": "user-internal",
+                "type": "UserMessage",
+                "content": [{
+                    "type": "text",
+                    "text": "<permissions>internal</permissions>",
+                }],
+            },
+        },
+    }) + "\n").encode()
+
+    assert parse_turn_markers(visible).has_visible_user_message is True
+    assert parse_turn_markers(internal).has_visible_user_message is False
 
 
 def test_codex_own_delayed_flush_does_not_mirror_or_lock(tmp_path):
@@ -1814,7 +2244,9 @@ class _RunTurnSdk(_CodexSdk):
     async def force_reconnect(self, **_kwargs):
         self.reconnects += 1
 
-    async def query(self, _prompt, images=None):
+    async def query(
+        self, _prompt, images=None, *, client_user_message_id=None,
+    ):
         self.queries += 1
 
     async def receive_response(self):

@@ -13,6 +13,7 @@ import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from itertools import islice
+from pathlib import Path
 from typing import Optional
 from urllib.parse import urlsplit
 
@@ -134,9 +135,17 @@ def resolve_codex_bin() -> str:
     return best
 
 
-def codex_env(bin_path: str) -> dict[str, str]:
+def codex_env(
+    bin_path: str,
+    codex_home: str | os.PathLike[str] | None = None,
+) -> dict[str, str]:
     """Build the sanitized environment for wrapper-owned Codex subprocesses."""
     env = sanitized_child_env()
+    if codex_home is not None:
+        home = Path(codex_home).expanduser()
+        if not home.is_absolute():
+            raise ValueError("CODEX_HOME must be absolute")
+        env["CODEX_HOME"] = str(home.resolve(strict=False))
     proxy = os.environ.get("CC_REMOTE_CODEX_PROXY", "").strip()
     if proxy:
         scheme = urlsplit(proxy).scheme.lower()

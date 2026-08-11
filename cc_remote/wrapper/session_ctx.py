@@ -38,6 +38,38 @@ class CodexGoalMutation:
 
 
 @dataclass
+class ClaudeClientAliasProbe:
+    """Frozen transcript append boundary for one browser-originated turn."""
+
+    msg_id: str
+    generation: int
+    session_id: Optional[str]
+    path: Optional[str]
+    file_id: Optional[tuple[int, int]]
+    offset: int
+    allow_new_file: bool
+    partial: bytes = b""
+
+
+@dataclass(frozen=True)
+class ActiveTurnBinding:
+    """Exact logical/native owner of the currently live turn segment.
+
+    Browser runtimes intentionally do not persist reducer ownership metadata.
+    A reconnect cursor may therefore sit after the original TurnBinding even
+    though the rebuilt page still needs that identity before replaying tail
+    frames.  Keep the authoritative wire identity and its original ordering
+    boundary beside the resident session; never infer it from output text or a
+    generic process turn id.
+    """
+
+    msg_id: str
+    turn_id: str
+    seq: int
+    generation: str
+
+
+@dataclass
 class SessionContext:
     # None until the first ResultMessage/init SystemMessage captures the real id
     # (a brand-new session). A resumed session knows its id at spawn time.
@@ -54,6 +86,11 @@ class SessionContext:
     seq: int = 0                       # per-session monotonic counter
     state: State = "idle"
     engine: str = "claude"             # "claude" (SdkHandle) | "codex" (CodexHandle)
+    # Codex's complete local account boundary. ``session_id`` remains the
+    # native app-server UUID while ``key`` is the browser-facing routing id
+    # (namespaced for every profile when multiple profiles are configured).
+    # Claude leaves this unset.
+    codex_profile_id: Optional[str] = None
     # Product-space identity. Work sessions are native engine sessions whose
     # cwd and metadata are owned by cc-remote's private Work registry.
     space: str = "code"
@@ -83,6 +120,11 @@ class SessionContext:
     # Correlates asynchronous turn crashes/drain failures with the optimistic
     # client turn. Control-command errors must never terminate an unrelated turn.
     active_msg_id: Optional[str] = None
+    # Latest exact TurnBinding/TurnSteered owner in this wrapper generation.
+    # It is client-reseeded on hello when the reconnect cursor has already
+    # consumed the original binding frame. It never survives a terminal/idle
+    # boundary and is not a substitute for the engine's native lifecycle.
+    active_turn_binding: Optional[ActiveTurnBinding] = None
     # Interrupt must wake a consumer that is already blocked in queue.get().  The
     # absolute monotonic deadline prevents each subsequent queue item from
     # restarting the drain timeout.
@@ -119,6 +161,11 @@ class SessionContext:
     # managed turn stream so the session remains single-writer and interruptible.
     codex_spontaneous_turn_id: Optional[str] = None
     codex_spontaneous_task: Optional[asyncio.Task] = None
+    # Do not invent an empty native-turn anchor before the app-server reveals
+    # whether a spontaneous turn came from a real CLI user item. The official
+    # user item id is also History's durable identity; Goal/automatic turns keep
+    # the native turn id only when no such user boundary exists.
+    codex_spontaneous_anchor_id: Optional[str] = None
     # A matching cached Goal is not proof that the current command applied it.
     # Keep the exact command scope and the automatic turn claimed while its RPC
     # was in flight; retries are idempotent only while that turn remains live.
@@ -132,9 +179,27 @@ class SessionContext:
     # with the same clientId confirms it, or the enclosing turn terminates.
     # ``Any`` avoids coupling this shared context module to a v21 wire class.
     codex_uncertain_steer: Any = None
+    # Successful Remote steers are published before app-server releases their
+    # official userMessage items. Preserve that client id until the live consumer
+    # can reconcile the official item without rendering a second steer boundary.
+    # The machine keeps this insertion-ordered mapping bounded and clears it at
+    # the enclosing native terminal.
+    codex_published_steers: dict[str, str] = field(default_factory=dict)
+    # The rollout path may lag the official live item. Retain only its bounded
+    # identity proof until it can be attached to that exact rollout inode.
+    codex_pending_steer_user_identities: dict[str, Any] = field(
+        default_factory=dict)
     # A shared-daemon turn started by Remote is leased on disk so a replacement
     # wrapper can safely reattach without classifying it as Codex App ownership.
     codex_owned_turn_id: Optional[str] = None
+    # Last logical message id successfully written into that durable lease.
+    # This deliberately differs from active_msg_id after a transient write
+    # failure so the next authoritative boundary can retry the same CAS base.
+    codex_owned_msg_id: Optional[str] = None
+    # Immutable browser owner of the first visible segment in the leased native
+    # turn. Later steers move ``codex_owned_msg_id`` but must not erase the
+    # identity required to rebuild completed history after a wrapper restart.
+    codex_owned_initial_msg_id: Optional[str] = None
     codex_recovered_turn_id: Optional[str] = None
     codex_recovered_msg_id: Optional[str] = None
     codex_recovered_automatic: Optional[bool] = None
@@ -171,6 +236,24 @@ class SessionContext:
     # the transcript. ``state=running`` starts earlier, during reconnect and
     # final ownership checks, so it is not sufficient write attribution.
     claude_write_active: bool = False
+    # Claude may legitimately remain silent while reasoning, running a tool, or
+    # waiting on its provider. Keep a turn-local activity clock so the wrapper
+    # can explain that silence without treating it as a timeout or breaking the
+    # mandatory ResultMessage drain. AskUser callbacks run beside the response
+    # iterator, so an Event wakes that iterator's wait when a question opens or
+    # closes and restarts the neutral notice clock from the right boundary.
+    claude_last_activity_at: float = 0.0
+    claude_activity_event: asyncio.Event = field(default_factory=asyncio.Event)
+    claude_progress_notice_active: bool = False
+    # Claude assigns transcript UUIDs inside its child. A turn-local append
+    # boundary learns the first real sdk-py user row without waiting for the
+    # later --replay-user-messages echo; replay remains the exact fallback.
+    # Keep a bounded same-process copy while the durable, source-bound store is
+    # unavailable or a new session has not captured its real id/path yet.
+    claude_client_message_ids: dict[str, str] = field(default_factory=dict)
+    claude_client_alias_bound_msg_id: Optional[str] = None
+    claude_client_alias_generation: int = 0
+    claude_client_alias_probe: Optional[ClaudeClientAliasProbe] = None
     # Authoritative v15 ownership/control projection.  These fields belong to
     # the resident session rather than to any browser so reconnects and history
     # refreshes cannot resurrect a stale read-only banner.  `control_revision`

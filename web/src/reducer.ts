@@ -15,7 +15,7 @@ import type {
   QueryImg, QueryFile, DirEntry, AssistantChannel, ProcessStatus,
   CollaborationModeName, Notice, RateLimitUpdate,
   StatusRateLimit, StatusRateWindow, SessionControl, PermissionProfileInfo,
-  PreviewAuthorizationOperation,
+  PreviewAuthorizationOperation, CodexProfileInfo,
 } from "./protocol";
 import type { SendMode } from "./composer-submit";
 import {
@@ -70,6 +70,7 @@ import {
 import type { HistoryDetailRequestContext } from "./history-requests";
 import { boundRuntimeTurns, pruneRuntimeMap } from "./runtime-bounds";
 import { bumpSessionActivity, setSessionPinned } from "./session-order";
+import { normalizeSessionList } from "./session-list";
 import { presentCommandProblem, presentTurnProblem } from "./problem-presentation";
 import {
   matchQueryAcceptanceHistory,
@@ -107,6 +108,23 @@ const MAX_LIVE_SPILL_ARCHIVE_CHARS = 16 * 1024 * 1024;
 // simultaneous startup/config/security warnings available without allowing a
 // noisy app-server to grow every resident session indefinitely.
 export const MAX_SESSION_NOTICES = 8;
+
+/** Account-sensitive model/default cache key. Claude remains byte-for-byte
+ * compatible with its historical engine key; every Codex CODEX_HOME gets an
+ * isolated lane so a late response can only update its own account. */
+export function modelCatalogScopeKey(
+  engine: string,
+  codexProfileId?: string | null,
+): string {
+  return engine === "codex"
+    ? `codex\u0000${codexProfileId || "__default__"}`
+    : engine;
+}
+
+export function nativeCodexSessionId(sessionId: string): string {
+  const separator = sessionId.indexOf("@");
+  return separator >= 0 ? sessionId.slice(separator + 1) : sessionId;
+}
 
 export interface PendingQuery {
   msg_id?: string;
@@ -219,6 +237,16 @@ export interface SessionRuntime {
   // Latest ordered live-row owner and the downstream sequence which established
   // it. This stays runtime-only and is never persisted as conversation content.
   liveOwner: { turnId: string; seq: number } | null;
+  // Exact logical/native owner announced by TurnBinding but not yet consumed by
+  // a narrative frame. Keeping this runtime-only prevents a wrapper restart
+  // from manufacturing a second prompt-less row while preserving the sequence
+  // and generation fences which make delayed replay safe.
+  pendingLiveBinding: {
+    msgId: string;
+    turnId: string;
+    seq: number;
+    generation: string | null;
+  } | null;
   // A wrapper restart invalidated every unscoped liveTaskId fallback still
   // present in the visible projection. New-generation events establish an
   // ordered owner; old legacy identities remain ineligible for this generation.
@@ -318,7 +346,13 @@ export interface AppState {
     cwdSource: "default" | "inherited" | "explicit";
     model: string | null;
     effort: string | null;
+    codexProfileId: string | null;
   } | null;
+  // Public labels/errors only; CODEX_HOME never crosses the wire. Selection is
+  // scoped like cwd so Code accounts cannot leak across devices or surfaces.
+  codexProfiles: CodexProfileInfo[];
+  defaultCodexProfileId: string | null;
+  codexProfileByScope: Record<string, string>;
   // sessions + multi-session runtimes
   sessions: SessionInfo[];
   focusedSid: string | null;
@@ -372,7 +406,8 @@ export function createRuntime(): SessionRuntime {
     historyGeneration: null, pendingHistoryGeneration: null,
     pendingHistoryCandidateBuildSeq: null,
     historyBuildSeq: 0, historyLiveSeq: 0,
-    historyFence: null, liveOwner: null, legacyLiveFallbackBlocked: false,
+    historyFence: null, liveOwner: null, pendingLiveBinding: null,
+    legacyLiveFallbackBlocked: false,
     lastLiveSeq: 0, lastLifecycleSeq: 0,
     hasLoadedOlderHistory: false,
     hydratedCacheTurnIds: [],
@@ -443,8 +478,9 @@ export type Action =
   | { type: "prune_runtimes"; protectedSids: string[] }
   | { type: "answer_question"; sid: string; ask_id: string }
   | { type: "dismiss_notice"; sid: string; noticeId: string }
-  | { type: "enter_new_chat"; cwd: string; cwdSource?: "default" | "inherited" | "explicit"; model?: string | null; effort?: string | null }
+  | { type: "enter_new_chat"; cwd: string; cwdSource?: "default" | "inherited" | "explicit"; model?: string | null; effort?: string | null; codexProfileId?: string | null }
   | { type: "set_new_chat_cwd"; cwd: string; cwdSource?: "default" | "inherited" | "explicit" }
+  | { type: "set_new_chat_codex_profile"; scopeKey: string; profileId: string }
   | { type: "clear_scope_cwd"; scopeKey: string }
   | { type: "set_new_chat_model"; model: string | null }
   | { type: "set_new_chat_effort"; effort: string | null }
@@ -460,6 +496,9 @@ export const initialState: AppState = {
   dirPicker: null,
   cwdByScope: {},
   newChat: null,
+  codexProfiles: [],
+  defaultCodexProfileId: null,
+  codexProfileByScope: {},
   sessions: [],
   focusedSid: null,
   runtimes: {},
@@ -673,6 +712,140 @@ function findExplicitLiveTaskOwner(
     !turn.done && !!turn.liveTaskId);
 }
 
+function runtimeOrderingGeneration(runtime: SessionRuntime): string | null {
+  return runtime.controlGeneration ?? runtime.historyGeneration;
+}
+
+function activatePendingLiveBinding(
+  runtime: SessionRuntime,
+  turns: Turn[],
+  eventSeq: number | null | undefined,
+  nativeTurnId?: string | null,
+  create = true,
+): Turn | undefined {
+  const binding = runtime.pendingLiveBinding;
+  if (!binding) return undefined;
+  if (binding.generation !== runtimeOrderingGeneration(runtime)) {
+    runtime.pendingLiveBinding = null;
+    return undefined;
+  }
+  if (typeof eventSeq === "number" && eventSeq < binding.seq) return undefined;
+  if (nativeTurnId && nativeTurnId !== binding.turnId) return undefined;
+  // A delayed sequenced binding/replay from a completed turn may still be in
+  // the ring, so only a current running lifecycle may reopen it. Sequence zero
+  // is reserved for the wrapper's client-only reconnect seed: the wrapper emits
+  // that frame only while the resident context is non-idle, and it may arrive
+  // before a freshly loaded reducer has recovered its lifecycle state. Use it
+  // solely for narrative ownership; later State/History remains authoritative
+  // for whether the UI itself is running.
+  if (runtime.state !== "running" && binding.seq !== 0) return undefined;
+
+  const matches = turns.filter((turn) =>
+    turnHasIdentityAlias(turn, binding.msgId));
+  if (matches.length > 1) return undefined;
+  let owner = matches[0];
+  if (!owner) {
+    if (!create) return undefined;
+    owner = {
+      id: binding.msgId,
+      clientMsgId: binding.msgId,
+      prompt: "",
+      blocks: [],
+      done: false,
+    };
+    turns.push(owner);
+  }
+  if (owner.forkPointId && owner.forkPointId !== binding.turnId
+      && owner.liveTaskId !== binding.turnId) return undefined;
+  if (owner.done) {
+    owner.done = false;
+    owner.doneTs = undefined;
+    owner.durationMs = undefined;
+    owner.interrupted = undefined;
+    owner.error = undefined;
+    owner.progress = undefined;
+    delete owner.terminalSource;
+  }
+  owner.forkPointId ??= binding.turnId;
+  runtime.liveOwner = {
+    turnId: owner.id,
+    seq: Math.max(binding.seq, eventSeq ?? binding.seq),
+  };
+  return owner;
+}
+
+function bindAuthoritativeActiveHistoryHead(
+  runtime: SessionRuntime,
+  turns: Turn[],
+  msgId: string,
+  nativeTurnId: string,
+  seq: number,
+  newestId: string | null = runtime.historyNewestId,
+  assumeRunning = false,
+  continuationTurnIds?: string[] | null,
+): Turn | undefined {
+  if ((!assumeRunning && runtime.state !== "running") || !newestId) {
+    return undefined;
+  }
+  const heads = turns.filter((turn) =>
+    !turn.done
+    && turnHasIdentityAlias(turn, newestId));
+  if (heads.length !== 1) return undefined;
+  const head = heads[0];
+  const historyStreamId = head.forkPointId;
+  if (head.clientMsgId && !turnHasIdentityAlias(head, msgId)) return undefined;
+  const logicalOwners = turns.filter((turn) =>
+    turnHasIdentityAlias(turn, msgId));
+  if (logicalOwners.length > 1) return undefined;
+  if (findTurnByEngineId([head], nativeTurnId) !== head) {
+    if (!historyStreamId
+        || !continuationTurnIds?.includes(nativeTurnId)
+        || !continuationTurnIds.includes(historyStreamId)) return undefined;
+    head.liveTaskId = nativeTurnId;
+  }
+  head.clientMsgId ??= msgId;
+  const logical = logicalOwners[0];
+  if (logical && logical !== head) {
+    const headIndex = turns.indexOf(head);
+    const logicalIndex = turns.indexOf(logical);
+    const mergedTurns = mergeInitialHistory(
+      [head], [logical], { preserveLiveTailOpen: true });
+    if (mergedTurns.length !== 1) return undefined;
+    const merged = mergedTurns[0];
+    // A recovered Codex control turn can own a distinct rollout stream task.
+    // Keep History's exact stream identity as the canonical branch point and
+    // record the control id only as a routing alias. Both ids must have arrived
+    // in the wrapper's bounded continuation proof above; never infer this from
+    // prompt text, timestamps, running state, or row position.
+    merged.forkPointId ??= nativeTurnId;
+    const first = Math.min(headIndex, logicalIndex);
+    const second = Math.max(headIndex, logicalIndex);
+    turns.splice(second, 1);
+    turns.splice(first, 1, merged);
+    runtime.liveOwner = { turnId: merged.id, seq };
+    return merged;
+  }
+  head.forkPointId ??= nativeTurnId;
+  runtime.liveOwner = { turnId: head.id, seq };
+  return head;
+}
+
+function findBoundLiveTaskOwner(
+  runtime: SessionRuntime,
+  turns: Turn[],
+  nativeTurnId: string | null | undefined,
+  eventSeq: number | null | undefined,
+  create = true,
+): Turn | undefined {
+  const pending = activatePendingLiveBinding(
+    runtime, turns, eventSeq, nativeTurnId, create);
+  if (pending) return pending;
+  const explicit = findExplicitLiveTaskOwner(runtime, turns);
+  return explicit && (!nativeTurnId
+      || findTurnByEngineId([explicit], nativeTurnId) === explicit)
+    ? explicit : undefined;
+}
+
 function remapExplicitLiveTaskOwner(
   owner: SessionRuntime["liveOwner"],
   turns: Turn[],
@@ -705,7 +878,11 @@ function openUnboundLiveTurn(
   turns: Turn[],
   fallbackId: string,
   ts?: number,
+  eventSeq?: number | null,
 ): Turn {
+  const bound = activatePendingLiveBinding(
+    runtime, turns, eventSeq, undefined, true);
+  if (bound) return bound;
   const owner = findCurrentUnownedLiveOwner(runtime, turns);
   if (owner) return owner;
   if (!runtime.legacyLiveFallbackBlocked) {
@@ -1213,16 +1390,14 @@ function reopenAuthoritativeActiveHistoryHead(
   compactionContinuationTurnIds: string[] | null | undefined,
 ): Turn[] {
   if (!newestId) return turns;
-  const matches = turns.map((turn, index) => ({ turn, index })).filter(
-    ({ turn }) => canonicalTurnId(turn) === newestId
-      || turnHasIdentityAlias(turn, newestId),
-  );
+  const matches = turns.filter((turn) =>
+    turnHasIdentityAlias(turn, newestId));
   if (matches.length !== 1) return turns;
-  const { turn, index } = matches[0];
-  const explicitLiveOwner = findExplicitLiveTaskOwner(
+  const turn = matches[0];
+  const index = turns.indexOf(turn);
+  if (findExplicitLiveTaskOwner(
     runtime, turns, ownerFenceSeq ?? null,
-  );
-  if (explicitLiveOwner) {
+  )) {
     // The active native task is already owned by a newer ordered steer row.
     // Until block identity proves both aliases are the same visible segment,
     // leave this History shell terminal instead of displaying two spinners.
@@ -1232,9 +1407,9 @@ function reopenAuthoritativeActiveHistoryHead(
   // row. ``in_progress``, a native forkPointId, recency, and browser-local
   // terminalSource are all insufficient on a cold refresh: they also describe
   // real user interrupts and crashes.
-  const continuationIds = new Set(compactionContinuationTurnIds ?? []);
-  if (!turn.forkPointId || !continuationIds.has(turn.forkPointId)
-      || !turn.done || turn.interrupted !== true) {
+  if (!turn.forkPointId
+      || !compactionContinuationTurnIds?.includes(turn.forkPointId)
+      || !turn.done || !turn.interrupted) {
     return turns;
   }
   const next = [...turns];
@@ -1258,8 +1433,7 @@ function findAuthoritativeActiveHistoryHead(
       || !runtime.historyNewestId) return undefined;
   const matches = turns.filter((turn) =>
     !turn.done
-    && (canonicalTurnId(turn) === runtime.historyNewestId
-      || turnHasIdentityAlias(turn, runtime.historyNewestId)));
+    && turnHasIdentityAlias(turn, runtime.historyNewestId));
   return matches.length === 1 ? matches[0] : undefined;
 }
 
@@ -1335,6 +1509,7 @@ function switchControlGeneration(
   if (orderingGeneration != null && orderingGeneration !== generation) {
     runtime.historyFence = null;
     runtime.liveOwner = null;
+    runtime.pendingLiveBinding = null;
     runtime.legacyLiveFallbackBlocked = true;
   }
   if (runtime.historyGeneration !== null
@@ -1466,7 +1641,8 @@ export function reduce(state: AppState, action: Action): AppState {
         ...initialState,
         sessions: [], runtimes: {}, artifact: null, dirPicker: null,
         newChat: null, btwByParentSid: {}, catalog: {}, catalogDefault: {},
-        catalogDefaultEffort: {}, catalogDefaultCwd: {},
+        catalogDefaultEffort: {}, catalogDefaultCwd: {}, codexProfiles: [],
+        defaultCodexProfileId: null, codexProfileByScope: {},
         retainedHistoryBrowse: null,
       };
     case "conn": {
@@ -1534,12 +1710,23 @@ export function reduce(state: AppState, action: Action): AppState {
       };
       let runtimes = reduceTargetedRuntime(
         state.runtimes, action.sid, { type: "query_sent", turn });
-      if (runtimes[action.sid]?.acceptancePending !== action.msg_id
-          || runtimes[action.sid]?.acceptanceKind == null) {
+      const submittedRuntime = runtimes[action.sid];
+      // A sequenced binding can arrive after the previous lifecycle already
+      // became idle. It is deliberately dormant while idle, but must not wake
+      // up when this newly submitted turn transitions the runtime to running.
+      // Preserve only an early binding for this exact optimistic message.
+      const clearsStaleBinding = action.type === "query_sent"
+        && !!submittedRuntime?.pendingLiveBinding
+        && submittedRuntime.pendingLiveBinding.msgId !== action.msg_id;
+      if (submittedRuntime?.acceptancePending !== action.msg_id
+          || submittedRuntime?.acceptanceKind == null
+          || clearsStaleBinding) {
         runtimes = {
           ...runtimes,
           [action.sid]: {
-            ...runtimes[action.sid],
+            ...submittedRuntime,
+            pendingLiveBinding: clearsStaleBinding
+              ? null : submittedRuntime.pendingLiveBinding,
             acceptancePending: action.msg_id,
             acceptanceKind: action.type === "steer_sent"
               ? "steer" : "query",
@@ -2233,6 +2420,7 @@ export function reduce(state: AppState, action: Action): AppState {
           cwdSource: action.cwdSource ?? "default",
           model: action.model ?? null,
           effort: action.effort ?? null,
+          codexProfileId: action.codexProfileId ?? null,
         },
       };
     case "set_new_chat_cwd":
@@ -2241,6 +2429,27 @@ export function reduce(state: AppState, action: Action): AppState {
         cwd: action.cwd,
         cwdSource: action.cwdSource ?? "explicit",
       } } : state;
+    case "set_new_chat_codex_profile": {
+      if (!state.newChat
+          || !state.codexProfiles.some((profile) => profile.id === action.profileId)) {
+        return state;
+      }
+      return {
+        ...state,
+        codexProfileByScope: {
+          ...state.codexProfileByScope,
+          [action.scopeKey]: action.profileId,
+        },
+        newChat: {
+          ...state.newChat,
+          codexProfileId: action.profileId,
+          // Catalog and execution controls are account-owned. Never carry an
+          // explicit choice into another CODEX_HOME before its catalog arrives.
+          model: null,
+          effort: null,
+        },
+      };
+    }
     case "clear_scope_cwd": {
       if (!(action.scopeKey in state.cwdByScope)) return state;
       const cwdByScope = { ...state.cwdByScope };
@@ -2341,6 +2550,12 @@ function reduceEvent(
           state: base.state,
           engine: ownership.engine,
           space: ownership.space,
+          codex_profile_id: ownership.engine === "codex"
+            ? ownership.codexProfileId ?? undefined
+            : undefined,
+          native_session_id: ownership.engine === "codex" && newF.includes("@")
+            ? nativeCodexSessionId(newF)
+            : undefined,
         } satisfies SessionInfo, ...state.sessions]
         : state.sessions;
       return {
@@ -2433,6 +2648,13 @@ function reduceEvent(
               && targetLiveTaskOwner && (!sourceLiveTaskOwner
                 || targetLiveTaskOwner.seq > sourceLiveTaskOwner.seq)
             ? targetLiveTaskOwner : sourceLiveTaskOwner ?? targetLiveTaskOwner;
+          const sourcePendingBinding = source.pendingLiveBinding;
+          const targetPendingBinding = mergeTarget.pendingLiveBinding;
+          const mergedPendingBinding = sameLiveOrderingScope
+              && targetPendingBinding && (!sourcePendingBinding
+                || targetPendingBinding.seq > sourcePendingBinding.seq)
+            ? targetPendingBinding
+            : sourcePendingBinding ?? targetPendingBinding;
           const mergedRuntime: SessionRuntime = {
             ...target,
             ...source,
@@ -2476,6 +2698,7 @@ function reduceEvent(
                       )
                 : source.historyFence,
             liveOwner: mergedLiveTaskOwner,
+            pendingLiveBinding: mergedPendingBinding,
             historyGeneration: source.historyRevision == null
               ? mergeTarget.historyGeneration : source.historyGeneration,
             pendingHistoryGeneration:
@@ -2551,6 +2774,10 @@ function reduceEvent(
             ...sourceSession,
             ...targetSession,
             session_id,
+            native_session_id: ownership?.engine === "codex"
+              ? nativeCodexSessionId(session_id)
+              : targetSession?.native_session_id
+                ?? sourceSession.native_session_id,
             cwd: e.cwd ?? targetSession?.cwd ?? sourceSession.cwd,
           },
         ]
@@ -2618,11 +2845,45 @@ function reduceEvent(
       return { ...state, sessions, cwdByScope, artifact };
     }
     case "session_list": {
+      const normalized = normalizeSessionList(
+        state.sessions,
+        state.codexProfiles,
+        state.defaultCodexProfileId,
+        e,
+      );
+      const {
+        sessions,
+        codexProfiles,
+        defaultCodexProfileId,
+      } = normalized;
+      let codexProfileByScope = state.codexProfileByScope;
+      let selectedCodexProfileId: string | null = null;
+      if (e.engine === "codex" && ownership && codexProfiles.length > 0) {
+        const known = new Set(codexProfiles.map((profile) => profile.id));
+        const preferred = state.newChat?.codexProfileId
+          ?? state.codexProfileByScope[ownership.scopeKey]
+          ?? defaultCodexProfileId;
+        // A non-null selection is user/account ownership state, not a catalog
+        // fallback hint. Preserve a removed id so the composer can stop and ask
+        // for an explicit replacement instead of silently using the default.
+        selectedCodexProfileId = preferred
+          ? preferred
+          : defaultCodexProfileId && known.has(defaultCodexProfileId)
+            ? defaultCodexProfileId
+            : codexProfiles[0].id;
+        if (state.codexProfileByScope[ownership.scopeKey]
+            !== selectedCodexProfileId) {
+          codexProfileByScope = {
+            ...state.codexProfileByScope,
+            [ownership.scopeKey]: selectedCodexProfileId,
+          };
+        }
+      }
       const focusedMissing = !!state.focusedSid
         && !state.focusedSid.startsWith("tmp-")
-        && !e.sessions.some((session) => session.session_id === state.focusedSid);
+        && !sessions.some((session) => session.session_id === state.focusedSid);
       const focusedSession = ownership && state.focusedSid
-        ? e.sessions.find(
+        ? sessions.find(
           (session) => session.session_id === state.focusedSid)
         : undefined;
       // Another client may migrate the focused session while this tab is
@@ -2632,26 +2893,39 @@ function reduceEvent(
           && state.cwdByScope[ownership.scopeKey] !== focusedSession.cwd
         ? { ...state.cwdByScope, [ownership.scopeKey]: focusedSession.cwd }
         : state.cwdByScope;
+      const replacementNewChat = focusedMissing
+        ? {
+          cwd: (ownership
+            ? state.cwdByScope[ownership.scopeKey] : "") || "~",
+          cwdSource: (ownership
+            && !!state.cwdByScope[ownership.scopeKey]
+              ? "inherited" : "default") as "inherited" | "default",
+          model: null,
+          effort: null,
+          codexProfileId: selectedCodexProfileId,
+        }
+        : state.newChat && e.engine === "codex" && selectedCodexProfileId
+          && state.newChat.codexProfileId !== selectedCodexProfileId
+          ? {
+            ...state.newChat,
+            codexProfileId: selectedCodexProfileId,
+            model: null,
+            effort: null,
+          }
+          : state.newChat;
       return {
         ...state,
-        sessions: e.sessions,
+        sessions,
         cwdByScope,
+        codexProfiles,
+        defaultCodexProfileId,
+        codexProfileByScope,
         focusedSid: focusedMissing ? null : state.focusedSid,
         historyRecovery: focusedMissing ? null : state.historyRecovery,
         historyBrowse: focusedMissing ? null : state.historyBrowse,
         retainedHistoryBrowse: focusedMissing
           ? null : state.retainedHistoryBrowse,
-        newChat: focusedMissing
-          ? {
-            cwd: (ownership
-              ? state.cwdByScope[ownership.scopeKey] : "") || "~",
-            cwdSource: ownership
-              && !!state.cwdByScope[ownership.scopeKey]
-              ? "inherited" : "default",
-            model: null,
-            effort: null,
-          }
-          : state.newChat,
+        newChat: replacementNewChat,
       };
     }
     case "session_activity": {
@@ -2691,6 +2965,7 @@ function reduceEvent(
         rt.historyLiveSeq = 0;
         rt.historyFence = null;
         rt.liveOwner = null;
+        rt.pendingLiveBinding = null;
         rt.hasLoadedOlderHistory = false;
         rt.hydratedCacheTurnIds = [];
         rt.liveDetailTurnIds = [];
@@ -2932,9 +3207,9 @@ function reduceEvent(
       }
       const racedLiveEvent = !e.before && e.live_seq != null
         && base.lastLiveSeq > e.live_seq;
-      const resolveUnknownSteerFromIdle = !e.before
-        && e.in_progress === false
-        && !racedLiveEvent
+      const settledHistory = !e.before && !racedLiveEvent
+        && e.in_progress === false;
+      const resolveUnknownSteerFromIdle = settledHistory
         && base.acceptanceKind === "steer_unknown"
         && !!base.acceptancePending
         && !acceptanceConfirmed;
@@ -2997,9 +3272,15 @@ function reduceEvent(
           // wrapper without that field falls back to the local runtime state.
           preserveLiveTailOpen: racedLiveEvent || e.in_progress === true
             || (e.in_progress == null && base.state !== "idle"),
+          // Codex app-server History reports the native turn's persisted
+          // completed/failed status. Once an idle, unraced page arrives it
+          // repairs a provisional live terminal (notably after compaction)
+          // while leaving Claude's transcript-only lifecycle untouched.
           newestHistoryId: e.newest_id ?? null,
           reconcileReplayOrphans: true,
-        });
+        }, settledHistory
+          && state.sessions.find((session) =>
+            session.session_id === sid)?.engine === "codex");
         if (acceptanceConfirmed && base.acceptancePending
             && (base.acceptanceKind === "steer"
               || base.acceptanceKind === "steer_unknown")
@@ -3013,7 +3294,7 @@ function reduceEvent(
         // A current first page which explicitly reports idle is the recovery
         // boundary for a lost TurnEnd. Do not close a merely optimistic local
         // query (base is still idle), or a tail advanced after this History read.
-        if (e.in_progress === false && !racedLiveEvent) {
+        if (settledHistory) {
           const wasInterrupting = base.state === "interrupting"
             || base.state === "draining";
           const doneTs = e.ts ? Math.round(e.ts * 1000) : Date.now();
@@ -3076,6 +3357,7 @@ function reduceEvent(
           base.turns.filter((turn) => observedIds.has(turn.id)),
         );
       }
+      let boundHistoryOwner: SessionRuntime["liveOwner"] = null;
       const currentRunningHistory = !e.before
         && e.in_progress === true
         && e.live_seq != null
@@ -3083,10 +3365,32 @@ function reduceEvent(
         && base.lastLifecycleSeq <= e.live_seq
         && (base.historyGeneration == null
           || e.generation === base.historyGeneration);
-      if (currentRunningHistory) {
+      if (currentRunningHistory && e.live_seq != null) {
         turns = reopenAuthoritativeActiveHistoryHead(
           base, turns, e.newest_id, e.live_seq,
           e.compaction_continuation_turn_ids);
+        const binding = base.pendingLiveBinding;
+        const responseGeneration = e.generation
+          ?? base.controlGeneration ?? base.historyGeneration;
+        if (binding && binding.generation === responseGeneration
+            && e.live_seq >= binding.seq) {
+          const bindingRuntime = {
+            ...base,
+            state: "running" as const,
+            liveOwner: base.liveOwner ? { ...base.liveOwner } : null,
+          };
+          bindAuthoritativeActiveHistoryHead(
+            bindingRuntime,
+            turns,
+            binding.msgId,
+            binding.turnId,
+            binding.seq,
+            e.newest_id ?? null,
+            true,
+            e.compaction_continuation_turn_ids,
+          );
+          boundHistoryOwner = bindingRuntime.liveOwner;
+        }
       }
       // A later canonical terminal is sufficient to settle a shell which an
       // earlier running History reopened across a compact boundary. Do not
@@ -3143,6 +3447,34 @@ function reduceEvent(
           && base.lastLifecycleSeq <= e.live_seq));
       const hadModel = e.events.some((ev) => (ev as { type?: string }).type === "model");
       const hadEffort = e.events.some((ev) => (ev as { type?: string }).type === "effort");
+      const nextHistoryGeneration = acceptsControlState
+        ? (e.generation ?? base.historyGeneration)
+        : base.historyGeneration;
+      const nextOrderingGeneration = base.controlGeneration
+        ?? nextHistoryGeneration;
+      let pendingLiveBinding = base.pendingLiveBinding;
+      let liveOwner = boundHistoryOwner
+        ?? remapExplicitLiveTaskOwner(base.liveOwner, turns);
+      if (pendingLiveBinding
+          && pendingLiveBinding.generation !== nextOrderingGeneration) {
+        pendingLiveBinding = null;
+      }
+      if (pendingLiveBinding && settledHistory && e.live_seq != null
+          && e.live_seq >= pendingLiveBinding.seq) {
+        pendingLiveBinding = null;
+      }
+      if (pendingLiveBinding && acceptsControlState
+          && e.in_progress === true) {
+        const exactBindingOwners = turns.filter((turn) =>
+          turnHasIdentityAlias(turn, pendingLiveBinding!.msgId));
+        if (exactBindingOwners.length === 1
+            && !exactBindingOwners[0].done) {
+          liveOwner = {
+            turnId: exactBindingOwners[0].id,
+            seq: pendingLiveBinding.seq,
+          };
+        }
+      }
       let historyBrowse = state.historyBrowse;
       let retainedHistoryBrowse = state.retainedHistoryBrowse;
       if (historyBrowse?.sid === sid) {
@@ -3187,9 +3519,8 @@ function reduceEvent(
             state: confirmsWrapperRunning
               ? (base.state === "interrupting" || base.state === "draining"
                   ? base.state : "running")
-              : acceptsControlState && !racedLiveEvent
+              : settledHistory
                   && e.external !== true && !base.external
-                  && e.in_progress === false
                 ? "idle"
                 : base.state,
             mirroredRunning: acceptsControlState && !racedLiveEvent
@@ -3201,9 +3532,7 @@ function reduceEvent(
               ? e.revision : base.historyRevision,
             pendingHistoryRevision: acceptsControlState
               ? null : base.pendingHistoryRevision,
-            historyGeneration: acceptsControlState
-              ? (e.generation ?? base.historyGeneration)
-              : base.historyGeneration,
+            historyGeneration: nextHistoryGeneration,
             pendingHistoryGeneration: acceptsControlState
               ? null : base.pendingHistoryGeneration,
             pendingHistoryCandidateBuildSeq: acceptsControlState
@@ -3217,6 +3546,8 @@ function reduceEvent(
             historyFence: acceptsControlState
               ? (e.live_seq ?? null)
               : base.historyFence,
+            liveOwner,
+            pendingLiveBinding,
             historyNewestId: acceptsControlState
               ? (Object.prototype.hasOwnProperty.call(e, "newest_id")
                   ? (e.newest_id ?? null)
@@ -3387,8 +3718,14 @@ function reduceEvent(
     // The engine's real model catalog. Empty => the wrapper couldn't read it; keep
     // what we have (data.ts's static table) rather than blanking the pickers.
     case "models": {
+      const cacheKey = modelCatalogScopeKey(
+        e.engine,
+        e.engine === "codex"
+          ? (e.codex_profile_id ?? state.defaultCodexProfileId)
+          : null,
+      );
       const catalog = e.models.length
-        ? { ...state.catalog, [e.engine]: e.models }
+        ? { ...state.catalog, [cacheKey]: e.models }
         : state.catalog;
       if (e.cwd && e.cwd !== state.newChat?.cwd) {
         // Cwd-aware reads run concurrently. Never let a late response for a
@@ -3404,26 +3741,26 @@ function reduceEvent(
         catalogDefault = { ...catalogDefault };
         catalogDefaultEffort = { ...catalogDefaultEffort };
         if (e.default_model) {
-          catalogDefault[e.engine] = matchModelId(e.default_model, e.engine);
+          catalogDefault[cacheKey] = matchModelId(e.default_model, e.engine);
         } else {
-          delete catalogDefault[e.engine];
+          delete catalogDefault[cacheKey];
         }
         if (e.default_effort) {
-          catalogDefaultEffort[e.engine] = e.default_effort;
+          catalogDefaultEffort[cacheKey] = e.default_effort;
         } else {
-          delete catalogDefaultEffort[e.engine];
+          delete catalogDefaultEffort[cacheKey];
         }
         catalogDefaultCwd = {
-          ...catalogDefaultCwd, [e.engine]: e.cwd,
+          ...catalogDefaultCwd, [cacheKey]: e.cwd,
         };
       } else {
         if (e.default_model) {
           catalogDefault = { ...catalogDefault,
-            [e.engine]: matchModelId(e.default_model, e.engine) };
+            [cacheKey]: matchModelId(e.default_model, e.engine) };
         }
         if (e.default_effort) {
           catalogDefaultEffort = {
-            ...catalogDefaultEffort, [e.engine]: e.default_effort,
+            ...catalogDefaultEffort, [cacheKey]: e.default_effort,
           };
         }
       }
@@ -3652,6 +3989,7 @@ function reduceEvent(
           turn.progress = undefined;
         }
         if (e.state === "idle") {
+          rt.pendingLiveBinding = null;
           rt.pendingQuestion = null;
           const doneTs = eventTimestampMs(e.ts) ?? Date.now();
           for (const candidate of turns) {
@@ -3899,6 +4237,7 @@ function reduceEvent(
             rt.historyLiveSeq = 0;
             rt.historyFence = null;
             rt.liveOwner = null;
+            rt.pendingLiveBinding = null;
             rt.historyGeneration = null;
             rt.historyNewestId = null;
             rt.lastLiveSeq = 0;
@@ -4142,6 +4481,11 @@ function reduceEvent(
     }
     case "turn_steered": {
       const next = patch(state, e.sid, (rt) => {
+        if (rt.pendingLiveBinding
+            && (typeof e.seq !== "number"
+              || e.seq >= rt.pendingLiveBinding.seq)) {
+          rt.pendingLiveBinding = null;
+        }
         const turns = cloneTurns(rt.turns);
         const imgs = (e.images && e.images.length) ? e.images : undefined;
         const fileMeta = (e.files && e.files.length)
@@ -4243,7 +4587,7 @@ function reduceEvent(
         const t = findTurnOwningMessage(turns, e.message_id)
           ?? preSteerTurn(rt, turns)
           ?? openUnboundLiveTurn(
-            rt, turns, e.message_id, eventTimestampMs(e.ts));
+            rt, turns, e.message_id, eventTimestampMs(e.ts), e.seq);
         markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
         t.progress = undefined;
         const block = mutableTurnBlocks(t).find((b) => b.kind === "text"
@@ -4262,7 +4606,7 @@ function reduceEvent(
         const t = findTurnOwningMessage(turns, e.message_id)
           ?? preSteerTurn(rt, turns)
           ?? openUnboundLiveTurn(
-            rt, turns, e.message_id, eventTimestampMs(e.ts));
+            rt, turns, e.message_id, eventTimestampMs(e.ts), e.seq);
         markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
         t.progress = undefined;
         let block = mutableTurnBlocks(t).find((b) => b.kind === "text"
@@ -4274,7 +4618,14 @@ function reduceEvent(
           if (boundCompletedTurns) limitTurnBlocks(t);
         }
         block.channel = resolvedChannel(block.channel, e.channel ?? "unknown");
-        block.text = appendField(block.text, e.text, MAX_LIVE_TEXT_CHARS);
+        // History can win the race against an app-server replay and install the
+        // completed native item before its delayed deltas arrive. Native message
+        // ids are immutable, so a completed exact block is authoritative. Never
+        // use text containment here: repeated prose and bounded History prefixes
+        // are both legitimate content and cannot safely prove replay identity.
+        if (!block.done) {
+          block.text = appendField(block.text, e.text, MAX_LIVE_TEXT_CHARS);
+        }
         if (block.channel !== "final" && e.text.length > 0) {
           markTurnDetailAsLive(rt, t.id, boundCompletedTurns);
         }
@@ -4288,7 +4639,7 @@ function reduceEvent(
           ?? findTurnOwningMessage(turns, e.message_id)
           ?? preSteerTurn(rt, turns)
           ?? openUnboundLiveTurn(
-            rt, turns, e.message_id, eventTimestampMs(e.ts));
+            rt, turns, e.message_id, eventTimestampMs(e.ts), e.seq);
         markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
         markTurnDetailAsLive(rt, t.id, boundCompletedTurns);
         t.progress = undefined;
@@ -4387,6 +4738,10 @@ function reduceEvent(
         // delayed subagent update creates a phantom new turn or attaches to the
         // wrong conversation.
         if (!owner) owner = findTurnOwningItem(turns, e.parent_id);
+        if (!owner) {
+          owner = findBoundLiveTaskOwner(
+            rt, turns, e.turn_id, e.seq, true);
+        }
         if (!owner) owner = findTurnByEngineId(turns, e.turn_id);
         if (!owner) {
           owner = openTurn(
@@ -4445,6 +4800,7 @@ function reduceEvent(
       return patch(state, e.sid, (rt) => {
         const turns = cloneTurns(rt.turns);
         let t = findTurnOwningItem(turns, e.item_id)
+          ?? findBoundLiveTaskOwner(rt, turns, e.turn_id, e.seq, true)
           ?? findTurnByEngineId(turns, e.turn_id);
         if (!t) {
           t = openTurn(
@@ -4473,6 +4829,7 @@ function reduceEvent(
       return patch(state, e.sid, (rt) => {
         const turns = cloneTurns(rt.turns);
         let t = findTurnOwningItem(turns, e.item_id)
+          ?? findBoundLiveTaskOwner(rt, turns, e.turn_id, e.seq, true)
           ?? findTurnByEngineId(turns, e.turn_id);
         if (!t) {
           t = openTurn(
@@ -4500,24 +4857,66 @@ function reduceEvent(
           clearAcceptance(rt);
         }
         const turns = cloneTurns(rt.turns);
-        const optimisticIndex = turns.findIndex((turn) =>
+        const seq = typeof e.seq === "number" ? e.seq : 0;
+        const binding = {
+          msgId: e.msg_id,
+          turnId: e.turn_id,
+          seq,
+          generation: runtimeOrderingGeneration(rt),
+        };
+        const currentOwner = rt.liveOwner
+          ? turns.find((turn) =>
+              turnHasIdentityAlias(turn, rt.liveOwner!.turnId))
+          : undefined;
+        const bindingOwnsCurrentRow = !!currentOwner
+          && turnHasIdentityAlias(currentOwner, e.msg_id);
+        const bindingCanSupersedeOwner = !rt.liveOwner
+          || bindingOwnsCurrentRow || seq > rt.liveOwner.seq;
+        const current = rt.pendingLiveBinding;
+        if (bindingCanSupersedeOwner && (
+          !current || current.generation !== binding.generation
+            || seq >= current.seq
+        )) {
+          rt.pendingLiveBinding = binding;
+        }
+        if (bindingCanSupersedeOwner) {
+          bindAuthoritativeActiveHistoryHead(
+            rt, turns, e.msg_id, e.turn_id, seq);
+        }
+        const exact = turns.filter((turn) =>
           turnHasIdentityAlias(turn, e.msg_id));
-        if (optimisticIndex < 0) return;
-        turns[optimisticIndex].forkPointId = e.turn_id;
-        const authoritativeIndex = turns.findIndex((turn, index) => (
-          index !== optimisticIndex
-          && (turn.forkPointId === e.turn_id || turn.id === e.turn_id)
-        ));
-        if (authoritativeIndex >= 0) {
-          const optimistic = turns[optimisticIndex];
-          const authoritative = turns[authoritativeIndex];
-          const merged = mergeInitialHistory(
-            [authoritative], [optimistic])[0] ?? optimistic;
-          merged.forkPointId = e.turn_id;
-          const first = Math.min(optimisticIndex, authoritativeIndex);
-          const second = Math.max(optimisticIndex, authoritativeIndex);
-          turns.splice(second, 1);
-          turns.splice(first, 1, merged);
+        if (exact.length === 1) {
+          const owner = exact[0];
+          const ownerIndex = turns.indexOf(owner);
+          const wasInitialUnboundOwner = !owner.done
+            && !turnHasBoundEngineId(owner);
+          const authoritativeCandidates = turns.filter((turn, index) =>
+            index !== ownerIndex
+            && (turn.forkPointId === e.turn_id || turn.id === e.turn_id));
+          if (!owner.forkPointId || owner.forkPointId === e.turn_id
+              || owner.liveTaskId === e.turn_id) {
+            owner.forkPointId = e.turn_id;
+            if (!owner.done && boundCompletedTurns) {
+              rt.liveOwner = { turnId: owner.id, seq };
+            }
+          }
+          // The initial Query may materialize in History before its first
+          // TurnBinding.  It is the only safe native-id-only merge: steer rows
+          // already carry liveTaskId, and completed predecessors must never be
+          // collapsed into a later segment which shares this native task.
+          if (wasInitialUnboundOwner
+              && authoritativeCandidates.length === 1) {
+            const authoritative = authoritativeCandidates[0];
+            const authoritativeIndex = turns.indexOf(authoritative);
+            const merged = mergeInitialHistory(
+              [authoritative], [owner])[0] ?? owner;
+            merged.forkPointId = e.turn_id;
+            const first = Math.min(ownerIndex, authoritativeIndex);
+            const second = Math.max(ownerIndex, authoritativeIndex);
+            turns.splice(second, 1);
+            turns.splice(first, 1, merged);
+            rt.liveOwner = { turnId: merged.id, seq };
+          }
         }
         if (boundCompletedTurns) replaceWithBoundedTurns(rt, turns);
         else rt.turns = turns;
@@ -4526,7 +4925,19 @@ function reduceEvent(
       return patch(state, e.sid, (rt) => {
         const turns = cloneTurns(rt.turns);
         const unknownSteerOwner = preSteerTurn(rt, turns);
-        let t = findTurnByEngineId(turns, e.turn_id);
+        let t = findBoundLiveTaskOwner(
+          rt, turns, e.turn_id, e.seq, false)
+          ?? findTurnByEngineId(turns, e.turn_id);
+        if (!t && e.checkpoint_id) {
+          // Claude binds the optimistic row to its native user/checkpoint UUID,
+          // while ResultMessage identifies the terminal with the final assistant
+          // UUID.  Codex has no checkpoint_id and keeps the strict turn_id path
+          // above; this exact Claude identity fallback must happen before the
+          // legacy single-open-row heuristic rejects an already-bound owner.
+          t = findBoundLiveTaskOwner(
+            rt, turns, e.checkpoint_id, e.seq, false)
+            ?? findTurnByEngineId(turns, e.checkpoint_id);
+        }
         if (!t) {
           const openTurns = turns.filter((turn) => !turn.done
             && !(rt.acceptanceKind === "steer_unknown"
@@ -4583,6 +4994,14 @@ function reduceEvent(
             t.detailRestorePending = true;
             t.detailRestoreIncomplete = true;
           }
+        }
+        const terminalBinding = rt.pendingLiveBinding;
+        if (terminalBinding
+            && (terminalBinding.turnId === e.turn_id
+              || terminalBinding.turnId === e.checkpoint_id)
+            && (typeof e.seq !== "number"
+              || e.seq >= terminalBinding.seq)) {
+          rt.pendingLiveBinding = null;
         }
         if (t && t === unknownSteerOwner) {
           resolveUnknownPendingSteer(

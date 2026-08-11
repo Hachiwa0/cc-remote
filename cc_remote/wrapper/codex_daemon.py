@@ -61,6 +61,10 @@ class CodexDaemonUpgradeRequired(RuntimeError):
     """The managed shared daemon could not be aligned with the selected CLI."""
 
 
+class CodexProfileDaemonUnavailable(CodexDaemonUpgradeRequired):
+    """A configured account profile has no usable shared control plane."""
+
+
 @dataclass(frozen=True)
 class _CommandResult:
     returncode: int
@@ -91,6 +95,97 @@ def _run_command(
         bytes(result.stdout or b"")[:_OUTPUT_MAX],
         bytes(result.stderr or b"")[:_OUTPUT_MAX],
     )
+
+
+def _prepare_profile_standalone(
+    codex_bin: str,
+    env: Mapping[str, str],
+) -> Optional[bool]:
+    """Expose one verified managed CLI payload inside a sibling CODEX_HOME.
+
+    Official daemon bootstrap looks for
+    ``$CODEX_HOME/packages/standalone/current/codex``. A second account made
+    with ``CODEX_HOME=... codex login`` owns valid auth and session state, but
+    normally still executes the primary home's global ``~/.local/bin/codex``;
+    it therefore has no profile-local managed path for bootstrap.
+
+    Share only the managed CLI's ``current`` entry. Daemon sockets, auth,
+    config, rollouts, and all other state stay rooted in the sibling
+    ``CODEX_HOME``. Refuse ambiguous layouts instead of replacing anything the
+    user already installed.
+    """
+    raw_home = env.get("CODEX_HOME")
+    if not isinstance(raw_home, str) or not raw_home:
+        return None
+    profile_home = Path(os.path.realpath(os.path.expanduser(raw_home)))
+    if not profile_home.is_absolute():
+        return None
+    try:
+        binary = Path(codex_bin).expanduser().resolve(strict=True)
+    except OSError:
+        return None
+    # Accept only the official standalone release layout. A package-manager
+    # binary or arbitrary executable must not become a trusted daemon payload.
+    if (
+        binary.parent.name != "bin"
+        or binary.parent.parent.parent.name != "releases"
+        or binary.parent.parent.parent.parent.name != "standalone"
+    ):
+        return None
+    standalone_root = binary.parent.parent.parent.parent
+    source_current = standalone_root / "current"
+    try:
+        source_binary = (source_current / "codex").resolve(strict=True)
+        source_stat = standalone_root.stat()
+        home_stat = profile_home.stat()
+    except OSError:
+        return None
+    if (
+        source_binary != binary
+        or not stat.S_ISDIR(source_stat.st_mode)
+        or source_stat.st_uid != os.getuid()
+        or not stat.S_ISDIR(home_stat.st_mode)
+        or home_stat.st_uid != os.getuid()
+    ):
+        return None
+
+    destination = profile_home / "packages" / "standalone" / "current"
+    if destination.is_file() or destination.is_dir():
+        try:
+            existing = (destination / "codex").resolve(strict=True)
+        except OSError:
+            return False
+        return existing == binary and os.access(existing, os.X_OK)
+    # ``Path.exists`` is false for a broken symlink. Never replace one.
+    if os.path.lexists(destination):
+        return False
+
+    try:
+        for directory in (
+            profile_home / "packages",
+            profile_home / "packages" / "standalone",
+        ):
+            try:
+                directory.mkdir(mode=0o700)
+            except FileExistsError:
+                pass
+            directory_stat = directory.lstat()
+            if (
+                not stat.S_ISDIR(directory_stat.st_mode)
+                or directory_stat.st_uid != os.getuid()
+            ):
+                return False
+        os.symlink(source_current, destination, target_is_directory=True)
+    except FileExistsError:
+        # A concurrent profile bootstrap won the race. Validate its result.
+        pass
+    except OSError:
+        return False
+    try:
+        prepared = (destination / "codex").resolve(strict=True)
+    except OSError:
+        return False
+    return prepared == binary and os.access(prepared, os.X_OK)
 
 
 def _json_object(data: bytes) -> Optional[dict[str, Any]]:
@@ -337,10 +432,12 @@ class CodexDaemonManager:
         *,
         socket_path: Optional[str] = None,
         command_timeout: float = _COMMAND_TIMEOUT,
+        require_shared: bool = False,
     ):
         self.mode = codex_daemon_mode(mode)
         self.socket_path = socket_path
         self.command_timeout = max(1.0, float(command_timeout))
+        self.require_shared = bool(require_shared)
         self._lock = asyncio.Lock()
         self._capability_identity: Optional[tuple[object, ...]] = None
         self._capable = False
@@ -355,8 +452,11 @@ class CodexDaemonManager:
     def strict_shared_affinity(self) -> bool:
         """Whether a verified managed daemon must not degrade to stdio."""
         return bool(
-            self._ready is not None
-            and self._ready.verified_remote_control
+            self.require_shared
+            or (
+                self._ready is not None
+                and self._ready.verified_remote_control
+            )
         )
 
     def invalidate(self) -> None:
@@ -404,6 +504,36 @@ class CodexDaemonManager:
         result = await self._run(
             codex_bin, env, "app-server", "daemon", "start")
         return _json_object(result.stdout) if result.returncode == 0 else None
+
+    async def bootstrap(
+        self, codex_bin: str, env: Mapping[str, str],
+    ) -> bool:
+        """Install one profile-local durable daemon with remote control.
+
+        Official daemon state is rooted in ``CODEX_HOME``.  This command is
+        therefore safe for explicitly configured sibling profiles and is the
+        supported first-start path on headless Linux hosts.
+        """
+        prepared = await asyncio.to_thread(
+            _prepare_profile_standalone, codex_bin, env)
+        if prepared is False:
+            log.warning(
+                "Codex profile managed standalone path could not be prepared")
+        result = await self._run(
+            codex_bin,
+            env,
+            "app-server",
+            "daemon",
+            "bootstrap",
+            "--remote-control",
+        )
+        if result.returncode != 0:
+            log.warning(
+                "Codex profile daemon bootstrap failed",
+                returncode=result.returncode,
+            )
+            return False
+        return True
 
     async def restart(
         self, codex_bin: str, env: Mapping[str, str],
@@ -463,9 +593,17 @@ class CodexDaemonManager:
             if identity == self._ready_identity and self._ready is not None:
                 return self._ready
             if not await self.capability(codex_bin, env):
+                if self.require_shared:
+                    raise CodexProfileDaemonUnavailable(
+                        "Codex profile shared daemon commands are unavailable"
+                    )
                 return None
 
             lifecycle = await self.version(codex_bin, env)
+            if lifecycle is None and self.require_shared:
+                log.info("bootstrapping required Codex profile daemon")
+                if await self.bootstrap(codex_bin, env):
+                    lifecycle = await self.version(codex_bin, env)
             if lifecycle is None:
                 await self.start(codex_bin, env)
                 lifecycle = await self.version(codex_bin, env)
@@ -489,16 +627,25 @@ class CodexDaemonManager:
                 if await self.restart(codex_bin, env):
                     lifecycle = await self.version(codex_bin, env)
             if lifecycle is None:
-                log.warning("Codex daemon start unavailable; using stdio")
                 self.invalidate()
+                if self.require_shared:
+                    raise CodexProfileDaemonUnavailable(
+                        "Codex profile shared daemon could not be started"
+                    )
+                log.warning("Codex daemon start unavailable; using stdio")
                 return None
             remote = await self.enable_remote_control(codex_bin, env)
             if remote is None:
                 existing = _existing_proxy_candidate(lifecycle)
                 if existing is None:
+                    self.invalidate()
+                    if self.require_shared:
+                        raise CodexProfileDaemonUnavailable(
+                            "Codex profile shared daemon remote control is "
+                            "unavailable"
+                        )
                     log.warning(
                         "Codex daemon remote control unavailable; using stdio")
-                    self.invalidate()
                     return None
                 # An official client already owns this app-server generation.
                 # proxy_args() exposes it tentatively; CodexHandle validates the
@@ -514,8 +661,12 @@ class CodexDaemonManager:
             # this point it is safe to align an older daemon generation.
             verified = await self.version(codex_bin, env)
             if verified is None:
-                log.warning("Codex daemon version probe failed; using stdio")
                 self.invalidate()
+                if self.require_shared:
+                    raise CodexProfileDaemonUnavailable(
+                        "Codex profile shared daemon could not be verified"
+                    )
+                log.warning("Codex daemon version probe failed; using stdio")
                 return None
             before_alignment = verified
             verified = await self._align_managed_daemon(
@@ -532,9 +683,14 @@ class CodexDaemonManager:
                     )
             info = _daemon_info(verified, remote)
             if info is None:
+                self.invalidate()
+                if self.require_shared:
+                    raise CodexProfileDaemonUnavailable(
+                        "Codex profile shared daemon did not confirm remote "
+                        "control"
+                    )
                 log.warning(
                     "Codex daemon did not confirm remote control; using stdio")
-                self.invalidate()
                 return None
             self._ready_identity = identity
             self._ready = info
@@ -552,14 +708,21 @@ class CodexDaemonManager:
             argv.extend(["--sock", socket_path])
         return argv
 
-_DEFAULT_MANAGERS: dict[tuple[str, Optional[str]], CodexDaemonManager] = {}
+_DEFAULT_MANAGERS: dict[
+    tuple[str, Optional[str], Optional[str]], CodexDaemonManager
+] = {}
 
 
 def default_codex_daemon_manager(
     mode: Optional[str] = None, *, socket_path: Optional[str] = None,
+    codex_home: Optional[str] = None,
 ) -> CodexDaemonManager:
     normalized = codex_daemon_mode(mode)
-    key = (normalized, socket_path)
+    normalized_home = (
+        os.path.realpath(os.path.expanduser(codex_home))
+        if codex_home else None
+    )
+    key = (normalized, socket_path, normalized_home)
     manager = _DEFAULT_MANAGERS.get(key)
     if manager is None:
         manager = CodexDaemonManager(normalized, socket_path=socket_path)

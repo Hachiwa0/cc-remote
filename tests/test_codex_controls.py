@@ -14,7 +14,7 @@ from pydantic import ValidationError
 from cc_remote import __version__
 from cc_remote.protocol import (
     ERR_NOT_STEERABLE, ERR_STEER_UNKNOWN,
-    CollaborationMode, CommandAck, Delta, Error, GoalState, Interrupt, Model,
+    CollaborationMode, CommandAck, Delta, Effort, Error, GoalState, Interrupt, Model,
     NewSession, PinSession, StateEvent, Steer, ThreadGoal, TurnBinding, TurnEnd,
     TurnSteered, UserMsg, PermissionProfile, PermissionProfiles,
     SetPermissionProfile, SetWebSearch, WebSearch,
@@ -1218,6 +1218,134 @@ def test_codex_recover_owned_turn_arms_stream_before_status_read():
     asyncio.run(run())
 
 
+def test_codex_owned_turn_probe_exposes_only_native_user_item_ids():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "recovered-thread"
+
+        async def request(method, params=None):
+            if method == "thread/read":
+                return {
+                    "thread": {
+                        "status": {"type": "active", "activeFlags": []},
+                    },
+                }
+            assert method == "thread/turns/list"
+            assert params["itemsView"] == "summary"
+            return {
+                "data": [{
+                    "id": "control-turn",
+                    "status": "inProgress",
+                    "items": [
+                        {
+                            "id": "native-user-item",
+                            "type": "userMessage",
+                            "content": [{"type": "text", "text": "secret"}],
+                        },
+                        {
+                            "id": "assistant-item",
+                            "type": "agentMessage",
+                            "text": "private answer",
+                        },
+                    ],
+                }],
+            }
+
+        handle._request = request
+        proof = await handle.probe_owned_turn("control-turn")
+        assert proof is not None
+        assert proof.turn_id == "control-turn"
+        assert proof.native_user_message_ids == ("native-user-item",)
+        assert handle.turn_id is None
+        assert handle.turn_active is False
+
+    asyncio.run(run())
+
+
+def test_codex_recovered_control_turn_accepts_only_bound_stream_task():
+    async def run():
+        lifecycle = []
+
+        async def on_lifecycle(phase, turn_id):
+            lifecycle.append((phase, turn_id))
+
+        handle = CodexHandle(
+            _Cfg(), turn_lifecycle_callback=on_lifecycle)
+        handle.thread_id = "recovered-thread"
+
+        async def request(method, _params=None):
+            if method == "thread/read":
+                return {
+                    "thread": {
+                        "status": {"type": "active", "activeFlags": []},
+                    },
+                }
+            assert method == "thread/turns/list"
+            return {
+                "data": [{
+                    "id": "control-turn",
+                    "status": "inProgress",
+                    "items": [],
+                    "itemsView": "notLoaded",
+                }],
+            }
+
+        handle._request = request
+        assert await handle.recover_owned_turn(
+            "control-turn", stream_turn_ids=("rollout-task",),
+        ) is True
+        assert handle.owned_turn_ids.issuperset({
+            "control-turn", "rollout-task",
+        })
+        assert handle.compaction_continuation_turn_ids == {
+            "control-turn", "rollout-task",
+        }
+
+        await handle._dispatch({
+            "method": "item/completed",
+            "params": {
+                "threadId": "recovered-thread",
+                "turnId": "rollout-task",
+                "item": {
+                    "type": "agentMessage",
+                    "id": "answer",
+                    "text": "still running",
+                },
+            },
+        })
+        await handle._dispatch({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "recovered-thread",
+                "turn": {
+                    "id": "rollout-task",
+                    "status": "completed",
+                },
+            },
+        })
+        frames = [
+            frame async for frame in
+            handle.receive_spontaneous_response("control-turn")
+        ]
+        assert [frame["method"] for frame in frames] == [
+            "item/completed", "turn/completed",
+        ]
+        assert [
+            frame["params"].get("turnId")
+            or frame["params"].get("turn", {}).get("id")
+            for frame in frames
+        ] == ["control-turn", "control-turn"]
+        assert lifecycle == [
+            ("started", "control-turn"),
+            ("completed", "control-turn"),
+        ]
+        assert handle.turn_active is False
+        assert handle.turn_id is None
+        assert handle.compaction_continuation_turn_ids == set()
+
+    asyncio.run(run())
+
+
 def test_codex_recover_owned_turn_rejects_a_different_active_turn():
     async def run():
         lifecycle = []
@@ -1558,7 +1686,9 @@ def test_managed_codex_overflow_preserves_authoritative_success_terminal():
             collaboration_mode = "default"
             service_tier = None
 
-            async def query(self, _prompt, images=None):
+            async def query(
+                self, _prompt, images=None, *, client_user_message_id=None,
+            ):
                 return "managed-overflow-turn"
 
             async def receive_response(self):
@@ -1637,7 +1767,9 @@ def test_managed_codex_overflow_reports_live_delay_without_idle_warning():
             collaboration_mode = "default"
             service_tier = None
 
-            async def query(self, _prompt, images=None):
+            async def query(
+                self, _prompt, images=None, *, client_user_message_id=None,
+            ):
                 return "managed-overflow-wait-turn"
 
             async def receive_response(self):
@@ -1710,7 +1842,9 @@ def test_managed_codex_overflow_keeps_authoritative_failure_terminal():
             collaboration_mode = "default"
             service_tier = None
 
-            async def query(self, _prompt, images=None):
+            async def query(
+                self, _prompt, images=None, *, client_user_message_id=None,
+            ):
                 return "managed-overflow-failed-turn"
 
             async def receive_response(self):
@@ -2791,6 +2925,56 @@ def test_http_provider_guard_runs_after_every_persisting_request(monkeypatch):
     asyncio.run(run())
 
 
+def test_http_provider_guard_isolated_to_explicit_codex_home(
+    tmp_path, monkeypatch,
+):
+    async def run():
+        codex_home = tmp_path / "codex-stack"
+        handle = CodexHandle(_Cfg(), codex_home=str(codex_home))
+        handle._http_provider_root_id = "root-thread"
+        handle.thread_id = "child-thread"
+        repair_calls = []
+        restored_calls = []
+
+        def repair(**kwargs):
+            repair_calls.append(kwargs)
+            return SimpleNamespace(
+                changed_db_thread_ids=(),
+                changed_rollout_thread_ids=(),
+                deferred_thread_ids=(),
+            )
+
+        def restored(thread_id, **kwargs):
+            restored_calls.append((thread_id, kwargs))
+            return True
+
+        monkeypatch.setattr(
+            codex_handle_module, "repair_http_provider_records", repair)
+        monkeypatch.setattr(
+            codex_handle_module,
+            "canonical_thread_provider_is_restored",
+            restored,
+        )
+
+        await handle._restore_http_provider_state(
+            include_descendants=True, strict=True)
+
+        resolved_home = str(codex_home.resolve())
+        assert repair_calls == [{
+            "apply": True,
+            "roots": {"root-thread"},
+            "include_thread_ids": {"root-thread", "child-thread"},
+            "codex_home": resolved_home,
+            "journal_dir": str(
+                codex_home.resolve()
+                / ".cc-remote-provider-repair-journal"),
+        }]
+        assert restored_calls == [(
+            "root-thread", {"codex_home": resolved_home})]
+
+    asyncio.run(run())
+
+
 def test_http_provider_guard_runs_for_late_persisting_notification(monkeypatch):
     async def run():
         handle = CodexHandle(_Cfg())
@@ -3452,6 +3636,8 @@ def test_machine_claude_ask_user_question_preserves_input_and_collects_answers()
     async def run():
         machine, transport = _mk_machine()
         ctx = _mk_ctx("claude-question", "claude-question")
+        ctx.state = "running"
+        ctx.active_msg_id = "claude-question-turn"
         tool_input = {
             "questions": [
                 {
@@ -3515,6 +3701,14 @@ def test_machine_claude_ask_user_question_preserves_input_and_collects_answers()
             and [option["label"] for option in message.options] == ["允许一次", "拒绝"]
             for message in transport.sent
         )
+        receipts = [
+            message for message in transport.sent
+            if isinstance(message, StateEvent)
+            and message.detail == "回答已收到，正在等待 Claude 继续。"
+        ]
+        assert len(receipts) == 1
+        assert receipts[0].msg_id == "claude-question-turn"
+        assert ctx.claude_progress_notice_active is True
 
     asyncio.run(run())
 
@@ -5084,7 +5278,9 @@ def test_managed_turn_exception_does_not_unlock_live_auto_turn():
             model = None
             effort = None
 
-            async def query(self, _prompt, images=None):
+            async def query(
+                self, _prompt, images=None, *, client_user_message_id=None,
+            ):
                 raise RuntimeError("managed launch failed")
 
         ctx.sdk = FailingSdk()
@@ -5116,7 +5312,9 @@ def test_managed_codex_turn_emits_authoritative_browser_turn_binding():
             collaboration_mode = "default"
             service_tier = None
 
-            async def query(self, _prompt, images=None):
+            async def query(
+                self, _prompt, images=None, *, client_user_message_id=None,
+            ):
                 return "native-turn"
 
             async def receive_response(self):
@@ -5140,6 +5338,67 @@ def test_managed_codex_turn_emits_authoritative_browser_turn_binding():
         assert [event.type for event in transport.sent].index("turn_binding") < [
             event.type for event in transport.sent
         ].index("turn_end")
+
+    asyncio.run(run())
+
+
+def test_managed_codex_turn_clears_stale_effort_when_sdk_has_none():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("no-effort-session", "no-effort-session")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        ctx.active_msg_id = "browser-message"
+        ctx.announced_effort = "ultra"
+        ctx.turn_task = asyncio.current_task()
+
+        class NoEffortSdk:
+            tier_dirty = False
+            model = None
+            effort = None
+            collaboration_mode = "default"
+            service_tier = None
+
+            async def query(
+                self, _prompt, images=None, *, client_user_message_id=None,
+            ):
+                return "native-turn"
+
+            async def receive_response(self):
+                yield {
+                    "method": "item/completed",
+                    "params": {
+                        "turnId": "native-turn",
+                        "item": {
+                            "id": "answer",
+                            "type": "agentMessage",
+                            "text": "done",
+                        },
+                    },
+                }
+                yield {
+                    "method": "turn/completed",
+                    "params": {"turn": {
+                        "id": "native-turn", "status": "completed",
+                    }},
+                }
+
+        ctx.sdk = NoEffortSdk()
+        machine._begin_codex_checkpoint = lambda _ctx: asyncio.sleep(0)
+        machine._accept_codex_checkpoint = lambda _ctx: asyncio.sleep(0)
+        await machine._run_turn(ctx, "hello")
+
+        assert ctx.announced_effort is None
+        assert [
+            event.effort for event in transport.sent
+            if isinstance(event, Effort)
+        ] == [""]
+        assert not [event for event in transport.sent
+                    if isinstance(event, Error)]
+        terminal = [event for event in transport.sent
+                    if isinstance(event, TurnEnd)]
+        assert len(terminal) == 1
+        assert terminal[0].result.is_error is False
 
     asyncio.run(run())
 
@@ -6241,11 +6500,22 @@ def test_codex_handle_inserts_steer_fence_at_response_before_provider_repair(
         assert handle._pending_response_boundaries == {}
 
         # A later live-detail overflow may shed frames, never the ordering
-        # control. The gap belongs before the retained user boundary.
+        # or identity controls. The gap belongs before the retained user
+        # boundary.
+        proof = codex_handle_module.CodexSteerUserIdentityProof(
+            thread_id="thread-1",
+            expected_turn_id="turn-1",
+            native_turn_id="native-turn-1",
+            native_message_id="native-message-2",
+            client_message_id="message-2",
+            generation=0,
+        )
         assert queue.put_nowait(before)
         queue.put_control_nowait(acceptance.fence)
+        queue.put_control_first_nowait(proof)
         queue.begin_gap(CodexManagedOverflow("turn-1"))
         assert isinstance(await queue.get(), CodexManagedOverflow)
+        assert await queue.get() is proof
         assert await queue.get() is acceptance.fence
         acceptance.fence.release_now()
 
@@ -6546,6 +6816,51 @@ def test_wrapper_steer_success_echoes_without_mutating_turn_lifecycle():
         assert ctx.codex_checkpoint_turn_id == "native-turn"
         assert ctx.codex_checkpoint_ready is True
         assert ctx.codex_checkpoint_accepted is True
+
+    asyncio.run(run())
+
+
+def test_wrapper_steer_rebinds_lease_before_live_echo_failure():
+    class Sdk:
+        turn_id = "native-turn"
+        turn_active = True
+        shared_daemon_affinity = True
+
+        async def steer(
+            self, prompt, images=None, *, client_user_message_id=None,
+        ):
+            assert prompt == "accepted before disconnect"
+            assert images == []
+            assert client_user_message_id == "steer-message"
+            return self.turn_id
+
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _install_running_steer_context(machine, Sdk())
+        machine._claim_codex_turn(
+            ctx, "native-turn", "original-message")
+        original_send = transport.send
+
+        async def fail_live_echo(message):
+            if isinstance(message, TurnSteered):
+                raise RuntimeError("relay disconnected after native acceptance")
+            await original_send(message)
+
+        transport.send = fail_live_echo
+        result = await machine._handle_steer(Steer(
+            sid=ctx.key,
+            cmd_id="steer-command",
+            client_id="client-1",
+            prompt="accepted before disconnect",
+            msg_id="steer-message",
+        ))
+
+        assert isinstance(result, TurnSteered)
+        lease = machine._codex_turn_leases.get(ctx.key)
+        assert lease is not None
+        assert lease.turn_id == "native-turn"
+        assert lease.msg_id == "steer-message"
+        assert ctx.active_msg_id == "steer-message"
 
     asyncio.run(run())
 

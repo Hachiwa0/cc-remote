@@ -7,6 +7,7 @@ import type {
 export interface QuotaWindows {
   fiveHour: StatusRateWindow | null;
   weekly: StatusRateWindow | null;
+  overall: StatusRateWindow | null;
   limit: StatusRateLimit | null;
 }
 
@@ -24,6 +25,15 @@ export function remainingPercent(
   return clampPercent(100 - window.used_percent);
 }
 
+export function quotaWindowLabel(minutes?: number | null): string {
+  if (minutes == null || !Number.isFinite(minutes) || minutes <= 0) {
+    return "滚动窗口";
+  }
+  if (minutes === 300) return "5 小时窗口";
+  if (minutes === 10_080) return "一周窗口";
+  return `${minutes} 分钟窗口`;
+}
+
 export function accountQuotaWindows(
   report?: StatusReport | null,
 ): QuotaWindows {
@@ -31,6 +41,14 @@ export function accountQuotaWindows(
   const hasWindow = (limit: StatusRateLimit, duration: number): boolean =>
     [limit.primary, limit.secondary].some(
       (window) => window?.window_duration_mins === duration,
+    );
+  const hasUsableWindow = (limit: StatusRateLimit): boolean =>
+    [limit.primary, limit.secondary].some((window) =>
+      window != null && (
+        window.used_percent != null
+        || window.resets_at != null
+        || window.window_duration_mins != null
+      )
     );
   const hasAccountWindow = (limit: StatusRateLimit): boolean =>
     hasWindow(limit, 300) || hasWindow(limit, 10_080);
@@ -43,7 +61,7 @@ export function accountQuotaWindows(
     candidate.limit_id == null && hasAccountWindow(candidate)
   );
   const limit = limits.find((candidate) =>
-    candidate.limit_id === "codex" && hasAccountWindow(candidate)
+    candidate.limit_id === "codex" && hasUsableWindow(candidate)
   ) ?? legacyLimits.find((candidate) =>
     hasWindow(candidate, 300) && hasWindow(candidate, 10_080),
   ) ?? legacyLimits[0] ?? null;
@@ -56,9 +74,17 @@ export function accountQuotaWindows(
   const weekly = windows.find(
     (window) => window.window_duration_mins === 10_080,
   ) ?? null;
+  // Free accounts currently expose one authoritative long-lived "codex"
+  // bucket instead of the paid-plan 5-hour/weekly pair. Preserve the native
+  // shape and present it as a single overall quota; never relabel it as a
+  // weekly window.
+  const overall = fiveHour == null && weekly == null
+    ? windows[0] ?? null
+    : null;
   return {
     fiveHour,
     weekly,
+    overall,
     limit,
   };
 }

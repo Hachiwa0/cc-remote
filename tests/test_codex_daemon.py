@@ -13,6 +13,7 @@ from cc_remote.wrapper import codex_daemon as daemon_module
 from cc_remote.wrapper import codex_handle as handle_module
 from cc_remote.wrapper.codex_daemon import (
     CodexDaemonManager,
+    CodexProfileDaemonUnavailable,
     CodexDaemonUpgradeRequired,
 )
 from cc_remote.wrapper.codex_handle import (
@@ -298,6 +299,152 @@ def test_unrecoverable_stale_daemon_still_falls_back_to_stdio(monkeypatch):
             ("app-server", "daemon", "--help"),
             ("app-server", "proxy", "--help"),
             ("app-server", "daemon", "version"),
+            ("app-server", "daemon", "start"),
+            ("app-server", "daemon", "version"),
+            ("app-server", "daemon", "restart"),
+        ]
+
+    asyncio.run(run())
+
+
+def test_required_profile_bootstraps_its_own_shared_daemon(monkeypatch):
+    async def run():
+        monkeypatch.setattr(
+            daemon_module, "_binary_identity", lambda _path: ("codex-v1",))
+        manager = CodexDaemonManager("auto", require_shared=True)
+        calls: list[tuple[str, ...]] = []
+        bootstrapped = False
+
+        async def command(_bin, _env, *args):
+            nonlocal bootstrapped
+            calls.append(args)
+            if args[-1] == "--help":
+                return _result(0)
+            if args[-1] == "version":
+                if not bootstrapped:
+                    return _result(1)
+                return _result(0, {
+                    "status": "running",
+                    "managedCodexPath": "/opt/codex/current/codex",
+                    "managedCodexVersion": "0.147.0",
+                    "socketPath": "/tmp/stack-codex.sock",
+                    "cliVersion": "0.147.0",
+                    "appServerVersion": "0.147.0",
+                })
+            if args[-2:] == ("bootstrap", "--remote-control"):
+                bootstrapped = True
+                return _result(0)
+            assert args[-1] == "enable-remote-control"
+            return _result(0, {
+                "status": "enabled",
+                "remoteControlEnabled": True,
+                "socketPath": "/tmp/stack-codex.sock",
+            })
+
+        manager._run = command  # type: ignore[method-assign]
+        assert await manager.proxy_args(
+            "/bin/codex", {"CODEX_HOME": "/tmp/codex-stack"},
+        ) == [
+            "/bin/codex", "app-server", "proxy",
+            "--sock", "/tmp/stack-codex.sock",
+        ]
+        assert manager.strict_shared_affinity is True
+        assert calls == [
+            ("app-server", "daemon", "--help"),
+            ("app-server", "proxy", "--help"),
+            ("app-server", "daemon", "version"),
+            (
+                "app-server", "daemon", "bootstrap",
+                "--remote-control",
+            ),
+            ("app-server", "daemon", "version"),
+            ("app-server", "daemon", "enable-remote-control"),
+            ("app-server", "daemon", "version"),
+        ]
+
+    asyncio.run(run())
+
+
+def test_profile_bootstrap_reuses_verified_managed_standalone(tmp_path):
+    primary = tmp_path / "primary"
+    standalone = primary / "packages" / "standalone"
+    release = standalone / "releases" / "0.147.0"
+    binary = release / "bin" / "codex"
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b"#!/bin/sh\n")
+    binary.chmod(0o755)
+    (release / "codex").symlink_to("bin/codex")
+    (standalone / "current").symlink_to(release, target_is_directory=True)
+    secondary = tmp_path / "secondary"
+    secondary.mkdir()
+
+    assert daemon_module._prepare_profile_standalone(
+        str(binary), {"CODEX_HOME": str(secondary)},
+    ) is True
+    linked_current = secondary / "packages" / "standalone" / "current"
+    assert linked_current.is_symlink()
+    assert linked_current.readlink() == standalone / "current"
+    assert (linked_current / "codex").resolve() == binary
+
+
+def test_profile_bootstrap_never_replaces_existing_managed_path(tmp_path):
+    primary = tmp_path / "primary"
+    standalone = primary / "packages" / "standalone"
+    release = standalone / "releases" / "0.147.0"
+    binary = release / "bin" / "codex"
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b"#!/bin/sh\n")
+    binary.chmod(0o755)
+    (release / "codex").symlink_to("bin/codex")
+    (standalone / "current").symlink_to(release, target_is_directory=True)
+    secondary = tmp_path / "secondary"
+    existing = secondary / "packages" / "standalone" / "current"
+    existing.mkdir(parents=True)
+    marker = existing / "keep"
+    marker.write_text("user-owned")
+
+    assert daemon_module._prepare_profile_standalone(
+        str(binary), {"CODEX_HOME": str(secondary)},
+    ) is False
+    assert marker.read_text() == "user-owned"
+    assert not existing.is_symlink()
+
+
+def test_required_profile_never_silently_falls_back_to_stdio(monkeypatch):
+    async def run():
+        monkeypatch.setattr(
+            daemon_module, "_binary_identity", lambda _path: ("codex-v1",))
+        monkeypatch.setattr(
+            daemon_module,
+            "_terminate_stale_darwin_daemon_updater",
+            lambda _bin, _env: False,
+        )
+        manager = CodexDaemonManager("auto", require_shared=True)
+        calls: list[tuple[str, ...]] = []
+
+        async def command(_bin, _env, *args):
+            calls.append(args)
+            if args[-1] == "--help":
+                return _result(0)
+            return _result(1)
+
+        manager._run = command  # type: ignore[method-assign]
+        with pytest.raises(
+            CodexProfileDaemonUnavailable,
+            match="profile shared daemon",
+        ):
+            await manager.proxy_args(
+                "/bin/codex", {"CODEX_HOME": "/tmp/codex-stack"})
+        assert manager.info is None
+        assert manager.strict_shared_affinity is True
+        assert calls == [
+            ("app-server", "daemon", "--help"),
+            ("app-server", "proxy", "--help"),
+            ("app-server", "daemon", "version"),
+            (
+                "app-server", "daemon", "bootstrap",
+                "--remote-control",
+            ),
             ("app-server", "daemon", "start"),
             ("app-server", "daemon", "version"),
             ("app-server", "daemon", "restart"),

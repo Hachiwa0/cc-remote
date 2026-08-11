@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from cc_remote.wrapper import machine as machine_module
 from cc_remote.protocol import (
+    CreateWorkSchedule,
     ERR_INVALID_CWD,
     NewSession,
     SessionFocus,
@@ -46,6 +47,23 @@ def test_new_session_query_and_turn_binding_roundtrip():
         NewSession(engine="claude", permission_mode="on-request")
     with pytest.raises(ValidationError):
         NewSession(engine="claude", service_tier="fast")
+    work = NewSession(
+        engine="codex", space="work", codex_profile_id="stack",
+    )
+    assert deserialize(serialize(work)) == work
+    with pytest.raises(ValidationError):
+        NewSession(engine="claude", space="work", codex_profile_id="stack")
+
+    schedule = CreateWorkSchedule(
+        engine="codex", codex_profile_id="stack", title="report",
+        prompt="build it", next_run_at=1,
+    )
+    assert deserialize(serialize(schedule)) == schedule
+    with pytest.raises(ValidationError):
+        CreateWorkSchedule(
+            engine="claude", codex_profile_id="stack", title="report",
+            prompt="build it", next_run_at=1,
+        )
 
     binding = TurnBinding(msg_id="browser-message", turn_id="native-turn")
     assert deserialize(serialize(binding)) == binding

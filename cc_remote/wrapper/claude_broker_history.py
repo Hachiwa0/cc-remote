@@ -112,6 +112,45 @@ def parse_claude_broker_lifecycle(
     )
 
 
+def first_claude_sdk_user_id(data: bytes) -> str | None:
+    """Return the first real top-level user UUID proven to be SDK-authored.
+
+    This is deliberately stricter than text matching: ``promptId`` is native
+    Claude metadata and is unrelated to the browser message id. A tool-result
+    envelope, sidechain, meta row, malformed line, or row without explicit SDK
+    provenance cannot establish the binding.
+    """
+    if not data or not data.endswith(b"\n"):
+        return None
+    rows: list[dict] = []
+    try:
+        for raw in data.splitlines():
+            if not raw.strip():
+                continue
+            row = json.loads(raw)
+            if not isinstance(row, dict):
+                return None
+            rows.append(row)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+
+    for row in rows:
+        if (
+            row.get("entrypoint") != "sdk-py"
+            and row.get("promptSource") != "sdk"
+        ):
+            continue
+        message = row.get("message")
+        if (
+            row.get("type") != "user"
+            or not isinstance(message, dict)
+            or not _is_real_user_message(row, message)
+        ):
+            continue
+        return _wire_id(row.get("uuid"))
+    return None
+
+
 def claude_broker_tail_state(
     path: str,
     max_bytes: int = DEFAULT_TAIL_BYTES,

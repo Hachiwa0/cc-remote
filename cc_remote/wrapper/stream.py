@@ -19,7 +19,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Mapping
 
 from claude_agent_sdk.types import (
     AssistantMessage, ResultMessage, UserMessage, SystemMessage,
@@ -47,6 +47,8 @@ _MAX_TRANSCRIPT_MATCHES = 1000
 _MAX_TRANSCRIPT_RECORD_CHARS = 64 * 1024 * 1024
 _MAX_TIMESTAMP_ENTRIES = 200_000
 _MAX_TRANSCRIPT_CHAIN_ENTRIES = 200_000
+_MAX_DELAYED_RETRY_TAIL_ROWS = 4096
+_MAX_DELAYED_RETRY_TAIL_BYTES = 64 * 1024 * 1024
 _MAX_INTERNAL_USER_EVENTS = 10_000
 _MAX_SUBAGENT_FILES = 128
 _MAX_SUBAGENT_TOTAL_BYTES = 32 * 1024 * 1024
@@ -81,6 +83,28 @@ def _short_text(value: Any, limit: int = 1024) -> str | None:
     text, _ = bounded_text(value, limit)
     text = " ".join(text.split())
     return text or None
+
+
+def replayed_user_message_id(message: Any) -> str | None:
+    """Return the native UUID for one top-level replayed human input.
+
+    ``--replay-user-messages`` is the only authoritative live bridge between a
+    browser Query and Claude's independently-generated transcript identity.
+    Tool-result user envelopes are part of the same turn and must never become
+    additional aliases for the optimistic browser row.
+    """
+    if not isinstance(message, UserMessage) or message.parent_tool_use_id:
+        return None
+    content = message.content if isinstance(message.content, list) else []
+    if any(isinstance(block, (ToolResultBlock, ServerToolResultBlock))
+           for block in content):
+        return None
+    native_id = message.uuid
+    return (
+        native_id
+        if isinstance(native_id, str) and _CLAUDE_MESSAGE_UUID.fullmatch(native_id)
+        else None
+    )
 
 
 _SENSITIVE_INPUT_MARKERS = (
@@ -733,10 +757,9 @@ class StreamTranslator:
         content = msg.content if isinstance(msg.content, list) else []
         has_tool_result = any(isinstance(block, (
             ToolResultBlock, ServerToolResultBlock)) for block in content)
-        if (not msg.parent_tool_use_id and not has_tool_result
-                and isinstance(msg.uuid, str)
-                and _CLAUDE_MESSAGE_UUID.fullmatch(msg.uuid)):
-            self._last_user_uuid = msg.uuid
+        replayed_id = replayed_user_message_id(msg)
+        if replayed_id is not None:
+            self._last_user_uuid = replayed_id
         result_meta = msg.tool_use_result if isinstance(msg.tool_use_result, dict) else {}
         summary_bits = []
         for key, label in (("agentType", "代理"), ("status", "状态"),
@@ -1075,39 +1098,6 @@ class CompactTranscriptPage:
     oldest_cursor: str | None
 
 
-class TranscriptTimestamps(dict[str, float]):
-    """Timestamp map with exact SDK query aliases retained from JSONL.
-
-    ``claude_agent_sdk.get_session_messages()`` intentionally projects only the
-    transcript UUID and message body.  Claude Code nevertheless persists the
-    originating remote query id in ``promptId``.  Keeping that metadata on the
-    existing side-read avoids another full transcript scan while allowing a
-    History row to reconcile with the browser's live optimistic row after a
-    session switch.  It remains a normal ``dict`` for existing callers.
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.client_message_ids: dict[str, str] = {}
-
-
-def _remember_transcript_client_id(
-    timestamps: TranscriptTimestamps,
-    row: dict[str, Any],
-) -> None:
-    uid = row.get("uuid")
-    prompt_id = row.get("promptId")
-    if (
-        row.get("type") == "user"
-        and isinstance(uid, str)
-        and _SAFE_WIRE_ID.fullmatch(uid)
-        and isinstance(prompt_id, str)
-        and _SAFE_WIRE_ID.fullmatch(prompt_id)
-        and prompt_id != uid
-    ):
-        timestamps.client_message_ids[uid] = prompt_id
-
-
 def _compact_visible_user(row: dict[str, Any]) -> bool:
     origin = row.get("origin")
     if (
@@ -1144,18 +1134,18 @@ def _compact_visible_user(row: dict[str, Any]) -> bool:
     )
 
 
-def _compact_chain_index(
+def _transcript_graph_index(
     source_path: str,
     *,
     index_store=None,
     snapshot_size: int | None = None,
     max_record_bytes: int = _MAX_TRANSCRIPT_RECORD_CHARS,
 ):
-    """Return compact main-chain ids plus bounded graph metadata.
+    """Return the bounded raw ancestry graph without retaining payloads.
 
-    Payloads are parsed only transiently. The retained graph stores small
-    identity fields and byte offsets so the second phase can seek directly to
-    the requested page instead of scanning or retaining every message body.
+    The same source-bound index backs compact pagination and the narrow delayed
+    request-retry repair below. Keeping graph construction in one place avoids
+    a second whole-transcript scan for ordinary production history reads.
     """
     rows: dict[str, tuple[object, ...]] = {}
     leaf: str | None = None
@@ -1239,11 +1229,17 @@ def _compact_chain_index(
             return None
     if not leaf:
         return None
+    return leaf, rows, queued
 
+
+def _ordered_graph_chain(
+    leaf: str,
+    rows: dict[str, tuple[object, ...]],
+) -> list[str] | None:
+    """Follow the engine's active ancestry, honoring compact logical parents."""
     chain_ids: list[str] = []
     seen: set[str] = set()
     cursor: str | None = leaf
-    saw_compact = False
     while cursor and cursor not in seen:
         seen.add(cursor)
         metadata = rows.get(cursor)
@@ -1251,15 +1247,389 @@ def _compact_chain_index(
             return None
         chain_ids.append(cursor)
         row_type, subtype, parent_uuid, logical_parent_uuid = metadata[:4]
-        is_compact = row_type == "system" and subtype == "compact_boundary"
-        saw_compact = saw_compact or is_compact
-        parent = logical_parent_uuid if is_compact else parent_uuid
+        parent = (
+            logical_parent_uuid
+            if row_type == "system" and subtype == "compact_boundary"
+            else parent_uuid
+        )
         if not isinstance(parent, str) or not _SAFE_WIRE_ID.fullmatch(parent):
             parent = None
         cursor = parent
-    if cursor is not None or not saw_compact:
+    if cursor is not None:
         return None
-    return list(reversed(chain_ids)), rows, queued
+    return list(reversed(chain_ids))
+
+
+def _compact_chain_index(
+    source_path: str,
+    *,
+    index_store=None,
+    snapshot_size: int | None = None,
+    max_record_bytes: int = _MAX_TRANSCRIPT_RECORD_CHARS,
+):
+    """Return compact main-chain ids plus bounded graph metadata."""
+    graph = _transcript_graph_index(
+        source_path,
+        index_store=index_store,
+        snapshot_size=snapshot_size,
+        max_record_bytes=max_record_bytes,
+    )
+    if graph is None:
+        return None
+    leaf, rows, queued = graph
+    chain_ids = _ordered_graph_chain(leaf, rows)
+    if chain_ids is None:
+        return None
+
+    if not any(
+        rows[uid][0] == "system" and rows[uid][1] == "compact_boundary"
+        for uid in chain_ids
+    ):
+        return None
+    return chain_ids, rows, queued
+
+
+def _indexed_transcript_row(
+    source,
+    uid: str,
+    metadata: tuple[object, ...],
+    *,
+    max_record_bytes: int,
+) -> dict[str, Any] | None:
+    """Seek and validate one source-bound graph row."""
+    offset = metadata[5]
+    record_bytes = metadata[7]
+    if (
+        not isinstance(offset, int)
+        or not isinstance(record_bytes, int)
+        or record_bytes <= 0
+        or record_bytes > max(1024, int(max_record_bytes))
+    ):
+        return None
+    try:
+        source.seek(offset)
+        raw = source.read(record_bytes)
+        if len(raw) != record_bytes:
+            return None
+        row = json.loads(raw)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(row, dict) or row.get("uuid") != uid:
+        return None
+    return row
+
+
+def _transcript_epoch(row: dict[str, Any]) -> float | None:
+    value = row.get("timestamp")
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(
+            value.replace("Z", "+00:00") if value.endswith("Z") else value
+        ).timestamp()
+    except (ValueError, OverflowError):
+        return None
+
+
+def _tool_result_user_row(row: dict[str, Any]) -> bool:
+    message = row.get("message")
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return False
+    content = message.get("content")
+    if not isinstance(content, list) or not content:
+        return False
+    kinds = [
+        block.get("type")
+        for block in content
+        if isinstance(block, dict)
+    ]
+    return bool(kinds) and len(kinds) == len(content) and all(
+        kind == "tool_result"
+        or isinstance(kind, str) and kind.endswith("_tool_result")
+        for kind in kinds
+    )
+
+
+def _delayed_retry_tail(
+    source,
+    retry_uid: str,
+    retry_index: int,
+    active_chain: list[str],
+    canonical_ids: set[str],
+    rows: dict[str, tuple[object, ...]],
+    children: dict[str, list[str]],
+    *,
+    max_record_bytes: int,
+) -> tuple[str, list[SimpleNamespace], dict[str, float]] | None:
+    """Return one unambiguous completed sibling bypassed by a delayed retry."""
+    retry_metadata = rows[retry_uid]
+    retry_parent = retry_metadata[2]
+    retry_offset = retry_metadata[5]
+    if (
+        not isinstance(retry_parent, str)
+        or retry_parent not in canonical_ids
+        or not isinstance(retry_offset, int)
+    ):
+        return None
+    retry_row = _indexed_transcript_row(
+        source, retry_uid, retry_metadata,
+        max_record_bytes=max_record_bytes,
+    )
+    if retry_row is None or (
+        retry_row.get("source") != "request_retry"
+        or not isinstance(retry_row.get("retryAttempt"), int)
+        or retry_row["retryAttempt"] < 1
+        or not isinstance(retry_row.get("maxRetries"), int)
+        or retry_row["maxRetries"] < retry_row["retryAttempt"]
+    ):
+        return None
+    retry_epoch = _transcript_epoch(retry_row)
+    if retry_epoch is None:
+        return None
+
+    # The later prompt must actually continue through this retry node. Without
+    # that proof this may be an ordinary abandoned API-error branch.
+    next_user_uid = next((
+        uid for uid in active_chain[retry_index + 1:]
+        if bool(rows[uid][6]) and uid in canonical_ids
+    ), None)
+    if next_user_uid is None:
+        return None
+    next_user_metadata = rows[next_user_uid]
+    next_user_offset = next_user_metadata[5]
+    if not isinstance(next_user_offset, int) or next_user_offset <= retry_offset:
+        return None
+    next_user_row = _indexed_transcript_row(
+        source, next_user_uid, next_user_metadata,
+        max_record_bytes=max_record_bytes,
+    )
+    if next_user_row is None:
+        return None
+
+    active_ids = set(active_chain)
+    alternatives = [
+        uid for uid in children.get(retry_parent, ())
+        if uid != retry_uid
+        and uid not in active_ids
+        and rows[uid][4] is not True
+        and isinstance(rows[uid][5], int)
+        and rows[uid][5] < retry_offset
+    ]
+    # Competing siblings are a real fork. Never guess which answer to revive.
+    if len(alternatives) != 1:
+        return None
+
+    cursor = alternatives[0]
+    visited: set[str] = set()
+    path_rows: list[dict[str, Any]] = []
+    path_meta: list[tuple[object, ...]] = []
+    total_bytes = 0
+    while cursor not in visited:
+        visited.add(cursor)
+        if len(visited) > _MAX_DELAYED_RETRY_TAIL_ROWS:
+            return None
+        metadata = rows.get(cursor)
+        if (
+            metadata is None
+            or metadata[4] is True
+            or cursor in active_ids
+            or bool(metadata[6])
+            or not isinstance(metadata[5], int)
+            or metadata[5] >= retry_offset
+            or not isinstance(metadata[7], int)
+        ):
+            return None
+        total_bytes += metadata[7]
+        if total_bytes > _MAX_DELAYED_RETRY_TAIL_BYTES:
+            return None
+        row = _indexed_transcript_row(
+            source, cursor, metadata,
+            max_record_bytes=max_record_bytes,
+        )
+        if row is None:
+            return None
+        row_type = metadata[0]
+        if row_type == "user":
+            if not _tool_result_user_row(row):
+                return None
+        elif row_type == "assistant":
+            message = row.get("message")
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                return None
+            stop_reason = message.get("stop_reason")
+            if stop_reason not in {None, "tool_use", "end_turn"}:
+                return None
+        elif row_type != "attachment":
+            # Compact/system/error/task rows change conversation semantics and
+            # are never presentation-only completion tails.
+            return None
+        path_rows.append(row)
+        path_meta.append(metadata)
+
+        successors = [
+            uid for uid in children.get(cursor, ())
+            if uid not in active_ids
+            and rows[uid][4] is not True
+            and isinstance(rows[uid][5], int)
+            and rows[uid][5] < retry_offset
+        ]
+        if not successors:
+            break
+        if len(successors) != 1:
+            return None
+        cursor = successors[0]
+    else:
+        return None
+
+    terminal_row = path_rows[-1] if path_rows else None
+    terminal_message = (
+        terminal_row.get("message")
+        if isinstance(terminal_row, dict) else None
+    )
+    if (
+        not isinstance(terminal_message, dict)
+        or terminal_row.get("type") != "assistant"
+        or terminal_message.get("role") != "assistant"
+        or terminal_message.get("stop_reason") != "end_turn"
+    ):
+        return None
+    terminal_epoch = _transcript_epoch(terminal_row)
+    next_user_epoch = _transcript_epoch(next_user_row)
+    if (
+        terminal_epoch is None
+        or next_user_epoch is None
+        or not retry_epoch < terminal_epoch < next_user_epoch
+        or path_meta[-1][5] >= retry_offset
+    ):
+        return None
+
+    messages: list[SimpleNamespace] = []
+    recovered_timestamps: dict[str, float] = {}
+    for row in path_rows:
+        row_type = row.get("type")
+        message = row.get("message")
+        if row_type not in {"user", "assistant"} or not isinstance(message, dict):
+            continue
+        messages.append(SimpleNamespace(
+            type=row_type,
+            uuid=row["uuid"],
+            session_id=(
+                row.get("sessionId")
+                if isinstance(row.get("sessionId"), str) else None
+            ),
+            message=message,
+            parent_tool_use_id=(
+                row.get("parentToolUseID")
+                or row.get("parent_tool_use_id")
+            ),
+        ))
+        epoch = _transcript_epoch(row)
+        if epoch is not None:
+            recovered_timestamps[row["uuid"]] = epoch
+    if not messages or messages[-1].uuid != terminal_row["uuid"]:
+        return None
+    return retry_parent, messages, recovered_timestamps
+
+
+def recover_claude_delayed_retry_tail(
+    session_id: str,
+    messages,
+    *,
+    path: str | None = None,
+    index_store=None,
+    snapshot_size: int | None = None,
+    max_record_bytes: int = _MAX_TRANSCRIPT_RECORD_CHARS,
+    timestamps: dict[str, float] | None = None,
+) -> list:
+    """Restore only completed tails bypassed by delayed request-retry records.
+
+    Claude's supported session reader follows the newest ``parentUuid`` chain.
+    A network retry can be appended much later with an older timestamp and make
+    the next human prompt branch from the middle of an already completed turn.
+    The raw answer remains on disk but disappears from that projection. This
+    repair is intentionally narrower than general branch recovery: physical
+    order, engine timestamps, retry provenance, a later human prompt and one
+    linear successful sibling must all agree, otherwise the SDK result wins.
+    """
+    canonical = list(messages or ())
+    if not _SAFE_SESSION_ID.fullmatch(session_id):
+        return canonical
+    source_path = path or transcript_path(session_id)
+    if not source_path:
+        return canonical
+    graph = _transcript_graph_index(
+        source_path,
+        index_store=index_store,
+        snapshot_size=snapshot_size,
+        max_record_bytes=max_record_bytes,
+    )
+    if graph is None:
+        return canonical
+    leaf, rows, _queued = graph
+    active_chain = _ordered_graph_chain(leaf, rows)
+    if active_chain is None:
+        return canonical
+    canonical_ids = {
+        uid for message in canonical
+        if isinstance((uid := getattr(message, "uuid", None)), str)
+    }
+    if not canonical_ids:
+        return canonical
+    children: dict[str, list[str]] = {}
+    for uid, metadata in rows.items():
+        parent = metadata[2]
+        if isinstance(parent, str):
+            children.setdefault(parent, []).append(uid)
+    for siblings in children.values():
+        siblings.sort(key=lambda uid: (
+            rows[uid][5] if isinstance(rows[uid][5], int) else -1))
+
+    insertions: dict[
+        str, tuple[list[SimpleNamespace], dict[str, float]]
+    ] = {}
+    recovered_ids: set[str] = set()
+    try:
+        with open(source_path, "rb") as source:
+            for index, uid in enumerate(active_chain):
+                metadata = rows[uid]
+                if metadata[0] != "system" or metadata[1] != "api_error":
+                    continue
+                recovered = _delayed_retry_tail(
+                    source,
+                    uid,
+                    index,
+                    active_chain,
+                    canonical_ids,
+                    rows,
+                    children,
+                    max_record_bytes=max_record_bytes,
+                )
+                if recovered is None:
+                    continue
+                parent_uid, tail, recovered_timestamps = recovered
+                if parent_uid in insertions or any(
+                    item.uuid in canonical_ids or item.uuid in recovered_ids
+                    for item in tail
+                ):
+                    continue
+                insertions[parent_uid] = (tail, recovered_timestamps)
+                recovered_ids.update(item.uuid for item in tail)
+    except OSError:
+        return canonical
+    if not insertions:
+        return canonical
+
+    output: list = []
+    for message in canonical:
+        output.append(message)
+        uid = getattr(message, "uuid", None)
+        insertion = insertions.get(uid)
+        if insertion:
+            tail, recovered_timestamps = insertion
+            output.extend(tail)
+            if timestamps is not None:
+                timestamps.update(recovered_timestamps)
+    return output
 
 
 def _load_compact_chain_messages(
@@ -1274,7 +1644,7 @@ def _load_compact_chain_messages(
     list[SimpleNamespace], dict[str, float], dict[str, ProcessEvent]
 ] | None:
     messages: list[SimpleNamespace] = []
-    timestamps = TranscriptTimestamps()
+    timestamps: dict[str, float] = {}
     internal_events: dict[str, ProcessEvent] = {}
     try:
         with open(source_path, "rb") as source:
@@ -1294,7 +1664,6 @@ def _load_compact_chain_messages(
                     return None
                 if row.get("uuid") != uid:
                     return None
-                _remember_transcript_client_id(timestamps, row)
                 internal = _internal_user_event_from_row(row, queued)
                 if internal is not None:
                     internal_events[uid] = internal
@@ -1333,7 +1702,7 @@ def transcript_timestamps(session_id: str) -> dict[str, float]:
     this, history events default their `ts` to now (making every past message show
     the current time — "like a clock"). Best-effort: {} if not found/readable.
     session_id is globally unique, so a glob across all project dirs locates it."""
-    out = TranscriptTimestamps()
+    out: dict[str, float] = {}
     if not _SAFE_SESSION_ID.fullmatch(session_id):
         return out
     try:
@@ -1346,7 +1715,6 @@ def transcript_timestamps(session_id: str) -> dict[str, float]:
                     d = json.loads(line)
                 except Exception:
                     continue
-                _remember_transcript_client_id(out, d)
                 uid, ts = d.get("uuid"), d.get("timestamp")
                 if not uid or not isinstance(ts, str):
                     continue
@@ -1612,8 +1980,15 @@ def transcript_internal_user_events(session_id: str) -> dict[str, ProcessEvent]:
     return events
 
 
-def translate_history(messages, tool_result_max: int, timestamps: dict | None = None,
-                      internal_user_events: dict[str, ProcessEvent] | None = None) -> list:
+def translate_history(
+    messages,
+    tool_result_max: int,
+    timestamps: dict | None = None,
+    internal_user_events: dict[str, ProcessEvent] | None = None,
+    *,
+    client_message_ids: Mapping[str, str] | None = None,
+    snapshot_in_progress: bool = False,
+) -> list:
     """Translate a session's on-disk transcript (list[SessionMessage]) into wire
     events the client reducer renders as past turns.
 
@@ -1657,7 +2032,7 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
     def _ts(uid):
         return timestamps.get(uid) if timestamps else None
 
-    client_message_ids = getattr(timestamps, "client_message_ids", {})
+    client_message_ids = client_message_ids or {}
 
     def _um(uid, prompt):
         client_msg_id = client_message_ids.get(uid)
@@ -1975,7 +2350,13 @@ def translate_history(messages, tool_result_max: int, timestamps: dict | None = 
         mts = _ts(source_uid)
         if mts is not None:
             last_ts = mts
-    close_turn()
+    # Claude's transcript does not persist the SDK ResultMessage. EOF normally
+    # acts as a synthetic completed boundary for an idle historical snapshot,
+    # but it is not lifecycle evidence while the resident SDK iterator is still
+    # active. Keep only that final group open; every earlier group was already
+    # closed authoritatively by the next visible user message.
+    if not snapshot_in_progress:
+        close_turn()
     return events
 
 

@@ -29,7 +29,9 @@ from cc_remote.attachments import (
 from cc_remote.protocol import ConversationTurn
 
 
-_SCHEMA_VERSION = 12
+# v17 also discards Codex pages whose legacy rollout user rows were materialized
+# without the adjacent native app-server item id used by the live stream.
+_SCHEMA_VERSION = 17
 _FINGERPRINT_SAMPLE_BYTES = 64 * 1024
 _DEFAULT_MAX_ENTRIES = 128
 _DEFAULT_MAX_BYTES = 64 * 1024 * 1024
@@ -199,6 +201,11 @@ class MaterializedHistoryPage:
     oldest_id: str | None
     newest_id: str | None
     turns: tuple[dict[str, Any], ...] = ()
+    # Claude transcript EOF is only a synthetic terminal. Bind newest-page
+    # projections to the resident lifecycle state so an exact source
+    # fingerprint cached during a turn cannot close it (or remain open) after
+    # ResultMessage changes state without adding another JSONL row.
+    in_progress: bool | None = None
 
     def as_payload(self) -> dict[str, Any]:
         return {
@@ -207,6 +214,7 @@ class MaterializedHistoryPage:
             "oldest_id": self.oldest_id,
             "newest_id": self.newest_id,
             "turns": list(self.turns),
+            "in_progress": self.in_progress,
         }
 
     def semantic_token(self) -> str:
@@ -228,6 +236,7 @@ class MaterializedHistoryPage:
             "oldest_id": self.oldest_id,
             "newest_id": self.newest_id,
             "turns": list(self.turns),
+            "in_progress": self.in_progress,
         }
         encoded = json.dumps(
             payload, ensure_ascii=False, sort_keys=True,
@@ -250,6 +259,9 @@ class MaterializedHistoryPage:
         if not isinstance(turns, (list, tuple)) or not all(
                 isinstance(turn, dict) for turn in turns):
             raise ValueError("invalid materialized history turns")
+        raw_in_progress = payload.get("in_progress")
+        if raw_in_progress is not None and not isinstance(raw_in_progress, bool):
+            raise ValueError("invalid materialized history lifecycle")
         # The SQLite projection is rebuildable, but can outlive a wire-schema
         # change.  Validate its cached summary at this single boundary so an
         # obsolete field is never served to the client; callers invalidate the
@@ -270,6 +282,7 @@ class MaterializedHistoryPage:
             newest_id=(payload.get("newest_id")
                        if isinstance(payload.get("newest_id"), str) else None),
             turns=tuple(normalized_turns),
+            in_progress=raw_in_progress,
         )
 
 
@@ -865,13 +878,13 @@ class HistoryIndexStore:
     def _ensure_schema(self) -> None:
         with self._connect() as connection:
             current = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if current == 10:
-                # v11 changes only Claude history translation: compacted
-                # transcripts now reconnect their pre-compact active ancestry.
-                # Exact v10 source fingerprints would otherwise keep serving a
-                # semantically stale post-compact-only page forever. Preserve
-                # Codex pages/images (which can be expensive to rebuild) and
-                # invalidate only the rebuildable Claude projection.
+            if current in (10, 11, 12, 13, 14):
+                # v14 corrected Claude browser-message identity and v15
+                # narrowly restores completed tails bypassed by delayed
+                # request-retry branches. Exact transcript fingerprints cannot
+                # reveal either projection change, so invalidate only Claude's
+                # rebuildable pages/details/images. Preserve expensive Codex
+                # projections and the independent compact-chain graph index.
                 for table in (
                     "history_pages",
                     "history_turn_details",
@@ -879,7 +892,19 @@ class HistoryIndexStore:
                 ):
                     connection.execute(
                         f"DELETE FROM {table} WHERE engine='claude'")
-            elif current not in (0, 11, _SCHEMA_VERSION):
+            if current in (10, 11, 12, 13, 14, 15, 16):
+                # v16 makes browser/native ownership durable; v17 reuses the
+                # adjacent native response-item id for legacy Codex user rows.
+                # Source fingerprints reveal neither projection change, so
+                # rebuild pages and source-complete details once. Image assets
+                # contain no turn-owner identity and remain valid/source-bound.
+                for table in (
+                    "history_pages",
+                    "history_turn_details",
+                ):
+                    connection.execute(
+                        f"DELETE FROM {table} WHERE engine='codex'")
+            elif current not in (0, _SCHEMA_VERSION):
                 # v9 changes the invariant of history_turn_details: those rows
                 # must contain the source-complete translated turn, never the
                 # transport-compacted History frame.  Both Claude and Codex v8

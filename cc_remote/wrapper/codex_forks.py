@@ -16,7 +16,7 @@ import threading
 import time
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from uuid import uuid4
 
 
@@ -25,6 +25,7 @@ _MAX_ENTRIES = 4096
 _MAX_FILE_BYTES = 4 * 1024 * 1024
 _MAX_META_RECORD_BYTES = 1024 * 1024
 _SOURCE_PREFIX = "cc-remote-fork:"
+_PROFILE_META_KEY = "__cc_remote_profile__"
 
 
 class ForkJournalError(RuntimeError):
@@ -43,6 +44,7 @@ class CodexForkJournal:
     def __init__(self, state_dir: Path):
         self.path = Path(state_dir) / "codex-forks.json"
         self._lock = threading.RLock()
+        self._profile_revision = 0
         self.entries = self._load()
 
     def _load(self) -> OrderedDict[str, dict[str, Any]]:
@@ -55,7 +57,20 @@ class CodexForkJournal:
             if len(raw_text.encode("utf-8", "surrogatepass")) > _MAX_FILE_BYTES:
                 raise ValueError("fork journal exceeds size limit")
             raw = json.loads(raw_text)
-            if not isinstance(raw, dict) or len(raw) > _MAX_ENTRIES:
+            if not isinstance(raw, dict):
+                raise ValueError("fork journal has an invalid shape")
+            profile_meta = raw.pop(_PROFILE_META_KEY, None)
+            if profile_meta is not None:
+                if (
+                    not isinstance(profile_meta, dict)
+                    or set(profile_meta) != {"revision"}
+                    or isinstance(profile_meta.get("revision"), bool)
+                    or not isinstance(profile_meta.get("revision"), int)
+                    or profile_meta["revision"] < 0
+                ):
+                    raise ValueError("fork journal profile metadata is invalid")
+                self._profile_revision = profile_meta["revision"]
+            if len(raw) > _MAX_ENTRIES:
                 raise ValueError("fork journal has an invalid shape")
             for request_id, entry in raw.items():
                 self._validate_entry(request_id, entry)
@@ -68,6 +83,42 @@ class CodexForkJournal:
             # browser retries. Refuse fail-open startup instead.
             raise ForkJournalError("Codex fork journal is unreadable") from exc
         return entries
+
+    def migrate_profile_sessions(
+        self,
+        transform: Callable[[str], str],
+        *,
+        profile_revision: int,
+    ) -> int:
+        """Atomically migrate parent/child ids without replaying a fork."""
+        if (
+            isinstance(profile_revision, bool)
+            or not isinstance(profile_revision, int)
+            or profile_revision < 1
+        ):
+            raise ForkJournalError("invalid Codex profile revision")
+        with self._lock:
+            if self._profile_revision >= profile_revision:
+                return 0
+            updated: OrderedDict[str, dict[str, Any]] = OrderedDict()
+            migrated = 0
+            for request_id, raw_entry in self.entries.items():
+                entry = dict(raw_entry)
+                parent = transform(entry["parent_session_id"])
+                migrated += parent != entry["parent_session_id"]
+                entry["parent_session_id"] = parent
+                child = entry.get("session_id")
+                if isinstance(child, str):
+                    routed_child = transform(child)
+                    migrated += routed_child != child
+                    entry["session_id"] = routed_child
+                self._validate_entry(request_id, entry)
+                updated[request_id] = entry
+            self._validate_aliases(updated)
+            self._persist(updated, profile_revision=profile_revision)
+            self.entries = updated
+            self._profile_revision = profile_revision
+            return migrated
 
     @staticmethod
     def _validate_aliases(entries: OrderedDict[str, dict[str, Any]]) -> None:
@@ -428,12 +479,24 @@ class CodexForkJournal:
         self.entries = updated
         return dict(updated[request_id])
 
-    def _persist(self, entries: OrderedDict[str, dict[str, Any]]) -> None:
+    def _persist(
+        self,
+        entries: OrderedDict[str, dict[str, Any]],
+        *,
+        profile_revision: int | None = None,
+    ) -> None:
         tmp = self.path.with_suffix(f".{os.getpid()}.{uuid4().hex}.tmp")
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             os.chmod(self.path.parent, 0o700)
-            payload = json.dumps(entries, separators=(",", ":"))
+            serializable = OrderedDict(entries)
+            serializable[_PROFILE_META_KEY] = {
+                "revision": (
+                    self._profile_revision
+                    if profile_revision is None else profile_revision
+                ),
+            }
+            payload = json.dumps(serializable, separators=(",", ":"))
             if len(payload.encode("utf-8")) > _MAX_FILE_BYTES:
                 raise ValueError("fork journal exceeds size limit")
             with tmp.open("w") as stream:

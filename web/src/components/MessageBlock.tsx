@@ -1,6 +1,8 @@
-import { createContext, isValidElement, useContext, useEffect, useMemo, useRef,
-  useState, useSyncExternalStore, type ComponentPropsWithoutRef,
+import { createContext, isValidElement, useContext, useEffect, useId,
+  useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore,
+  type ComponentPropsWithoutRef,
   type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import ReactMarkdown, { type Components } from "react-markdown";
 import { parseLocalFileTarget } from "../file-link";
 import { Icon } from "../icons";
@@ -373,9 +375,8 @@ function MarkdownLink({
   const file = parseLocalFileTarget(href);
   if (file && onOpenFile) {
     const location = file.line ? `${file.path}:${file.line}` : file.path;
-    return <button type="button" className="message-file-link"
-      title={`在 Remote 中打开 ${location}`}
-      onClick={() => onOpenFile(file.path, file.line)}>{children}</button>;
+    return <LocalFileLink location={location}
+      onOpen={() => onOpenFile(file.path, file.line)}>{children}</LocalFileLink>;
   }
   if (/^https?:\/\//i.test(href) || /^mailto:/i.test(href)) {
     return <a href={href} target="_blank" rel="noopener noreferrer"
@@ -384,6 +385,105 @@ function MarkdownLink({
   if (href.startsWith("#")) return <a href={href} title={title}>{children}</a>;
   return <span className="message-link-disabled"
     title="该链接无法在当前会话中打开">{children}</span>;
+}
+
+function LocalFileLink({ location, children, onOpen }: {
+  location: string;
+  children: ReactNode;
+  onOpen: () => void;
+}) {
+  const tooltipId = useId();
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const tooltipRef = useRef<HTMLSpanElement>(null);
+  const pathRef = useRef<HTMLSpanElement>(null);
+  const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [shown, setShown] = useState(false);
+  const [position, setPosition] = useState({ left: 0, top: 0 });
+
+  const cancelClose = () => {
+    if (!closeTimer.current) return;
+    clearTimeout(closeTimer.current);
+    closeTimer.current = null;
+  };
+  const open = () => {
+    cancelClose();
+    setShown(true);
+  };
+  const scheduleClose = () => {
+    cancelClose();
+    closeTimer.current = setTimeout(() => {
+      setShown(false);
+      closeTimer.current = null;
+    }, 220);
+  };
+
+  useEffect(() => () => {
+    if (closeTimer.current) clearTimeout(closeTimer.current);
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!shown) return;
+    const update = () => {
+      const trigger = triggerRef.current;
+      const tooltip = tooltipRef.current;
+      if (!trigger || !tooltip) return;
+      const anchor = trigger.getBoundingClientRect();
+      const box = tooltip.getBoundingClientRect();
+      const margin = 10;
+      const gap = 8;
+      const idealLeft = anchor.left + anchor.width / 2 - box.width / 2;
+      const left = Math.min(
+        Math.max(margin, idealLeft),
+        Math.max(margin, window.innerWidth - box.width - margin),
+      );
+      const above = anchor.top - box.height - gap;
+      const top = above >= margin
+        ? above
+        : Math.min(window.innerHeight - box.height - margin, anchor.bottom + gap);
+      setPosition((current) => current.left === left && current.top === top
+        ? current : { left, top });
+    };
+    update();
+    window.addEventListener("resize", update);
+    window.addEventListener("scroll", update, true);
+    return () => {
+      window.removeEventListener("resize", update);
+      window.removeEventListener("scroll", update, true);
+    };
+  }, [shown, location]);
+
+  const selectPath = () => {
+    const path = pathRef.current;
+    const selection = window.getSelection();
+    if (!path || !selection) return;
+    const range = document.createRange();
+    range.selectNodeContents(path);
+    selection.removeAllRanges();
+    selection.addRange(range);
+  };
+
+  return <>
+    <button ref={triggerRef} type="button" className="message-file-link"
+      aria-label={`在 Remote 中打开 ${location}`}
+      aria-describedby={shown ? tooltipId : undefined}
+      onPointerEnter={open} onPointerLeave={scheduleClose}
+      onFocus={open} onBlur={scheduleClose}
+      onClick={onOpen}>{children}</button>
+    {shown && createPortal(
+      <span ref={tooltipRef} id={tooltipId} role="tooltip"
+        className="message-file-tooltip"
+        style={{ left: position.left, top: position.top }}
+        onPointerEnter={open} onPointerLeave={scheduleClose}
+        onFocus={open} onBlur={scheduleClose}>
+        <span ref={pathRef} className="message-file-tooltip-path"
+          onDoubleClick={(event) => {
+            event.preventDefault();
+            selectPath();
+          }}>{location}</span>
+      </span>,
+      document.body,
+    )}
+  </>;
 }
 
 function fenceClassName(children: ReactNode): string | undefined {

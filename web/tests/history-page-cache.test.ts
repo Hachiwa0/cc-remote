@@ -315,6 +315,74 @@ corruptStorage.records.set(corruptKey, { malformed: true });
 assert.equal(await corruptCache.getPage(scope, "corrupt"), null);
 assert.deepEqual(corruptStorage.deletedKeys, [corruptKey]);
 
+// v3 corrects Claude turn identity semantics. Reuse old Codex pages, but
+// discard v1/v2 Claude projections so a reconnect cannot resurrect either the
+// pre-alias shape or v2's incorrect native promptId alias.
+const legacyCodexStorage = new MemoryStorage();
+const legacyCodexCache = new HistoryPageCache({ storage: legacyCodexStorage });
+assert.equal((await legacyCodexCache.putPage(scope, {
+  pageKey: "legacy-codex-v1",
+  turns: [turn("legacy-codex")],
+  hasOlder: false,
+  olderCursor: "legacy-codex",
+})).ok, true);
+const legacyCodexKey = legacyCodexCache.pageKey(scope, "legacy-codex-v1");
+(legacyCodexStorage.records.get(legacyCodexKey) as { version: number })
+  .version = 1;
+assert.equal(
+  (await legacyCodexCache.getPage(scope, "legacy-codex-v1"))
+    ?.turns[0]?.id,
+  "legacy-codex",
+);
+(legacyCodexStorage.records.get(legacyCodexKey) as { version: number })
+  .version = 2;
+assert.equal(
+  (await legacyCodexCache.getPage(scope, "legacy-codex-v1"))
+    ?.turns[0]?.id,
+  "legacy-codex",
+);
+
+const claudeScope = { ...scope, engine: "claude" };
+const legacyClaudeStorage = new MemoryStorage();
+const legacyClaudeCache = new HistoryPageCache({ storage: legacyClaudeStorage });
+assert.equal((await legacyClaudeCache.putPage(claudeScope, {
+  pageKey: "legacy-claude-v1",
+  turns: [turn("legacy-claude")],
+  hasOlder: false,
+  olderCursor: "legacy-claude",
+})).ok, true);
+const legacyClaudeKey = legacyClaudeCache.pageKey(
+  claudeScope, "legacy-claude-v1",
+);
+(legacyClaudeStorage.records.get(legacyClaudeKey) as { version: number })
+  .version = 1;
+assert.equal(
+  await legacyClaudeCache.getPage(claudeScope, "legacy-claude-v1"),
+  null,
+);
+assert.deepEqual(legacyClaudeStorage.deletedKeys, [legacyClaudeKey]);
+
+const legacyClaudeV2Storage = new MemoryStorage();
+const legacyClaudeV2Cache = new HistoryPageCache({
+  storage: legacyClaudeV2Storage,
+});
+assert.equal((await legacyClaudeV2Cache.putPage(claudeScope, {
+  pageKey: "legacy-claude-v2",
+  turns: [turn("legacy-claude-v2")],
+  hasOlder: false,
+  olderCursor: "legacy-claude-v2",
+})).ok, true);
+const legacyClaudeV2Key = legacyClaudeV2Cache.pageKey(
+  claudeScope, "legacy-claude-v2",
+);
+(legacyClaudeV2Storage.records.get(legacyClaudeV2Key) as { version: number })
+  .version = 2;
+assert.equal(
+  await legacyClaudeV2Cache.getPage(claudeScope, "legacy-claude-v2"),
+  null,
+);
+assert.deepEqual(legacyClaudeV2Storage.deletedKeys, [legacyClaudeV2Key]);
+
 const legacyMissingAvailabilityStorage = new MemoryStorage();
 const legacyMissingAvailabilityCache = new HistoryPageCache({
   storage: legacyMissingAvailabilityStorage,

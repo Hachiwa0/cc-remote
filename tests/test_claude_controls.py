@@ -136,6 +136,121 @@ def test_handoff_ignores_incomplete_latest_turn_and_synthetic_response(
     assert controls.effort == "high"
 
 
+def test_handoff_reads_completed_tail_bypassed_by_delayed_retry(
+    tmp_path, monkeypatch,
+):
+    path = tmp_path / f"{SESSION_ID}.jsonl"
+    rows = [
+        {
+            "type": "user",
+            "uuid": "11111111-1111-4111-8111-111111111112",
+            "parentUuid": None,
+            "isSidechain": False,
+            "timestamp": "2026-08-07T03:42:31.117Z",
+            "message": {"role": "user", "content": "first"},
+        },
+        {
+            "type": "assistant",
+            "uuid": "22222222-2222-4222-8222-222222222222",
+            "parentUuid": "11111111-1111-4111-8111-111111111112",
+            "isSidechain": False,
+            "timestamp": "2026-08-07T03:47:00.000Z",
+            "effort": "high",
+            "message": {
+                "role": "assistant",
+                "model": "claude-opus-4-6",
+                "stop_reason": "tool_use",
+                "content": [],
+            },
+        },
+        {
+            "type": "user",
+            "uuid": "33333333-3333-4333-8333-333333333333",
+            "parentUuid": "22222222-2222-4222-8222-222222222222",
+            "isSidechain": False,
+            "timestamp": "2026-08-07T03:48:40.000Z",
+            "message": {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_retry",
+                    "content": "ok",
+                }],
+            },
+        },
+        {
+            "type": "assistant",
+            "uuid": "44444444-4444-4444-8444-444444444444",
+            "parentUuid": "33333333-3333-4333-8333-333333333333",
+            "isSidechain": False,
+            "timestamp": "2026-08-07T03:58:01.136Z",
+            "effort": "max",
+            "message": {
+                "role": "assistant",
+                "model": "claude-opus-4-6",
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "completed"}],
+            },
+        },
+        {
+            "type": "system",
+            "subtype": "api_error",
+            "uuid": "55555555-5555-4555-8555-555555555555",
+            "parentUuid": "33333333-3333-4333-8333-333333333333",
+            "isSidechain": False,
+            "timestamp": "2026-08-07T03:48:50.436Z",
+            "source": "request_retry",
+            "retryAttempt": 1,
+            "maxRetries": 10,
+        },
+        {
+            "type": "user",
+            "uuid": "66666666-6666-4666-8666-666666666666",
+            "parentUuid": "55555555-5555-4555-8555-555555555555",
+            "isSidechain": False,
+            "timestamp": "2026-08-07T05:57:37.880Z",
+            "message": {"role": "user", "content": "second"},
+        },
+        {
+            "type": "assistant",
+            "uuid": "77777777-7777-4777-8777-777777777777",
+            "parentUuid": "66666666-6666-4666-8666-666666666666",
+            "isSidechain": False,
+            "timestamp": "2026-08-07T06:00:00.000Z",
+            "effort": "low",
+            "message": {
+                "role": "assistant",
+                "model": "claude-sonnet-5",
+                "stop_reason": "tool_use",
+                "content": [],
+            },
+        },
+    ]
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    by_id = {row["uuid"]: row for row in rows}
+    canonical_ids = [rows[index]["uuid"] for index in (0, 1, 2, 5, 6)]
+    messages = [
+        _message(
+            by_id[message_id]["type"],
+            message_id,
+            by_id[message_id]["message"],
+        )
+        for message_id in canonical_ids
+    ]
+    monkeypatch.setattr(
+        controls_module, "transcript_path", lambda _sid: str(path))
+    monkeypatch.setattr(
+        controls_module, "get_session_messages",
+        lambda _sid, directory: messages,
+    )
+
+    controls = last_completed_assistant_controls(
+        SESSION_ID, directory=str(tmp_path), max_bytes=1024 * 1024)
+
+    assert controls.model == "claude-opus-4-6"
+    assert controls.effort == "max"
+
+
 def test_handoff_never_falls_back_to_older_model_for_proxy_upstream(
     tmp_path, monkeypatch,
 ):

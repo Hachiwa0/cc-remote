@@ -30,10 +30,27 @@ const SCHEMA = 1;
 // assistant blocks after switching away from and back to a running session.
 // v10 separates the instant timeline skeleton from heavyweight detail so one
 // image or tool output can no longer evict an otherwise valid completed turn.
-// v11 discards rows written before Claude transcript promptId was retained as
-// clientMsgId. Those rows can otherwise paint beside the live optimistic row
-// after switching engines until authoritative History replaces both.
-const CACHE_VER = 11;
+// v11 attempted to retain Claude's transcript promptId as clientMsgId. Claude
+// Code generates promptId internally, so it is not the browser Query.msg_id.
+// v12 discards both older shapes; only wrapper-observed native UUID aliases may
+// reconcile a canonical History turn with its optimistic browser row.
+// v13 discards projections written by the delayed completed-message replay bug.
+// The cache is only a rebuildable local projection; canonical History restores
+// the same conversations without guessing whether repeated prose was pollution.
+// v14 discards completed prompt-less replay orphans which an older matcher kept
+// when several tool blocks legitimately shared one assistant message id.
+// v15 discards projections written when a wrapper restart recovered the tail of
+// an active Codex turn without re-announcing its exact logical message owner.
+// v16 discards completed Codex projections written before canonical History
+// persisted that exact owner. Hard refresh keeps IndexedDB, so a version fence
+// is required to remove already-polluted duplicate layers once.
+// v17 also discards legacy CLI projections whose historical user row did not
+// yet reuse the adjacent native app-server item id emitted by the live stream.
+// v18 discards active projections written while an evicted TurnBinding was
+// seeded after (instead of before) its proven replay suffix. Those rows can
+// contain a canonical History owner plus a second prompt-less live layer; the
+// cache is rebuildable, so one clean reload is safer than shape-based guessing.
+const CACHE_VER = 18;
 const MAX_CACHE_SESSIONS = 64;
 const MAX_CACHE_TURNS = 100;
 const MAX_CACHE_BYTES = 2 * 1024 * 1024;
@@ -386,6 +403,73 @@ export function boundCachedTurns(turns: unknown[]): unknown[] {
   return kept;
 }
 
+function cachedTurnRecord(value: unknown): Record<string, unknown> | null {
+  return value != null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown> : null;
+}
+
+function cachedCompactionTurnIds(turn: Record<string, unknown>): Set<string> {
+  const blocks = Array.isArray(turn.blocks) ? turn.blocks : [];
+  return new Set(blocks.flatMap((value) => {
+    const block = cachedTurnRecord(value);
+    return block?.kind === "process"
+      && block.processKind === "compaction"
+      && typeof block.turn_id === "string"
+      && block.turn_id
+      ? [block.turn_id] : [];
+  }));
+}
+
+function cachedNativeTurnIds(turn: Record<string, unknown>): Set<string> {
+  return new Set([
+    turn.forkPointId,
+    turn.liveTaskId,
+    turn.codexTurnId,
+  ].filter((value): value is string => typeof value === "string" && !!value));
+}
+
+/** Identify only the exact v15 corruption produced when a reconnect replayed
+ * a compacted Codex tail after its original TurnBinding cursor.  This is not a
+ * general duplicate matcher: legitimate optimistic steers may briefly leave
+ * two open rows, and repeated text/native task ids are never identity proof. */
+export function hasOrphanedActiveCompactionProjection(
+  turns: unknown,
+): boolean {
+  if (!Array.isArray(turns)) return false;
+  const records = turns.map(cachedTurnRecord)
+    .filter((turn): turn is Record<string, unknown> => turn !== null);
+  const orphans = records.filter((turn) => {
+    if (turn.done !== false || turn.prompt !== ""
+        || typeof turn.id !== "string" || !turn.id) return false;
+    if ([
+      turn.clientMsgId,
+      turn.historyTurnId,
+      turn.forkPointId,
+      turn.checkpointId,
+      turn.codexTurnId,
+      turn.liveTaskId,
+    ].some((value) => typeof value === "string" && !!value)) return false;
+    const blocks = Array.isArray(turn.blocks) ? turn.blocks : [];
+    const ownsAssistantEnvelope = blocks.some((value) => {
+      const block = cachedTurnRecord(value);
+      return block?.kind === "text" && block.message_id === turn.id;
+    });
+    return ownsAssistantEnvelope
+      && cachedCompactionTurnIds(turn).size === 1;
+  });
+  if (orphans.length !== 1) return false;
+
+  const orphan = orphans[0];
+  const [compactionTurnId] = cachedCompactionTurnIds(orphan);
+  const canonical = records.filter((turn) => {
+    if (turn === orphan || turn.done !== false
+        || typeof turn.prompt !== "string" || !turn.prompt) return false;
+    return cachedNativeTurnIds(turn).has(compactionTurnId)
+      && cachedCompactionTurnIds(turn).has(compactionTurnId);
+  });
+  return canonical.length === 1;
+}
+
 async function pruneCacheStore(d: IDBDatabase): Promise<void> {
   await new Promise<void>((resolve) => {
     const tx = d.transaction(STORE, "readwrite");
@@ -396,7 +480,8 @@ async function pruneCacheStore(d: IDBDatabase): Promise<void> {
       const cur = req.result;
       if (!cur) return;
       const value = cur.value as (CachedSession & { v?: number }) | undefined;
-      if (!value || value.v !== CACHE_VER) {
+      if (!value || value.v !== CACHE_VER
+          || hasOrphanedActiveCompactionProjection(value.turns)) {
         cur.delete();
         cur.continue();
         return;
@@ -467,7 +552,8 @@ export async function loadSession(sessionId: string): Promise<CachedSession | nu
         // Ignore stale caches from before the current shape (v must match).
         if (invalidatedSessions.has(sessionId) || !r || r.v !== CACHE_VER
             || typeof r.revision !== "string" || !r.revision
-            || (r.control != null && !isSessionControl(r.control))) {
+            || (r.control != null && !isSessionControl(r.control))
+            || hasOrphanedActiveCompactionProjection(r.turns)) {
           resolve(null);
           return;
         }
@@ -523,6 +609,7 @@ export async function loadAllReplayState(): Promise<{
         if (r && r.v === CACHE_VER
             && typeof r.revision === "string" && r.revision
             && typeof r.lastSeq === "number"
+            && !hasOrphanedActiveCompactionProjection(r.turns)
             && (r.lastSeq > 0 || isSessionControl(r.control))) {
           const sid = String(cur.key);
           const control = controlForCachedSession(sid, r.control);
@@ -608,6 +695,10 @@ async function flush(): Promise<void> {
         if (invalidatedSessions.has(job.sid)
             || job.epoch !== sessionEpoch(job.sid)) continue;
         const turns = boundCachedTurns(job.turns);
+        if (hasOrphanedActiveCompactionProjection(turns)) {
+          store.delete(job.sid);
+          continue;
+        }
         store.put(
           { v: CACHE_VER, turns, lastSeq: job.lastSeq,
             revision: job.revision, generation: job.generation,

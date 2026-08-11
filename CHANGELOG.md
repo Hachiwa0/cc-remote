@@ -4,6 +4,46 @@
 
 ## Unreleased
 
+- Store files and images attached to Work messages under that conversation's
+  private `workspace/uploads` directory, where the Work sandbox can actually
+  read them, while keeping uploaded source material out of generated Artifacts
+  and retaining history compatibility with the earlier sibling layout.
+- Let mobile Markdown source editors fill the available file panel, keep active
+  session cards visibly selected, restore code-copy contrast in dark mode, and
+  keep desktop dark code blocks visually separate from the page background.
+- Restore the exact active-turn owner before reconnect tail replay, persist its
+  source-bound browser/native identity into completed Codex History, and expire
+  projections written before that identity was durable instead of repainting a
+  duplicate response after refresh. Legacy CLI rollout user rows now reuse the
+  adjacent native app-server item id as well, so a history refresh cannot paint
+  one terminal prompt and its live mirror as two separate turns.
+  Remote steers flushed under a concurrent CLI turn now retain their exact
+  official `clientId` without admitting foreign CLI content, so delayed native
+  History rows collapse into the original optimistic message instead of
+  repainting it. Live rollout and official History item ids may coexist as
+  exact aliases of that one browser message instead of conflicting with each
+  other. Initial `turn/start` inputs now carry the same exact identity;
+  restart recovery can reattach an officially active split control/rollout turn
+  even after an oversized task's lifecycle marker has fallen outside the
+  bounded tail, preventing false interruption and duplicate prompt projections.
+  When that bounded tail has also evicted the active `TurnBinding`, its original
+  sequence now proves and pre-binds the retained current-turn suffix before Web
+  reduces it; projections cached with the old reversed order are expired once.
+  Once an unraced official Codex History page reports the thread idle, its
+  exact persisted success or failure also replaces a provisional live terminal
+  without discarding live detail or weakening Claude SDK terminal authority.
+- Upgrade the coordinated Wrapper/Relay/Web wire gate to protocol v33 and add
+  multi-account Codex Work. New Work sessions and schedules can select any
+  configured profile, persist that ownership independently of the current
+  default, and keep the same account across retries and wrapper restarts.
+  Legacy Work rows are idempotently assigned to the upgrade-time default even
+  when an earlier account-topology migration already completed. Removed
+  profiles leave existing Work bound and fail closed instead of being
+  reassigned; transient catalog read failures remain warnings, retain each
+  failed profile's last-known
+  session projection, and never trigger a silent fallback. Wrapper activation
+  now snapshots both Work SQLite registries, verifies the ownership migration,
+  and restores matching data before restarting old code after a failed release.
 - Upgrade the coordinated Wrapper/Relay/Web gate to protocol v31. Wrapper-side
   catalog mutations now broadcast an unbuffered invalidation instead of an
   uncorrelated session list; each visible browser coalesces the hint into its
@@ -11,6 +51,37 @@
   delimiters split across deltas, paused Goal resumes retain one bounded
   objective anchor, and compact continuation no longer renders a live spinner
   beside a real interrupted terminal.
+- Upgrade the coordinated Wrapper/Relay/Web wire gate to protocol v32 and add
+  concurrent Codex account profiles. Each configured `CODEX_HOME` owns its own
+  official daemon, catalog, controls, and history namespace; Code combines the
+  sessions with account labels and filters, while Work remains on the default
+  profile only. Single-account installs retain native ids and their old UI;
+  multi-account cards use stable colored `default`/celestial ribbons. Local
+  profile-key migrations are crash-resumable and include aliases, fork recovery,
+  turn leases, controls, pins, Work ownership, and rollback checkpoints.
+  Headless profiles now bootstrap their own official remote-control daemon
+  instead of silently degrading to a private stdio process. OAuth-only sibling
+  homes safely reuse the verified managed standalone CLI entry while retaining
+  independent auth, rollout, socket, and daemon state; existing custom layouts
+  are never replaced. An unavailable account control plane fails clearly, while
+  single-account fallback semantics remain unchanged. An authenticated account
+  whose quota read temporarily
+  returns no windows is also shown as a refreshable read failure rather than a
+  missing account.
+- Keep Claude prompts stable across refreshes and Claude/Codex surface switches.
+  Claude Code's internal `promptId` is no longer mistaken for the browser
+  message id; the wrapper persists only exact native-user aliases observed
+  after a generation-bound Agent SDK transcript boundary (with SDK replay as
+  fallback) or a broker-owned append boundary. Learning this Claude metadata
+  no longer invalidates Codex account caches. Derived Claude pages from the old
+  identity model are invalidated without discarding Codex history pages. While
+  an Agent SDK turn is live, transcript EOF now remains an open projection and
+  the first ownership scan no longer mirrors a duplicate partial page; the real
+  `ResultMessage` is the sole completion boundary. A
+  narrowly-proved delayed `request_retry` branch no longer hides the already
+  completed sibling tail, and entering or retrying a resident-session switch
+  publishes the current lifecycle state with a fresh sequence instead of
+  replaying a stale `running` frame.
 - Add protocol v28 Codex account activity. The existing one-shot status read
   carries a validated, bounded 53-week daily token series, and Web exposes a
   Codex-only Desktop-style activity calendar without storing it in live replay.

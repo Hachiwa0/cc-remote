@@ -3,6 +3,7 @@ import json
 from cc_remote.wrapper.claude_broker_history import (
     MAX_PARTIAL_LINE,
     claude_broker_tail_state,
+    first_claude_sdk_user_id,
     parse_claude_broker_lifecycle,
 )
 
@@ -41,6 +42,27 @@ def test_multimodal_prompt_counts_but_meta_and_sidechain_do_not():
              message={"role": "user", "content": [{"type": "image"}]}),
     ])
     assert parse_claude_broker_lifecycle(data).started == ("real",)
+
+
+def test_sdk_user_identity_requires_provenance_and_real_top_level_prompt():
+    data = b"".join([
+        _row(type="queue-operation", operation="enqueue"),
+        _row(type="user", uuid="tool-result", entrypoint="sdk-py",
+             message={"role": "user", "content": [{"type": "tool_result"}]}),
+        _row(type="user", uuid="sidechain", promptSource="sdk",
+             isSidechain=True,
+             message={"role": "user", "content": "agent task"}),
+        _row(type="user", uuid="real", promptSource="sdk",
+             message={"role": "user", "content": "hello"}),
+    ])
+
+    assert first_claude_sdk_user_id(data) == "real"
+    assert first_claude_sdk_user_id(_row(
+        type="user",
+        uuid="unproven",
+        message={"role": "user", "content": "hello"},
+    )) is None
+    assert first_claude_sdk_user_id(b"{broken\n" + data) is None
 
 
 def test_partial_rows_are_joined_and_malformed_rows_are_skipped():

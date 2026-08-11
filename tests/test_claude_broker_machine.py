@@ -1417,6 +1417,9 @@ def test_managed_broker_turn_finishes_on_engine_transcript_boundary(
         assert ctx.sdk.submitted == ["managed prompt"]
         assert ctx.state == "idle" and ctx.turn_task is None
         assert mirrors == [SESSION_ID, SESSION_ID]
+        assert machine._claude_client_messages.get(
+            SESSION_ID, transcript,
+        ) == {"user-1": "msg-managed"}
         turn_end = next(message for message in transport.sent
                         if message.type == "turn_end")
         assert turn_end.result.subtype == "success"

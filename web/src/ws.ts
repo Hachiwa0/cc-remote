@@ -37,6 +37,7 @@ export interface EventOwnership {
   machineId: string;
   engine: "claude" | "codex";
   space: Space;
+  codexProfileId?: string | null;
   surfaceEpoch: number;
   connectionGeneration: number;
 }
@@ -156,6 +157,7 @@ export class RelayWs {
   private replayOrder: string[] = [];
   private engineBySession: Record<string, "claude" | "codex"> = {};
   private spaceBySession: Record<string, Space> = {};
+  private codexProfileBySession: Record<string, string> = {};
   private focusedSid: string | null = null;
   private activeEngine: "claude" | "codex" = "claude";
   private activeSpace: Space = "code";
@@ -474,7 +476,12 @@ export class RelayWs {
     return this.engineBySession[sid] === engine && this.spaceBySession[sid] === space;
   }
 
-  setSessionEngines(sessions: Array<{ session_id: string; engine?: string | null; space?: Space | null }>): void {
+  setSessionEngines(sessions: Array<{
+    session_id: string;
+    engine?: string | null;
+    space?: Space | null;
+    codex_profile_id?: string | null;
+  }>): void {
     for (const session of sessions) {
       if (session.engine === "codex" || session.engine === "claude") {
         this.engineBySession[session.session_id] = session.engine;
@@ -482,11 +489,16 @@ export class RelayWs {
       if (session.space === "work" || session.space === "code") {
         this.spaceBySession[session.session_id] = session.space;
       }
+      if (session.codex_profile_id) {
+        this.codexProfileBySession[session.session_id] =
+          session.codex_profile_id;
+      }
     }
   }
 
   private ownershipSnapshot(
     engine = this.activeEngine, space = this.activeSpace,
+    codexProfileId?: string | null,
   ): EventOwnership {
     const scopeKey = sessionScopeKey(this.machineId, engine, space);
     return {
@@ -494,6 +506,7 @@ export class RelayWs {
       machineId: this.machineId,
       engine,
       space,
+      codexProfileId: engine === "codex" ? (codexProfileId ?? null) : null,
       surfaceEpoch: this.surfaceEpochByScope[scopeKey] ?? 0,
       connectionGeneration: this.connectionGeneration,
     };
@@ -740,11 +753,15 @@ export class RelayWs {
     this.send({ v: PROTOCOL_VERSION, type: "set_perm", mode, ts: nowTs(), ...this.sidObj() });
   }
 
-  sendGetPermissionProfiles(cwd?: string): string | null {
+  sendGetPermissionProfiles(
+    cwd?: string,
+    codexProfileId?: string | null,
+  ): string | null {
     return this.sendTracked({
       v: PROTOCOL_VERSION,
       type: "get_permission_profiles",
       ts: nowTs(),
+      ...(codexProfileId ? { codex_profile_id: codexProfileId } : {}),
       ...(cwd ? { cwd } : this.sidObj()),
     });
   }
@@ -896,34 +913,49 @@ export class RelayWs {
 
   /** Ask the engine for its catalog and explicit new-session defaults. Claude
    *  needs cwd because project/local settings can change the selected model. */
-  sendGetModels(engine: "cc" | "claude" | "codex", cwd?: string | null): void {
+  sendGetModels(
+    engine: "cc" | "claude" | "codex",
+    cwd?: string | null,
+    codexProfileId?: string | null,
+  ): void {
     const frame: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "get_models", engine,
       client_id: this.clientId, ts: nowTs(),
     };
     if (cwd) frame.cwd = cwd;
+    if (engine === "codex" && codexProfileId) {
+      frame.codex_profile_id = codexProfileId;
+    }
     this.send(frame);
   }
 
   sendGetEngineCapabilities(engine: "claude" | "codex", space: Space,
                             cwd?: string | null,
-                            skillsOnly = false): string | null {
+                            skillsOnly = false,
+                            codexProfileId?: string | null): string | null {
     const frame: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "get_engine_capabilities", engine, space,
       client_id: this.clientId, skills_only: skillsOnly, ts: nowTs(),
     };
     if (cwd) frame.cwd = cwd;
+    if (engine === "codex" && codexProfileId) {
+      frame.codex_profile_id = codexProfileId;
+    }
     return this.sendTracked(frame);
   }
 
   sendManageEnginePlugin(engine: "claude" | "codex", space: Space,
                          action: "install" | "uninstall", pluginId: string,
-                         cwd?: string | null): string | null {
+                         cwd?: string | null,
+                         codexProfileId?: string | null): string | null {
     const frame: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "manage_engine_plugin", engine, space,
       action, plugin_id: pluginId, client_id: this.clientId, ts: nowTs(),
     };
     if (cwd) frame.cwd = cwd;
+    if (engine === "codex" && codexProfileId) {
+      frame.codex_profile_id = codexProfileId;
+    }
     return this.sendTracked(frame);
   }
 
@@ -935,6 +967,7 @@ export class RelayWs {
       instructions?: string; scope?: "user" | "project";
     },
     cwd?: string | null,
+    codexProfileId?: string | null,
   ): string | null {
     const frame: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "manage_engine_skill", engine, space, action,
@@ -946,6 +979,9 @@ export class RelayWs {
     if (options.instructions !== undefined) frame.instructions = options.instructions;
     if (options.scope) frame.scope = options.scope;
     if (cwd) frame.cwd = cwd;
+    if (engine === "codex" && codexProfileId) {
+      frame.codex_profile_id = codexProfileId;
+    }
     return this.sendTracked(frame);
   }
 
@@ -957,6 +993,7 @@ export class RelayWs {
       timeout?: number; scope?: "user" | "project";
     },
     cwd?: string | null,
+    codexProfileId?: string | null,
   ): string | null {
     const frame: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "manage_engine_hook", engine, space, action,
@@ -969,6 +1006,9 @@ export class RelayWs {
     if (options.timeout !== undefined) frame.timeout = options.timeout;
     if (options.scope) frame.scope = options.scope;
     if (cwd) frame.cwd = cwd;
+    if (engine === "codex" && codexProfileId) {
+      frame.codex_profile_id = codexProfileId;
+    }
     return this.sendTracked(frame);
   }
 
@@ -1115,7 +1155,14 @@ export class RelayWs {
     const targetEngine = engine ?? this.activeEngine;
     if (engine) this.engineBySession[sessionId] = engine;
     this.spaceBySession[sessionId] = space;
-    const ownership = this.ownershipSnapshot(targetEngine, space);
+    const ownership = this.ownershipSnapshot(
+      targetEngine,
+      space,
+      targetEngine === "codex"
+        ? this.codexProfileBySession[sessionId]
+          ?? this.ownershipBySession[sessionId]?.codexProfileId
+        : null,
+    );
     const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "switch_session", session_id: sessionId, ts: nowTs() };
     if (engine && engine !== "claude") obj.engine = engine;
     if (space !== "code") obj.space = space;
@@ -1132,19 +1179,26 @@ export class RelayWs {
                  permissionProfile?: string,
                  webSearch?: "cached" | "live",
                  serviceTier?: "default" | "fast",
-                 space: Space = "code", projectId?: string | null): boolean {
+                 space: Space = "code", projectId?: string | null,
+                 codexProfileId?: string | null): boolean {
     const requestId = initial?.msg_id ?? uuid();
     this.newSessionFocusRequestId = requestId;
     this.newSessionEngine = engine ?? "claude";
     this.newSessionSpace = space;
     const ownership = this.ownershipSnapshot(
-      this.newSessionEngine, this.newSessionSpace);
+      this.newSessionEngine,
+      this.newSessionSpace,
+      this.newSessionEngine === "codex" ? codexProfileId : null,
+    );
     this.pendingOwnershipByRequest[requestId] = ownership;
     const obj: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "new_session", request_id: requestId, ts: nowTs(),
     };
     if (cwd) obj.cwd = cwd;
     if (engine && engine !== "claude") obj.engine = engine;
+    if (engine === "codex" && codexProfileId) {
+      obj.codex_profile_id = codexProfileId;
+    }
     if (space !== "code") obj.space = space;
     if (space === "work" && projectId) obj.project_id = projectId;
     if (model) obj.model = model;
@@ -1313,13 +1367,17 @@ export class RelayWs {
 
   sendCreateWorkSchedule(engine: "claude" | "codex", title: string,
                          prompt: string, nextRunAt: number,
-                         repeatSeconds?: number, projectId?: string): boolean {
+                         repeatSeconds?: number, projectId?: string,
+                         codexProfileId?: string): boolean {
     const command: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "create_work_schedule", engine,
       title, prompt, next_run_at: nextRunAt, ts: nowTs(),
     };
     if (repeatSeconds) command.repeat_seconds = repeatSeconds;
     if (projectId) command.project_id = projectId;
+    if (engine === "codex" && codexProfileId) {
+      command.codex_profile_id = codexProfileId;
+    }
     return this.send(command);
   }
 
@@ -1529,9 +1587,21 @@ export class RelayWs {
             this.latestAcceptedListOrderByScope.set(
               scopeKey, listedRequest.order);
             for (const session of msg.sessions) {
+              const sessionOwnership: EventOwnership = {
+                ...listedOwnership,
+                codexProfileId: msg.engine === "codex"
+                  ? session.codex_profile_id
+                    ?? msg.default_codex_profile_id
+                    ?? null
+                  : null,
+              };
               this.engineBySession[session.session_id] = msg.engine;
               this.spaceBySession[session.session_id] = listedSpace;
-              this.ownershipBySession[session.session_id] = listedOwnership;
+              if (session.codex_profile_id) {
+                this.codexProfileBySession[session.session_id] =
+                  session.codex_profile_id;
+              }
+              this.ownershipBySession[session.session_id] = sessionOwnership;
             }
           }
         }
@@ -1576,6 +1646,10 @@ export class RelayWs {
           this.focusedSid = msg.session_id;
           if (isCreatedFocus) this.engineBySession[msg.session_id] = this.newSessionEngine;
           if (isCreatedFocus) this.spaceBySession[msg.session_id] = this.newSessionSpace;
+          if (ownership?.codexProfileId) {
+            this.codexProfileBySession[msg.session_id] =
+              ownership.codexProfileId;
+          }
           if (ownership) this.ownershipBySession[msg.session_id] = ownership;
           this.touchReplay(msg.session_id);
           this.cb.onEvent(
@@ -1617,6 +1691,12 @@ export class RelayWs {
               this.spaceBySession[session_id] = this.spaceBySession[old_key];
             }
             delete this.spaceBySession[old_key];
+            if (this.codexProfileBySession[old_key]
+                && !this.codexProfileBySession[session_id]) {
+              this.codexProfileBySession[session_id] =
+                this.codexProfileBySession[old_key];
+            }
+            delete this.codexProfileBySession[old_key];
             if (this.historyHeadBySession[old_key]
                 && !this.historyHeadBySession[session_id]) {
               this.historyHeadBySession[session_id] =

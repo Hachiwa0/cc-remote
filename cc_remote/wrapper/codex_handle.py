@@ -26,6 +26,7 @@ import hashlib
 import hmac
 import json
 import os
+from pathlib import Path
 import re
 import signal
 import time
@@ -83,6 +84,8 @@ _STATUS_RATE_LIMIT_MAX = 16
 _STATUS_USAGE_BUCKET_SCAN_MAX = 4096
 _RUNTIME_EVENT_PENDING_MAX = 32
 _RUNTIME_EVENT_SEEN_MAX = 128
+_PENDING_STEER_USER_IDENTITIES_MAX = 512
+_ACTIVE_STREAM_TURN_IDS_MAX = 8
 _NOTICE_MESSAGE_MAX = 2 * 1024
 _NOTICE_DETAIL_MAX = 4 * 1024
 _NOTICE_PATH_MAX = 1024
@@ -143,11 +146,13 @@ _HTTP_PROVIDER_PERSISTING_NOTIFICATIONS = frozenset({
     "turn/completed",
     "turn/started",
 })
+_EXTERNAL_THREAD_STARTED_SOURCES = frozenset({"cli", "vscode", "exec"})
 
 ApprovalCallback = Callable[[str, dict], Awaitable[str]]
 InteractionCallback = Callable[[str, dict], Awaitable[dict[str, Any]]]
 GoalCallback = Callable[[Optional[dict[str, Any]]], Awaitable[None]]
 TurnLifecycleCallback = Callable[[str, str], Awaitable[None]]
+ThreadStartedCallback = Callable[[str], None]
 RuntimeEvent = Notice | RateLimitUpdate
 RuntimeEventCallback = Callable[[RuntimeEvent], Awaitable[None]]
 
@@ -295,6 +300,98 @@ class CodexSteerFence:
 
     def release_now(self) -> None:
         self.release.set()
+
+
+class CodexSteerUserIdentityProof:
+    """Content-free proof that one official user item is a Remote input.
+
+    Shared app-server notifications can flush either ``turn/start`` or a steer
+    under a different native task from the control turn returned to this handle.
+    The foreign frame must remain filtered, but its exact upstream ``clientId``
+    is safe to use as an identity bridge when this generation registered it.
+    """
+
+    __slots__ = (
+        "thread_id",
+        "expected_turn_id",
+        "native_turn_id",
+        "native_message_id",
+        "client_message_id",
+        "generation",
+        "kind",
+    )
+
+    def __init__(
+        self,
+        *,
+        thread_id: str,
+        expected_turn_id: Optional[str],
+        native_turn_id: str,
+        native_message_id: str,
+        client_message_id: str,
+        generation: int,
+        kind: str = "steer",
+    ) -> None:
+        self.thread_id = thread_id
+        self.expected_turn_id = expected_turn_id
+        self.native_turn_id = native_turn_id
+        self.native_message_id = native_message_id
+        self.client_message_id = client_message_id
+        self.generation = generation
+        self.kind = kind
+
+
+class CodexOwnedTurnProbe:
+    """Content-free official proof for one active control turn."""
+
+    __slots__ = ("turn_id", "native_user_message_ids")
+
+    def __init__(
+        self,
+        *,
+        turn_id: str,
+        native_user_message_ids: tuple[str, ...],
+    ) -> None:
+        self.turn_id = turn_id
+        self.native_user_message_ids = native_user_message_ids
+
+
+class _PendingSteerUserIdentity:
+    """One bounded, generation-owned client id awaiting official identity."""
+
+    __slots__ = (
+        "thread_id",
+        "expected_turn_id",
+        "client_message_id",
+        "generation",
+        "queue",
+        "state",
+        "proof",
+        "delivered",
+        "completed_seen",
+        "kind",
+    )
+
+    def __init__(
+        self,
+        *,
+        thread_id: str,
+        expected_turn_id: Optional[str],
+        client_message_id: str,
+        generation: int,
+        queue: Any,
+        kind: str = "steer",
+    ) -> None:
+        self.thread_id = thread_id
+        self.expected_turn_id = expected_turn_id
+        self.client_message_id = client_message_id
+        self.generation = generation
+        self.queue = queue
+        self.state = "pending"
+        self.proof: Optional[CodexSteerUserIdentityProof] = None
+        self.delivered = False
+        self.completed_seen = False
+        self.kind = kind
 
 
 class CodexNoActiveTurnFence:
@@ -450,16 +547,37 @@ class CodexSteerAcceptance(str):
 class _CodexSteerResponseBoundary:
     """Mutable response-dispatch handoff for one exact turn/steer RPC."""
 
-    __slots__ = ("thread_id", "turn_id", "fence")
+    __slots__ = ("thread_id", "turn_id", "client_message_id", "fence")
 
-    def __init__(self, thread_id: str, turn_id: str):
+    def __init__(
+        self,
+        thread_id: str,
+        turn_id: str,
+        client_message_id: Optional[str] = None,
+    ):
         self.thread_id = thread_id
         self.turn_id = turn_id
+        self.client_message_id = client_message_id
         self.fence: Optional[CodexSteerFence] = None
 
     def release(self) -> None:
         if self.fence is not None:
             self.fence.release_now()
+
+
+class _CodexTurnStartResponseBoundary:
+    """Bind a pending Remote input at the exact ``turn/start`` response."""
+
+    __slots__ = ("thread_id", "client_message_id")
+
+    def __init__(self, thread_id: str, client_message_id: Optional[str]):
+        self.thread_id = thread_id
+        self.client_message_id = client_message_id
+
+    def release(self) -> None:
+        # Query owns cleanup of the registered identity.  This common hook keeps
+        # request/disconnect cleanup polymorphic with the steer fence.
+        return
 
 
 class _SpontaneousNotificationQueue:
@@ -523,6 +641,70 @@ class _SpontaneousNotificationQueue:
         self._items.append((item, 0))
         self._ready.set()
 
+    def put_control_first_nowait(self, item: object) -> None:
+        """Prepend one zero-byte identity proof before buffered model frames."""
+        self._items.appendleft((item, 0))
+        self._ready.set()
+
+    def remap_turn_id(self, native_turn_id: str, control_turn_id: str) -> bool:
+        """Rewrite already-buffered frames after ``turn/start`` returns.
+
+        The stdout reader can receive an exact client-id user item and a few
+        following frames before the request coroutine wakes up.  They belong to
+        this queue, but the logical control id is not known until the JSON-RPC
+        response.  Rewrite only the proven native id and keep byte accounting
+        bounded; arbitrary queued controls and sibling turns are untouched.
+        """
+        if native_turn_id == control_turn_id:
+            return True
+
+        def rewrite(item: object, old_size: int) -> tuple[object, int]:
+            if (
+                not isinstance(item, dict)
+                or _notification_turn_id(item) != native_turn_id
+            ):
+                return item, old_size
+            raw_params = item.get("params")
+            if not isinstance(raw_params, dict):
+                return item, old_size
+            mapped = dict(item)
+            params = dict(raw_params)
+            params["turnId"] = control_turn_id
+            raw_turn = raw_params.get("turn")
+            if (
+                isinstance(raw_turn, dict)
+                and raw_turn.get("id") == native_turn_id
+            ):
+                params["turn"] = {**raw_turn, "id": control_turn_id}
+            mapped["params"] = params
+            try:
+                size = len(json.dumps(
+                    mapped,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8", errors="surrogatepass"))
+            except Exception:
+                return item, old_size
+            return mapped, size
+
+        items = deque(rewrite(item, size) for item, size in self._items)
+        end = (
+            rewrite(*self._end)
+            if self._end is not None else None
+        )
+        live_bytes = sum(size for _item, size in items)
+        end_bytes = end[1] if end is not None else 0
+        if (
+            live_bytes > self._live_max_bytes
+            or end_bytes > self.max_end_bytes
+            or live_bytes + end_bytes > self.max_bytes
+        ):
+            return False
+        self._items = items
+        self._end = end
+        self._bytes = live_bytes + end_bytes
+        return True
+
     def _can_put_live(self, size: int) -> bool:
         return not (
             self._end is not None
@@ -558,13 +740,17 @@ class _SpontaneousNotificationQueue:
 
     def begin_gap(self, marker: object) -> None:
         """Drop one stale live tail and open a bounded loss epoch."""
-        # Control-plane ordering boundaries are not lossy live detail. Preserve
-        # them even when later output overflows before the consumer reaches the
-        # barrier.
+        # Control-plane ordering and identity boundaries are not lossy live
+        # detail. Preserve them even when later output overflows before the
+        # consumer reaches the barrier.
         controls = [
             entry for entry in self._items
             if isinstance(
-                entry[0], (CodexSteerFence, CodexNoActiveTurnFence)
+                entry[0], (
+                    CodexSteerFence,
+                    CodexSteerUserIdentityProof,
+                    CodexNoActiveTurnFence,
+                )
             )
         ]
         self._items.clear()
@@ -806,7 +992,7 @@ def _codex_version(path: str) -> tuple[int, ...]:
 
 
 def _newer_private_core_for_oversized_resume(
-    managed_bin: str, resume_id: Optional[str],
+    managed_bin: str, resume_id: Optional[str], codex_home: Optional[str] = None,
 ) -> Optional[str]:
     """Select a newer official desktop app-server for one oversized thread.
 
@@ -823,7 +1009,11 @@ def _newer_private_core_for_oversized_resume(
     if (not resume_id or os.environ.get("CODEX_BIN")
             or managed_bin in _CODEX_DESKTOP_BIN_CANDIDATES):
         return None
-    rollout_path = codex_rollout_path(resume_id)
+    rollout_path = (
+        codex_rollout_path(resume_id)
+        if codex_home is None
+        else codex_rollout_path(resume_id, codex_home=codex_home)
+    )
     if not rollout_path:
         return None
     try:
@@ -856,7 +1046,7 @@ def _newer_private_core_for_oversized_resume(
 
 
 def _oversized_desktop_openai_resume_requires_http(
-    resume_id: Optional[str],
+    resume_id: Optional[str], codex_home: Optional[str] = None,
 ) -> bool:
     """Use Codex's official Responses HTTP path for one pathological resume.
 
@@ -874,7 +1064,11 @@ def _oversized_desktop_openai_resume_requires_http(
     """
     if not resume_id:
         return False
-    rollout_path = codex_rollout_path(resume_id)
+    rollout_path = (
+        codex_rollout_path(resume_id)
+        if codex_home is None
+        else codex_rollout_path(resume_id, codex_home=codex_home)
+    )
     if not rollout_path:
         return False
     try:
@@ -933,21 +1127,45 @@ def _resolve_codex_bin() -> str:
     return _runtime_resolve_codex_bin()
 
 
-def _codex_env(bin_path: str) -> dict[str, str]:
+def _codex_env(
+    bin_path: str, codex_home: Optional[str] = None,
+) -> dict[str, str]:
     """Compatibility seam for wrapper-owned Codex child environments."""
-    return _runtime_codex_env(bin_path)
+    if codex_home is None:
+        return _runtime_codex_env(bin_path)
+    return _runtime_codex_env(bin_path, codex_home)
 
 
-def _codex_runtime_tmp() -> str:
+def _profile_codex_env(
+    bin_path: str, codex_home: Optional[str],
+) -> dict[str, str]:
+    return (_codex_env(bin_path) if codex_home is None
+            else _codex_env(bin_path, codex_home))
+
+
+def _profile_rollout_path(
+    session_id: str, codex_home: Optional[str],
+) -> Optional[str]:
+    return (
+        codex_rollout_path(session_id)
+        if codex_home is None
+        else codex_rollout_path(session_id, codex_home=codex_home)
+    )
+
+
+def _codex_runtime_tmp(codex_home: Optional[str] = None) -> str:
     """Return the private runtime directory Codex uses for sandbox launchers.
 
     Work leaves unspecified paths ungranted and opens only its own workspace.
     Codex stages ``codex-linux-sandbox`` below ``$CODEX_HOME/tmp`` before every
     tool call, so that narrow runtime path must remain readable as well.
     """
-    codex_home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
-    codex_home = os.path.abspath(os.path.expanduser(codex_home))
-    return os.path.join(codex_home, "tmp")
+    selected_home = (
+        codex_home or os.environ.get("CODEX_HOME")
+        or os.path.expanduser("~/.codex")
+    )
+    selected_home = os.path.abspath(os.path.expanduser(selected_home))
+    return os.path.join(selected_home, "tmp")
 
 
 def _initialize_params() -> dict[str, Any]:
@@ -1041,10 +1259,16 @@ class CodexHandle:
                  interaction_callback: Optional[InteractionCallback] = None,
                  goal_callback: Optional[GoalCallback] = None,
                  turn_lifecycle_callback: Optional[TurnLifecycleCallback] = None,
+                 thread_started_callback: Optional[ThreadStartedCallback] = None,
                  runtime_event_callback: Optional[RuntimeEventCallback] = None,
                  daemon_mode: Optional[str] = None,
-                 daemon_manager: Optional[CodexDaemonManager] = None):
+                 daemon_manager: Optional[CodexDaemonManager] = None,
+                 codex_home: Optional[str] = None):
         self.cfg = cfg
+        self.codex_home = (
+            os.path.realpath(os.path.expanduser(codex_home))
+            if codex_home else None
+        )
         self.proc: Optional[asyncio.subprocess.Process] = None
         self.thread_id: Optional[str] = None
         # A shared daemon can publish every subscribed thread immediately after
@@ -1055,6 +1279,10 @@ class CodexHandle:
         self.turn_id: Optional[str] = None
         self.turn_start_pending = False
         self.turn_active = False
+        # A control/API turn can be streamed and persisted beneath another
+        # native task after a cross-client steer. Keep turn_id logical; exact
+        # native-item proofs may add only a bounded set of active aliases.
+        self._active_stream_turn_ids: set[str] = set()
         # App-server 0.147 can emit thread/compacted followed by an
         # ``interrupted`` turn/completed for the same native turn, then keep
         # appending items to that turn. The compact notification is the only
@@ -1088,7 +1316,8 @@ class CodexHandle:
         self.daemon_manager = (
             daemon_manager
             if daemon_manager is not None
-            else default_codex_daemon_manager(self.daemon_mode)
+            else default_codex_daemon_manager(
+                self.daemon_mode, codex_home=self.codex_home)
         )
         self._using_daemon_proxy = False
         # Once a Code session has joined the official shared app-server, a
@@ -1103,8 +1332,11 @@ class CodexHandle:
         self._id = 0
         self._pending: dict[int, asyncio.Future] = {}
         self._pending_response_boundaries: dict[
-            int, _CodexSteerResponseBoundary
+            int, _CodexSteerResponseBoundary | _CodexTurnStartResponseBoundary
         ] = {}
+        self._pending_steer_user_identities: OrderedDict[
+            str, _PendingSteerUserIdentity
+        ] = OrderedDict()
         self._turn_q: Optional[Any] = None
         self._managed_overflow = False
         self._reader: Optional[asyncio.Task] = None
@@ -1126,6 +1358,7 @@ class CodexHandle:
         self.interaction_callback = interaction_callback
         self.goal_callback = goal_callback
         self.turn_lifecycle_callback = turn_lifecycle_callback
+        self.thread_started_callback = thread_started_callback
         # App-server can emit initialize/config warnings before thread/start has
         # returned.  Machine binds this callback immediately but activates it only
         # after the SessionContext has a non-null routing key.  Until then, keep a
@@ -1180,14 +1413,23 @@ class CodexHandle:
         # turn. Config.toml is read-only here and supplies fresh-thread defaults.
         # Codex equivalents of cc's model / effort / permission-mode. Defaults come
         # from ~/.codex/config.toml; the client overrides them via set_* .
-        self.model: Optional[str] = codex_model()
-        self.effort: Optional[str] = codex_effort()         # low | medium | high | xhigh
+        self.model: Optional[str] = (
+            codex_model() if self.codex_home is None
+            else codex_model(codex_home=self.codex_home)
+        )
+        self.effort: Optional[str] = (
+            codex_effort() if self.codex_home is None
+            else codex_effort(codex_home=self.codex_home)
+        )         # low | medium | high | xhigh
         self.applied_effort = self.effort                   # keep machine's spawn-time check a no-op
         # Work is governed by its per-process named permission profile. It must
         # never fall back to interactive escalation outside that profile, even
         # when a resumed native thread persisted a Code-time approval policy.
         self.approval: str = (
-            "never" if self.work_mode else codex_approval())  # UI/callback projection
+            "never" if self.work_mode else (
+                codex_approval() if self.codex_home is None
+                else codex_approval(codex_home=self.codex_home)
+            ))  # UI/callback projection
         # Official named profile id (for example ``:workspace`` or
         # ``:danger-full-access``).  It is independent from approvalPolicy:
         # the profile says what the sandbox may access; approvalPolicy says
@@ -1200,11 +1442,17 @@ class CodexHandle:
         # locally so controlled reconnects preserve it.
         self.web_search_override: Optional[str] = None
         self.web_search: str = (
-            "cached" if self.work_mode else codex_web_search()
+            "cached" if self.work_mode else (
+                codex_web_search() if self.codex_home is None
+                else codex_web_search(codex_home=self.codex_home)
+            )
         )
         self.collaboration_mode: str = "default"            # default | plan; independent of approval
         self.service_tier: Optional[str] = (
-            "fast" if codex_fast_enabled() else None
+            "fast" if (
+                codex_fast_enabled() if self.codex_home is None
+                else codex_fast_enabled(codex_home=self.codex_home)
+            ) else None
         )                                                    # thread-scoped; None = standard
 
     async def activate_runtime_events(self) -> None:
@@ -1389,7 +1637,7 @@ class CodexHandle:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=self._cwd,
-            env=_codex_env(codex_bin),
+            env=_profile_codex_env(codex_bin, self.codex_home),
             # JSONL and reassembled WebSocket messages share this hard ceiling.
             limit=_PROXY_MESSAGE_MAX,
             start_new_session=(os.name == "posix"),
@@ -1399,6 +1647,7 @@ class CodexHandle:
         self._proxy_read_buffer.clear()
         self._proxy_close_sent = False
         self._process_group = proc.pid if os.name == "posix" else None
+        self._clear_steer_user_identities()
         self._generation += 1
         generation = self._generation
         self._dead = False
@@ -1418,6 +1667,7 @@ class CodexHandle:
         self._goal_prompt_candidate = None
         self._goal_replacement_fence = None
         self._spontaneous_turn_id = None
+        self._active_stream_turn_ids.clear()
         self._compaction_continuation_turn_id = None
         self._discard_managed_compaction_continuation()
         self.last_token_usage = None
@@ -1455,18 +1705,25 @@ class CodexHandle:
             http_only_resume = await asyncio.to_thread(
                 _oversized_desktop_openai_resume_requires_http,
                 resume_id,
+            ) if self.codex_home is None else await asyncio.to_thread(
+                _oversized_desktop_openai_resume_requires_http,
+                resume_id, self.codex_home,
             )
             private_core = await asyncio.to_thread(
                 _newer_private_core_for_oversized_resume,
                 codex_bin,
                 resume_id,
+            ) if self.codex_home is None else await asyncio.to_thread(
+                _newer_private_core_for_oversized_resume,
+                codex_bin,
+                resume_id, self.codex_home,
             )
             if private_core is not None:
                 codex_bin = private_core
         self._http_provider_root_id = resume_id if http_only_resume else None
         if http_only_resume:
             self._http_provider_repair_stop.clear()
-        child_env = _codex_env(codex_bin)
+        child_env = _profile_codex_env(codex_bin, self.codex_home)
         stdio_argv = [codex_bin, "app-server", "--stdio"]
         if http_only_resume:
             _append_openai_http_resume_provider(stdio_argv)
@@ -1483,7 +1740,7 @@ class CodexHandle:
             # bwrap and every tool fails with ENOENT before its command starts.
             filesystem_entries = [
                 '":minimal" = "read"',
-                f'{json.dumps(_codex_runtime_tmp())} = "read"',
+                f'{json.dumps(_codex_runtime_tmp() if self.codex_home is None else _codex_runtime_tmp(self.codex_home))} = "read"',
                 f'{json.dumps(os.path.realpath(codex_bin))} = "read"',
                 f'{json.dumps(self._cwd)} = "write"',
             ]
@@ -1667,7 +1924,7 @@ class CodexHandle:
                     # transport ceiling; otherwise fail before the stdout reader
                     # is destroyed by an oversized thread/resume response.
                     rollout_path = await asyncio.to_thread(
-                        codex_rollout_path, resume_id)
+                        _profile_rollout_path, resume_id, self.codex_home)
                     try:
                         rollout_size = (
                             await asyncio.to_thread(os.path.getsize, rollout_path)
@@ -1762,17 +2019,24 @@ class CodexHandle:
         log.info("codex connected", thread_id=self.thread_id, cwd=self._cwd,
                  resume=bool(resume_id), fork=fork)
 
-    async def query(self, prompt, images=None) -> Optional[str]:
+    async def query(
+        self,
+        prompt,
+        images=None,
+        *,
+        client_user_message_id: Optional[str] = None,
+    ) -> Optional[str]:
         if self.thread_id and (
             self.proc is None or self._dead or self.proc.returncode is not None
         ):
             await self.force_reconnect(self.thread_id, self._cwd, reason="app-server unavailable")
         await self._release_managed_compaction_continuation()
         assert self.proc is not None and self.thread_id, "connect() first"
+        thread_id = self.thread_id
         self._open_managed_stream()
         queue = self._turn_q
         params = {
-            "threadId": self.thread_id,
+            "threadId": thread_id,
             "input": _to_input(prompt, images),
             "approvalPolicy": self.approval_policy,
         }
@@ -1791,7 +2055,10 @@ class CodexHandle:
         # Codex Plan mode is a collaboration-mode override, not an approval
         # policy. The app-server schema requires settings.model. Code selects the
         # built-in mode instructions with null; Work repeats its isolated policy.
-        collaboration_model = self.model or codex_model()
+        collaboration_model = self.model or (
+            codex_model() if self.codex_home is None
+            else codex_model(codex_home=self.codex_home)
+        )
         if collaboration_model:
             params["collaborationMode"] = self._collaboration_setting(
                 self.collaboration_mode)
@@ -1800,6 +2067,19 @@ class CodexHandle:
         # null is intentional: in app-server 0.144.1 it clears a persisted Fast
         # override, while omission would leave the previous tier unchanged.
         params["serviceTier"] = self.service_tier
+        registered_identity = self._register_query_user_identity(
+            client_user_message_id,
+            thread_id,
+        )
+        if registered_identity:
+            params["clientUserMessageId"] = client_user_message_id
+        response_boundary = (
+            _CodexTurnStartResponseBoundary(
+                thread_id,
+                client_user_message_id,
+            )
+            if registered_identity else None
+        )
         # Mark the turn active before awaiting the RPC.  app-server may dispatch
         # turn/completed immediately after the response, before this coroutine is
         # scheduled again; setting this afterwards would resurrect a completed
@@ -1812,8 +2092,16 @@ class CodexHandle:
         self.turn_active = True
         self.turn_start_pending = True
         try:
-            res = await self._request("turn/start", params)
+            if response_boundary is None:
+                res = await self._request("turn/start", params)
+            else:
+                res = await self._request(
+                    "turn/start",
+                    params,
+                    response_boundary=response_boundary,
+                )
         except BaseException:
+            self._discard_steer_user_identity(client_user_message_id)
             self.turn_active = False
             self.turn_id = None
             if self._turn_q is queue:
@@ -1863,7 +2151,16 @@ class CodexHandle:
         }
         if client_user_message_id:
             params["clientUserMessageId"] = client_user_message_id
-        boundary = _CodexSteerResponseBoundary(thread_id, turn_id)
+        self._register_steer_user_identity(
+            client_user_message_id,
+            thread_id,
+            turn_id,
+        )
+        boundary = _CodexSteerResponseBoundary(
+            thread_id,
+            turn_id,
+            client_user_message_id,
+        )
         try:
             result = await self._request(
                 "turn/steer",
@@ -1871,6 +2168,7 @@ class CodexHandle:
                 response_boundary=boundary,
             )
         except CodexAppServerError:
+            self._discard_steer_user_identity(client_user_message_id)
             raise
         except Exception as exc:
             raise CodexSteerOutcomeUnknown(
@@ -1880,11 +2178,283 @@ class CodexHandle:
         )
         if returned_turn_id != turn_id:
             boundary.release()
+            self._discard_steer_user_identity(client_user_message_id)
             raise CodexAppServerError({
                 "code": -32600,
                 "message": "expected turn mismatch after turn/steer",
             })
+        self._accept_steer_user_identity(client_user_message_id)
         return CodexSteerAcceptance(turn_id, boundary.fence)
+
+    def _steer_user_identity_queue(self, turn_id: str) -> Any:
+        if isinstance(self._turn_q, _SpontaneousNotificationQueue):
+            return self._turn_q
+        if (
+            self._spontaneous_queue_turn_id == turn_id
+            and isinstance(self._spontaneous_q, _SpontaneousNotificationQueue)
+        ):
+            return self._spontaneous_q
+        return None
+
+    def _register_user_identity(
+        self,
+        client_message_id: Optional[str],
+        thread_id: str,
+        expected_turn_id: Optional[str],
+        *,
+        kind: str,
+        queue: Any,
+    ) -> bool:
+        """Register one content-free upstream client id for this generation."""
+        if (
+            kind not in {"query", "steer"}
+            or not isinstance(client_message_id, str)
+            or not _STATUS_WIRE_ID.fullmatch(client_message_id)
+            or not _STATUS_WIRE_ID.fullmatch(thread_id)
+            or (
+                expected_turn_id is not None
+                and not _STATUS_WIRE_ID.fullmatch(expected_turn_id)
+            )
+        ):
+            return False
+        pending = _PendingSteerUserIdentity(
+            thread_id=thread_id,
+            expected_turn_id=expected_turn_id,
+            client_message_id=client_message_id,
+            generation=self._generation,
+            queue=queue,
+            kind=kind,
+        )
+        self._pending_steer_user_identities.pop(client_message_id, None)
+        self._pending_steer_user_identities[client_message_id] = pending
+        while (
+            len(self._pending_steer_user_identities)
+            > _PENDING_STEER_USER_IDENTITIES_MAX
+        ):
+            self._pending_steer_user_identities.popitem(last=False)
+        return True
+
+    def _register_query_user_identity(
+        self,
+        client_message_id: Optional[str],
+        thread_id: str,
+    ) -> bool:
+        return self._register_user_identity(
+            client_message_id,
+            thread_id,
+            None,
+            kind="query",
+            queue=self._turn_q,
+        )
+
+    def _register_steer_user_identity(
+        self,
+        client_message_id: Optional[str],
+        thread_id: str,
+        expected_turn_id: str,
+    ) -> bool:
+        """Register only a safe client id; never retain its prompt or content."""
+        return self._register_user_identity(
+            client_message_id,
+            thread_id,
+            expected_turn_id,
+            kind="steer",
+            queue=self._steer_user_identity_queue(expected_turn_id),
+        )
+
+    def _discard_steer_user_identity(
+        self, client_message_id: Optional[str],
+    ) -> None:
+        if isinstance(client_message_id, str):
+            self._pending_steer_user_identities.pop(client_message_id, None)
+
+    def _clear_steer_user_identities(self) -> None:
+        self._pending_steer_user_identities.clear()
+
+    def _deliver_steer_user_identity(
+        self, pending: _PendingSteerUserIdentity,
+    ) -> bool:
+        proof = pending.proof
+        queue = pending.queue
+        if (
+            proof is None
+            or not isinstance(proof.expected_turn_id, str)
+            or not _STATUS_WIRE_ID.fullmatch(proof.expected_turn_id)
+            or pending.generation != self._generation
+            or pending.thread_id != self.thread_id
+            or not isinstance(queue, _SpontaneousNotificationQueue)
+            or queue.end_delivered
+        ):
+            return False
+        if pending.delivered:
+            if (
+                pending.completed_seen
+                and self._pending_steer_user_identities.get(
+                    pending.client_message_id) is pending
+            ):
+                self._pending_steer_user_identities.pop(
+                    pending.client_message_id, None)
+            return True
+        self.bind_owned_turn_stream(
+            proof.expected_turn_id,
+            proof.native_turn_id,
+        )
+        if pending.kind == "query":
+            queue.put_control_first_nowait(proof)
+        else:
+            queue.put_control_nowait(proof)
+        pending.delivered = True
+        if (
+            pending.completed_seen
+            and self._pending_steer_user_identities.get(
+                pending.client_message_id) is pending
+        ):
+            self._pending_steer_user_identities.pop(
+                pending.client_message_id, None)
+        return True
+
+    def _accept_query_user_identity(
+        self,
+        client_message_id: Optional[str],
+        control_turn_id: str,
+    ) -> None:
+        if (
+            not isinstance(client_message_id, str)
+            or not _STATUS_WIRE_ID.fullmatch(control_turn_id)
+        ):
+            return
+        pending = self._pending_steer_user_identities.get(client_message_id)
+        if pending is None or pending.kind != "query":
+            return
+        pending.expected_turn_id = control_turn_id
+        proof = pending.proof
+        if proof is not None:
+            proof.expected_turn_id = control_turn_id
+            queue = pending.queue
+            if isinstance(queue, _SpontaneousNotificationQueue):
+                if not queue.remap_turn_id(
+                    proof.native_turn_id,
+                    control_turn_id,
+                ):
+                    self._pending_steer_user_identities.pop(
+                        client_message_id, None)
+                    log.warning(
+                        "Codex query stream identity remap exceeded queue bounds",
+                        thread_id=pending.thread_id,
+                    )
+                    return
+        pending.state = "accepted"
+        self._deliver_steer_user_identity(pending)
+
+    def _accept_steer_user_identity(
+        self, client_message_id: Optional[str],
+    ) -> None:
+        if not isinstance(client_message_id, str):
+            return
+        pending = self._pending_steer_user_identities.get(client_message_id)
+        if pending is None:
+            return
+        pending.state = "accepted"
+        self._deliver_steer_user_identity(pending)
+
+    def mark_steer_outcome_unknown(
+        self, client_message_id: Optional[str],
+    ) -> None:
+        """Arm a timed-out steer after Machine publishes its uncertainty state."""
+        if not isinstance(client_message_id, str):
+            return
+        pending = self._pending_steer_user_identities.get(client_message_id)
+        if pending is None:
+            return
+        pending.state = "uncertain"
+        self._deliver_steer_user_identity(pending)
+
+    def _capture_steer_user_identity(self, message: dict) -> bool:
+        """Extract a registered identity before foreign-frame filtering.
+
+        This deliberately copies only bounded ids.  Prompt text, images,
+        tool output and every other foreign field remain inaccessible to the
+        managed/spontaneous consumers.
+        """
+        if message.get("method") not in {"item/started", "item/completed"}:
+            return False
+        params = message.get("params")
+        item = params.get("item") if isinstance(params, dict) else None
+        if not isinstance(item, dict) or item.get("type") != "userMessage":
+            return False
+        client_message_id = item.get("clientId")
+        pending = (
+            self._pending_steer_user_identities.get(client_message_id)
+            if isinstance(client_message_id, str) else None
+        )
+        if pending is None:
+            return False
+        thread_id = _notification_thread_id(message)
+        native_turn_id = _notification_turn_id(message)
+        native_message_id = item.get("id")
+        if (
+            pending.generation != self._generation
+            or thread_id != pending.thread_id
+            or not isinstance(native_turn_id, str)
+            or not _STATUS_WIRE_ID.fullmatch(native_turn_id)
+            or not isinstance(native_message_id, str)
+            or not _STATUS_WIRE_ID.fullmatch(native_message_id)
+        ):
+            return False
+        proof = CodexSteerUserIdentityProof(
+            thread_id=thread_id,
+            expected_turn_id=pending.expected_turn_id,
+            native_turn_id=native_turn_id,
+            native_message_id=native_message_id,
+            client_message_id=pending.client_message_id,
+            generation=pending.generation,
+            kind=pending.kind,
+        )
+        previous = pending.proof
+        if previous is not None:
+            if (
+                previous.native_turn_id == proof.native_turn_id
+                and previous.native_message_id == proof.native_message_id
+            ):
+                if message.get("method") == "item/completed":
+                    pending.completed_seen = True
+                if pending.state in {"accepted", "uncertain"}:
+                    self._deliver_steer_user_identity(pending)
+                return True
+            # One client id proving two native items is ambiguous. Fail closed
+            # instead of letting arrival order choose a durable alias.
+            self._pending_steer_user_identities.pop(
+                pending.client_message_id, None)
+            log.warning(
+                "conflicting Codex user identities dropped",
+                thread_id=thread_id,
+            )
+            return True
+        pending.proof = proof
+        pending.completed_seen = message.get("method") == "item/completed"
+        if pending.kind == "query" and pending.expected_turn_id is None:
+            # The exact upstream client id proves this native task belongs to
+            # the in-flight turn/start even if its JSON-RPC response has not yet
+            # reached the request coroutine. Admit only that bounded task so
+            # immediately following frames can be retained and remapped once
+            # the response supplies the logical control id.
+            if (
+                native_turn_id not in self._active_stream_turn_ids
+                and len(self._active_stream_turn_ids)
+                >= _ACTIVE_STREAM_TURN_IDS_MAX
+            ):
+                self._pending_steer_user_identities.pop(
+                    pending.client_message_id, None)
+                log.warning(
+                    "Codex query stream identity cap reached",
+                    thread_id=thread_id,
+                )
+                return True
+            self._active_stream_turn_ids.add(native_turn_id)
+            self.remember_owned_turn_id(native_turn_id)
+        if pending.state in {"accepted", "uncertain"}:
+            self._deliver_steer_user_identity(pending)
+        return True
 
     def remember_owned_turn_id(self, turn_id: str) -> None:
         self._owned_turn_ids[turn_id] = None
@@ -1892,13 +2462,49 @@ class CodexHandle:
         while len(self._owned_turn_ids) > _OWNED_TURN_IDS_MAX:
             self._owned_turn_ids.popitem(last=False)
 
+    def bind_owned_turn_stream(
+        self,
+        control_turn_id: str,
+        stream_turn_id: str,
+    ) -> bool:
+        """Admit one exactly proven native stream into the active control turn."""
+        if (
+            not isinstance(control_turn_id, str)
+            or not _STATUS_WIRE_ID.fullmatch(control_turn_id)
+            or not isinstance(stream_turn_id, str)
+            or not _STATUS_WIRE_ID.fullmatch(stream_turn_id)
+            or not self.turn_active
+            or self.turn_id != control_turn_id
+        ):
+            return False
+        if stream_turn_id == control_turn_id:
+            self.remember_owned_turn_id(stream_turn_id)
+            return True
+        if (
+            stream_turn_id not in self._active_stream_turn_ids
+            and len(self._active_stream_turn_ids) >= _ACTIVE_STREAM_TURN_IDS_MAX
+        ):
+            return False
+        self._active_stream_turn_ids.add(stream_turn_id)
+        self.remember_owned_turn_id(stream_turn_id)
+        return True
+
     @property
     def owned_turn_ids(self) -> frozenset[str]:
         return frozenset(self._owned_turn_ids)
 
     @property
     def compaction_continuation_turn_ids(self) -> frozenset[str]:
-        """Native/logical ids backed by this handle's exact compact fence."""
+        """Native/logical ids backed by an exact live continuation proof.
+
+        The wire field predates split control/stream ids and is also the
+        browser's guarded way to reopen a persisted compact-interrupt shell.
+        A source-proven active stream alias supplies the same narrow fact: these
+        ids are one still-running task, not a generic in-progress guess.
+        """
+        ids = set(self._active_stream_turn_ids)
+        if ids and self.turn_active and self.turn_id is not None:
+            ids.add(self.turn_id)
         fence = self._managed_compaction_continuation
         if (
             fence is None
@@ -1906,8 +2512,9 @@ class CodexHandle:
             or not self._managed_compaction_fence_current(
                 fence, check_deadline=False)
         ):
-            return frozenset()
-        return frozenset({fence.logical_turn_id, fence.native_turn_id})
+            return frozenset(ids)
+        ids.update({fence.logical_turn_id, fence.native_turn_id})
+        return frozenset(ids)
 
     @property
     def turn_attribution_pending(self) -> bool:
@@ -2308,6 +2915,30 @@ class CodexHandle:
         logical["params"] = params
         return logical
 
+    def _logicalize_active_stream_notification(
+        self, message: dict,
+    ) -> dict:
+        """Project a proven native stream task onto its control-turn id."""
+        target_turn_id = _notification_turn_id(message)
+        logical_turn_id = self.turn_id
+        if (
+            target_turn_id not in self._active_stream_turn_ids
+            or not isinstance(logical_turn_id, str)
+            or target_turn_id == logical_turn_id
+        ):
+            return message
+        raw_params = message.get("params")
+        if not isinstance(raw_params, dict):
+            return message
+        logical = dict(message)
+        params = dict(raw_params)
+        params["turnId"] = logical_turn_id
+        raw_turn = raw_params.get("turn")
+        if isinstance(raw_turn, dict) and raw_turn.get("id") == target_turn_id:
+            params["turn"] = {**raw_turn, "id": logical_turn_id}
+        logical["params"] = params
+        return logical
+
     def _open_managed_stream(self) -> None:
         """Create a bounded producer that can never block JSON-RPC stdout."""
         self._discard_managed_compaction_continuation()
@@ -2315,6 +2946,7 @@ class CodexHandle:
         # consume a delayed Goal objective which was waiting for an automatic
         # continuation.
         self._goal_prompt_candidate = None
+        self._active_stream_turn_ids.clear()
         item_cap, byte_cap = self._notification_queue_limits(managed=True)
         self._turn_q = _SpontaneousNotificationQueue(item_cap, byte_cap)
         self._managed_overflow = False
@@ -2735,6 +3367,7 @@ class CodexHandle:
         for boundary in self._pending_response_boundaries.values():
             boundary.release()
         self._pending_response_boundaries.clear()
+        self._clear_steer_user_identities()
         self.proc = None
         self._process_group = None
         self._reader = None
@@ -2785,6 +3418,7 @@ class CodexHandle:
         self.turn_id = None
         self.turn_start_pending = False
         self.turn_active = False
+        self._active_stream_turn_ids.clear()
         if spontaneous_turn_id is not None:
             await self._publish_turn_lifecycle(
                 "completed", spontaneous_turn_id)
@@ -2859,7 +3493,10 @@ class CodexHandle:
         return False
 
     def _collaboration_setting(self, mode: str) -> dict[str, Any]:
-        model = self.model or codex_model()
+        model = self.model or (
+            codex_model() if self.codex_home is None
+            else codex_model(codex_home=self.codex_home)
+        )
         if not model:
             raise RuntimeError("Codex collaboration mode requires an active model")
         settings: dict[str, Any] = {
@@ -3605,6 +4242,19 @@ class CodexHandle:
                 error_type=type(exc).__name__,
             )
 
+    def _publish_thread_started_hint(self, thread_id: str) -> None:
+        """Schedule-only catalog hint; never await relay work on stdout reader."""
+        callback = self.thread_started_callback
+        if callback is None:
+            return
+        try:
+            callback(thread_id)
+        except Exception as exc:
+            log.warning(
+                "codex thread catalog callback failed",
+                error_type=type(exc).__name__,
+            )
+
     async def get_context_usage(self) -> dict:
         # Real shape (verified, gpt-5.5): tokenUsage = {last:{totalTokens,…},
         # total:{totalTokens,…}, modelContextWindow}. `last.totalTokens` is the most
@@ -3618,28 +4268,121 @@ class CodexHandle:
         if used is None:
             used = total.get("totalTokens")
         # server value (captured in _dispatch) wins; else the config-declared window.
-        win = self.context_window or u.get("modelContextWindow") or codex_context_window()
+        win = self.context_window or u.get("modelContextWindow") or (
+            codex_context_window() if self.codex_home is None
+            else codex_context_window(codex_home=self.codex_home)
+        )
         return {"used_tokens": used, "context_window": win, "raw": u}
 
-    async def recover_owned_turn(self, turn_id: str) -> bool:
+    async def probe_owned_turn(
+        self, turn_id: str,
+    ) -> Optional[CodexOwnedTurnProbe]:
+        """Read an active control turn without claiming or changing lifecycle."""
+        if (
+            not isinstance(turn_id, str)
+            or not _STATUS_WIRE_ID.fullmatch(turn_id)
+            or not isinstance(self.thread_id, str)
+        ):
+            return None
+        response = await self._request("thread/read", {
+            "threadId": self.thread_id,
+            "includeTurns": False,
+        })
+        thread = response.get("thread") if isinstance(response, dict) else None
+        raw_status = thread.get("status") if isinstance(thread, dict) else None
+        if (
+            not isinstance(raw_status, dict)
+            or raw_status.get("type") != "active"
+        ):
+            return None
+        page = await self._request("thread/turns/list", {
+            "threadId": self.thread_id,
+            "cursor": None,
+            "limit": 1,
+            "sortDirection": "desc",
+            "itemsView": "summary",
+        })
+        turns = page.get("data") if isinstance(page, dict) else None
+        if not isinstance(turns, list) or len(turns) != 1:
+            return None
+        latest = turns[0]
+        if (
+            not isinstance(latest, dict)
+            or latest.get("id") != turn_id
+            or latest.get("status") != "inProgress"
+        ):
+            return None
+        items = latest.get("items")
+        native_user_message_ids: list[str] = []
+        if isinstance(items, list):
+            for item in reversed(
+                items[-_PENDING_STEER_USER_IDENTITIES_MAX:]
+            ):
+                if not isinstance(item, dict) or item.get("type") != "userMessage":
+                    continue
+                native_message_id = item.get("id")
+                if (
+                    isinstance(native_message_id, str)
+                    and _STATUS_WIRE_ID.fullmatch(native_message_id)
+                    and native_message_id not in native_user_message_ids
+                ):
+                    native_user_message_ids.append(native_message_id)
+                    if len(native_user_message_ids) >= 64:
+                        break
+        return CodexOwnedTurnProbe(
+            turn_id=turn_id,
+            native_user_message_ids=tuple(native_user_message_ids),
+        )
+
+    async def recover_owned_turn(
+        self,
+        turn_id: str,
+        *,
+        stream_turn_ids: tuple[str, ...] = (),
+    ) -> bool:
         """Reattach one durably attributed turn after a wrapper restart.
 
         Arm the bounded stream before the status reads so a terminal notification
         racing either RPC is captured rather than leaving a false running state.
-        Machine has already matched this id against its private lease and rollout
-        tail; the bounded latest-turn page supplies the missing native-id proof.
+        Machine has already matched this id against its private lease and an
+        exact source-bound rollout witness; the bounded latest-turn page
+        revalidates that the official control turn is still active.
         """
         if not isinstance(turn_id, str) or not turn_id:
             raise ValueError("invalid Codex turn id")
+        if not isinstance(stream_turn_ids, tuple):
+            raise ValueError("invalid Codex stream turn ids")
+        stream_ids: set[str] = set()
+        for value in stream_turn_ids:
+            if (
+                not isinstance(value, str)
+                or not _STATUS_WIRE_ID.fullmatch(value)
+            ):
+                raise ValueError("invalid Codex stream turn ids")
+            if value != turn_id:
+                stream_ids.add(value)
+        if len(stream_ids) > _ACTIVE_STREAM_TURN_IDS_MAX:
+            raise ValueError("invalid Codex stream turn ids")
         if self.turn_active or self._spontaneous_turn_id is not None:
-            return (
+            recovered = (
                 self.turn_id == turn_id
                 and self._spontaneous_turn_id == turn_id
             )
+            if recovered:
+                for stream_turn_id in stream_ids:
+                    self.bind_owned_turn_stream(turn_id, stream_turn_id)
+            return recovered
 
         self.turn_id = turn_id
         self.turn_active = True
+        self._active_stream_turn_ids.clear()
         self.remember_owned_turn_id(turn_id)
+        for stream_turn_id in stream_ids:
+            if not self.bind_owned_turn_stream(turn_id, stream_turn_id):
+                self.turn_id = None
+                self.turn_active = False
+                self._active_stream_turn_ids.clear()
+                return False
         self._spontaneous_turn_id = turn_id
         self._open_spontaneous_stream(turn_id)
         try:
@@ -3688,6 +4431,7 @@ class CodexHandle:
             if self.turn_id == turn_id:
                 self.turn_id = None
             self.turn_active = False
+            self._active_stream_turn_ids.clear()
             raise
 
         # turn/completed may have been dispatched while the read response was
@@ -3709,6 +4453,7 @@ class CodexHandle:
         if self.turn_id == turn_id:
             self.turn_id = None
         self.turn_active = False
+        self._active_stream_turn_ids.clear()
         return False
 
     async def get_status(self) -> dict:
@@ -3904,7 +4649,9 @@ class CodexHandle:
         method: str,
         params: Optional[dict] = None,
         *,
-        response_boundary: Optional[_CodexSteerResponseBoundary] = None,
+        response_boundary: Optional[
+            _CodexSteerResponseBoundary | _CodexTurnStartResponseBoundary
+        ] = None,
     ):
         self._id += 1
         rid = self._id
@@ -3945,15 +4692,28 @@ class CodexHandle:
         roots = {root_id} if include_descendants else set()
         async with self._http_provider_repair_lock:
             try:
+                repair_kwargs: dict[str, Any] = {}
+                restored_kwargs: dict[str, Any] = {}
+                if self.codex_home is not None:
+                    repair_kwargs = {
+                        "codex_home": self.codex_home,
+                        "journal_dir": str(
+                            Path(self.codex_home)
+                            / ".cc-remote-provider-repair-journal"
+                        ),
+                    }
+                    restored_kwargs = {"codex_home": self.codex_home}
                 report = await asyncio.to_thread(
                     repair_http_provider_records,
                     apply=True,
                     roots=roots,
                     include_thread_ids=include_ids,
+                    **repair_kwargs,
                 )
                 restored = await asyncio.to_thread(
                     canonical_thread_provider_is_restored,
                     root_id,
+                    **restored_kwargs,
                 )
                 if strict and not restored:
                     raise RuntimeError(
@@ -4360,6 +5120,7 @@ class CodexHandle:
                 for fut in self._pending.values():
                     if not fut.done():
                         fut.set_exception(RuntimeError("codex app-server closed"))
+                self._clear_steer_user_identities()
                 if spontaneous_turn_id is not None:
                     await self._publish_turn_lifecycle(
                         "completed", spontaneous_turn_id)
@@ -4384,7 +5145,10 @@ class CodexHandle:
             self._using_daemon_proxy
             and target_thread_id is None
             and target_turn_id is not None
-            and target_turn_id == self.turn_id
+            and (
+                target_turn_id == self.turn_id
+                or target_turn_id in self._active_stream_turn_ids
+            )
             and self.turn_active
             and self._turn_q is not None
             and self._spontaneous_turn_id is None
@@ -4448,6 +5212,23 @@ class CodexHandle:
                 self.turn_id,
             }:
                 return True
+
+        if (
+            self.turn_active
+            and target_turn_id is not None
+            and target_turn_id in self._active_stream_turn_ids
+        ):
+            if self._notification_is_user_message(message):
+                # The one Remote user item which established this alias was
+                # consumed by _capture_steer_user_identity above. A different
+                # user boundary on the same native task is not ours merely
+                # because later assistant frames share its task id.
+                log.warning(
+                    "unproven Codex stream user notification dropped",
+                    method=method,
+                )
+                return False
+            return True
 
         if method == "turn/started":
             if target_turn_id is None:
@@ -4543,9 +5324,47 @@ class CodexHandle:
         )
         if queue is None or queue.end_delivered:
             return
+        pending = self._pending_steer_user_identities.get(
+            boundary.client_message_id)
+        if pending is not None:
+            pending.queue = queue
         fence = CodexSteerFence()
         queue.put_control_nowait(fence)
         boundary.fence = fence
+        self._accept_steer_user_identity(boundary.client_message_id)
+
+    def _install_turn_start_response_boundary(
+        self,
+        boundary: _CodexTurnStartResponseBoundary,
+        response: dict,
+    ) -> None:
+        """Attach an exact client id before post-response frames are routed."""
+        if "error" in response or self.thread_id != boundary.thread_id:
+            return
+        result = response.get("result")
+        turn = result.get("turn") if isinstance(result, dict) else None
+        control_turn_id = turn.get("id") if isinstance(turn, dict) else None
+        if (
+            not isinstance(control_turn_id, str)
+            or not _STATUS_WIRE_ID.fullmatch(control_turn_id)
+        ):
+            return
+        pending = self._pending_steer_user_identities.get(
+            boundary.client_message_id)
+        if (
+            pending is None
+            or pending.kind != "query"
+            or pending.thread_id != boundary.thread_id
+            or pending.generation != self._generation
+        ):
+            return
+        self.remember_owned_turn_id(control_turn_id)
+        if self.turn_active:
+            self.turn_id = control_turn_id
+        self._accept_query_user_identity(
+            boundary.client_message_id,
+            control_turn_id,
+        )
 
     async def _dispatch(self, m: dict, raw_size: Optional[int] = None) -> None:
         has_id = "id" in m
@@ -4554,8 +5373,10 @@ class CodexHandle:
             fut = self._pending.get(m["id"])
             if fut and not fut.done():
                 boundary = self._pending_response_boundaries.get(m["id"])
-                if boundary is not None:
+                if isinstance(boundary, _CodexSteerResponseBoundary):
                     self._install_steer_response_boundary(boundary, m)
+                elif isinstance(boundary, _CodexTurnStartResponseBoundary):
+                    self._install_turn_start_response_boundary(boundary, m)
                 if "error" in m:
                     fut.set_exception(CodexAppServerError(m["error"]))
                 else:
@@ -4619,6 +5440,25 @@ class CodexHandle:
             return
         # notification
         method = m.get("method")
+        if method == "thread/started" and self._using_daemon_proxy:
+            target_thread_id = _notification_thread_id(m)
+            params = m.get("params")
+            thread = params.get("thread") if isinstance(params, dict) else None
+            source = thread.get("source") if isinstance(thread, dict) else None
+            current_thread_id = (
+                self._shared_resume_binding_thread_id or self.thread_id
+            )
+            if (
+                isinstance(target_thread_id, str)
+                and _STATUS_WIRE_ID.fullmatch(target_thread_id)
+                and source in _EXTERNAL_THREAD_STARTED_SOURCES
+                and isinstance(current_thread_id, str)
+                and target_thread_id != current_thread_id
+            ):
+                # A shared daemon publishes sibling thread creation to every
+                # subscribed handle. Preserve the strict foreign-frame drop below;
+                # expose only this content-free catalog hint to Machine.
+                self._publish_thread_started_hint(target_thread_id)
         if method == "serverRequest/resolved":
             params = m.get("params")
             request_id = _server_request_key(
@@ -4628,8 +5468,17 @@ class CodexHandle:
                 task = self._server_request_tasks_by_id.pop(request_id, None)
                 if task is not None and not task.done():
                     task.cancel()
+        # Preserve the strict ownership filter below. The only pre-filter
+        # exception is a content-free identity proof for a client id registered
+        # by this exact handle generation.
+        if self._capture_steer_user_identity(m):
+            return
         if not self._notification_is_current(m):
             return
+        logical_stream_message = self._logicalize_active_stream_notification(m)
+        if logical_stream_message is not m:
+            m = logical_stream_message
+            raw_size = self._notification_wire_size(m)
         if self._stage_managed_compaction_replacement(m, raw_size):
             # ``turn/started`` alone is ambiguous: app-server may be announcing
             # the compact replacement or an independent user/Goal turn. Hold it
@@ -4987,6 +5836,8 @@ class CodexHandle:
             if (self._review_active
                     and completed_turn_id == self._review_outer_turn_id):
                 self._clear_review_tracking()
+            if completed_turn_id is not None:
+                self._active_stream_turn_ids.clear()
 
     @staticmethod
     def _force_turn_sentinel(queue: Any) -> None:

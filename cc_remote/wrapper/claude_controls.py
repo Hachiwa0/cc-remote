@@ -14,7 +14,10 @@ from uuid import UUID, uuid4
 
 from claude_agent_sdk import get_session_messages
 
-from cc_remote.wrapper.stream import transcript_path
+from cc_remote.wrapper.stream import (
+    recover_claude_delayed_retry_tail,
+    transcript_path,
+)
 
 
 CLAUDE_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
@@ -289,6 +292,7 @@ def last_completed_assistant_controls(
     *,
     directory: str,
     max_bytes: int,
+    index_store=None,
 ) -> ClaudeControls:
     """Read controls from the latest completed native assistant turn.
 
@@ -308,7 +312,14 @@ def last_completed_assistant_controls(
     if not stat.S_ISREG(info.st_mode) or info.st_size > max_bytes:
         return ClaudeControls()
 
-    messages = get_session_messages(session_id, directory=directory)
+    messages = recover_claude_delayed_retry_tail(
+        session_id,
+        get_session_messages(session_id, directory=directory),
+        path=path,
+        index_store=index_store,
+        snapshot_size=info.st_size,
+        max_record_bytes=max_bytes,
+    )
     turns: list[list[Any]] = []
     for item in messages:
         if getattr(item, "type", None) == "user" or not turns:

@@ -3,6 +3,11 @@ import type { Notice, StatusRateLimit, StatusRateWindow, StatusReport } from "..
 import { Icon } from "../icons";
 import { accountStatsNote } from "../status-capabilities";
 import { statusNotices } from "../notice-presentation";
+import {
+  quotaTone,
+  quotaWindowLabel,
+  remainingPercent,
+} from "../rate-limit-usage";
 
 interface Props {
   open: boolean;
@@ -35,11 +40,12 @@ function Row({ label, children, mono = false }: { label: string; children: React
 
 function RateWindow({ name, window }: { name: string; window?: StatusRateWindow | null }) {
   if (!window) return null;
-  const pct = window.used_percent == null ? null : Math.max(0, Math.min(100, window.used_percent));
+  const remaining = remainingPercent(window);
+  const tone = quotaTone(remaining);
   return <div className="status-rate-window">
-    <div><span>{name}</span><b>{pct == null ? "—" : `${pct}% 已用`}</b></div>
-    <i><span style={{ width: `${pct ?? 0}%` }} /></i>
-    <small>{window.window_duration_mins ? `${window.window_duration_mins} 分钟窗口` : "滚动窗口"} · {resetTime(window.resets_at)} 重置</small>
+    <div><span>{name}</span><b>{remaining == null ? "—" : `剩余 ${remaining.toFixed(0)}%`}</b></div>
+    <i><span className={tone} style={{ width: `${remaining ?? 0}%` }} /></i>
+    <small>{quotaWindowLabel(window.window_duration_mins)} · {resetTime(window.resets_at)} 重置</small>
   </div>;
 }
 

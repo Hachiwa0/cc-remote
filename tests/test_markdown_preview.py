@@ -1255,9 +1255,11 @@ def test_machine_preview_rekey_and_delete_migrate_then_clear_state(tmp_path):
         ))
         assert isinstance(required, PreviewAuthorizationRequired)
 
-        await machine._rekey_preview_session(ctx, ctx.key, "real-session")
-        assert machine._preview_capabilities(ctx) == {}
-        ctx.session_id = "real-session"
+        old_key = ctx.key
+        await machine._capture_session_id(ctx, "real-session")
+        assert machine._preview_capability_store.snapshot(
+            "claude", "code", old_key,
+        ) == {}
         assert str(outside.resolve()) in machine._preview_capabilities(ctx)
         assert machine._preview_challenges[
             required.authorization_id

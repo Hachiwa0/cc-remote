@@ -44,11 +44,22 @@ def normalize_permission_profiles(result: Any) -> list[dict[str, Any]]:
     return profiles
 
 
-async def codex_permission_profiles(cwd: str) -> list[dict[str, Any]]:
+async def codex_permission_profiles(
+    cwd: str,
+    *,
+    codex_home: str | None = None,
+) -> list[dict[str, Any]]:
     """Probe the control plane without creating a thread or spending tokens."""
-    result = await codex_rpc(
-        "permissionProfile/list",
-        {"cwd": cwd, "limit": MAX_PERMISSION_PROFILES},
-        cwd=cwd,
-    )
+    params = {"cwd": cwd, "limit": MAX_PERMISSION_PROFILES}
+    if codex_home is None:
+        # Preserve the long-standing call shape for the default profile and for
+        # embedders which wrap the one-shot RPC helper.
+        result = await codex_rpc("permissionProfile/list", params, cwd=cwd)
+    else:
+        result = await codex_rpc(
+            "permissionProfile/list",
+            params,
+            cwd=cwd,
+            codex_home=codex_home,
+        )
     return normalize_permission_profiles(result)

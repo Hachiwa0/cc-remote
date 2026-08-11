@@ -11,7 +11,8 @@ from cc_remote.codex_daemon_restart import (
 )
 from cc_remote.protocol import (
     Delta, Effort, Error, GetStatus, Model, Query, SessionActivity,
-    SessionControl, StatusReport, Takeover, TurnEnd, UserMsg,
+    SessionControl, StateEvent, StatusReport, Takeover, TurnBinding, TurnEnd,
+    UserMsg,
 )
 from cc_remote.wrapper.codex_external import HolderScan, ProcessIdentity
 from tests.test_codex_external import _CodexSdk, _record_async, _watch
@@ -32,6 +33,20 @@ def _user_event(message: str) -> bytes:
     }) + "\n").encode()
 
 
+def _response_user_item(message_id: str, task_id: str) -> bytes:
+    return (json.dumps({
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": "user",
+            "id": message_id,
+            "internal_chat_message_metadata_passthrough": {
+                "turn_id": task_id,
+            },
+        },
+    }) + "\n").encode()
+
+
 class _SharedSdk(_CodexSdk):
     using_daemon_proxy = True
     model = "gpt-test"
@@ -45,7 +60,9 @@ class _SharedSdk(_CodexSdk):
         self.queries: list[tuple[str, list[str] | None]] = []
         self.reconnects = 0
 
-    async def query(self, prompt: str, images=None) -> None:
+    async def query(
+        self, prompt: str, images=None, *, client_user_message_id=None,
+    ) -> None:
         self.queries.append((prompt, images))
 
     async def receive_response(self):
@@ -123,7 +140,9 @@ class _AccountSwitchSharedSdk(_SharedSdk):
         self.readers = 0
         self.restart_path = None
 
-    async def query(self, prompt: str, images=None) -> str:
+    async def query(
+        self, prompt: str, images=None, *, client_user_message_id=None,
+    ) -> str:
         self.queries.append((prompt, images))
         return "turn-old" if len(self.queries) == 1 else "turn-new"
 
@@ -333,10 +352,31 @@ class _RecoveredOwnedTurnSdk(_SharedSdk):
         self.interrupted.set()
 
 
+class _RecoveredSplitTurnSdk(_RecoveredOwnedTurnSdk):
+    def __init__(self) -> None:
+        super().__init__()
+        self.recovered_stream_turn_ids = None
+
+    async def probe_owned_turn(self, turn_id: str):
+        assert turn_id == "control-turn"
+        return SimpleNamespace(
+            turn_id=turn_id,
+            native_user_message_ids=("native-user-item",),
+        )
+
+    async def recover_owned_turn(
+        self, turn_id: str, *, stream_turn_ids=(),
+    ) -> bool:
+        self.recovered_stream_turn_ids = tuple(stream_turn_ids)
+        return await super().recover_owned_turn(turn_id)
+
+
 class _RecoveredAccountSwitchSdk(_SpontaneousAccountSwitchSharedSdk):
     """Replacement wrapper sees the old leased turn already aborted."""
 
-    async def query(self, prompt: str, images=None) -> str:
+    async def query(
+        self, prompt: str, images=None, *, client_user_message_id=None,
+    ) -> str:
         self.queries.append((prompt, images))
         return "goal-new"
 
@@ -414,7 +454,13 @@ def test_restarted_wrapper_reclaims_only_leased_active_daemon_turn(
         machine.sessions[ctx.key] = ctx
 
         assert await machine._recover_codex_owned_turn(ctx, "sid") is True
-        await asyncio.sleep(0)
+        async def recovery_binding_arrived() -> None:
+            while not any(
+                isinstance(event, TurnBinding) for event in transport.sent
+            ):
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(recovery_binding_arrived(), timeout=1.0)
 
         assert ctx.state == "running"
         assert ctx.codex_spontaneous_turn_id == "owned-turn"
@@ -424,9 +470,25 @@ def test_restarted_wrapper_reclaims_only_leased_active_daemon_turn(
         lease = machine._codex_turn_leases.get("sid")
         assert lease is not None
         assert lease.automatic is False
+        assert lease.initial_msg_id == "logical-message"
+        aliases = machine._codex_client_messages.get(rollout)
+        assert aliases.segments == {
+            ("owned-turn", 0): "logical-message",
+        }
         assert not [
             event for event in transport.sent if isinstance(event, UserMsg)
         ]
+        recovery_events = [
+            event for event in transport.sent
+            if isinstance(event, (TurnBinding, StateEvent))
+        ]
+        assert [type(event) for event in recovery_events[:2]] == [
+            TurnBinding, StateEvent,
+        ]
+        assert recovery_events[0].msg_id == "logical-message"
+        assert recovery_events[0].turn_id == "owned-turn"
+        assert recovery_events[1].state == "running"
+        assert recovery_events[1].msg_id == "logical-message"
 
         await machine._handle_interrupt(SimpleNamespace(sid="sid"))
         task = ctx.codex_spontaneous_task
@@ -437,6 +499,145 @@ def test_restarted_wrapper_reclaims_only_leased_active_daemon_turn(
         assert ctx.state == "idle"
         assert ctx.codex_owned_turn_id is None
         assert machine._codex_turn_leases.get("sid") is None
+        assert machine._codex_client_messages.get(rollout).segments == {
+            ("owned-turn", 0): "logical-message",
+        }
+
+    asyncio.run(go())
+
+
+def test_restarted_wrapper_binds_control_turn_to_exact_active_rollout_task(
+    tmp_path, monkeypatch,
+):
+    async def go() -> None:
+        machine, transport = _mk_machine()
+        rollout = tmp_path / "rollout.jsonl"
+        rollout.write_bytes(
+            _response_user_item("native-user-item", "rollout-task")
+            + _event("task_started", "rollout-task")
+        )
+        monkeypatch.setattr(
+            "cc_remote.wrapper.machine.codex_rollout_path",
+            lambda _sid: str(rollout),
+        )
+        machine._codex_turn_leases.claim(
+            "sid", "control-turn", "browser-message")
+
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.sdk = _RecoveredSplitTurnSdk()
+        ctx.sdk.machine = machine
+        ctx.sdk.ctx = ctx
+        machine.sessions[ctx.key] = ctx
+
+        assert await machine._recover_codex_owned_turn(ctx, "sid") is True
+        assert ctx.sdk.recovered_stream_turn_ids == ("rollout-task",)
+        lease = machine._codex_turn_leases.get("sid")
+        assert lease is not None
+        source = rollout.stat()
+        assert lease.stream_task_ids(
+            source_device=source.st_dev,
+            source_inode=source.st_ino,
+        ) == {"rollout-task"}
+        aliases = machine._codex_client_messages.get(rollout)
+        assert aliases.native_messages == {
+            "native-user-item": "browser-message",
+        }
+        assert not [
+            event for event in transport.sent
+            if isinstance(event, (Error, TurnEnd))
+        ]
+
+        await machine._handle_interrupt(SimpleNamespace(sid="sid"))
+        task = ctx.codex_spontaneous_task
+        assert task is not None
+        await asyncio.wait_for(task, timeout=1.0)
+
+    asyncio.run(go())
+
+
+def test_restarted_wrapper_recovers_split_turn_without_tail_lifecycle_marker(
+    tmp_path, monkeypatch,
+):
+    async def go() -> None:
+        machine, transport = _mk_machine()
+        rollout = tmp_path / "oversized-tail.jsonl"
+        # The exact user item remains recent, but task_started has fallen beyond
+        # the bounded lifecycle tail of a long-running oversized session.
+        rollout.write_bytes(
+            _response_user_item("native-user-item", "rollout-task")
+        )
+        monkeypatch.setattr(
+            "cc_remote.wrapper.machine.codex_rollout_path",
+            lambda _sid: str(rollout),
+        )
+        machine._codex_turn_leases.claim(
+            "sid", "control-turn", "browser-message")
+
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.sdk = _RecoveredSplitTurnSdk()
+        ctx.sdk.machine = machine
+        ctx.sdk.ctx = ctx
+        machine.sessions[ctx.key] = ctx
+
+        assert await machine._recover_codex_owned_turn(ctx, "sid") is True
+        assert ctx.sdk.recovered_stream_turn_ids == ("rollout-task",)
+        lease = machine._codex_turn_leases.get("sid")
+        assert lease is not None
+        assert lease.stream_bindings[0].native_message_id == (
+            "native-user-item")
+        assert machine._codex_client_messages.get(
+            rollout).native_messages == {
+                "native-user-item": "browser-message",
+            }
+        assert not [
+            event for event in transport.sent
+            if isinstance(event, (Error, TurnEnd))
+        ]
+
+        await machine._handle_interrupt(SimpleNamespace(sid="sid"))
+        task = ctx.codex_spontaneous_task
+        assert task is not None
+        await asyncio.wait_for(task, timeout=1.0)
+
+    asyncio.run(go())
+
+
+def test_restarted_wrapper_keeps_lease_when_stream_witness_is_incomplete(
+    tmp_path, monkeypatch,
+):
+    async def go() -> None:
+        machine, transport = _mk_machine()
+        rollout = tmp_path / "rollout.jsonl"
+        rollout.write_bytes(_event("task_started", "rollout-task"))
+        monkeypatch.setattr(
+            "cc_remote.wrapper.machine.codex_rollout_path",
+            lambda _sid: str(rollout),
+        )
+        machine._codex_turn_leases.claim(
+            "sid", "control-turn", "browser-message")
+
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.sdk = _RecoveredSplitTurnSdk()
+        ctx.sdk.machine = machine
+        ctx.sdk.ctx = ctx
+        machine.sessions[ctx.key] = ctx
+
+        assert await machine._recover_codex_owned_turn(ctx, "sid") is False
+        lease = machine._codex_turn_leases.get("sid")
+        assert lease is not None
+        assert lease.turn_id == "control-turn"
+        assert lease.stream_bindings == ()
+        assert ctx.state == "idle"
+        assert not [
+            event for event in transport.sent
+            if isinstance(event, (Error, TurnEnd, StateEvent))
+        ]
 
     asyncio.run(go())
 
@@ -456,8 +657,71 @@ def test_unmarked_daemon_generation_persists_a_recoverable_turn_lease():
     assert lease is not None
     assert lease.turn_id == "owned-turn"
     assert lease.msg_id == "logical-message"
+    assert lease.initial_msg_id == "logical-message"
     assert lease.daemon_epoch is None
     assert ctx.codex_owned_turn_id == "owned-turn"
+    assert ctx.codex_owned_initial_msg_id == "logical-message"
+
+
+def test_lease_rebind_retry_uses_last_durable_message_id():
+    machine, _transport = _mk_machine()
+    ctx = _mk_ctx("sid", "sid")
+    ctx.engine = "codex"
+    ctx.space = "code"
+    ctx.sdk = _SharedSdk()
+    machine.sessions[ctx.key] = ctx
+    machine._claim_codex_turn(ctx, "owned-turn", "message-a")
+
+    durable_rebind = machine._codex_turn_leases.rebind
+    attempts = 0
+
+    def fail_once(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return False
+        return durable_rebind(*args, **kwargs)
+
+    machine._codex_turn_leases.rebind = fail_once
+    assert machine._rebind_codex_turn(
+        ctx, "owned-turn", "message-b") is False
+    assert ctx.codex_owned_msg_id == "message-a"
+    assert machine._rebind_codex_turn(
+        ctx, "owned-turn", "message-c") is True
+    assert ctx.codex_owned_msg_id == "message-c"
+    lease = machine._codex_turn_leases.get("sid")
+    assert lease is not None
+    assert lease.msg_id == "message-c"
+    assert lease.initial_msg_id == "message-a"
+
+
+def test_managed_terminal_retries_initial_alias_before_releasing_lease(
+    tmp_path,
+):
+    async def go() -> None:
+        machine, _transport = _mk_machine()
+        rollout = tmp_path / "rollout.jsonl"
+        rollout.write_bytes(_event("task_started", "owned-turn"))
+        machine._codex_rollout_for_wire = lambda _sid: str(rollout)
+
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.state = "running"
+        ctx.sdk = _SharedSdk()
+        machine.sessions[ctx.key] = ctx
+        machine._claim_codex_turn(ctx, "owned-turn", "logical-message")
+
+        await machine._set_idle_after_managed_turn(ctx)
+
+        assert ctx.state == "idle"
+        assert ctx.codex_owned_turn_id is None
+        assert machine._codex_turn_leases.get("sid") is None
+        assert machine._codex_client_messages.get(rollout).segments == {
+            ("owned-turn", 0): "logical-message",
+        }
+
+    asyncio.run(go())
 
 
 def test_restarted_wrapper_continues_leased_turn_aborted_by_account_switch(
@@ -1330,6 +1594,7 @@ def test_shared_code_query_refreshes_activity_without_locking_cli(
         watch = _watch(path)
         watch.update({
             "external": True,
+            "scan_complete": True,
             "holders": {ProcessIdentity(111, 1101)},
             "writers": {ProcessIdentity(111, 1101)},
         })
@@ -1381,6 +1646,7 @@ def test_interrupted_shared_query_reconnects_and_refreshes_activity(
         watch = _watch(path)
         watch.update({
             "external": True,
+            "scan_complete": True,
             "holders": {ProcessIdentity(111, 1101)},
             "writers": {ProcessIdentity(111, 1101)},
         })
@@ -2134,6 +2400,7 @@ def test_shared_takeover_is_an_idempotent_noop(monkeypatch, tmp_path):
         path.write_bytes(b"")
         holder = ProcessIdentity(303, 3003)
         watch = _watch(path)
+        watch["scan_complete"] = True
         watch["holders"] = {holder}
         watch["writers"] = {holder}
         machine._watch["sid"] = watch

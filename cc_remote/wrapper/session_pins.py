@@ -12,7 +12,7 @@ import re
 import stat
 import threading
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
 from uuid import uuid4
 
 
@@ -31,6 +31,7 @@ class SessionPinStore:
     def __init__(self, state_dir: Path):
         self.path = Path(state_dir) / "session-pins.json"
         self._lock = threading.RLock()
+        self._profile_revision = 0
         self._pins = self._load()
 
     def ids(self, engine: Engine) -> frozenset[str]:
@@ -52,6 +53,99 @@ class SessionPinStore:
             self._persist(updated)
             self._pins = updated
 
+    def namespace_legacy_codex_sessions(self, profile_id: str) -> int:
+        """Move pre-multi-account Codex pins into the default namespace."""
+        if not isinstance(profile_id, str) or not profile_id or "@" in profile_id:
+            raise SessionPinStoreError("invalid Codex profile id")
+        with self._lock:
+            old = self._pins["codex"]
+            migrated = {sid for sid in old if "@" not in sid}
+            if not migrated:
+                return 0
+            updated = {name: set(values) for name, values in self._pins.items()}
+            updated["codex"].difference_update(migrated)
+            updated["codex"].update(
+                f"{profile_id}@{session_id}" for session_id in migrated)
+            for session_id in updated["codex"]:
+                self._validate_identity("codex", session_id)
+            self._persist(updated)
+            self._pins = updated
+            return len(migrated)
+
+    def denamespace_codex_profile_sessions(self, profile_id: str) -> int:
+        """Make the active profile native-keyed while retaining dormant pins."""
+        if not isinstance(profile_id, str) or not profile_id or "@" in profile_id:
+            raise SessionPinStoreError("invalid Codex profile id")
+        prefix = f"{profile_id}@"
+        with self._lock:
+            migrated = {
+                sid for sid in self._pins["codex"] if sid.startswith(prefix)
+            }
+            if not migrated:
+                return 0
+            updated = {name: set(values) for name, values in self._pins.items()}
+            updated["codex"].difference_update(migrated)
+            updated["codex"].update(sid[len(prefix):] for sid in migrated)
+            for session_id in updated["codex"]:
+                self._validate_identity("codex", session_id)
+            self._persist(updated)
+            self._pins = updated
+            return len(migrated)
+
+    def remap_codex_profile_sessions(self, remaps: dict[str, str]) -> int:
+        with self._lock:
+            updated = {name: set(values) for name, values in self._pins.items()}
+            migrated = 0
+            remapped: set[str] = set()
+            for session_id in self._pins["codex"]:
+                if "@" not in session_id:
+                    remapped.add(session_id)
+                    continue
+                old_id, native_id = session_id.split("@", 1)
+                new_id = remaps.get(old_id)
+                if not new_id or new_id == old_id:
+                    remapped.add(session_id)
+                    continue
+                target = f"{new_id}@{native_id}"
+                self._validate_identity("codex", target)
+                remapped.add(target)
+                migrated += 1
+            if migrated:
+                updated["codex"] = remapped
+                self._persist(updated)
+                self._pins = updated
+            return migrated
+
+    def migrate_codex_profile_sessions(
+        self,
+        transform: Callable[[str], str],
+        *,
+        profile_revision: int,
+    ) -> int:
+        """Atomically translate Codex pins once per topology revision."""
+        if (
+            isinstance(profile_revision, bool)
+            or not isinstance(profile_revision, int)
+            or profile_revision < 1
+        ):
+            raise SessionPinStoreError("invalid Codex profile revision")
+        with self._lock:
+            if self._profile_revision >= profile_revision:
+                return 0
+            remapped: set[str] = set()
+            migrated = 0
+            for session_id in self._pins["codex"]:
+                target = transform(session_id)
+                self._validate_identity("codex", target)
+                remapped.add(target)
+                migrated += target != session_id
+            updated = {name: set(values) for name, values in self._pins.items()}
+            updated["codex"] = remapped
+            self._persist(updated, profile_revision=profile_revision)
+            self._pins = updated
+            self._profile_revision = profile_revision
+            return migrated
+
     @staticmethod
     def _validate_identity(engine: object, session_id: object) -> None:
         if engine not in {"claude", "codex"}:
@@ -69,8 +163,19 @@ class SessionPinStore:
             if len(raw_bytes) > _MAX_FILE_BYTES:
                 raise ValueError("session pin store exceeds size limit")
             raw = json.loads(raw_bytes.decode("utf-8"))
-            if not isinstance(raw, dict) or set(raw) != {"claude", "codex"}:
+            if (
+                not isinstance(raw, dict)
+                or set(raw) - {"claude", "codex", "profile_revision"}
+                or not {"claude", "codex"}.issubset(raw)
+            ):
                 raise ValueError("session pin store has an invalid shape")
+            profile_revision = raw.get("profile_revision", 0)
+            if (
+                isinstance(profile_revision, bool)
+                or not isinstance(profile_revision, int)
+                or profile_revision < 0
+            ):
+                raise ValueError("session pin profile revision is invalid")
             loaded: dict[Engine, set[str]] = {"claude": set(), "codex": set()}
             for engine in ("claude", "codex"):
                 values = raw.get(engine)
@@ -81,19 +186,30 @@ class SessionPinStore:
                     loaded[engine].add(session_id)
             if sum(len(values) for values in loaded.values()) > _MAX_ENTRIES:
                 raise ValueError("session pin store has too many entries")
+            self._profile_revision = profile_revision
             return loaded
         except FileNotFoundError:
             return empty
         except Exception as exc:
             raise SessionPinStoreError("session pin store is unreadable") from exc
 
-    def _persist(self, pins: dict[Engine, set[str]]) -> None:
+    def _persist(
+        self,
+        pins: dict[Engine, set[str]],
+        *,
+        profile_revision: int | None = None,
+    ) -> None:
         tmp = self.path.with_suffix(f".{os.getpid()}.{uuid4().hex}.tmp")
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             os.chmod(self.path.parent, 0o700)
             payload = json.dumps({
-                engine: sorted(pins[engine]) for engine in ("claude", "codex")
+                "claude": sorted(pins["claude"]),
+                "codex": sorted(pins["codex"]),
+                "profile_revision": (
+                    self._profile_revision
+                    if profile_revision is None else profile_revision
+                ),
             }, separators=(",", ":")).encode("utf-8")
             if len(payload) > _MAX_FILE_BYTES:
                 raise ValueError("session pin store exceeds size limit")

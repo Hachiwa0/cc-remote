@@ -20,10 +20,12 @@ import {
   type Turn,
 } from "../src/reducer";
 import type {
+  CodexProfileInfo,
   PermissionProfileInfo,
   QueryFile,
   QueryImg,
   ServerEvent,
+  SessionInfo,
   Space,
   StatusReport,
   ThreadGoal,
@@ -61,6 +63,7 @@ import { Composer } from "../src/components/Composer";
 import { ComposerDraftStore } from "../src/composer-drafts";
 import { GoalPanel } from "../src/components/GoalPanel";
 import { ProcessTimeline } from "../src/components/ProcessTimeline";
+import { SessionsSidebar } from "../src/components/SessionsSidebar";
 import { useMobileViewport } from "../src/use-mobile-viewport";
 
 const LONG_PERMISSION_PROFILE_ID =
@@ -1920,6 +1923,7 @@ function HistoryConversationBrowserFixture() {
 export function HistoryBrowserFixture() {
   const params = new URLSearchParams(window.location.search);
   const planUi = params.get("plan-ui");
+  if (params.has("profile-sidebar")) return <ProfileSidebarFixture />;
   if (planUi) return <PlanUiFixture mode={planUi} />;
   if (params.has("goal-ui")) {
     return <GoalUiFixture status={params.get("goal-status")} />;
@@ -1933,6 +1937,81 @@ export function HistoryBrowserFixture() {
     return <MobileViewportHistoryConversationBrowserFixture />;
   }
   return <HistoryConversationBrowserFixture />;
+}
+
+function ProfileSidebarFixture() {
+  const params = new URLSearchParams(window.location.search);
+  const theme = params.get("theme") === "dark"
+    ? "dark"
+    : "light";
+  const [space, setSpace] = useState<Space>(
+    params.get("profile-sidebar") === "work" ? "work" : "code",
+  );
+  const [newProfileId, setNewProfileId] = useState("none");
+  useEffect(() => {
+    const root = document.documentElement;
+    const previousEngine = root.dataset.engine;
+    const previousTheme = root.dataset.theme;
+    root.dataset.engine = "codex";
+    root.dataset.theme = theme;
+    return () => {
+      if (previousEngine === undefined) delete root.dataset.engine;
+      else root.dataset.engine = previousEngine;
+      if (previousTheme === undefined) delete root.dataset.theme;
+      else root.dataset.theme = previousTheme;
+    };
+  }, [theme]);
+  const profiles: CodexProfileInfo[] = [
+    { id: "primary", label: "Main" },
+    { id: "stack", label: "Stack" },
+  ];
+  const sessions: SessionInfo[] = [{
+    session_id: "profile-sidebar-active",
+    first_prompt: "看看当前仓库。",
+    cwd: "/repo/cc-remote",
+    pinned: true,
+    state: "idle",
+    engine: "codex",
+    space,
+    codex_profile_id: "stack",
+    codex_profile_label: "Stack",
+  }, {
+    session_id: "profile-sidebar-default",
+    summary: "cc-remote 派生",
+    cwd: "/repo/cc-remote",
+    state: "idle",
+    engine: "codex",
+    space,
+    codex_profile_id: "primary",
+    codex_profile_label: "Main",
+  }];
+  const noop = () => {};
+  return (
+    <>
+      <output data-testid="new-work-profile" hidden>{newProfileId}</output>
+      <SessionsSidebar
+        open
+        engine="codex"
+        space={space}
+        profileScopeKey={`fixture:codex:${space}`}
+        codexProfiles={profiles}
+        defaultCodexProfileId="primary"
+        sessions={sessions}
+        activeSessionId="profile-sidebar-active"
+        onSpaceChange={setSpace}
+        onSelect={noop}
+        onNew={(profileId) => setNewProfileId(profileId ?? "none")}
+        onNewInDir={noop}
+        onClose={noop}
+        onRename={noop}
+        onArchive={noop}
+        onPin={noop}
+        onDelete={noop}
+        onForkWorktree={noop}
+        onMigrate={noop}
+      />
+    </>
+  );
 }
 
 function MobileViewportHistoryConversationBrowserFixture() {
@@ -2215,7 +2294,7 @@ const UNSAFE_SVG = [
 ].join("");
 
 function ArtifactPreviewFixture({ kind }: {
-  kind: "html" | "svg" | "markdown-svg";
+  kind: "html" | "svg" | "markdown-svg" | "markdown-source";
 }) {
   const svgData = window.btoa(UNSAFE_SVG);
   const artifact = kind === "html"
@@ -2247,6 +2326,20 @@ function ArtifactPreviewFixture({ kind }: {
       size: UNSAFE_SVG.length,
       mtimeNs: "1",
     }
+    : kind === "markdown-source"
+    ? {
+      file: "LONG_REPORT.md",
+      sid: "artifact-preview-session",
+      requestId: "artifact-preview-request",
+      kind: "md" as const,
+      content: Array.from(
+        { length: 160 },
+        (_, index) => `## Section ${index + 1}\n\nMobile source line ${index + 1}.`,
+      ).join("\n\n"),
+      size: 12_000,
+      mtimeNs: "1",
+      revision: "c".repeat(64),
+    }
     : {
       file: "README.md",
       sid: "artifact-preview-session",
@@ -2269,6 +2362,33 @@ function ArtifactPreviewFixture({ kind }: {
   </main>;
 }
 
+function CodeCopyThemeFixture({ theme }: { theme: "light" | "dark" }) {
+  useEffect(() => {
+    const root = document.documentElement;
+    const previousEngine = root.dataset.engine;
+    const previousTheme = root.dataset.theme;
+    root.dataset.engine = "codex";
+    root.dataset.theme = theme;
+    return () => {
+      if (previousEngine === undefined) delete root.dataset.engine;
+      else root.dataset.engine = previousEngine;
+      if (previousTheme === undefined) delete root.dataset.theme;
+      else root.dataset.theme = previousTheme;
+    };
+  }, [theme]);
+  return <main style={{ minHeight: "100dvh", padding: 24, background: "var(--bg)" }}>
+    <MessageBlock text={"```text\nfix(web): keep copy actions readable\n```"} done />
+  </main>;
+}
+
+function LocalFileLinkFixture() {
+  return <main style={{ minHeight: "100dvh", padding: 24 }}>
+    <MessageBlock
+      text="[release-test](/tmp/qwen3-tts-v017-release-test:42)"
+      done onOpenFile={() => {}} />
+  </main>;
+}
+
 const rootParams = new URLSearchParams(window.location.search);
 createRoot(document.getElementById("root")!).render(
   rootParams.has("artifact-html")
@@ -2277,6 +2397,13 @@ createRoot(document.getElementById("root")!).render(
     ? <ArtifactPreviewFixture kind="svg" />
     : rootParams.has("artifact-markdown-svg")
     ? <ArtifactPreviewFixture kind="markdown-svg" />
+    : rootParams.has("artifact-markdown-source")
+    ? <ArtifactPreviewFixture kind="markdown-source" />
+    : rootParams.has("code-copy-theme")
+    ? <CodeCopyThemeFixture
+        theme={rootParams.get("theme") === "light" ? "light" : "dark"} />
+    : rootParams.has("local-file-link")
+    ? <LocalFileLinkFixture />
     : rootParams.has("inline-image-capacity")
     ? <InlineImageCapacityFixture />
     : rootParams.has("inline-image-eviction")

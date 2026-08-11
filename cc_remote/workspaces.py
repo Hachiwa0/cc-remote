@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sqlite3
 import stat
@@ -28,7 +29,10 @@ Engine = Literal["claude", "codex"]
 _MAX_WORK_ARTIFACTS = 200
 _MAX_WORK_ARTIFACT_SCAN = 4096
 _WORK_CONTEXT_MANIFEST = ".cc-remote-context.json"
+WORK_UPLOADS_MARKER = ".cc-remote-upload-root"
+WORK_UPLOADS_MARKER_PAYLOAD = b"cc-remote Work uploads v1\n"
 _WORK_SCHEDULE_MAX_ATTEMPTS = 3
+_CODEX_PROFILE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
 _WORK_ARTIFACT_PREVIEW_SUFFIXES = frozenset({
     ".c", ".cc", ".conf", ".cpp", ".css", ".csv", ".go", ".h", ".hpp",
     ".htm", ".html", ".ini", ".java", ".js", ".json", ".jsonl", ".log", ".md",
@@ -158,6 +162,9 @@ class WorkSessionRecord:
     context_baseline_tokens: int | None
     created_at: float
     updated_at: float
+    # Codex native UUIDs are account-local. Keep the owning profile beside the
+    # native id so changing the configured default cannot reclassify Work data.
+    codex_profile_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -196,12 +203,13 @@ class WorkRegistry:
                 CREATE TABLE IF NOT EXISTS work_sessions (
                     work_id TEXT PRIMARY KEY,
                     engine TEXT NOT NULL CHECK (engine IN ('claude', 'codex')),
-                    session_id TEXT UNIQUE,
+                    session_id TEXT,
                     cwd TEXT NOT NULL UNIQUE,
                     title TEXT,
                     project_id TEXT,
                     archived INTEGER NOT NULL DEFAULT 0,
                     context_baseline_tokens INTEGER,
+                    codex_profile_id TEXT,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 );
@@ -242,6 +250,7 @@ class WorkRegistry:
                     schedule_id TEXT PRIMARY KEY,
                     project_id TEXT REFERENCES work_projects(project_id)
                         ON DELETE SET NULL,
+                    codex_profile_id TEXT,
                     title TEXT NOT NULL,
                     prompt TEXT NOT NULL,
                     next_run_at REAL NOT NULL,
@@ -249,6 +258,7 @@ class WorkRegistry:
                     enabled INTEGER NOT NULL DEFAULT 1,
                     last_run_at REAL,
                     last_session_id TEXT,
+                    last_codex_profile_id TEXT,
                     last_error TEXT,
                     deleted_at REAL,
                     created_at REAL NOT NULL,
@@ -267,6 +277,7 @@ class WorkRegistry:
                     lease_until REAL,
                     attempt INTEGER NOT NULL DEFAULT 0,
                     session_id TEXT,
+                    codex_profile_id TEXT,
                     last_error TEXT,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
@@ -274,6 +285,10 @@ class WorkRegistry:
                 );
                 CREATE INDEX IF NOT EXISTS work_schedule_runs_ready
                     ON work_schedule_runs(status, available_at, scheduled_for);
+                CREATE TABLE IF NOT EXISTS work_profile_migrations (
+                    revision INTEGER PRIMARY KEY,
+                    applied_at REAL NOT NULL
+                );
                 """
             )
             # Existing self-hosted registries predate Work's split between
@@ -291,6 +306,61 @@ class WorkRegistry:
                     "ALTER TABLE work_sessions "
                     "ADD COLUMN context_baseline_tokens INTEGER"
                 )
+            if "codex_profile_id" not in columns:
+                db.execute(
+                    "ALTER TABLE work_sessions ADD COLUMN codex_profile_id TEXT"
+                )
+            table_sql_row = db.execute(
+                """SELECT sql FROM sqlite_master
+                   WHERE type = 'table' AND name = 'work_sessions'"""
+            ).fetchone()
+            table_sql = str(table_sql_row["sql"] or "") if table_sql_row else ""
+            if re.search(r"session_id\s+TEXT\s+UNIQUE", table_sql, re.IGNORECASE):
+                # The pre-profile schema made a native UUID globally unique.
+                # Rebuild once so two CODEX_HOMEs may legitimately own the same
+                # native UUID while Claude/null-profile rows stay unique.
+                db.execute(
+                    """CREATE TABLE work_sessions_profiled (
+                        work_id TEXT PRIMARY KEY,
+                        engine TEXT NOT NULL CHECK (engine IN ('claude', 'codex')),
+                        session_id TEXT,
+                        cwd TEXT NOT NULL UNIQUE,
+                        title TEXT,
+                        project_id TEXT,
+                        archived INTEGER NOT NULL DEFAULT 0,
+                        context_baseline_tokens INTEGER,
+                        codex_profile_id TEXT,
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL
+                    )"""
+                )
+                db.execute(
+                    """INSERT INTO work_sessions_profiled (
+                        work_id, engine, session_id, cwd, title, project_id,
+                        archived, context_baseline_tokens, codex_profile_id,
+                        created_at, updated_at
+                    ) SELECT
+                        work_id, engine, session_id, cwd, title, project_id,
+                        archived, context_baseline_tokens, codex_profile_id,
+                        created_at, updated_at
+                    FROM work_sessions"""
+                )
+                db.execute("DROP TABLE work_sessions")
+                db.execute(
+                    "ALTER TABLE work_sessions_profiled RENAME TO work_sessions")
+                db.execute(
+                    "CREATE INDEX work_sessions_updated "
+                    "ON work_sessions(updated_at DESC)")
+                db.execute(
+                    "CREATE INDEX work_sessions_project "
+                    "ON work_sessions(project_id, updated_at DESC)")
+            db.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS work_sessions_identity
+                   ON work_sessions(
+                       engine, IFNULL(codex_profile_id, ''), session_id
+                   ) WHERE session_id IS NOT NULL
+                    """
+            )
             schedule_columns = {
                 str(row["name"])
                 for row in db.execute("PRAGMA table_info(work_schedules)")
@@ -299,10 +369,37 @@ class WorkRegistry:
                 db.execute(
                     "ALTER TABLE work_schedules ADD COLUMN deleted_at REAL"
                 )
+            if "codex_profile_id" not in schedule_columns:
+                db.execute(
+                    "ALTER TABLE work_schedules "
+                    "ADD COLUMN codex_profile_id TEXT"
+                )
+            if "last_codex_profile_id" not in schedule_columns:
+                db.execute(
+                    "ALTER TABLE work_schedules "
+                    "ADD COLUMN last_codex_profile_id TEXT"
+                )
+            run_columns = {
+                str(row["name"])
+                for row in db.execute("PRAGMA table_info(work_schedule_runs)")
+            }
+            if "codex_profile_id" not in run_columns:
+                db.execute(
+                    "ALTER TABLE work_schedule_runs "
+                    "ADD COLUMN codex_profile_id TEXT"
+                )
         self._chmod_file(self.db_path)
 
-    def create_session(self, project_id: str | None = None) -> WorkSessionRecord:
+    def create_session(
+        self,
+        project_id: str | None = None,
+        *,
+        codex_profile_id: str | None = None,
+    ) -> WorkSessionRecord:
         self.initialize()
+        codex_profile_id = self._profile_id(codex_profile_id)
+        if self.engine != "codex" and codex_profile_id is not None:
+            raise ValueError("Claude Work cannot carry a Codex profile")
         if project_id and self.get_project(project_id) is None:
             raise LookupError(f"unknown Work project: {project_id}")
         now = time.time()
@@ -310,22 +407,29 @@ class WorkRegistry:
         chat_root = self.chats_root / work_id
         workspace = chat_root / "workspace"
         for directory in (
-            chat_root, workspace, chat_root / "uploads",
+            chat_root, workspace, workspace / "uploads",
         ):
             self._mkdir_private(directory)
+        self._atomic_write_private(
+            workspace / "uploads" / WORK_UPLOADS_MARKER,
+            WORK_UPLOADS_MARKER_PAYLOAD,
+        )
         cwd = str(workspace)
         with self._connect() as db:
             db.execute(
                 """INSERT INTO work_sessions
-                   (work_id, engine, session_id, cwd, project_id, created_at, updated_at)
-                   VALUES (?, ?, NULL, ?, ?, ?, ?)""",
-                (work_id, self.engine, cwd, project_id, now, now),
+                   (work_id, engine, session_id, cwd, project_id,
+                    codex_profile_id, created_at, updated_at)
+                   VALUES (?, ?, NULL, ?, ?, ?, ?, ?)""",
+                (work_id, self.engine, cwd, project_id,
+                 codex_profile_id, now, now),
             )
         record = WorkSessionRecord(
             work_id=work_id, engine=self.engine, cwd=cwd, session_id=None,
             title=None, project_id=project_id, archived=False,
             context_baseline_tokens=None,
             created_at=now, updated_at=now,
+            codex_profile_id=codex_profile_id,
         )
         try:
             self._materialize_project(record)
@@ -397,24 +501,34 @@ class WorkRegistry:
             updated_at=float(row["updated_at"]),
         )
 
-    def artifacts(self, session_id: str) -> list[dict[str, object]]:
+    def artifacts(
+        self,
+        session_id: str,
+        *,
+        codex_profile_id: str | None = None,
+    ) -> list[dict[str, object]]:
         """List bounded, user-visible deliverables from one private Work cwd.
 
         Project context and copied source material are inputs, not artifacts.
         Symlinks and hidden paths are ignored so enumeration never escapes or
         exposes implementation state from the wrapper-owned workspace.
         """
-        record = self.get_by_session(session_id)
+        record = self.get_by_session(
+            session_id, codex_profile_id=codex_profile_id)
         if record is None or not self.contains_cwd(record.cwd):
             raise LookupError(f"unknown Work session: {session_id}")
         root = os.path.realpath(record.cwd)
+        managed_uploads = self._is_managed_upload_root(
+            Path(root) / "uploads")
         artifacts: list[dict[str, object]] = []
         scanned = 0
         for current, dirs, files in os.walk(root, topdown=True, followlinks=False):
             relative_dir = os.path.relpath(current, root)
             if relative_dir == ".":
                 dirs[:] = [name for name in dirs
-                           if not name.startswith(".") and name != "资料库"]
+                           if not name.startswith(".")
+                           and name != "资料库"
+                           and not (name == "uploads" and managed_uploads)]
             else:
                 dirs[:] = [name for name in dirs if not name.startswith(".")]
             for name in files:
@@ -576,8 +690,14 @@ class WorkRegistry:
 
     def create_schedule(self, title: str, prompt: str, next_run_at: float,
                         repeat_seconds: int | None = None,
-                        project_id: str | None = None) -> str:
+                        project_id: str | None = None, *,
+                        codex_profile_id: str | None = None) -> str:
         self.initialize()
+        codex_profile_id = self._profile_id(codex_profile_id)
+        if self.engine == "codex" and codex_profile_id is None:
+            raise ValueError("Codex Work schedule profile is required")
+        if self.engine != "codex" and codex_profile_id is not None:
+            raise ValueError("Claude Work cannot carry a Codex profile")
         if project_id and self.get_project(project_id) is None:
             raise LookupError(f"unknown Work project: {project_id}")
         schedule_id = f"schedule-{uuid4().hex}"
@@ -585,10 +705,12 @@ class WorkRegistry:
         with self._connect() as db:
             db.execute(
                 """INSERT INTO work_schedules
-                   (schedule_id, project_id, title, prompt, next_run_at,
+                   (schedule_id, project_id, codex_profile_id,
+                    title, prompt, next_run_at,
                     repeat_seconds, enabled, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)""",
-                (schedule_id, project_id, title, prompt, next_run_at,
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)""",
+                (schedule_id, project_id, codex_profile_id,
+                 title, prompt, next_run_at,
                  repeat_seconds, now, now),
             )
         return schedule_id
@@ -681,9 +803,10 @@ class WorkRegistry:
                 db.execute(
                     """INSERT OR IGNORE INTO work_schedule_runs
                        (run_id, schedule_id, scheduled_for, status, available_at,
-                        attempt, created_at, updated_at)
-                       VALUES (?, ?, ?, 'queued', ?, 0, ?, ?)""",
-                    (run_id, row["schedule_id"], scheduled_for, now, now, now),
+                        attempt, codex_profile_id, created_at, updated_at)
+                       VALUES (?, ?, ?, 'queued', ?, 0, ?, ?, ?)""",
+                    (run_id, row["schedule_id"], scheduled_for, now,
+                     row["codex_profile_id"], now, now),
                 )
                 repeat = row["repeat_seconds"]
                 enabled = 1 if repeat else 0
@@ -751,6 +874,9 @@ class WorkRegistry:
     def complete_schedule(
         self, run_id: str, session_id: str | None, error: str | None,
         now: float | None = None,
+        *,
+        codex_profile_id: str | None = None,
+        retryable: bool = True,
     ) -> str:
         """Finish a run or place it back on the durable retry queue."""
         self.initialize()
@@ -758,7 +884,8 @@ class WorkRegistry:
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
-                """SELECT r.schedule_id, r.attempt, s.deleted_at
+                """SELECT r.schedule_id, r.attempt, r.codex_profile_id,
+                          s.deleted_at
                    FROM work_schedule_runs r
                    JOIN work_schedules s ON s.schedule_id = r.schedule_id
                    WHERE r.run_id = ?""",
@@ -766,11 +893,21 @@ class WorkRegistry:
             ).fetchone()
             if row is None:
                 raise LookupError(f"unknown Work schedule run: {run_id}")
+            requested_profile_id = self._profile_id(codex_profile_id)
+            stored_profile_id = self._profile_id(row["codex_profile_id"])
+            if (
+                requested_profile_id is not None
+                and stored_profile_id is not None
+                and requested_profile_id != stored_profile_id
+            ):
+                raise ValueError("Work schedule run profile cannot change")
+            effective_profile_id = stored_profile_id or requested_profile_id
             deleting = row["deleted_at"] is not None
             if error is None:
                 status = "succeeded"
                 available_at = completed_at
-            elif not deleting and int(row["attempt"]) < _WORK_SCHEDULE_MAX_ATTEMPTS:
+            elif (retryable and not deleting
+                  and int(row["attempt"]) < _WORK_SCHEDULE_MAX_ATTEMPTS):
                 status = "queued"
                 available_at = completed_at + min(
                     300, 15 * (2 ** max(0, int(row["attempt"]) - 1)))
@@ -779,14 +916,18 @@ class WorkRegistry:
                 available_at = completed_at
             db.execute(
                 """UPDATE work_schedule_runs SET status = ?, available_at = ?,
-                   lease_until = NULL, session_id = ?, last_error = ?, updated_at = ?
+                   lease_until = NULL, session_id = ?, codex_profile_id = ?,
+                   last_error = ?, updated_at = ?
                    WHERE run_id = ?""",
-                (status, available_at, session_id, error, completed_at, run_id),
+                (status, available_at, session_id, effective_profile_id,
+                 error, completed_at, run_id),
             )
             db.execute(
                 """UPDATE work_schedules SET last_run_at = ?, last_session_id = ?,
-                   last_error = ?, updated_at = ? WHERE schedule_id = ?""",
-                (completed_at, session_id, error, completed_at, row["schedule_id"]),
+                   last_codex_profile_id = ?, last_error = ?, updated_at = ?
+                   WHERE schedule_id = ?""",
+                (completed_at, session_id, effective_profile_id, error,
+                 completed_at, row["schedule_id"]),
             )
             if deleting:
                 db.execute(
@@ -1036,12 +1177,24 @@ class WorkRegistry:
         except (FileNotFoundError, OSError):
             pass
 
-    def bind_session(self, work_id: str, session_id: str) -> None:
+    def bind_session(
+        self,
+        work_id: str,
+        session_id: str,
+        *,
+        codex_profile_id: str | None = None,
+    ) -> None:
+        codex_profile_id = self._profile_id(codex_profile_id)
+        if self.engine != "codex" and codex_profile_id is not None:
+            raise ValueError("Claude Work cannot carry a Codex profile")
         with self._connect() as db:
             changed = db.execute(
-                """UPDATE work_sessions SET session_id = ?, updated_at = ?
-                   WHERE work_id = ? AND engine = ?""",
-                (session_id, time.time(), work_id, self.engine),
+                """UPDATE work_sessions SET session_id = ?,
+                   codex_profile_id = COALESCE(codex_profile_id, ?), updated_at = ?
+                   WHERE work_id = ? AND engine = ?
+                     AND (codex_profile_id IS NULL OR codex_profile_id IS ?)""",
+                (session_id, codex_profile_id, time.time(), work_id,
+                 self.engine, codex_profile_id),
             ).rowcount
         if changed != 1:
             raise LookupError(f"unknown Work session: {work_id}")
@@ -1109,13 +1262,256 @@ class WorkRegistry:
                 pass
         return str(path)
 
-    def get_by_session(self, session_id: str) -> WorkSessionRecord | None:
+    def assign_legacy_codex_profile(self, profile_id: str) -> int:
+        """Bind legacy Codex Work state to the current default account once.
+
+        Schedule ownership was dynamic before profiles were selectable: every
+        occurrence ran on whichever account was default at launch.  The first
+        profile-aware wrapper freezes all still-unowned schedules and runs to
+        its current default.  This repair is deliberately independent of the
+        topology revision because that revision may predate the schedule
+        ownership column.
+        """
+        if self.engine != "codex":
+            return 0
+        profile_id = self._profile_id(profile_id)
+        if profile_id is None:
+            raise ValueError("Codex Work profile is required")
         self.initialize()
         with self._connect() as db:
-            row = db.execute(
-                "SELECT * FROM work_sessions WHERE session_id = ? AND engine = ?",
-                (session_id, self.engine),
+            changed = db.execute(
+                """UPDATE work_sessions SET codex_profile_id = ?, updated_at = ?
+                   WHERE engine = 'codex' AND codex_profile_id IS NULL""",
+                (profile_id, time.time()),
+            ).rowcount
+            db.execute(
+                """UPDATE work_schedules SET codex_profile_id = ?
+                   WHERE codex_profile_id IS NULL""",
+                (profile_id,),
+            )
+            db.execute(
+                """UPDATE work_schedules SET last_codex_profile_id = ?
+                   WHERE last_session_id IS NOT NULL
+                     AND last_codex_profile_id IS NULL""",
+                (profile_id,),
+            )
+            db.execute(
+                """UPDATE work_schedule_runs
+                   SET codex_profile_id = COALESCE(
+                       (SELECT s.codex_profile_id FROM work_schedules s
+                        WHERE s.schedule_id = work_schedule_runs.schedule_id),
+                       ?)
+                   WHERE codex_profile_id IS NULL""",
+                (profile_id,),
+            )
+        return changed
+
+    def remap_codex_profiles(self, remaps: dict[str, str]) -> int:
+        """Keep Work ownership attached to CODEX_HOME across profile id renames."""
+        if self.engine != "codex" or not remaps:
+            return 0
+        normalized = {
+            self._profile_id(old): self._profile_id(new)
+            for old, new in remaps.items()
+        }
+        self.initialize()
+        changed = 0
+        with self._connect() as db:
+            staged: list[tuple[str, str]] = []
+            occupied = set(normalized) | set(normalized.values())
+            for index, (old_id, new_id) in enumerate(normalized.items()):
+                if old_id is None or new_id is None or old_id == new_id:
+                    continue
+                temporary = f"ccremote_profile_migration_{index}"
+                while temporary in occupied:
+                    temporary += "_"
+                occupied.add(temporary)
+                changed += db.execute(
+                    """UPDATE work_sessions SET codex_profile_id = ?, updated_at = ?
+                       WHERE engine = 'codex' AND codex_profile_id = ?""",
+                    (temporary, time.time(), old_id),
+                ).rowcount
+                db.execute(
+                    """UPDATE work_schedules SET codex_profile_id = ?
+                       WHERE codex_profile_id = ?""",
+                    (temporary, old_id),
+                )
+                db.execute(
+                    """UPDATE work_schedules SET last_codex_profile_id = ?
+                       WHERE last_codex_profile_id = ?""",
+                    (temporary, old_id),
+                )
+                db.execute(
+                    """UPDATE work_schedule_runs SET codex_profile_id = ?
+                       WHERE codex_profile_id = ?""",
+                    (temporary, old_id),
+                )
+                staged.append((temporary, new_id))
+            for temporary, new_id in staged:
+                db.execute(
+                    """UPDATE work_sessions SET codex_profile_id = ?, updated_at = ?
+                       WHERE engine = 'codex' AND codex_profile_id = ?""",
+                    (new_id, time.time(), temporary),
+                )
+                db.execute(
+                    """UPDATE work_schedules SET codex_profile_id = ?
+                       WHERE codex_profile_id = ?""",
+                    (new_id, temporary),
+                )
+                db.execute(
+                    """UPDATE work_schedules SET last_codex_profile_id = ?
+                       WHERE last_codex_profile_id = ?""",
+                    (new_id, temporary),
+                )
+                db.execute(
+                    """UPDATE work_schedule_runs SET codex_profile_id = ?
+                       WHERE codex_profile_id = ?""",
+                    (new_id, temporary),
+                )
+        return changed
+
+    def migrate_codex_profiles(
+        self,
+        remaps: dict[str, str],
+        *,
+        legacy_profile_id: str,
+        profile_revision: int,
+    ) -> int:
+        """Atomically apply one profile topology revision to all Work rows."""
+        if self.engine != "codex":
+            return 0
+        legacy_profile_id = self._profile_id(legacy_profile_id)
+        if legacy_profile_id is None:
+            raise ValueError("Codex Work profile is required")
+        if (
+            isinstance(profile_revision, bool)
+            or not isinstance(profile_revision, int)
+            or profile_revision < 1
+        ):
+            raise ValueError("Codex Work profile revision is invalid")
+        normalized = {
+            self._profile_id(old): self._profile_id(new)
+            for old, new in remaps.items()
+        }
+        self.initialize()
+        changed = 0
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            applied = db.execute(
+                "SELECT 1 FROM work_profile_migrations WHERE revision = ?",
+                (profile_revision,),
             ).fetchone()
+            if applied is not None:
+                return 0
+            staged: list[tuple[str, str]] = []
+            occupied = set(normalized) | set(normalized.values())
+            for index, (old_id, new_id) in enumerate(normalized.items()):
+                if old_id is None or new_id is None or old_id == new_id:
+                    continue
+                temporary = f"ccremote_profile_migration_{profile_revision}_{index}"
+                while temporary in occupied:
+                    temporary += "_"
+                occupied.add(temporary)
+                changed += db.execute(
+                    """UPDATE work_sessions SET codex_profile_id = ?, updated_at = ?
+                       WHERE engine = 'codex' AND codex_profile_id = ?""",
+                    (temporary, time.time(), old_id),
+                ).rowcount
+                db.execute(
+                    """UPDATE work_schedules SET codex_profile_id = ?
+                       WHERE codex_profile_id = ?""",
+                    (temporary, old_id),
+                )
+                db.execute(
+                    """UPDATE work_schedules SET last_codex_profile_id = ?
+                       WHERE last_codex_profile_id = ?""",
+                    (temporary, old_id),
+                )
+                db.execute(
+                    """UPDATE work_schedule_runs SET codex_profile_id = ?
+                       WHERE codex_profile_id = ?""",
+                    (temporary, old_id),
+                )
+                staged.append((temporary, new_id))
+            for temporary, new_id in staged:
+                db.execute(
+                    """UPDATE work_sessions SET codex_profile_id = ?, updated_at = ?
+                       WHERE engine = 'codex' AND codex_profile_id = ?""",
+                    (new_id, time.time(), temporary),
+                )
+                db.execute(
+                    """UPDATE work_schedules SET codex_profile_id = ?
+                       WHERE codex_profile_id = ?""",
+                    (new_id, temporary),
+                )
+                db.execute(
+                    """UPDATE work_schedules SET last_codex_profile_id = ?
+                       WHERE last_codex_profile_id = ?""",
+                    (new_id, temporary),
+                )
+                db.execute(
+                    """UPDATE work_schedule_runs SET codex_profile_id = ?
+                       WHERE codex_profile_id = ?""",
+                    (new_id, temporary),
+                )
+            changed += db.execute(
+                """UPDATE work_sessions SET codex_profile_id = ?, updated_at = ?
+                   WHERE engine = 'codex' AND codex_profile_id IS NULL""",
+                (legacy_profile_id, time.time()),
+            ).rowcount
+            db.execute(
+                """UPDATE work_schedules SET codex_profile_id = ?
+                   WHERE codex_profile_id IS NULL""",
+                (legacy_profile_id,),
+            )
+            db.execute(
+                """UPDATE work_schedules SET last_codex_profile_id = ?
+                   WHERE last_session_id IS NOT NULL
+                     AND last_codex_profile_id IS NULL""",
+                (legacy_profile_id,),
+            )
+            db.execute(
+                """UPDATE work_schedule_runs
+                   SET codex_profile_id = COALESCE(
+                       (SELECT s.codex_profile_id FROM work_schedules s
+                        WHERE s.schedule_id = work_schedule_runs.schedule_id),
+                       ?)
+                   WHERE codex_profile_id IS NULL""",
+                (legacy_profile_id,),
+            )
+            db.execute(
+                "INSERT INTO work_profile_migrations(revision, applied_at) "
+                "VALUES (?, ?)",
+                (profile_revision, time.time()),
+            )
+        return changed
+
+    def get_by_session(
+        self,
+        session_id: str,
+        *,
+        codex_profile_id: str | None = None,
+    ) -> WorkSessionRecord | None:
+        self.initialize()
+        codex_profile_id = self._profile_id(codex_profile_id)
+        with self._connect() as db:
+            if codex_profile_id is None:
+                rows = db.execute(
+                    "SELECT * FROM work_sessions "
+                    "WHERE session_id = ? AND engine = ? LIMIT 2",
+                    (session_id, self.engine),
+                ).fetchall()
+                if len(rows) > 1:
+                    raise ValueError(
+                        "ambiguous Codex Work session; profile is required"
+                    )
+                row = rows[0] if rows else None
+            else:
+                row = db.execute(
+                    "SELECT * FROM work_sessions WHERE session_id = ? "
+                    "AND engine = ? AND codex_profile_id = ?",
+                    (session_id, self.engine, codex_profile_id),
+                ).fetchone()
         return self._record(row)
 
     def get_by_work_id(self, work_id: str) -> WorkSessionRecord | None:
@@ -1135,9 +1531,32 @@ class WorkRegistry:
                    WHERE session_id IS NOT NULL AND engine = ?""",
                 (self.engine,),
             ).fetchall()
+        result: dict[str, WorkSessionRecord] = {}
+        for row in rows:
+            record = self._record(row)
+            if record is None or record.session_id is None:
+                continue
+            if record.session_id in result:
+                raise ValueError(
+                    "ambiguous Codex Work sessions; use account-aware records"
+                )
+            result[record.session_id] = record
+        return result
+
+    def records_by_profile_session(
+        self,
+    ) -> dict[tuple[str | None, str], WorkSessionRecord]:
+        """Return account-aware keys for Codex catalog classification."""
+        self.initialize()
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT * FROM work_sessions
+                   WHERE session_id IS NOT NULL AND engine = ?""",
+                (self.engine,),
+            ).fetchall()
         records = (self._record(row) for row in rows)
         return {
-            record.session_id: record
+            (record.codex_profile_id, record.session_id): record
             for record in records
             if record is not None and record.session_id is not None
         }
@@ -1168,23 +1587,51 @@ class WorkRegistry:
             return False
         return common == str(self.chats_root)
 
-    def update_title(self, session_id: str, title: str) -> None:
-        self._update(session_id, "title", title)
+    def update_title(
+        self, session_id: str, title: str, *, codex_profile_id: str | None = None,
+    ) -> None:
+        self._update(
+            session_id, "title", title, codex_profile_id=codex_profile_id)
 
-    def update_archived(self, session_id: str, archived: bool) -> None:
-        self._update(session_id, "archived", 1 if archived else 0)
+    def update_archived(
+        self,
+        session_id: str,
+        archived: bool,
+        *,
+        codex_profile_id: str | None = None,
+    ) -> None:
+        self._update(
+            session_id, "archived", 1 if archived else 0,
+            codex_profile_id=codex_profile_id)
 
-    def delete(self, session_id: str) -> WorkSessionRecord:
-        record = self.get_by_session(session_id)
+    def delete(
+        self, session_id: str, *, codex_profile_id: str | None = None,
+    ) -> WorkSessionRecord:
+        record = self.get_by_session(
+            session_id, codex_profile_id=codex_profile_id)
         if record is None:
             raise LookupError(f"unknown Work session: {session_id}")
         chat_root = Path(record.cwd).parent
         self._require_owned_chat_root(chat_root, record.work_id)
         with self._connect() as db:
-            db.execute(
-                "DELETE FROM work_sessions WHERE session_id = ? AND engine = ?",
-                (session_id, self.engine),
+            effective_profile_id = (
+                record.codex_profile_id
+                if self.engine == "codex" else codex_profile_id
             )
+            if effective_profile_id is None:
+                changed = db.execute(
+                    "DELETE FROM work_sessions "
+                    "WHERE session_id = ? AND engine = ?",
+                    (session_id, self.engine),
+                ).rowcount
+            else:
+                changed = db.execute(
+                    "DELETE FROM work_sessions WHERE session_id = ? "
+                    "AND engine = ? AND codex_profile_id = ?",
+                    (session_id, self.engine, effective_profile_id),
+                ).rowcount
+        if changed != 1:
+            raise LookupError(f"unknown Work session: {session_id}")
         if chat_root.exists():
             shutil.rmtree(chat_root)
         policy = self.root / "policies" / f"{record.work_id}.json"
@@ -1214,15 +1661,42 @@ class WorkRegistry:
         except FileNotFoundError:
             pass
 
-    def _update(self, session_id: str, column: str, value: object) -> None:
+    def _update(
+        self,
+        session_id: str,
+        column: str,
+        value: object,
+        *,
+        codex_profile_id: str | None = None,
+    ) -> None:
         if column not in {"title", "archived"}:
             raise ValueError("unsupported Work metadata column")
         with self._connect() as db:
-            db.execute(
-                f"UPDATE work_sessions SET {column} = ?, updated_at = ? "
-                "WHERE session_id = ? AND engine = ?",
-                (value, time.time(), session_id, self.engine),
-            )
+            if codex_profile_id is None:
+                matches = db.execute(
+                    "SELECT COUNT(*) FROM work_sessions "
+                    "WHERE session_id = ? AND engine = ?",
+                    (session_id, self.engine),
+                ).fetchone()[0]
+                if matches > 1:
+                    raise ValueError(
+                        "ambiguous Codex Work session; profile is required"
+                    )
+                changed = db.execute(
+                    f"UPDATE work_sessions SET {column} = ?, updated_at = ? "
+                    "WHERE session_id = ? AND engine = ?",
+                    (value, time.time(), session_id, self.engine),
+                ).rowcount
+            else:
+                changed = db.execute(
+                    f"UPDATE work_sessions SET {column} = ?, updated_at = ? "
+                    "WHERE session_id = ? AND engine = ? "
+                    "AND codex_profile_id = ?",
+                    (value, time.time(), session_id, self.engine,
+                     codex_profile_id),
+                ).rowcount
+        if changed != 1:
+            raise LookupError(f"unknown Work session: {session_id}")
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -1248,7 +1722,19 @@ class WorkRegistry:
                 if row["context_baseline_tokens"] is not None else None
             ),
             created_at=float(row["created_at"]), updated_at=float(row["updated_at"]),
+            codex_profile_id=row["codex_profile_id"],
         )
+
+    @staticmethod
+    def _profile_id(value: str | None) -> str | None:
+        if value is None:
+            return None
+        if (
+            not isinstance(value, str)
+            or not _CODEX_PROFILE_ID.fullmatch(value)
+        ):
+            raise ValueError("invalid Codex Work profile id")
+        return value
 
     @staticmethod
     def _mkdir_private(path: Path) -> None:
@@ -1263,6 +1749,40 @@ class WorkRegistry:
             return
         if stat.S_ISREG(mode):
             path.chmod(0o600)
+
+    @staticmethod
+    def _is_managed_upload_root(path: Path) -> bool:
+        if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+            return False
+        flags = (
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        directory_fd = marker_fd = -1
+        try:
+            directory_fd = os.open(path, flags)
+            directory = os.fstat(directory_fd)
+            marker_fd = os.open(
+                WORK_UPLOADS_MARKER,
+                os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=directory_fd,
+            )
+            marker = os.fstat(marker_fd)
+            with os.fdopen(marker_fd, "rb", closefd=False) as stream:
+                payload = stream.read(len(WORK_UPLOADS_MARKER_PAYLOAD) + 1)
+        except OSError:
+            return False
+        finally:
+            for descriptor in (marker_fd, directory_fd):
+                if descriptor >= 0:
+                    os.close(descriptor)
+        return (stat.S_ISDIR(directory.st_mode)
+                and stat.S_ISREG(marker.st_mode)
+                and marker.st_uid == os.geteuid()
+                and marker.st_nlink == 1
+                and payload == WORK_UPLOADS_MARKER_PAYLOAD)
 
     def _require_owned_chat_root(self, path: Path, work_id: str) -> None:
         expected = self.chats_root / work_id
@@ -1286,9 +1806,21 @@ class WorkStores:
         for store in self._stores.values():
             store.initialize()
 
-    def classify(self, engine: str, session_id: str | None, cwd: str | None) -> str:
+    def classify(
+        self,
+        engine: str,
+        session_id: str | None,
+        cwd: str | None,
+        *,
+        codex_profile_id: str | None = None,
+    ) -> str:
         store = self.for_engine(engine)
-        if session_id and store.get_by_session(session_id) is not None:
+        if session_id and store.get_by_session(
+            session_id,
+            codex_profile_id=(
+                codex_profile_id if engine == "codex" else None
+            ),
+        ) is not None:
             return "work"
         return "work" if store.contains_cwd(cwd) else "code"
 
