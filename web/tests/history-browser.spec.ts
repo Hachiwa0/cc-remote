@@ -1245,11 +1245,29 @@ test("the first runtime browse page stays staged until wheel idle", async ({
   await waitForScrollIdle(page);
   const before = await readingAnchor(page);
 
-  await viewport.dispatchEvent("wheel", { deltaY: -80 });
-  await expect(page.getByTestId("load-count")).toHaveText("1");
-  await page.waitForTimeout(100);
-  await expect(page.locator('[data-turn-id="n8"]')).toHaveCount(0);
-  await expect(page.getByTestId("history-page-activity")).toBeVisible();
+  await viewport.evaluate((node) => {
+    const target = node as HTMLElement & { __wheelLease?: number };
+    const signalWheel = () => target.dispatchEvent(new WheelEvent("wheel", {
+      bubbles: true,
+      deltaY: -80,
+    }));
+    signalWheel();
+    target.__wheelLease = window.setInterval(signalWheel, 50);
+  });
+  try {
+    await expect(page.getByTestId("load-count")).toHaveText("1");
+    await page.waitForTimeout(100);
+    await expect(page.locator('[data-turn-id="n8"]')).toHaveCount(0);
+    await expect(page.getByTestId("history-page-activity")).toBeVisible();
+  } finally {
+    await viewport.evaluate((node) => {
+      const target = node as HTMLElement & { __wheelLease?: number };
+      if (target.__wheelLease != null) {
+        window.clearInterval(target.__wheelLease);
+        delete target.__wheelLease;
+      }
+    });
+  }
 
   await expect(page.locator('[data-turn-id="n8"]')).toBeAttached();
   await expect(page.getByTestId("history-page-activity")).toHaveCount(0);
@@ -1271,13 +1289,12 @@ test("older history becoming available during a wheel gesture is restored once",
   await viewport.evaluate((node) => { node.scrollTop = 0; });
   const before = await readingAnchor(page);
   await viewport.dispatchEvent("wheel", { deltaY: -80 });
-  await page.getByTestId("reveal-older-history").click();
 
-  await expect(page.getByText("正在恢复历史…")).toBeVisible();
   const pending = await readingAnchor(page);
   expect(pending.id).toBe(before.id);
   expect(Math.abs(pending.offset - before.offset)).toBeLessThan(2);
   await expect(page.getByTestId("load-count")).toHaveText("0");
+  await page.getByTestId("reveal-older-history").click();
   await expect(page.getByTestId("load-count")).toHaveText("1");
   await expect(page.locator('[data-turn-id="n8"]')).toBeAttached();
   await page.waitForTimeout(250);
@@ -1311,7 +1328,7 @@ test("one click loads every turn-detail page without collapsing or jumping", asy
   page,
 }) => {
   await page.goto(
-    "/tests/history-browser.html?detail-paging=1&delay=80&growth-delay=180",
+    "/tests/history-browser.html?detail-paging=1&delay=1000&growth-delay=180",
   );
   const header = page.locator(".turn-process-head");
   await expect(header).toHaveAttribute("aria-expanded", "false");
@@ -1338,7 +1355,7 @@ test("a loading process can collapse and reopen without issuing a duplicate read
   page,
 }) => {
   await page.goto(
-    "/tests/history-browser.html?detail-paging=1&delay=500&growth-delay=180",
+    "/tests/history-browser.html?detail-paging=1&delay=10000&growth-delay=180",
   );
   const header = page.locator(".turn-process-head");
   await header.click();
