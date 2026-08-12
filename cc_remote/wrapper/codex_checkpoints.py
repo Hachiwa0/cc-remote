@@ -196,6 +196,81 @@ def _checkpoint_session_key(session_id: str) -> str:
     ).hexdigest()[:24]
 
 
+def cleanup_codex_checkpoint_session(
+    state_dir: Path,
+    session_id: str,
+) -> int:
+    """Force-remove one session's journals without needing its former cwd."""
+    if not isinstance(session_id, str) or not session_id.strip():
+        raise ValueError("session_id is required")
+    root = (
+        Path(state_dir).expanduser().resolve(strict=False)
+        / "codex-checkpoints"
+    )
+    try:
+        repositories = [
+            entry
+            for entry in os.scandir(root)
+            if entry.is_dir(follow_symlinks=False)
+        ]
+    except FileNotFoundError:
+        return 0
+    except OSError as exc:
+        raise CheckpointError(
+            "Unable to inspect Codex checkpoint journals"
+        ) from exc
+
+    session_key = _checkpoint_session_key(session_id)
+    removed = 0
+    for repository in repositories:
+        candidate = Path(repository.path) / session_key
+        try:
+            mode = candidate.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise CheckpointError(
+                "Unable to inspect Codex checkpoint journal"
+            ) from exc
+        if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+            raise CheckpointError(
+                "Checkpoint session path is not a directory"
+            )
+
+        lock_fd: Optional[int] = None
+        tombstone: Optional[Path] = None
+        try:
+            lock_flags = os.O_RDWR | os.O_CREAT
+            lock_flags |= getattr(os, "O_NOFOLLOW", 0)
+            lock_fd = os.open(candidate / "journal.lock", lock_flags, 0o600)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            tombstone = candidate.with_name(
+                f".{candidate.name}.delete-{uuid.uuid4().hex}"
+            )
+            try:
+                os.replace(candidate, tombstone)
+            except FileNotFoundError:
+                tombstone = None
+                continue
+        except OSError as exc:
+            raise CheckpointError(
+                "Unable to retire Codex checkpoint journal"
+            ) from exc
+        finally:
+            if lock_fd is not None:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+        if tombstone is not None:
+            try:
+                shutil.rmtree(tombstone, ignore_errors=False)
+            except OSError as exc:
+                raise CheckpointError(
+                    "Unable to remove Codex checkpoint journal"
+                ) from exc
+            removed += 1
+    return removed
+
+
 def migrate_codex_checkpoint_profiles(
     state_dir: Path,
     transform: Callable[[str], str],

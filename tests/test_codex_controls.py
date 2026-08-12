@@ -90,6 +90,396 @@ def test_codex_json_rpc_error_preserves_typed_no_active_turn_signal():
     asyncio.run(run())
 
 
+def test_codex_delete_thread_uses_loaded_app_server_connection():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-1"
+        requests = []
+
+        async def request(method, params):
+            requests.append((method, params))
+            return {}
+
+        handle._request = request
+
+        deleted = await handle.delete_thread("thread-1")
+
+        assert requests == [(
+            "thread/delete",
+            {"threadId": "thread-1"},
+        )]
+        assert deleted == ("thread-1",)
+        assert handle.thread_id is None
+
+    asyncio.run(run())
+
+
+def test_codex_read_thread_parent_uses_exact_loaded_thread_metadata():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        requests = []
+
+        async def request(method, params):
+            requests.append((method, params))
+            thread_id = params["threadId"]
+            return {"thread": {
+                "id": thread_id,
+                "forkedFromId": (
+                    "thread-1" if thread_id == "thread-2" else None
+                ),
+            }}
+
+        handle._request = request
+
+        assert await handle.read_thread_parent("thread-2") == "thread-1"
+        assert await handle.read_thread_parent("thread-1") is None
+        assert requests == [
+            (
+                "thread/read",
+                {"threadId": "thread-2", "includeTurns": False},
+            ),
+            (
+                "thread/read",
+                {"threadId": "thread-1", "includeTurns": False},
+            ),
+        ]
+
+    asyncio.run(run())
+
+
+def test_codex_delete_catalog_pages_active_and_archived_threads():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        requests = []
+
+        async def request(method, params):
+            requests.append((method, params))
+            key = (params["archived"], params.get("cursor"))
+            pages = {
+                (False, None): {
+                    "data": [{
+                        "id": "thread-root",
+                        "status": {"type": "idle"},
+                    }],
+                    "nextCursor": "active-next",
+                },
+                (False, "active-next"): {
+                    "data": [{
+                        "id": "thread-child",
+                        "status": {"type": "active"},
+                    }],
+                    "nextCursor": None,
+                },
+                (True, None): {
+                    "data": [{
+                        "id": "thread-archived",
+                        "status": {"type": "notLoaded"},
+                    }],
+                    "nextCursor": None,
+                },
+            }
+            assert method == "thread/list"
+            return pages[key]
+
+        handle._request = request
+
+        assert await handle.list_thread_delete_candidates() == (
+            ("thread-root", False),
+            ("thread-child", True),
+            ("thread-archived", False),
+        )
+        assert [params for _method, params in requests] == [
+            {
+                "archived": False,
+                "limit": 100,
+                "sortKey": "updated_at",
+                "sortDirection": "desc",
+            },
+            {
+                "archived": False,
+                "limit": 100,
+                "sortKey": "updated_at",
+                "sortDirection": "desc",
+                "cursor": "active-next",
+            },
+            {
+                "archived": True,
+                "limit": 100,
+                "sortKey": "updated_at",
+                "sortDirection": "desc",
+            },
+        ]
+
+    asyncio.run(run())
+
+
+def test_codex_unloaded_delete_requires_control_connection():
+    async def run():
+        handle = CodexHandle(_Cfg())
+
+        async def forbidden_request(*_args):
+            raise AssertionError("invalid delete must not reach app-server")
+
+        handle._request = forbidden_request
+
+        with pytest.raises(RuntimeError, match="live control connection"):
+            await handle.delete_thread("thread-1")
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("work_mode", "connect_kwargs"),
+    [
+        (False, {"resume_id": "thread-1"}),
+        (False, {"fork": True}),
+        (True, {}),
+    ],
+)
+def test_codex_control_connection_rejects_thread_binding(
+    work_mode,
+    connect_kwargs,
+):
+    async def run():
+        handle = CodexHandle(_Cfg(), work_mode=work_mode)
+
+        with pytest.raises(ValueError, match="cannot bind a thread"):
+            await handle.connect(control_only=True, **connect_kwargs)
+
+    asyncio.run(run())
+
+
+def test_codex_delete_thread_rejects_wrong_or_active_thread():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-1"
+
+        async def forbidden_request(*_args):
+            raise AssertionError("invalid delete must not reach app-server")
+
+        handle._request = forbidden_request
+
+        with pytest.raises(ValueError, match="does not match"):
+            await handle.delete_thread("thread-2")
+
+        handle.turn_active = True
+        with pytest.raises(RuntimeError, match="turn is active"):
+            await handle.delete_thread("thread-1")
+
+    asyncio.run(run())
+
+
+def test_codex_control_only_connect_skips_thread_binding(monkeypatch):
+    class Manager:
+        mode = "auto"
+        strict_shared_affinity = True
+
+        async def proxy_args(self, _bin, _env):
+            return ["/usr/bin/codex", "app-server", "proxy"]
+
+        def invalidate(self):
+            pass
+
+    async def run():
+        monkeypatch.setattr(
+            codex_handle_module,
+            "_resolve_codex_bin",
+            lambda: "/usr/bin/codex",
+        )
+        monkeypatch.setattr(
+            codex_handle_module,
+            "_newer_private_core_for_oversized_resume",
+            lambda _bin, _sid: None,
+        )
+        monkeypatch.setattr(
+            codex_handle_module,
+            "_oversized_desktop_openai_resume_requires_http",
+            lambda _sid: False,
+        )
+        handle = CodexHandle(
+            _Cfg(),
+            daemon_mode="auto",
+            daemon_manager=Manager(),
+        )
+        requests = []
+        server_requests = []
+
+        async def handle_server_request(message):
+            server_requests.append(message)
+
+        handle._handle_server_request = handle_server_request
+
+        async def open_process(_argv, _bin, *, daemon_proxy):
+            assert daemon_proxy is True
+            handle.proc = SimpleNamespace(returncode=None)
+            handle._using_daemon_proxy = True
+            handle._dead = False
+
+        async def request(method, params=None):
+            requests.append((method, params))
+            if method == "initialize":
+                await handle._dispatch({
+                    "method": "thread/started",
+                    "params": {"thread": {
+                        "id": "initializing-sibling-thread",
+                        "source": "cli",
+                    }},
+                })
+                await handle._dispatch({
+                    "id": "initializing-approval",
+                    "method": "item/commandExecution/requestApproval",
+                    "params": {"threadId": "initializing-sibling-thread"},
+                })
+                return {"userAgent": "codex_cli_rs/0.147.0 (test)"}
+            assert method == "thread/delete"
+            return {}
+
+        handle._open_process = open_process
+        handle._request = request
+        handle._notify = lambda *_args, **_kwargs: asyncio.sleep(0)
+
+        await handle.connect(cwd="/tmp", control_only=True)
+
+        assert requests == [(
+            "initialize",
+            codex_handle_module._initialize_params(),
+        )]
+        await handle._dispatch({
+            "method": "thread/started",
+            "params": {"thread": {
+                "id": "sibling-thread",
+                "source": "cli",
+            }},
+        })
+        await handle._dispatch({
+            "id": "approval",
+            "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "sibling-thread"},
+        })
+        await asyncio.sleep(0)
+        assert handle.thread_id is None
+        assert server_requests == []
+        assert handle._pending_server_request_ids == set()
+        assert handle.using_daemon_proxy is True
+        assert await handle.delete_thread("thread-1") == ("thread-1",)
+        assert requests[-1] == (
+            "thread/delete",
+            {"threadId": "thread-1"},
+        )
+        handle.proc = None
+
+    asyncio.run(run())
+
+
+def test_codex_delete_thread_collects_descendant_notifications():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-1"
+
+        async def request(method, params):
+            assert method == "thread/delete"
+            assert params == {"threadId": "thread-1"}
+            await handle._dispatch({
+                "method": "thread/deleted",
+                "params": {"threadId": "child-1"},
+            })
+            await handle._dispatch({
+                "method": "thread/deleted",
+                "params": {"threadId": "thread-1"},
+            })
+            return {}
+
+        handle._request = request
+
+        deleted = await handle.delete_thread("thread-1")
+
+        assert deleted == ("child-1", "thread-1")
+        assert handle._capture_thread_deleted_notification({
+            "method": "thread/deleted",
+            "params": {"threadId": "unrelated"},
+        }) is False
+
+    asyncio.run(run())
+
+
+def test_codex_delete_thread_marks_notification_overflow(monkeypatch):
+    async def run():
+        monkeypatch.setattr(
+            codex_handle_module,
+            "_THREAD_DELETE_NOTIFY_MAX",
+            2,
+        )
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-1"
+
+        async def request(_method, _params):
+            for thread_id in ("child-1", "child-2", "child-3", "thread-1"):
+                await handle._dispatch({
+                    "method": "thread/deleted",
+                    "params": {"threadId": thread_id},
+                })
+            return {}
+
+        handle._request = request
+
+        deleted = await handle.delete_thread("thread-1")
+
+        assert deleted == ("child-1", "child-2", "thread-1")
+        assert handle.thread_delete_notifications_overflowed is True
+
+    asyncio.run(run())
+
+
+def test_codex_delete_thread_collects_notifications_after_root(
+    monkeypatch,
+):
+    async def run():
+        monkeypatch.setattr(
+            codex_handle_module,
+            "_THREAD_DELETE_NOTIFY_TIMEOUT",
+            0.05,
+        )
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-1"
+        reader_release = asyncio.Event()
+        handle._reader = asyncio.create_task(reader_release.wait())
+        notification_task = None
+
+        async def notify_after_response():
+            await asyncio.sleep(0)
+            await handle._dispatch({
+                "method": "thread/deleted",
+                "params": {"threadId": "thread-1"},
+            })
+            await asyncio.sleep(0.01)
+            await handle._dispatch({
+                "method": "thread/deleted",
+                "params": {"threadId": "child-1"},
+            })
+
+        async def request(method, params):
+            nonlocal notification_task
+            assert method == "thread/delete"
+            assert params == {"threadId": "thread-1"}
+            notification_task = asyncio.create_task(
+                notify_after_response()
+            )
+            return {}
+
+        handle._request = request
+        try:
+            deleted = await handle.delete_thread("thread-1")
+            assert notification_task is not None
+            await notification_task
+        finally:
+            reader_release.set()
+            await handle._reader
+
+        assert deleted == ("thread-1", "child-1")
+
+    asyncio.run(run())
+
+
 def test_codex_initialize_declares_experimental_api_for_collaboration_mode():
     assert codex_handle_module._initialize_params() == {
         "clientInfo": {"name": "cc-remote", "version": __version__},

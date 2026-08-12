@@ -15,6 +15,7 @@ from cc_remote.wrapper.codex_checkpoints import (
     CompletedCheckpoint,
     CodexCheckpointJournal,
     NotGitWorkspaceError,
+    cleanup_codex_checkpoint_session,
 )
 
 
@@ -564,3 +565,28 @@ def test_git_boundary_abort_and_cleanup_are_explicit(tmp_path):
     corrupt.manifest_path.write_text("{not-json", encoding="utf-8")
     corrupt.cleanup(force=True)
     assert not corrupt.session_dir.exists()
+
+
+def test_cleanup_session_removes_journals_from_every_repository(tmp_path):
+    first_parent = tmp_path / "first"
+    second_parent = tmp_path / "second"
+    first_parent.mkdir()
+    second_parent.mkdir()
+    first = _repo(first_parent, {"first.txt": "first\n"})
+    second = _repo(second_parent, {"second.txt": "second\n"})
+    state = tmp_path / "state"
+    first_journal = CodexCheckpointJournal(
+        str(first),
+        state,
+        "cold-child",
+    )
+    second_journal = CodexCheckpointJournal(
+        str(second),
+        state,
+        "cold-child",
+    )
+
+    assert cleanup_codex_checkpoint_session(state, "cold-child") == 2
+    assert not first_journal.session_dir.exists()
+    assert not second_journal.session_dir.exists()
+    assert cleanup_codex_checkpoint_session(state, "cold-child") == 0

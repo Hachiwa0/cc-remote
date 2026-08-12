@@ -84,6 +84,11 @@ _STATUS_RATE_LIMIT_MAX = 16
 _STATUS_USAGE_BUCKET_SCAN_MAX = 4096
 _RUNTIME_EVENT_PENDING_MAX = 32
 _RUNTIME_EVENT_SEEN_MAX = 128
+_THREAD_DELETE_NOTIFY_MAX = 512
+_THREAD_DELETE_NOTIFY_TIMEOUT = 1.0
+_THREAD_DELETE_LIST_PAGE_SIZE = 100
+_THREAD_DELETE_LIST_MAX_PAGES = 20
+_THREAD_DELETE_LIST_MAX_IDS = 4096
 _PENDING_STEER_USER_IDENTITIES_MAX = 512
 _ACTIVE_STREAM_TURN_IDS_MAX = 8
 _NOTICE_MESSAGE_MAX = 2 * 1024
@@ -1320,6 +1325,7 @@ class CodexHandle:
                 self.daemon_mode, codex_home=self.codex_home)
         )
         self._using_daemon_proxy = False
+        self._control_only_connection = False
         # Once a Code session has joined the official shared app-server, a
         # transport interruption must not silently turn it into a private stdio
         # session.  Keep this affinity across proxy reconnects so Machine can
@@ -1342,6 +1348,10 @@ class CodexHandle:
         self._reader: Optional[asyncio.Task] = None
         self._stderr_task: Optional[asyncio.Task] = None
         self._thread_settings_updated = asyncio.Event()
+        self._thread_delete_target: Optional[str] = None
+        self._thread_deleted_ids: Optional[list[str]] = None
+        self.thread_delete_notifications_overflowed = False
+        self._thread_delete_done = asyncio.Event()
         # Human approval can take minutes.  It must not block the sole stdout
         # reader, which still has to consume turn/interrupt and other RPC replies.
         # Keep detached request handlers generation-owned and cancel them on
@@ -1692,16 +1702,29 @@ class CodexHandle:
         fork: bool = False,
         preserve_controls: bool = False,
         preserve_permission_profile: bool = True,
+        control_only: bool = False,
     ) -> None:
+        if control_only and (resume_id is not None or fork or self.work_mode):
+            raise ValueError(
+                "control-only Codex connections cannot bind a thread"
+            )
         if self.proc is not None:
             await self.disconnect()
+        # Arm this before the reader starts. A shared daemon can publish a
+        # sibling thread/started during initialize, and a control connection
+        # must never adopt that unrelated thread while it is still unbound.
+        self._control_only_connection = control_only
         self._shared_resume_binding_thread_id = None
         self._cwd = cwd or self._cwd or getattr(self.cfg, "cc_cwd", None) or os.getcwd()
         # version-probes subprocesses on first call; keep it off the event loop.
         codex_bin = await asyncio.to_thread(_resolve_codex_bin)
         private_core = None
         http_only_resume = False
-        if not self.work_mode and not self._daemon_proxy_established:
+        if (
+            not self.work_mode
+            and not self._daemon_proxy_established
+            and not control_only
+        ):
             http_only_resume = await asyncio.to_thread(
                 _oversized_desktop_openai_resume_requires_http,
                 resume_id,
@@ -1787,6 +1810,12 @@ class CodexHandle:
             # stdio.  Leave the handle disconnected and let Machine retry the
             # shared proxy instead of manufacturing a false external-CLI lock.
             attempts = [(proxy_argv, True)]
+        if control_only:
+            if proxy_argv is None:
+                raise RuntimeError(
+                    "shared Codex app-server proxy is unavailable"
+                )
+            attempts = [(proxy_argv, True)]
         initialized: Any = None
         for argv, daemon_proxy in attempts:
             self._shared_resume_binding_thread_id = (
@@ -1812,7 +1841,11 @@ class CodexHandle:
                 if not daemon_proxy:
                     raise
                 self.daemon_manager.invalidate()
-                if strict_shared or self._daemon_proxy_established:
+                if (
+                    strict_shared
+                    or self._daemon_proxy_established
+                    or control_only
+                ):
                     log.warning(
                         "Codex shared daemon proxy unavailable; reconnect required",
                         error_type=type(exc).__name__,
@@ -1825,6 +1858,9 @@ class CodexHandle:
         else:  # pragma: no cover - the attempt list is never empty
             raise RuntimeError("unable to start Codex app-server transport")
         try:
+            if control_only:
+                log.info("codex control connection established", cwd=self._cwd)
+                return
             if self.work_mode:
                 # Inspect the effective native runtime rather than guessing at
                 # user-configured skill and MCP names.  Failure is fatal: silently
@@ -3342,6 +3378,178 @@ class CodexHandle:
             self._spontaneous_turn_id = None
         return True
 
+    async def delete_thread(
+        self, expected_thread_id: Optional[str] = None,
+    ) -> tuple[str, ...]:
+        """Delete the loaded thread through its authoritative app-server."""
+        loaded_thread_id = self.thread_id
+        thread_id = expected_thread_id or loaded_thread_id
+        if not thread_id:
+            raise RuntimeError("connect() or an explicit thread id is required")
+        if loaded_thread_id is None and not (
+            self._control_only_connection and self.using_daemon_proxy
+        ):
+            raise RuntimeError(
+                "unloaded Codex deletion requires a live control connection"
+            )
+        if (
+            loaded_thread_id is not None
+            and expected_thread_id is not None
+            and expected_thread_id != loaded_thread_id
+        ):
+            raise ValueError("loaded Codex thread does not match delete target")
+        if self.turn_active or self.turn_start_pending:
+            raise RuntimeError("Codex turn is active")
+        if self._thread_delete_target is not None:
+            raise RuntimeError("Codex thread deletion is already active")
+        self._thread_delete_target = thread_id
+        self._thread_deleted_ids = []
+        self.thread_delete_notifications_overflowed = False
+        self._thread_delete_done.clear()
+        try:
+            await self._request(
+                "thread/delete",
+                {"threadId": thread_id},
+            )
+            if self._reader is not None and not self._reader.done():
+                loop = asyncio.get_running_loop()
+                notification_deadline = (
+                    loop.time() + _THREAD_DELETE_NOTIFY_TIMEOUT
+                )
+                try:
+                    await asyncio.wait_for(
+                        self._thread_delete_done.wait(),
+                        timeout=_THREAD_DELETE_NOTIFY_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    log.warning(
+                        "Codex thread deletion notification timed out",
+                        thread_id=thread_id,
+                    )
+                else:
+                    # The current app-server emits the root last, but the wire
+                    # contract promises one notification per deleted thread,
+                    # not that the root is the final notification. Keep the
+                    # collector alive for the original bounded window so a
+                    # root-first batch cannot strand local descendants.
+                    remaining = notification_deadline - loop.time()
+                    if remaining > 0:
+                        await asyncio.sleep(remaining)
+            deleted_ids = list(self._thread_deleted_ids)
+        finally:
+            self._thread_delete_target = None
+            self._thread_deleted_ids = None
+            self._thread_delete_done.clear()
+        if thread_id not in deleted_ids:
+            deleted_ids.append(thread_id)
+        if self.thread_id == thread_id:
+            self.thread_id = None
+        self._shared_resume_binding_thread_id = None
+        return tuple(deleted_ids)
+
+    async def read_thread_parent(self, thread_id: str) -> Optional[str]:
+        """Return one thread's authoritative native fork parent."""
+        if (
+            not isinstance(thread_id, str)
+            or not _STATUS_WIRE_ID.fullmatch(thread_id)
+        ):
+            raise ValueError("invalid Codex thread id")
+        response = await self._request(
+            "thread/read",
+            {"threadId": thread_id, "includeTurns": False},
+        )
+        thread = (
+            response.get("thread")
+            if isinstance(response, dict) else None
+        )
+        if not isinstance(thread, dict) or thread.get("id") != thread_id:
+            raise RuntimeError("Codex thread/read returned another thread")
+        parent = thread.get("forkedFromId")
+        if parent is None:
+            return None
+        if (
+            not isinstance(parent, str)
+            or not _STATUS_WIRE_ID.fullmatch(parent)
+        ):
+            raise RuntimeError("Codex thread/read returned an invalid parent")
+        return parent
+
+    async def list_thread_delete_candidates(
+        self,
+    ) -> tuple[tuple[str, bool], ...]:
+        """List every bounded native thread before a recursive delete."""
+        candidates: dict[str, bool] = {}
+        for archived in (False, True):
+            cursor: Optional[str] = None
+            seen_cursors: set[str] = set()
+            for _page in range(_THREAD_DELETE_LIST_MAX_PAGES):
+                params: dict[str, Any] = {
+                    "archived": archived,
+                    "limit": _THREAD_DELETE_LIST_PAGE_SIZE,
+                    "sortKey": "updated_at",
+                    "sortDirection": "desc",
+                }
+                if cursor is not None:
+                    params["cursor"] = cursor
+                response = await self._request("thread/list", params)
+                rows = (
+                    response.get("data")
+                    if isinstance(response, dict)
+                    else None
+                )
+                if not isinstance(rows, list):
+                    raise RuntimeError(
+                        "Codex thread/list returned an invalid response"
+                    )
+                if len(rows) > _THREAD_DELETE_LIST_PAGE_SIZE:
+                    raise RuntimeError(
+                        "Codex thread/list exceeded its requested page size"
+                    )
+                for thread in rows:
+                    thread_id = (
+                        thread.get("id")
+                        if isinstance(thread, dict)
+                        else None
+                    )
+                    if (
+                        not isinstance(thread_id, str)
+                        or not _STATUS_WIRE_ID.fullmatch(thread_id)
+                    ):
+                        raise RuntimeError(
+                            "Codex thread/list returned an invalid thread"
+                        )
+                    status = thread.get("status")
+                    status_type = (
+                        status.get("type")
+                        if isinstance(status, dict)
+                        else status
+                    )
+                    candidates[thread_id] = bool(
+                        candidates.get(thread_id)
+                        or status_type == "active"
+                    )
+                    if len(candidates) > _THREAD_DELETE_LIST_MAX_IDS:
+                        raise RuntimeError(
+                            "Codex deletion catalog exceeds the safety limit"
+                        )
+                next_cursor = response.get("nextCursor")
+                if next_cursor in (None, ""):
+                    break
+                if (
+                    not isinstance(next_cursor, str)
+                    or next_cursor in seen_cursors
+                ):
+                    raise RuntimeError(
+                        "Codex thread/list returned an invalid cursor"
+                    )
+                seen_cursors.add(next_cursor)
+                cursor = next_cursor
+            else:
+                raise RuntimeError(
+                    "Codex deletion catalog exceeds the page limit"
+                )
+        return tuple(candidates.items())
+
     async def disconnect(self) -> None:
         self._http_provider_repair_stop.set()
         proc = self.proc
@@ -3404,6 +3612,7 @@ class CodexHandle:
             if process_group is not None:
                 stop(signal.SIGKILL, force=True)
         self._using_daemon_proxy = False
+        self._control_only_connection = False
         self._shared_resume_binding_thread_id = None
         self._proxy_read_buffer.clear()
         self._proxy_close_sent = False
@@ -5366,6 +5575,27 @@ class CodexHandle:
             control_turn_id,
         )
 
+    def _capture_thread_deleted_notification(self, message: dict) -> bool:
+        """Collect the target and its descendants until the target arrives."""
+        if message.get("method") != "thread/deleted":
+            return False
+        thread_id = _notification_thread_id(message)
+        deleted_ids = self._thread_deleted_ids
+        if deleted_ids is None or self._thread_delete_target is None:
+            return False
+        if (
+            isinstance(thread_id, str)
+            and _STATUS_WIRE_ID.fullmatch(thread_id)
+        ):
+            if thread_id not in deleted_ids:
+                if len(deleted_ids) < _THREAD_DELETE_NOTIFY_MAX:
+                    deleted_ids.append(thread_id)
+                else:
+                    self.thread_delete_notifications_overflowed = True
+            if thread_id == self._thread_delete_target:
+                self._thread_delete_done.set()
+        return True
+
     async def _dispatch(self, m: dict, raw_size: Optional[int] = None) -> None:
         has_id = "id" in m
         has_method = "method" in m
@@ -5384,6 +5614,15 @@ class CodexHandle:
             return
         if has_id and has_method:                            # server -> client request
             method = m.get("method")
+            if self._control_only_connection:
+                # This proxy has no thread or interaction owner. A shared
+                # daemon can broadcast a sibling's approval request here;
+                # silence leaves it available to that thread's real client.
+                log.warning(
+                    "Codex control connection left server request pending",
+                    method=method,
+                )
+                return
             request_id = _server_request_key(m.get("id"))
             missing_callback = isinstance(method, str) and ((
                 method in _NEW_APPROVAL_METHODS | _LEGACY_APPROVAL_METHODS
@@ -5440,6 +5679,13 @@ class CodexHandle:
             return
         # notification
         method = m.get("method")
+        if self._capture_thread_deleted_notification(m):
+            return
+        if self._control_only_connection:
+            # Responses are handled above and thread/deleted is the only
+            # notification used by this connection. In particular, never let
+            # shared-daemon sibling lifecycle bind or mutate this handle.
+            return
         if method == "thread/started" and self._using_daemon_proxy:
             target_thread_id = _notification_thread_id(m)
             params = m.get("params")

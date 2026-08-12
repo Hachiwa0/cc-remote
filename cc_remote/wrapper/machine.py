@@ -54,7 +54,7 @@ import tempfile
 import time
 import unicodedata
 from collections import OrderedDict
-from contextlib import contextmanager
+from contextlib import AsyncExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
@@ -267,7 +267,8 @@ from cc_remote.wrapper.codex_worktrees import (
 )
 from cc_remote.wrapper.codex_checkpoints import (
     CheckpointConflict, CheckpointError, CodexCheckpointJournal,
-    NotGitWorkspaceError, migrate_codex_checkpoint_profiles,
+    NotGitWorkspaceError, cleanup_codex_checkpoint_session,
+    migrate_codex_checkpoint_profiles,
 )
 from cc_remote.wrapper.codex_forks import (
     CodexForkJournal, ForkJournalError, find_rollout_fork,
@@ -333,6 +334,7 @@ state. Do not repeat work that is already complete. Do not discuss the account
 switch unless it prevents completion.
 </codex_internal_context>"""
 _CODEX_DAEMON_UNMARKED_EPOCH = "unmarked"
+_CODEX_DELETE_ANCESTRY_LIMIT = 256
 
 
 def _codex_fast_on(value: Optional[str]) -> bool:
@@ -6062,6 +6064,17 @@ class WrapperMachine:
         accepted = False
         async with ctx.emit_lock:
             async with ctx.queued_query_lock:
+                if not self._is_resident_context(ctx):
+                    error = Error(
+                        code=ERR_NOT_RUNNING,
+                        message="该会话已被删除，本次排队未提交。",
+                        msg_id=cmd.msg_id,
+                        request_id=getattr(cmd, "cmd_id", None),
+                        to=getattr(cmd, "client_id", None),
+                        sid=self._ctx_wire_sid(ctx),
+                    )
+                    await self.transport.send(error)
+                    return error
                 duplicate = next((
                     queued for queued in ctx.queued_queries
                     if queued.msg_id == cmd.msg_id
@@ -7582,16 +7595,32 @@ class WrapperMachine:
             return None
         return "running" if watch.get("active_external_turns") else None
 
-    def _codex_own_processes(self) -> set[ProcessIdentity]:
+    @staticmethod
+    def _codex_handle_process_identity(
+        sdk: CodexHandle,
+    ) -> ProcessIdentity | None:
+        proc = getattr(sdk, "proc", None)
+        pid = getattr(proc, "pid", None)
+        if (
+            not isinstance(pid, int)
+            or getattr(proc, "returncode", None) is not None
+        ):
+            return None
+        return process_identity(pid, parent_pid=os.getpid())
+
+    def _codex_own_processes(
+        self,
+        extra_handles: tuple[CodexHandle, ...] = (),
+    ) -> set[ProcessIdentity]:
         own: set[ProcessIdentity] = set()
-        for ctx in list(self.sessions.values()):
-            if ctx.engine != "codex":
-                continue
-            proc = getattr(ctx.sdk, "proc", None)
-            pid = getattr(proc, "pid", None)
-            if not isinstance(pid, int) or getattr(proc, "returncode", None) is not None:
-                continue
-            identity = process_identity(pid, parent_pid=os.getpid())
+        handles = [
+            ctx.sdk
+            for ctx in list(self.sessions.values())
+            if ctx.engine == "codex"
+        ]
+        handles.extend(extra_handles)
+        for sdk in handles:
+            identity = self._codex_handle_process_identity(sdk)
             if identity is not None:
                 own.add(identity)
         return own
@@ -7602,8 +7631,13 @@ class WrapperMachine:
             if w.get("engine") == "codex" and (only_sid is None or sid == only_sid)
         }
 
-    async def _probe_codex_holders(self, paths: dict[str, str]):
-        initial_own = self._codex_own_processes()
+    async def _probe_codex_holders(
+        self,
+        paths: dict[str, str],
+        *,
+        extra_handles: tuple[CodexHandle, ...] = (),
+    ):
+        initial_own = self._codex_own_processes(extra_handles)
         grouped: dict[str, dict[str, str]] = {}
         for sid, path in paths.items():
             watch = self._watch.get(sid) or {}
@@ -7785,7 +7819,7 @@ class WrapperMachine:
         # A reconnect can replace an app-server while /proc is being scanned.
         # Remove both the initial and current exact child identities before the
         # result is allowed to influence ownership.
-        current_own = self._codex_own_processes()
+        current_own = self._codex_own_processes(extra_handles)
         for holders in scan.holders.values():
             holders.difference_update(initial_own)
             holders.difference_update(current_own)
@@ -7927,13 +7961,24 @@ class WrapperMachine:
         writers = raw.difference(ignored)
         return writers.difference(passive), writers, private.intersection(writers)
 
-    async def _prime_codex_ownership(self, sid: str) -> bool:
+    async def _prime_codex_ownership(
+        self,
+        sid: str,
+        *,
+        extra_handles: tuple[CodexHandle, ...] = (),
+    ) -> bool:
         """Atomically consume growth and refresh one owner before History/Query."""
         w = self._watch.get(sid)
         if not w or w.get("engine") != "codex":
             return False
         async with self._codex_watch_lock:
-            scan = await self._probe_codex_holders({sid: w["path"]})
+            if extra_handles:
+                scan = await self._probe_codex_holders(
+                    {sid: w["path"]},
+                    extra_handles=extra_handles,
+                )
+            else:
+                scan = await self._probe_codex_holders({sid: w["path"]})
             holders, writers, private_holders = self._codex_holder_sets(
                 w, scan, sid)
             scan_complete = self._codex_scan_complete_for_sid(scan, sid)
@@ -11155,6 +11200,8 @@ class WrapperMachine:
         if getattr(cmd, "delivery", "immediate") != "immediate":
             return await self._enqueue_deferred_query(ctx, cmd)
         async with ctx.query_lock:
+            if not self._is_resident_context(ctx):
+                return await self._missing_session_error(cmd, "发送消息")
             return await self._handle_immediate_query(ctx, cmd)
 
     async def _handle_immediate_query(self, ctx: SessionContext, cmd):
@@ -18299,11 +18346,7 @@ class WrapperMachine:
                     self._codex_rollout_for_wire, sid)
             except (OSError, ValueError):
                 codex_alias_path = None
-        if ctx is not None and (
-            ctx.state != "idle"
-            or ctx.queued_queries
-            or self._query_queue_task_active(ctx)
-        ):
+        if ctx is not None and self._session_delete_busy(ctx):
             error = Error(
                 code=ERR_BUSY,
                 message="Work 会话仍在运行或有排队消息，请先停止并取消排队后再删除",
@@ -18312,17 +18355,40 @@ class WrapperMachine:
             )
             await self.transport.send(error)
             return error
+        codex_deleted = False
         if ctx is not None:
-            await ctx.sdk.disconnect()
-            self.sessions.pop(ctx.key or sid, None)
-            self._purge_preview_image_snapshots(ctx.preview_snapshot_token)
+            if engine == "codex":
+                delete_result = await self._delete_loaded_codex_thread(
+                    cmd,
+                    sid,
+                    native_sid,
+                    ctx,
+                    rollout_path=codex_alias_path,
+                )
+                if isinstance(delete_result, Error):
+                    return delete_result
+                codex_deleted = True
+            else:
+                await ctx.sdk.disconnect()
+                self.sessions.pop(ctx.key or sid, None)
+                self._purge_preview_image_snapshots(
+                    ctx.preview_snapshot_token,
+                )
         try:
             if engine == "codex":
-                await self._codex_rpc_for_wire(
-                    sid, "thread/delete", {"threadId": sid})
+                if not codex_deleted:
+                    await self._codex_rpc_for_wire(
+                        sid,
+                        "thread/delete",
+                        {"threadId": sid},
+                    )
+                    self._invalidate_codex_session_catalog()
             else:
                 await asyncio.to_thread(
-                    delete_session, sid, directory=record.cwd)
+                    delete_session,
+                    sid,
+                    directory=record.cwd,
+                )
             await asyncio.to_thread(
                 store.delete,
                 native_sid,
@@ -18366,6 +18432,812 @@ class WrapperMachine:
         await self._handle_list_sessions(cmd)
         log.info("Work session deleted", engine=engine, session_id=sid)
 
+    def _session_delete_busy(self, ctx: SessionContext) -> bool:
+        active = any(
+            task is not None and not task.done()
+            for task in (ctx.turn_task, ctx.codex_spontaneous_task)
+        )
+        return bool(
+            ctx.state != "idle"
+            or active
+            or ctx.queued_queries
+            or ctx.queued_query_starting_msg_id
+            or self._query_queue_task_active(ctx)
+            or getattr(ctx.sdk, "turn_active", False)
+            or getattr(ctx.sdk, "turn_start_pending", False)
+        )
+
+    def _codex_context_native_thread_id(
+        self,
+        ctx: SessionContext,
+        profile: CodexProfile,
+    ) -> str | None:
+        """Resolve a resident context to its native app-server thread id."""
+        for candidate in (
+            ctx.session_id,
+            ctx.btw_real_id,
+            getattr(ctx.sdk, "thread_id", None),
+        ):
+            if not isinstance(candidate, str):
+                continue
+            try:
+                self._codex_wire_sid(profile, candidate)
+            except ValueError:
+                continue
+            return candidate
+        return None
+
+    async def _codex_thread_descends_from(
+        self,
+        sdk: CodexHandle,
+        thread_id: str,
+        ancestor_id: str,
+        parent_cache: dict[str, str | None],
+    ) -> bool:
+        """Follow exact loaded-thread metadata to one requested ancestor."""
+        current = thread_id
+        seen: set[str] = set()
+        for _depth in range(_CODEX_DELETE_ANCESTRY_LIMIT):
+            if current == ancestor_id:
+                return True
+            if current in seen:
+                raise RuntimeError("Codex fork ancestry contains a cycle")
+            seen.add(current)
+            if current not in parent_cache:
+                try:
+                    parent_cache[current] = (
+                        await sdk.read_thread_parent(current)
+                    )
+                except (CodexAppServerError, CodexRpcRejected) as exc:
+                    if self._codex_thread_not_loaded(exc, current):
+                        return False
+                    raise
+            parent = parent_cache[current]
+            if parent is None:
+                return False
+            current = parent
+        raise RuntimeError("Codex fork ancestry exceeds the safety limit")
+
+    async def _preflight_codex_delete_descendants(
+        self,
+        ctx: SessionContext,
+        native_sid: str,
+        residents: tuple[SessionContext, ...],
+    ) -> tuple[SessionContext | str | None, tuple[str, ...]]:
+        """Collect recursive-delete descendants and find protected work."""
+        profile = self._codex_profile_for_ctx(ctx)
+        parent_cache: dict[str, str | None] = {}
+        resident_by_native: dict[str, SessionContext] = {}
+        descendant_sids: list[str] = []
+        for candidate in residents:
+            candidate_native_sid = self._codex_context_native_thread_id(
+                candidate,
+                profile,
+            )
+            if candidate_native_sid is None:
+                raise RuntimeError(
+                    "Codex resident has no native thread id"
+                )
+            resident_by_native[candidate_native_sid] = candidate
+
+        candidate_activity = dict(
+            await ctx.sdk.list_thread_delete_candidates()
+        )
+        for candidate_native_sid in resident_by_native:
+            candidate_activity.setdefault(candidate_native_sid, False)
+        for candidate_sid, watch in tuple(self._watch.items()):
+            if watch.get("engine") != "codex":
+                continue
+            try:
+                candidate_profile, candidate_native_sid = (
+                    self._codex_target(candidate_sid)
+                )
+            except ValueError:
+                continue
+            if candidate_profile.id != profile.id:
+                continue
+            # The watch supplies identity even when a just-created thread has
+            # not materialized in thread/list yet. Its activity must still be
+            # refreshed by _cold_codex_delete_blocked below, not trusted as a
+            # potentially stale snapshot here.
+            candidate_activity.setdefault(candidate_native_sid, False)
+
+        for candidate_native_sid in sorted(candidate_activity):
+            if candidate_native_sid == native_sid:
+                if candidate_activity[candidate_native_sid]:
+                    return candidate_native_sid, tuple(descendant_sids)
+                continue
+            is_descendant = await self._codex_thread_descends_from(
+                ctx.sdk,
+                candidate_native_sid,
+                native_sid,
+                parent_cache,
+            )
+            if not is_descendant:
+                continue
+            candidate_sid = self._codex_wire_sid(
+                profile,
+                candidate_native_sid,
+            )
+            descendant_sids.append(candidate_sid)
+            candidate = resident_by_native.get(candidate_native_sid)
+            if candidate is not None:
+                if (
+                    self._session_delete_busy(candidate)
+                    or (
+                        not candidate.btw
+                        and await self._codex_delete_external_owner(
+                            candidate_sid
+                        )
+                    )
+                ):
+                    return candidate, tuple(descendant_sids)
+                continue
+            if candidate_activity[candidate_native_sid]:
+                return candidate_sid, tuple(descendant_sids)
+            try:
+                rollout_path = self._codex_rollout_for_wire(candidate_sid)
+            except (OSError, ValueError):
+                rollout_path = None
+            if await self._cold_codex_delete_blocked(
+                candidate_sid,
+                rollout_path,
+                own_handle=ctx.sdk,
+            ):
+                return candidate_sid, tuple(descendant_sids)
+        return None, tuple(descendant_sids)
+
+    async def _codex_delete_external_owner(self, sid: str) -> bool:
+        """Close the ownership interval before deleting one Code thread."""
+        self._watch_session(sid)
+        watch = self._watch.get(sid)
+        if watch is None or watch.get("engine") != "codex":
+            log.warning(
+                "Codex delete ownership watch unavailable; failing closed",
+                session_id=sid,
+            )
+            return True
+        external = await self._prime_codex_ownership(sid)
+        watch = self._watch.get(sid)
+        if watch is None or watch.get("engine") != "codex":
+            log.warning(
+                "Codex delete ownership watch disappeared; failing closed",
+                session_id=sid,
+            )
+            return True
+        active_external_turns = watch.get("active_external_turns")
+        # Shared-daemon CLI turns intentionally remain writable from Remote,
+        # so ``_is_external`` does not report them. Deletion is different: a
+        # recursive thread/delete must never remove their active thread.
+        return bool(
+            external
+            or not watch.get("scan_complete", False)
+            or active_external_turns
+        )
+
+    async def _send_code_delete_error(
+        self,
+        cmd,
+        sid: str,
+        code: str,
+        message: str,
+    ) -> Error:
+        error = Error(
+            code=code,
+            message=message,
+            sid=sid,
+            to=getattr(cmd, "client_id", None),
+        )
+        await self.transport.send(error)
+        return error
+
+    async def _codex_session_exists(self, sid: str) -> bool:
+        """Check one exact native thread without a bounded catalog scan."""
+        _profile, native_sid = self._codex_target(sid)
+        try:
+            response = await self._codex_rpc_for_wire(
+                sid,
+                "thread/read",
+                {
+                    "threadId": sid,
+                    "includeTurns": False,
+                },
+            )
+        except CodexRpcRejected as exc:
+            if self._codex_thread_not_loaded(exc, native_sid):
+                return False
+            raise
+        thread = response.get("thread") if isinstance(response, dict) else None
+        if not isinstance(thread, dict) or thread.get("id") != native_sid:
+            raise RuntimeError("Codex thread/read returned another thread")
+        return True
+
+    @staticmethod
+    def _codex_thread_not_loaded(
+        exc: CodexAppServerError | CodexRpcRejected,
+        native_sid: str,
+    ) -> bool:
+        """Recognize only the app-server's exact missing-thread rejection."""
+        return bool(
+            exc.code == -32600
+            and exc.message.endswith(f"thread not loaded: {native_sid}")
+        )
+
+    async def _cold_codex_delete_context(
+        self,
+        cmd,
+        sid: str,
+        native_sid: str,
+    ) -> SessionContext | Error:
+        """Open a non-resident control connection for one cold deletion."""
+        try:
+            profile, resolved_native_sid = self._codex_target(sid)
+        except ValueError:
+            return await self._send_code_delete_error(
+                cmd,
+                sid,
+                ERR_AUTH,
+                "Codex 账号或会话标识无效",
+            )
+        if resolved_native_sid != native_sid:
+            return await self._send_code_delete_error(
+                cmd,
+                sid,
+                ERR_AUTH,
+                "Codex 会话标识不一致",
+            )
+
+        controls = await self._load_codex_session_controls(sid)
+        try:
+            native_cwd = await asyncio.to_thread(
+                self._codex_cwd_for_wire,
+                sid,
+            )
+        except (OSError, ValueError):
+            native_cwd = None
+        target_cwd = next((
+            os.path.realpath(candidate)
+            for candidate in (
+                controls.cwd_override,
+                native_cwd,
+                self.cfg.cc_cwd,
+                str(profile.home),
+            )
+            if isinstance(candidate, str) and os.path.isdir(candidate)
+        ), None)
+        if target_cwd is None:
+            return await self._send_code_delete_error(
+                cmd,
+                sid,
+                ERR_INVALID_CWD,
+                "没有可用目录连接 Codex，无法删除会话",
+            )
+
+        handle_kwargs = {
+            "cwd": target_cwd,
+            "daemon_mode": getattr(
+                self.cfg,
+                "codex_daemon_mode",
+                "auto",
+            ),
+            "daemon_manager": self._codex_daemon_for_profile(profile),
+        }
+        codex_home = self._codex_home(profile)
+        if codex_home is not None:
+            handle_kwargs["codex_home"] = codex_home
+        sdk = CodexHandle(self.cfg, **handle_kwargs)
+        try:
+            if sdk.daemon_mode == "auto":
+                try:
+                    await sdk.connect(cwd=target_cwd, control_only=True)
+                except Exception as proxy_exc:
+                    try:
+                        await sdk.disconnect()
+                    except Exception:
+                        pass
+                    log.warning(
+                        "cold Codex shared delete connection failed; "
+                        "using stdio",
+                        session_id=sid,
+                        error_type=type(proxy_exc).__name__,
+                    )
+                    fallback_kwargs = dict(handle_kwargs)
+                    fallback_kwargs["daemon_mode"] = "off"
+                    fallback_kwargs.pop("daemon_manager", None)
+                    sdk = CodexHandle(self.cfg, **fallback_kwargs)
+                    await sdk.connect(
+                        resume_id=native_sid,
+                        cwd=target_cwd,
+                    )
+            else:
+                await sdk.connect(resume_id=native_sid, cwd=target_cwd)
+        except Exception as exc:
+            try:
+                await sdk.disconnect()
+            except Exception:
+                pass
+            log.warning(
+                "cold Codex delete control connection failed",
+                session_id=sid,
+                error_type=type(exc).__name__,
+            )
+            return await self._send_code_delete_error(
+                cmd,
+                sid,
+                ERR_NOT_RUNNING,
+                "Codex 删除通道连接失败，请稍后重试",
+            )
+        ctx = SessionContext(
+            session_id=native_sid,
+            sdk=sdk,
+            buffer=RingBuffer(
+                self.cfg.ring_max_events,
+                self.cfg.ring_max_bytes,
+            ),
+            cwd=target_cwd,
+            engine="codex",
+            codex_profile_id=profile.id,
+            space="code",
+        )
+        # This transient context never owns a checkpoint object. Confirmed
+        # cold deletion cleans persistent repository buckets by session id.
+        ctx.codex_checkpoint = False
+        return ctx
+
+    async def _cleanup_deleted_codex_checkpoint(
+        self,
+        ctx: SessionContext,
+        sid: str,
+    ) -> None:
+        """Remove one deleted Code thread's private checkpoint journal."""
+        journal = ctx.codex_checkpoint
+        if journal is False:
+            return
+        if journal is None:
+            # A resumed context can be using cfg.cc_cwd after its persisted cwd
+            # disappeared. Deletion is session-wide, so do not infer the
+            # journal bucket from that fallback directory.
+            ctx.codex_checkpoint = False
+            await self._cleanup_cold_deleted_codex_checkpoint(sid)
+            return
+        ctx.codex_checkpoint = False
+        try:
+            await asyncio.to_thread(journal.cleanup, force=True)
+        except (CheckpointError, OSError):
+            log.warning(
+                "Codex checkpoint cleanup after delete failed",
+                session_id=sid,
+            )
+
+    async def _cleanup_cold_deleted_codex_checkpoint(
+        self,
+        sid: str,
+    ) -> None:
+        """Remove a confirmed cold thread's journals from every former cwd."""
+        try:
+            await asyncio.to_thread(
+                cleanup_codex_checkpoint_session,
+                Path(self.cfg.state_dir),
+                sid,
+            )
+        except (CheckpointError, OSError, ValueError) as exc:
+            log.warning(
+                "cold Codex checkpoint cleanup after delete failed",
+                session_id=sid,
+                error_type=type(exc).__name__,
+            )
+
+    async def _cold_codex_delete_blocked(
+        self,
+        sid: str,
+        rollout_path: str | None,
+        *,
+        own_handle: CodexHandle,
+    ) -> bool:
+        """Check cold shared ownership without registering a resident watch."""
+        watch = self._watch.get(sid)
+        if watch is not None and watch.get("engine") == "codex":
+            await self._prime_codex_ownership(
+                sid,
+                extra_handles=(own_handle,),
+            )
+            return bool(
+                not watch.get("scan_complete", False)
+                or watch.get("active_external_turns")
+            )
+        if not rollout_path:
+            return False
+        try:
+            stat_result = await asyncio.to_thread(os.stat, rollout_path)
+        except OSError:
+            return False
+        active_turns, _partial = self._codex_tail_state(
+            rollout_path,
+            stat_result.st_size,
+        )
+        ephemeral_watch = {
+            "active_external_turns": {
+                turn_id: time.time()
+                for turn_id in active_turns
+            },
+            "seeded_external_turns": set(active_turns),
+            # A private Codex App turn can write through short-lived opens and
+            # expose no stable holder. A destructive one-shot probe must keep
+            # its active tail marker; a later retry can observe the terminal,
+            # while a normal watch can retire a proven crashed orphan by TTL.
+            "preserve_seeded_without_holder": True,
+            "takeover_holders": set(),
+            "takeover_interactive_holders": set(),
+        }
+        async with self._codex_watch_lock:
+            scan = await self._probe_codex_holders(
+                {sid: rollout_path},
+                extra_handles=(own_handle,),
+            )
+            self._codex_holder_sets(
+                ephemeral_watch,
+                scan,
+                sid,
+            )
+            scan_complete = self._codex_scan_complete_for_sid(scan, sid)
+        return bool(
+            not scan_complete
+            or ephemeral_watch["active_external_turns"]
+        )
+
+    async def _reconcile_loaded_codex_delete(
+        self,
+        ctx: SessionContext,
+        sid: str,
+        profile: CodexProfile,
+        preflight_descendant_sids: tuple[str, ...],
+        deleted_native_ids: tuple[str, ...] | list[str],
+    ) -> tuple[list[str], list[SessionContext], set[str]]:
+        """Confirm deleted identities and remove residents while locked."""
+        self._invalidate_codex_session_catalog()
+        candidate_sids = list(preflight_descendant_sids)
+        for deleted_native_sid in deleted_native_ids:
+            if not isinstance(deleted_native_sid, str):
+                continue
+            try:
+                deleted_sid = self._codex_wire_sid(
+                    profile,
+                    deleted_native_sid,
+                )
+            except ValueError:
+                continue
+            if deleted_sid not in candidate_sids:
+                candidate_sids.append(deleted_sid)
+        if getattr(
+            ctx.sdk,
+            "thread_delete_notifications_overflowed",
+            False,
+        ):
+            log.warning(
+                "Codex delete notifications overflowed; reconciling "
+                "preflight descendants",
+                session_id=sid,
+                candidate_count=len(candidate_sids),
+            )
+        resident_identities: list[
+            tuple[SessionContext, frozenset[str]]
+        ] = []
+        indexed_contexts: set[int] = set()
+        for candidate in tuple(self.sessions.values()):
+            if (
+                candidate.engine != "codex"
+                or self._codex_profile_for_ctx(candidate).id != profile.id
+            ):
+                continue
+            identity = id(candidate)
+            if identity in indexed_contexts:
+                continue
+            indexed_contexts.add(identity)
+            identity_sids: set[str] = set()
+            route_sid = self._ctx_wire_sid(candidate)
+            if route_sid is not None:
+                identity_sids.add(route_sid)
+            candidate_native_sid = self._codex_context_native_thread_id(
+                candidate,
+                profile,
+            )
+            if candidate_native_sid is not None:
+                identity_sids.add(self._codex_wire_sid(
+                    profile,
+                    candidate_native_sid,
+                ))
+            resident_identities.append((
+                candidate,
+                frozenset(identity_sids),
+            ))
+        deleted_sids = [sid]
+        if ctx.space == "code":
+            for candidate_sid in candidate_sids:
+                if candidate_sid == sid:
+                    continue
+                try:
+                    still_exists = await self._codex_session_exists(
+                        candidate_sid,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "Codex descendant deletion could not be confirmed",
+                        session_id=candidate_sid,
+                        error_type=type(exc).__name__,
+                    )
+                    continue
+                if not still_exists:
+                    deleted_sids.append(candidate_sid)
+        deleted_set = set(deleted_sids)
+        deleted_contexts: list[SessionContext] = []
+        deleted_context_ids: set[int] = set()
+        deleted_context_sids: set[str] = set()
+        for candidate, candidate_sids in resident_identities:
+            identity = id(candidate)
+            if (
+                candidate_sids.isdisjoint(deleted_set)
+                or identity in deleted_context_ids
+            ):
+                continue
+            deleted_contexts.append(candidate)
+            deleted_context_ids.add(identity)
+            deleted_context_sids.update(candidate_sids)
+        for deleted_ctx_sid in sorted(deleted_context_sids):
+            if deleted_ctx_sid not in deleted_set:
+                deleted_sids.append(deleted_ctx_sid)
+                deleted_set.add(deleted_ctx_sid)
+        for deleted_ctx in deleted_contexts:
+            if (
+                deleted_ctx.key is not None
+                and self.sessions.get(deleted_ctx.key) is deleted_ctx
+            ):
+                self.sessions.pop(deleted_ctx.key, None)
+        return deleted_sids, deleted_contexts, deleted_context_sids
+
+    async def _delete_loaded_codex_thread(
+        self,
+        cmd,
+        sid: str,
+        native_sid: str,
+        ctx: SessionContext,
+        *,
+        rollout_path: str | None,
+        transient: bool = False,
+    ) -> Error | tuple[str, ...]:
+        """Delete a loaded Codex thread before releasing its writer."""
+        async with ctx.query_lock:
+            if self._session_delete_busy(ctx):
+                return await self._send_code_delete_error(
+                    cmd,
+                    sid,
+                    ERR_BUSY,
+                    "会话仍在运行或有排队消息，请先停止并取消排队后再删除",
+                )
+            if ctx.space == "code":
+                if transient:
+                    if (
+                        ctx.sdk.daemon_mode == "auto"
+                        and not self._codex_shared_live(ctx)
+                    ):
+                        return await self._send_code_delete_error(
+                            cmd,
+                            sid,
+                            ERR_NOT_RUNNING,
+                            "Codex 共享删除通道不可用，请重试",
+                        )
+                else:
+                    control_error = await self._runtime_control_preflight(
+                        ctx,
+                        action="删除会话",
+                        request_id=getattr(cmd, "cmd_id", None),
+                        client_id=getattr(cmd, "client_id", None),
+                    )
+                    if control_error is not None:
+                        return control_error
+                if transient:
+                    external_owner = await self._cold_codex_delete_blocked(
+                        sid,
+                        rollout_path,
+                        own_handle=ctx.sdk,
+                    )
+                else:
+                    external_owner = (
+                        await self._codex_delete_external_owner(sid)
+                    )
+                if external_owner:
+                    return await self._send_code_delete_error(
+                        cmd,
+                        sid,
+                        ERR_BUSY,
+                        "会话正由 Codex App 使用，无法删除",
+                    )
+            if self._session_delete_busy(ctx):
+                return await self._send_code_delete_error(
+                    cmd,
+                    sid,
+                    ERR_BUSY,
+                    "会话状态已变化，请等待当前回合结束后再删除",
+                )
+
+            profile = self._codex_profile_for_ctx(ctx)
+            resident_candidates = sorted(
+                (
+                    candidate
+                    for candidate in tuple(self.sessions.values())
+                    if candidate is not ctx
+                    and candidate.engine == "codex"
+                    and self._codex_profile_for_ctx(candidate).id == profile.id
+                ),
+                key=lambda candidate: candidate.key or "",
+            )
+            async with AsyncExitStack() as resident_locks:
+                await resident_locks.enter_async_context(
+                    ctx.queued_query_lock
+                )
+                for candidate in resident_candidates:
+                    await resident_locks.enter_async_context(
+                        candidate.query_lock
+                    )
+                    await resident_locks.enter_async_context(
+                        candidate.queued_query_lock
+                    )
+                resident_candidates = [
+                    candidate
+                    for candidate in resident_candidates
+                    if self._is_resident_context(candidate)
+                ]
+                if self._session_delete_busy(ctx):
+                    return await self._send_code_delete_error(
+                        cmd,
+                        sid,
+                        ERR_BUSY,
+                        "会话状态已变化，请等待当前回合结束后再删除",
+                    )
+                try:
+                    (
+                        busy_descendant,
+                        preflight_descendant_sids,
+                    ) = await self._preflight_codex_delete_descendants(
+                        ctx,
+                        native_sid,
+                        tuple(resident_candidates),
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "Codex descendant deletion preflight failed",
+                        session_id=sid,
+                        error_type=type(exc).__name__,
+                    )
+                    return await self._send_code_delete_error(
+                        cmd,
+                        sid,
+                        ERR_INTERNAL,
+                        "无法确认派生会话状态，未执行删除",
+                    )
+                if busy_descendant is not None:
+                    return await self._send_code_delete_error(
+                        cmd,
+                        sid,
+                        ERR_BUSY,
+                        "派生会话仍在运行、排队或由其他 Codex 客户端使用",
+                    )
+
+                try:
+                    deleted_native_ids = await ctx.sdk.delete_thread(
+                        native_sid
+                    )
+                except CodexAppServerError as exc:
+                    log.warning(
+                        "loaded Codex session deletion rejected",
+                        session_id=sid,
+                        error_code=exc.code,
+                    )
+                    return await self._send_code_delete_error(
+                        cmd,
+                        sid,
+                        ERR_INTERNAL,
+                        "会话删除失败，请刷新后重试",
+                    )
+                except Exception as exc:
+                    # A transport loss after the request write cannot prove
+                    # whether thread/delete committed. Require two exact
+                    # native-storage signals before deciding that local
+                    # metadata may be removed.
+                    log.warning(
+                        "loaded Codex session deletion outcome unknown",
+                        session_id=sid,
+                        error_type=type(exc).__name__,
+                    )
+                    try:
+                        still_exists = await self._codex_session_exists(sid)
+                    except Exception as reconcile_error:
+                        log.warning(
+                            "Codex deletion reconciliation failed",
+                            session_id=sid,
+                            error_type=type(reconcile_error).__name__,
+                        )
+                        return await self._send_code_delete_error(
+                            cmd,
+                            sid,
+                            ERR_INTERNAL,
+                            "会话删除结果暂时无法确认，请刷新后重试",
+                        )
+                    rollout_gone = bool(
+                        rollout_path
+                        and not await asyncio.to_thread(
+                            os.path.exists,
+                            rollout_path,
+                        )
+                    )
+                    if still_exists or not rollout_gone:
+                        return await self._send_code_delete_error(
+                            cmd,
+                            sid,
+                            ERR_INTERNAL,
+                            "会话删除失败，请刷新后重试",
+                        )
+                    deleted_native_ids = (native_sid,)
+                if not isinstance(deleted_native_ids, (tuple, list)):
+                    deleted_native_ids = (native_sid,)
+                (
+                    deleted_sids,
+                    deleted_contexts,
+                    deleted_context_sids,
+                ) = await self._reconcile_loaded_codex_delete(
+                    ctx,
+                    sid,
+                    profile,
+                    preflight_descendant_sids,
+                    deleted_native_ids,
+                )
+
+            for deleted_ctx in deleted_contexts:
+                deleted_sid = self._ctx_wire_sid(deleted_ctx)
+                await self._discard_query_queue(deleted_ctx)
+                tasks = {
+                    task
+                    for task in (
+                        deleted_ctx.turn_task,
+                        deleted_ctx.codex_spontaneous_task,
+                    )
+                    if task is not None
+                    and task is not asyncio.current_task()
+                    and not task.done()
+                }
+                for task in tasks:
+                    task.cancel()
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                try:
+                    await deleted_ctx.sdk.disconnect()
+                except Exception as exc:
+                    # Native deletion already committed. A failed proxy cleanup
+                    # must not preserve a context which cannot be resumed.
+                    log.warning(
+                        "deleted Codex session disconnect failed",
+                        session_id=self._ctx_wire_sid(deleted_ctx),
+                        error_type=type(exc).__name__,
+                    )
+                finally:
+                    await self._cleanup_codex_steer_attachments(deleted_ctx)
+                if deleted_ctx.space == "code":
+                    await self._cleanup_deleted_codex_checkpoint(
+                        deleted_ctx,
+                        deleted_sid,
+                    )
+                self._purge_preview_image_snapshots(
+                    deleted_ctx.preview_snapshot_token,
+                )
+            for deleted_sid in deleted_sids:
+                if (
+                    deleted_sid != sid
+                    and deleted_sid not in deleted_context_sids
+                ):
+                    await self._cleanup_cold_deleted_codex_checkpoint(
+                        deleted_sid,
+                    )
+        return tuple(deleted_sids)
+
     async def _handle_delete_session(self, cmd):
         """Delete one native session without confusing Code and Work roots."""
         if getattr(cmd, "space", "code") == "work":
@@ -18402,19 +19274,24 @@ class WrapperMachine:
             await self.transport.send(error)
             return error
         ctx = self._ctx_for(sid)
-        if ctx is not None and (
-            ctx.state != "idle"
-            or ctx.queued_queries
-            or self._query_queue_task_active(ctx)
-        ):
-            error = Error(
-                code=ERR_BUSY,
-                message="会话仍在运行或有排队消息，请先停止并取消排队后再删除",
-                sid=sid,
-                to=getattr(cmd, "client_id", None),
+        transient_codex_ctx = False
+        if engine == "codex" and ctx is None:
+            ctx_or_error = await self._cold_codex_delete_context(
+                cmd,
+                sid,
+                native_sid,
             )
-            await self.transport.send(error)
-            return error
+            if isinstance(ctx_or_error, Error):
+                return ctx_or_error
+            ctx = ctx_or_error
+            transient_codex_ctx = True
+        if ctx is not None and self._session_delete_busy(ctx):
+            return await self._send_code_delete_error(
+                cmd,
+                sid,
+                ERR_BUSY,
+                "会话仍在运行或有排队消息，请先停止并取消排队后再删除",
+            )
         cwd = ctx.cwd if ctx is not None else None
         codex_alias_path = None
         if engine == "codex":
@@ -18423,7 +19300,6 @@ class WrapperMachine:
                     self._codex_rollout_for_wire, sid)
             except (OSError, ValueError):
                 codex_alias_path = None
-        checkpoint_cleanup_journal = None
         if engine == "codex" and cwd is None:
             try:
                 cwd = await asyncio.to_thread(
@@ -18447,120 +19323,126 @@ class WrapperMachine:
                 )
                 await self.transport.send(error)
                 return error
-        if engine == "codex" and cwd:
-            existing_journal = ctx.codex_checkpoint if ctx is not None else None
-            if existing_journal is not False:
-                try:
-                    checkpoint_cleanup_journal = existing_journal or (
-                        await asyncio.to_thread(
-                            CodexCheckpointJournal,
-                            cwd,
-                            Path(self.cfg.state_dir),
-                            sid,
-                            profile_revision=self._codex_profile_revision,
-                        )
-                    )
-                except (CheckpointError, NotGitWorkspaceError) as exc:
-                    log.warning(
-                        "Codex checkpoint journal could not be opened for delete cleanup",
-                        session_id=sid,
-                        error_type=type(exc).__name__,
-                    )
-        if ctx is not None:
+        if engine == "codex":
+            assert ctx is not None
             try:
-                await ctx.sdk.disconnect()
+                delete_result = await self._delete_loaded_codex_thread(
+                    cmd,
+                    sid,
+                    native_sid,
+                    ctx,
+                    rollout_path=codex_alias_path,
+                    transient=transient_codex_ctx,
+                )
+            finally:
+                if transient_codex_ctx:
+                    try:
+                        await ctx.sdk.disconnect()
+                    except Exception as exc:
+                        log.warning(
+                            "cold Codex delete control cleanup failed",
+                            session_id=sid,
+                            error_type=type(exc).__name__,
+                        )
+            if isinstance(delete_result, Error):
+                return delete_result
+            deleted_sids = delete_result
+            if transient_codex_ctx:
+                await self._cleanup_cold_deleted_codex_checkpoint(sid)
+        else:
+            if ctx is not None:
+                try:
+                    await ctx.sdk.disconnect()
+                except Exception:
+                    log.exception(
+                        "session disconnect before delete failed",
+                        engine=engine,
+                        session_id=sid,
+                    )
+                    return await self._send_code_delete_error(
+                        cmd,
+                        sid,
+                        ERR_INTERNAL,
+                        "无法安全停止会话，未执行删除",
+                    )
+                self.sessions.pop(ctx.key or sid, None)
+                self._purge_preview_image_snapshots(
+                    ctx.preview_snapshot_token,
+                )
+            try:
+                await asyncio.to_thread(delete_session, sid, directory=cwd)
             except Exception:
                 log.exception(
-                    "session disconnect before delete failed",
+                    "Code session deletion failed",
                     engine=engine,
                     session_id=sid,
                 )
-                error = Error(
-                    code=ERR_INTERNAL,
-                    message="无法安全停止会话，未执行删除",
-                    sid=sid,
-                    to=getattr(cmd, "client_id", None),
+                return await self._send_code_delete_error(
+                    cmd,
+                    sid,
+                    ERR_INTERNAL,
+                    "会话删除失败，请刷新后重试",
                 )
-                await self.transport.send(error)
-                return error
-            self.sessions.pop(ctx.key or sid, None)
-            self._purge_preview_image_snapshots(ctx.preview_snapshot_token)
-        try:
-            if engine == "codex":
-                try:
-                    await self._codex_rpc_for_wire(
-                        sid, "thread/delete", {"threadId": sid})
-                except CodexRpcOutcomeUnknown:
-                    profile, native_sid = self._codex_target(sid)
-                    home = self._codex_home(profile)
-                    remaining = (
-                        await list_codex_sessions(200)
-                        if home is None else
-                        await list_codex_sessions(200, codex_home=home)
-                    )
-                    if any(
-                        row.get("session_id") == native_sid
-                        for row in remaining
-                    ):
-                        raise
-                self._invalidate_codex_session_catalog()
-            else:
-                await asyncio.to_thread(delete_session, sid, directory=cwd)
-        except Exception:
-            log.exception("Code session deletion failed", engine=engine, session_id=sid)
-            error = Error(
-                code=ERR_INTERNAL,
-                message="会话删除失败，请刷新后重试",
-                sid=sid,
-                to=getattr(cmd, "client_id", None),
-            )
-            await self.transport.send(error)
-            return error
+            deleted_sids = (sid,)
         if engine == "claude":
             await self._delete_claude_client_message_ids(sid)
         else:
             await self._delete_codex_client_message_ids(codex_alias_path)
-        await self._drop_preview_session(engine, sid)
-        if engine == "codex" and checkpoint_cleanup_journal is not None:
-            try:
-                await asyncio.to_thread(
-                    checkpoint_cleanup_journal.cleanup, force=True
-                )
-            except CheckpointError:
-                log.warning(
-                    "Codex checkpoint cleanup after delete failed", session_id=sid
-                )
-        if engine == "codex" and self._codex_controls is not None:
-            try:
-                await asyncio.to_thread(self._codex_controls.delete, sid)
-            except CodexControlStoreError:
-                log.warning(
-                    "stale Codex controls cleanup failed", session_id=sid)
-        if engine == "codex" and self._session_plans is not None:
-            try:
-                await asyncio.to_thread(self._session_plans.delete, sid)
-            except SessionPlanStoreError:
-                log.warning(
-                    "stale Codex plan cleanup failed", session_id=sid)
-        if self._session_presentation is not None:
-            try:
-                await asyncio.to_thread(
-                    self._session_presentation.delete, sid
-                )
-            except SessionPresentationStoreError:
-                log.warning(
-                    "stale Code presentation cleanup failed",
-                    session_id=sid,
-                )
-        if self._session_pins is not None:
-            try:
-                await asyncio.to_thread(
-                    self._session_pins.set_pinned, engine, sid, False)
-            except SessionPinStoreError:
-                log.warning("stale Code session pin cleanup failed",
-                            engine=engine, session_id=sid)
-        self._watch.pop(sid, None)
-        if self.focused_sid in {sid, getattr(ctx, "key", None)}:
+        for deleted_sid in deleted_sids:
+            await self._drop_preview_session(engine, deleted_sid)
+        for deleted_sid in deleted_sids:
+            if engine == "codex" and self._codex_controls is not None:
+                try:
+                    await asyncio.to_thread(
+                        self._codex_controls.delete,
+                        deleted_sid,
+                    )
+                except CodexControlStoreError:
+                    log.warning(
+                        "stale Codex controls cleanup failed",
+                        session_id=deleted_sid,
+                    )
+            if engine == "codex" and self._session_plans is not None:
+                try:
+                    await asyncio.to_thread(
+                        self._session_plans.delete,
+                        deleted_sid,
+                    )
+                except SessionPlanStoreError:
+                    log.warning(
+                        "stale Codex plan cleanup failed",
+                        session_id=deleted_sid,
+                    )
+            if self._session_presentation is not None:
+                try:
+                    await asyncio.to_thread(
+                        self._session_presentation.delete,
+                        deleted_sid,
+                    )
+                except SessionPresentationStoreError:
+                    log.warning(
+                        "stale Code presentation cleanup failed",
+                        session_id=deleted_sid,
+                    )
+            if self._session_pins is not None:
+                try:
+                    await asyncio.to_thread(
+                        self._session_pins.set_pinned,
+                        engine,
+                        deleted_sid,
+                        False,
+                    )
+                except SessionPinStoreError:
+                    log.warning(
+                        "stale Code session pin cleanup failed",
+                        engine=engine,
+                        session_id=deleted_sid,
+                    )
+            self._watch.pop(deleted_sid, None)
+            self._codex_sidebar_watches.pop(deleted_sid, None)
+        if self.focused_sid in set(deleted_sids) | {
+            getattr(ctx, "key", None),
+        }:
             self.focused_sid = None
         await self._handle_list_sessions(cmd)
         log.info("Code session deleted", engine=engine, session_id=sid)
