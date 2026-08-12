@@ -13825,6 +13825,59 @@ try {
     id: "active-follow-up", prompt: "补充要求", done: false, blocks: [],
   }])?.turnId, "active-plan-turn",
   "a follow-up does not hide an unfinished task monitor");
+  const interruptedPlanBlock: Block = {
+    ...activePlanBlock,
+    item_id: "interrupted-plan",
+    status: "interrupted",
+    done: true,
+  };
+  const interruptedPlanOwner: Turn = {
+    id: "interrupted-plan-turn",
+    prompt: "执行后终止",
+    done: true,
+    interrupted: true,
+    blocks: [interruptedPlanBlock],
+  };
+  assert.equal(planProgressPresentation(
+    latestPlanProgress([interruptedPlanOwner])!.block).failed, true,
+  "an interrupted Plan remains visible until the next user turn");
+  assert.equal(latestPlanProgress([interruptedPlanOwner, {
+    id: "interrupt-system-tail", prompt: "", done: true, blocks: [],
+  }])?.turnId, "interrupted-plan-turn",
+  "a promptless continuation cannot acknowledge an interrupted Plan");
+  const afterInterruptedPlan: Turn = {
+    id: "after-interrupted-plan",
+    prompt: "按新要求继续",
+    done: false,
+    blocks: [],
+  };
+  assert.equal(latestPlanProgress([
+    interruptedPlanOwner, afterInterruptedPlan,
+  ]), null,
+  "the next user turn retires the previous interrupted Plan");
+  const interruptedPlanCache = new SessionPlanProgressCache(2);
+  const interruptedProgress = latestPlanProgress([interruptedPlanOwner]);
+  assert.equal(interruptedPlanCache.resolve({
+    sid: "interrupted-plan-session",
+    runtime: interruptedProgress,
+    history: null,
+    runtimeTurns: [interruptedPlanOwner],
+    historyTurns: [interruptedPlanOwner],
+    recovering: false,
+    runtimeLoading: false,
+  })?.block.item_id, "interrupted-plan");
+  assert.equal(interruptedPlanCache.resolve({
+    sid: "interrupted-plan-session",
+    runtime: latestPlanProgress([
+      interruptedPlanOwner, afterInterruptedPlan,
+    ]),
+    history: null,
+    runtimeTurns: [interruptedPlanOwner, afterInterruptedPlan],
+    historyTurns: [interruptedPlanOwner, afterInterruptedPlan],
+    recovering: false,
+    runtimeLoading: false,
+  }), null,
+  "the retained cache cannot resurrect an acknowledged interrupted Plan");
   assert.equal(latestPlanProgress([{
     id: "older-plan", prompt: "旧任务", done: true,
     blocks: [planOnlyBlock],
@@ -13876,6 +13929,67 @@ try {
     "1 / 2");
   assert.equal(refocusedPlan?.needsDetail, false,
     "the retained Plan follows its owner's current detail state");
+  const newerLivePlan: Block = {
+    kind: "process", item_id: "shared-plan", processKind: "plan",
+    phase: "snapshot", status: "succeeded", title: "计划", done: true,
+    plan: [
+      { step: "读取状态", status: "completed" },
+      { step: "修复问题", status: "completed" },
+      { step: "完成验证", status: "inProgress" },
+    ],
+  };
+  const staleDetailPlan: Block = {
+    ...newerLivePlan,
+    plan: [
+      { step: "读取状态", status: "completed" },
+      { step: "修复问题", status: "inProgress" },
+      { step: "完成验证", status: "pending" },
+    ],
+  };
+  for (const location of ["blocks", "liveSpillBlocks"] as const) {
+    const livePlanAfterStaleDetail = latestPlanProgress([{
+      id: `late-plan-detail-${location}`,
+      prompt: "执行任务",
+      done: true,
+      blocks: location === "blocks" ? [newerLivePlan] : [],
+      liveSpillBlocks: location === "liveSpillBlocks"
+        ? [newerLivePlan] : undefined,
+      detailProjection: {
+        segments: [], capped: false, hasMore: false,
+        oldestCursor: null, hasNewer: false, newerCursor: null,
+        blocks: [staleDetailPlan],
+      },
+    }]);
+    assert.equal(planProgressPresentation(
+      livePlanAfterStaleDetail!.block).progressLabel, "2 / 3",
+    `a late detail cannot roll back the Plan in ${location}`);
+    assert.equal(planProgressPresentation(
+      livePlanAfterStaleDetail!.block).currentStep, "完成验证");
+  }
+  const completedDetailPlan: Block = {
+    ...staleDetailPlan,
+    plan: [
+      { step: "读取状态", status: "completed" },
+      { step: "修复问题", status: "completed" },
+      { step: "完成验证", status: "completed" },
+    ],
+  };
+  const completedDetailAfterStaleLive = latestPlanProgress([{
+    id: "completed-detail-after-stale-live",
+    prompt: "执行任务",
+    done: true,
+    blocks: [staleDetailPlan],
+    detailProjection: {
+      segments: [], capped: false, hasMore: false,
+      oldestCursor: null, hasNewer: false, newerCursor: null,
+      blocks: [completedDetailPlan],
+    },
+  }]);
+  assert.equal(planProgressPresentation(
+    completedDetailAfterStaleLive!.block).progressLabel, "3 / 3",
+  "completed detail cannot be rolled back by an older live snapshot");
+  assert.equal(planProgressPresentation(
+    completedDetailAfterStaleLive!.block).complete, true);
   const completedPlanCache = new SessionPlanProgressCache(2);
   const completedPlanOwner: Turn = {
     id: "completed-plan-turn",

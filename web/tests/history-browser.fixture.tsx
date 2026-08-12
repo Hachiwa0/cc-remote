@@ -1965,7 +1965,9 @@ export function HistoryBrowserFixture() {
   const planUi = params.get("plan-ui");
   if (params.has("profile-sidebar")) return <ProfileSidebarFixture />;
   if (planUi) return <PlanUiFixture mode={planUi} />;
-  if (params.has("plan-lifecycle")) return <PlanLifecycleFixture />;
+  if (params.has("plan-lifecycle")) {
+    return <PlanLifecycleFixture mode={params.get("plan-lifecycle") ?? ""} />;
+  }
   if (params.has("goal-ui")) {
     return <GoalUiFixture status={params.get("goal-status")}
       withPlan={params.has("plan")} hidden={params.has("goal-hidden")}
@@ -2058,21 +2060,23 @@ function ProfileSidebarFixture() {
   );
 }
 
-function PlanLifecycleFixture() {
+function PlanLifecycleFixture({ mode }: { mode: string }) {
+  const interrupted = mode === "interrupted";
   const [turns, setTurns] = useState<Turn[]>(() => [{
-    id: "completed-plan-turn",
-    prompt: "完成当前任务",
+    id: interrupted ? "interrupted-plan-turn" : "completed-plan-turn",
+    prompt: interrupted ? "执行后终止" : "完成当前任务",
     done: true,
+    interrupted: interrupted || undefined,
     blocks: [{
       kind: "process",
-      item_id: "completed-plan-item",
+      item_id: interrupted ? "interrupted-plan-item" : "completed-plan-item",
       processKind: "plan",
       phase: "end",
-      status: "succeeded",
+      status: interrupted ? "interrupted" : "succeeded",
       title: "计划",
       plan: [
         { step: "实现功能", status: "completed" },
-        { step: "完成验证", status: "completed" },
+        { step: "完成验证", status: interrupted ? "inProgress" : "completed" },
       ],
       done: true,
     }],

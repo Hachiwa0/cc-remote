@@ -3170,6 +3170,19 @@ test("a completed session Plan disappears when the next message begins", async (
   await expect(chip).toHaveCount(0);
 });
 
+test("an interrupted session Plan disappears when the next message begins", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?plan-lifecycle=interrupted");
+  const chip = page.getByRole("button", { name: /查看计划进度/ });
+  await expect(chip).toBeVisible();
+  await expect(chip.locator(".plan-chip-ring.failed")).toHaveCount(1);
+  await expect(chip).toContainText("1 / 2");
+
+  await page.getByTestId("send-next-plan-message").click();
+  await expect(chip).toHaveCount(0);
+});
+
 test("an existing Goal owns the turn plan in its detail sheet", async ({
   page,
 }) => {
