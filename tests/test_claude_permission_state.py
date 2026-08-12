@@ -388,6 +388,12 @@ def test_implicit_claude_default_failure_reports_probed_provider_model(
             SdkHandle, "preflight", staticmethod(lambda _path: None))
         monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
+        monkeypatch.setattr(
+            machine_module.WrapperMachine,
+            "_claude_managed_settings_paths",
+            staticmethod(lambda: []),
+        )
         machine, transport = _mk_machine()
         machine._load_history = lambda *_args: asyncio.sleep(0)
 
@@ -428,6 +434,12 @@ def test_implicit_claude_default_and_probe_failure_emit_no_fake_model(
             SdkHandle, "preflight", staticmethod(lambda _path: None))
         monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
+        monkeypatch.setattr(
+            machine_module.WrapperMachine,
+            "_claude_managed_settings_paths",
+            staticmethod(lambda: []),
+        )
         machine, transport = _mk_machine()
         machine._load_history = lambda *_args: asyncio.sleep(0)
 
