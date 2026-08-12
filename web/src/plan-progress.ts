@@ -82,7 +82,7 @@ export class SessionPlanProgressCache {
     if (selected) {
       const selectedTurns = runtime ? runtimeTurns : historyTurns;
       const newerTurns = runtime ? [] : runtimeTurns;
-      if (completedPlanHasNewerTurn(
+      if (terminalPlanHasNewerTurn(
         selected, selectedTurns, newerTurns)) {
         this.entries.delete(sid);
         return null;
@@ -105,7 +105,7 @@ export class SessionPlanProgressCache {
     const owner = turns.find((turn) => turnOwnsProgress(
       turn, retained.turnId));
     const newerTurns = retained.source === "history" ? runtimeTurns : [];
-    if (owner && completedPlanHasNewerTurn(
+    if (owner && terminalPlanHasNewerTurn(
       retained, turns, newerTurns)) {
       this.entries.delete(sid);
       return null;
@@ -146,7 +146,8 @@ export class SessionPlanProgressCache {
  * Codex records a task plan on the turn which created it, while later steer or
  * follow-up turns can continue an unfinished task without repeating that plan.
  * Search turns newest-first so old sessions keep their latest active monitor,
- * but retire a completed Plan as soon as the next user turn begins.
+ * but retire a completed or negatively terminated Plan as soon as the next
+ * user turn begins.
  */
 export function latestPlanProgress(
   turns: readonly Turn[],
@@ -154,7 +155,7 @@ export function latestPlanProgress(
   for (let index = turns.length - 1; index >= 0; index--) {
     const progress = turnPlanProgress(turns[index]);
     if (!progress) continue;
-    return completedPlanHasNewerTurn(progress, turns) ? null : progress;
+    return terminalPlanHasNewerTurn(progress, turns) ? null : progress;
   }
   return null;
 }
@@ -202,12 +203,16 @@ export function planFollowsCompletedGoal(
     && progress.ownerMatchesTurn !== false;
 }
 
-function completedPlanHasNewerTurn(
+function terminalPlanHasNewerTurn(
   progress: TurnPlanProgress,
   turns: readonly Turn[],
   newerTurns: readonly Turn[] = [],
 ): boolean {
-  if (!planProgressPresentation(progress.block).complete) return false;
+  const presentation = planProgressPresentation(progress.block);
+  // An active unfinished Plan may span clarification turns. A negative
+  // terminal belongs to the interrupted attempt, though: keep it visible until
+  // acknowledged by the next user message, then wait for that turn's own Plan.
+  if (!presentation.complete && !presentation.failed) return false;
   const ownerIndex = turns.findIndex((turn) =>
     turnOwnsProgress(turn, progress.turnId));
   if (ownerIndex >= 0
@@ -225,30 +230,70 @@ function completedPlanHasNewerTurn(
     && (ownerStartedAt == null || turn.ts == null || turn.ts > ownerStartedAt));
 }
 
+const PLAN_STEP_RANK = {
+  pending: 0,
+  inProgress: 1,
+  completed: 2,
+} as const;
+
+/** Prove that one snapshot advances the same plan without guessing by source.
+ *
+ * Detail can race the live stream in either direction: a late response may be
+ * stale, while a completed detail page may be newer than a retained live tail.
+ * Only identical step structure gives us a safe monotonic comparison.
+ */
+function planSnapshotAdvances(
+  candidate: ProcessBlock,
+  baseline: ProcessBlock,
+): boolean {
+  if (!candidate.plan || !baseline.plan
+      || candidate.plan.length !== baseline.plan.length) return false;
+  let advanced = false;
+  for (let index = 0; index < candidate.plan.length; index += 1) {
+    const next = candidate.plan[index];
+    const previous = baseline.plan[index];
+    if (next.step !== previous.step) return false;
+    const nextRank = PLAN_STEP_RANK[next.status];
+    const previousRank = PLAN_STEP_RANK[previous.status];
+    if (nextRank < previousRank) return false;
+    if (nextRank > previousRank) advanced = true;
+  }
+  return advanced;
+}
+
 function turnPlanProgress(turn: Turn): TurnPlanProgress | null {
   const preferCompletedDetail = turn.done
     && !turn.detailRestorePending && !turn.detailRestoreIncomplete;
   const plansOnly = (blocks: readonly Block[]) =>
     blocks.filter((block): block is ProcessBlock =>
       block.kind === "process" && block.processKind === "plan");
-  const withArchive = mergeDetailWithLiveTail(
-    plansOnly(turn.detailProjection?.blocks ?? []),
+  const detailPlans = plansOnly(turn.detailProjection?.blocks ?? []);
+  const livePlans = plansOnly(mergeDetailWithLiveTail(
     plansOnly(turn.liveSpillBlocks ?? []),
-    preferCompletedDetail,
-  );
-  const blocks = mergeDetailWithLiveTail(
-    withArchive,
     plansOnly(turn.blocks),
+  ));
+  const blocks = plansOnly(mergeDetailWithLiveTail(
+    detailPlans,
+    livePlans,
     preferCompletedDetail,
-  );
+  ));
   // Match ProcessTimeline: prefer the newest structured update, while still
   // supporting older app-server records which only contain free-form detail.
-  const block = [...blocks].reverse().find((candidate) =>
+  const mergedBlock = [...blocks].reverse().find((candidate) =>
     candidate.kind === "process" && candidate.plan != null) ?? blocks.at(-1);
-  if (!block) return null;
-  // plansOnly() makes every merged block a ProcessBlock. Keep the narrowing
-  // explicit at this module boundary so future merge helpers can stay generic.
-  if (block.kind !== "process") return null;
+  if (!mergedBlock) return null;
+  let block = mergedBlock;
+  const detailSnapshot = [...detailPlans].reverse().find((candidate) =>
+    candidate.item_id === block.item_id && candidate.plan != null);
+  const liveSnapshot = [...livePlans].reverse().find((candidate) =>
+    candidate.item_id === block.item_id && candidate.plan != null);
+  if (detailSnapshot && liveSnapshot) {
+    if (planSnapshotAdvances(liveSnapshot, detailSnapshot)) {
+      block = liveSnapshot;
+    } else if (planSnapshotAdvances(detailSnapshot, liveSnapshot)) {
+      block = detailSnapshot;
+    }
+  }
   return {
     turnId: turn.id,
     block,
