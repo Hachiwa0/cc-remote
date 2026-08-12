@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +15,7 @@ from cc_remote.protocol import (
     is_downstream,
     serialize,
 )
+from cc_remote.codex_profiles import CodexProfile
 from cc_remote.wrapper import machine as machine_module
 from cc_remote.wrapper.codex_worktrees import WorktreeSpec
 from cc_remote.wrapper.codex_forks import CodexForkJournal
@@ -75,6 +78,309 @@ def test_worktree_fork_protocol_roundtrips_as_control_messages():
         last_turn_id="turn-2")))
     assert ordinary.type == "fork_session"
     assert ordinary.last_turn_id == "turn-2"
+
+
+def test_same_cwd_fork_invalidates_catalog_before_publication(monkeypatch):
+    async def run():
+        machine, transport = _mk_machine()
+        machine._codex_forks.begin(
+            "request-1",
+            "parent",
+            "turn-2",
+            "/repo/component",
+        )
+        machine._codex_session_list_cache = (
+            0.0,
+            [{"session_id": "parent"}],
+            (),
+        )
+        initial_epoch = machine._codex_session_list_epoch
+        sent = transport.send
+
+        async def assert_fresh_catalog(message):
+            if message.type == "session_forked":
+                assert machine._codex_session_list_cache is None
+                assert machine._codex_session_list_epoch == initial_epoch + 1
+            await sent(message)
+
+        async def list_sessions(_cmd):
+            assert machine._codex_session_list_cache is None
+
+        monkeypatch.setattr(transport, "send", assert_fresh_catalog)
+        monkeypatch.setattr(machine, "_list_codex_sessions", list_sessions)
+
+        result = await machine._finish_same_cwd_fork(
+            _command(last_turn_id="turn-2"),
+            "parent",
+            "/repo/component",
+            "forked-thread",
+        )
+
+        assert result.session_id == "forked-thread"
+        assert [message.type for message in transport.sent] == [
+            "session_forked",
+        ]
+
+    asyncio.run(run())
+
+
+def test_worktree_fork_invalidates_catalog_before_publication(monkeypatch):
+    async def run():
+        machine, transport = _mk_machine()
+        spec = _spec()
+        machine._codex_forks.begin(
+            "request-1",
+            "parent",
+            "cc-remote-worktree-head",
+            spec.cwd,
+            target="worktree",
+        )
+        machine._codex_session_list_cache = (
+            0.0,
+            [{"session_id": "parent"}],
+            (),
+        )
+        initial_epoch = machine._codex_session_list_epoch
+        sent = transport.send
+
+        async def assert_fresh_catalog(message):
+            if message.type == "session_forked":
+                assert machine._codex_session_list_cache is None
+                assert machine._codex_session_list_epoch == initial_epoch + 1
+            await sent(message)
+
+        async def list_sessions(_cmd):
+            assert machine._codex_session_list_cache is None
+
+        monkeypatch.setattr(transport, "send", assert_fresh_catalog)
+        monkeypatch.setattr(machine, "_list_codex_sessions", list_sessions)
+
+        result = await machine._finish_worktree_fork(
+            _command(name=""),
+            "parent",
+            spec,
+            "forked-thread",
+            "cc-remote-fork:request-1",
+        )
+
+        assert result.session_id == "forked-thread"
+        assert [message.type for message in transport.sent] == [
+            "session_forked",
+        ]
+
+    asyncio.run(run())
+
+
+def test_same_cwd_fork_refresh_includes_child_after_fresh_parent_cache(
+    monkeypatch, tmp_path,
+):
+    async def run():
+        machine, _ = _mk_machine()
+        machine._codex_forks.begin(
+            "request-1",
+            "parent",
+            "turn-2",
+            "/repo/component",
+        )
+        machine._codex_session_list_cache = (
+            time.monotonic(),
+            [{"session_id": "parent"}],
+            (),
+        )
+        published = []
+        rollout = tmp_path / (
+            "rollout-2026-08-13T09-06-10-forked-thread.jsonl")
+        rollout.write_text(json.dumps({
+            "type": "session_meta",
+            "payload": {
+                "id": "forked-thread",
+                "cwd": "/repo/component",
+                "thread_source": "cc-remote-fork:request-1",
+                "forked_from_id": "parent",
+            },
+        }) + "\n")
+
+        async def read_catalog():
+            return ([
+                {
+                    "session_id": "parent",
+                    "native_session_id": "parent",
+                    "codex_profile_id": "primary",
+                    "codex_profile_label": "Primary",
+                    "summary": "Parent task",
+                    "cwd": "/repo/component",
+                    "last_modified": "1",
+                },
+            ], ())
+
+        async def send_list(_cmd, raw, **_kwargs):
+            published.append(raw)
+
+        def find_rollouts(candidates):
+            assert [item[2] for item in candidates] == ["forked-thread"]
+            return {("primary", "forked-thread"): (str(rollout), False)}
+
+        monkeypatch.setattr(
+            machine,
+            "_read_codex_profile_catalog",
+            read_catalog,
+        )
+        monkeypatch.setattr(
+            machine,
+            "_find_completed_codex_fork_rollouts",
+            find_rollouts,
+        )
+        monkeypatch.setattr(machine, "_send_codex_session_list", send_list)
+
+        await machine._finish_same_cwd_fork(
+            _command(last_turn_id="turn-2"),
+            "parent",
+            "/repo/component",
+            "forked-thread",
+        )
+
+        assert len(published) == 1
+        by_id = {row["session_id"]: row for row in published[0]}
+        assert set(by_id) == {"parent", "forked-thread"}
+        assert by_id["forked-thread"]["summary"] == "Parent task (fork)"
+        assert by_id["forked-thread"]["forked_from_id"] == "parent"
+        assert by_id["forked-thread"]["status"] == "notLoaded"
+
+    asyncio.run(run())
+
+
+def test_completed_fork_without_rollout_is_not_restored(monkeypatch):
+    async def run():
+        machine, _ = _mk_machine()
+        machine._codex_forks.begin(
+            "request-1", "parent", "turn-2", "/repo/component")
+        machine._codex_forks.complete("request-1", "deleted-child")
+
+        async def read_catalog():
+            return ([{
+                "session_id": "parent",
+                "native_session_id": "parent",
+                "codex_profile_id": "primary",
+            }], ())
+
+        monkeypatch.setattr(
+            machine, "_read_codex_profile_catalog", read_catalog)
+        monkeypatch.setattr(
+            machine,
+            "_find_completed_codex_fork_rollouts",
+            lambda _candidates: {},
+        )
+
+        rows = await machine._refresh_codex_session_catalog()
+
+        assert [row["session_id"] for row in rows] == ["parent"]
+
+    asyncio.run(run())
+
+
+def test_renamed_fork_keeps_title_while_native_catalog_omits_it(
+    monkeypatch, tmp_path,
+):
+    async def run():
+        machine, _ = _mk_machine()
+        machine._codex_forks.begin(
+            "request-1", "parent", "turn-2", "/repo/component")
+        machine._codex_forks.complete("request-1", "forked-thread")
+        rollout = tmp_path / (
+            "rollout-2026-08-13T09-06-10-forked-thread.jsonl")
+        rollout.write_text(json.dumps({
+            "type": "session_meta",
+            "payload": {
+                "id": "forked-thread",
+                "cwd": "/repo/component",
+                "thread_source": "cc-remote-fork:request-1",
+                "forked_from_id": "parent",
+            },
+        }) + "\n")
+        published = []
+        rpc_calls = []
+
+        async def is_codex(_sid):
+            return True
+
+        async def rpc(sid, method, params, **_kwargs):
+            rpc_calls.append((sid, method, params))
+            return {}
+
+        async def read_catalog():
+            return ([{
+                "session_id": "parent",
+                "native_session_id": "parent",
+                "codex_profile_id": "primary",
+                "codex_profile_label": "Primary",
+                "summary": "Parent task",
+            }], ())
+
+        async def send_list(_cmd, raw, **_kwargs):
+            published.append(raw)
+
+        monkeypatch.setattr(machine, "_is_codex_session", is_codex)
+        monkeypatch.setattr(machine, "_codex_rpc_for_wire", rpc)
+        monkeypatch.setattr(
+            machine, "_read_codex_profile_catalog", read_catalog)
+        monkeypatch.setattr(
+            machine,
+            "_find_completed_codex_fork_rollouts",
+            lambda _candidates: {
+                ("primary", "forked-thread"): (str(rollout), False),
+            },
+        )
+        monkeypatch.setattr(machine, "_send_codex_session_list", send_list)
+
+        await machine._handle_rename_session(SimpleNamespace(
+            session_id="forked-thread",
+            title="Renamed fork",
+            engine="codex",
+            space="code",
+        ))
+
+        assert rpc_calls == [(
+            "forked-thread",
+            "thread/name/set",
+            {"threadId": "forked-thread", "name": "Renamed fork"},
+        )]
+        by_id = {row["session_id"]: row for row in published[-1]}
+        assert by_id["forked-thread"]["summary"] == "Renamed fork"
+        assert machine._codex_forks.completed_results(1)[0][
+            "title"] == "Renamed fork"
+
+    asyncio.run(run())
+
+
+def test_completed_fork_rollout_scan_is_batched_and_archive_aware(tmp_path):
+    machine, _ = _mk_machine()
+    profile = CodexProfile(
+        id="primary",
+        label="Primary",
+        home=tmp_path,
+        is_default=True,
+    )
+    active = tmp_path / "sessions" / "2026" / "08" / "13"
+    archived = tmp_path / "archived_sessions"
+    active.mkdir(parents=True)
+    archived.mkdir()
+    active_child = active / (
+        "rollout-2026-08-13T09-06-10-child-active.jsonl")
+    archived_child = archived / (
+        "rollout-2026-08-12T09-06-10-child-archived.jsonl")
+    active_child.write_text("{}\n")
+    archived_child.write_text("{}\n")
+    candidates = [
+        ({}, profile, "child-active", "parent", "parent"),
+        ({}, profile, "child-archived", "parent", "parent"),
+    ]
+
+    found = machine._find_completed_codex_fork_rollouts(candidates)
+
+    assert found[("primary", "child-active")] == (
+        str(active_child.resolve()), False)
+    assert found[("primary", "child-archived")] == (
+        str(archived_child.resolve()), True)
 
 
 def test_codex_same_cwd_fork_uses_selected_turn_and_is_durable(monkeypatch):

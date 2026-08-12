@@ -271,7 +271,7 @@ from cc_remote.wrapper.codex_checkpoints import (
 )
 from cc_remote.wrapper.codex_forks import (
     CodexForkJournal, ForkJournalError, find_rollout_fork,
-    fork_thread_source,
+    fork_thread_source, rollout_fork_meta,
 )
 from cc_remote.wrapper.claude_forks import (
     ClaudeForkJournal, ClaudeForkJournalError, claude_fork_marker,
@@ -1285,6 +1285,7 @@ class WrapperMachine:
     # full and its catalog strings are at their protocol limits.
     CODEX_SESSION_LIST_MAX_ROWS = 400
     CODEX_SESSION_LIST_MAX_BYTES = 8 * 1024 * 1024
+    CODEX_FORK_CATALOG_MAX_SCAN_FILES = 20_000
     PREVIEW_ASSET_MEDIA_TYPES = {
         ".png": "image/png",
         ".jpg": "image/jpeg",
@@ -16947,11 +16948,182 @@ class WrapperMachine:
                 if row.get("codex_profile_id") in failed_profile_ids
             ]
             raw = self._bounded_codex_profile_catalog([*raw, *stale_rows])
+        raw = await asyncio.to_thread(
+            self._overlay_completed_codex_forks, raw)
         self._codex_session_profile_errors = profile_errors
         self._codex_session_list_cache = (
             time.monotonic(), raw, profile_errors,
         )
         return raw
+
+    def _overlay_completed_codex_forks(
+        self, raw: list[dict],
+    ) -> list[dict]:
+        """Keep fork-only children visible until app-server indexes a turn."""
+        existing = {
+            row.get("session_id")
+            for row in raw
+            if isinstance(row.get("session_id"), str)
+        }
+        candidates: list[
+            tuple[dict, CodexProfile, str, str, str]
+        ] = []
+        for entry in self._codex_forks.completed_results(
+            self.CODEX_SESSION_LIST_MAX_ROWS,
+        ):
+            child_wire_sid = entry.get("session_id")
+            parent_wire_sid = entry.get("parent_session_id")
+            if (
+                not isinstance(child_wire_sid, str)
+                or child_wire_sid in existing
+                or not isinstance(parent_wire_sid, str)
+            ):
+                continue
+            try:
+                child_profile, child_native_sid = self._codex_target(
+                    child_wire_sid)
+                parent_profile, parent_native_sid = self._codex_target(
+                    parent_wire_sid)
+            except (RuntimeError, ValueError):
+                continue
+            if child_profile.id != parent_profile.id:
+                continue
+            candidates.append((
+                entry,
+                child_profile,
+                child_native_sid,
+                parent_native_sid,
+                parent_wire_sid,
+            ))
+
+        if not candidates:
+            return raw
+        paths = self._find_completed_codex_fork_rollouts(candidates)
+        parent_rows = {
+            row.get("session_id"): row
+            for row in raw
+            if isinstance(row.get("session_id"), str)
+        }
+        overlays: list[dict] = []
+        for (
+            entry,
+            profile,
+            child_native_sid,
+            parent_native_sid,
+            parent_wire_sid,
+        ) in candidates:
+            child_wire_sid = entry["session_id"]
+            located = paths.get((profile.id, child_native_sid))
+            if located is None:
+                continue
+            path, archived = located
+            meta = rollout_fork_meta(path)
+            if (
+                meta is None
+                or meta.get("session_id") != child_native_sid
+                or meta.get("forked_from_id") != parent_native_sid
+                or meta.get("thread_source") != entry.get("thread_source")
+            ):
+                continue
+            try:
+                modified = max(
+                    float(entry.get("created_at", 0)),
+                    float(entry.get("title_updated_at", 0)),
+                    os.stat(path).st_mtime,
+                )
+            except (OSError, TypeError, ValueError):
+                continue
+            parent = parent_rows.get(parent_wire_sid, {})
+            inherited_title = (
+                parent.get("summary") or parent.get("first_prompt")
+            )
+            persisted_title = entry.get("title")
+            summary = (
+                str(persisted_title).strip() if persisted_title else (
+                    f"{str(inherited_title).strip()} (fork)"
+                    if inherited_title else "Forked session"
+                )
+            )[:500]
+            overlays.append({
+                "session_id": child_wire_sid,
+                "native_session_id": child_native_sid,
+                "codex_profile_id": profile.id,
+                "codex_profile_label": profile.label,
+                "forked_from_id": parent_wire_sid,
+                "summary": summary,
+                "first_prompt": parent.get("first_prompt"),
+                "cwd": entry.get("cwd") or meta.get("cwd"),
+                "last_modified": str(modified),
+                "git_branch": parent.get("git_branch"),
+                "tag": "archived" if archived else None,
+                "status": "notLoaded",
+            })
+        if not overlays:
+            return raw
+        return self._bounded_codex_profile_catalog([*raw, *overlays])
+
+    def _find_completed_codex_fork_rollouts(
+        self,
+        candidates: list[tuple[dict, CodexProfile, str, str, str]],
+    ) -> dict[tuple[str, str], tuple[str, bool]]:
+        """Locate many journaled children with one bounded scan per profile."""
+        pending: dict[str, dict[str, None]] = {}
+        profiles: dict[str, CodexProfile] = {}
+        for _entry, profile, child_sid, _parent_sid, _parent_wire in candidates:
+            pending.setdefault(profile.id, {})[child_sid] = None
+            profiles[profile.id] = profile
+
+        found: dict[tuple[str, str], tuple[str, bool]] = {}
+        scanned = 0
+        exhausted = False
+        for profile_id, wanted in pending.items():
+            profile = profiles[profile_id]
+            remaining = set(wanted)
+            for root_name, archived in (
+                ("sessions", False),
+                ("archived_sessions", True),
+            ):
+                root = os.path.realpath(profile.home / root_name)
+                if not os.path.isdir(root):
+                    continue
+                for directory, directories, files in os.walk(root):
+                    directories.sort(reverse=True)
+                    files.sort(reverse=True)
+                    for filename in files:
+                        if not filename.endswith(".jsonl"):
+                            continue
+                        scanned += 1
+                        if scanned > self.CODEX_FORK_CATALOG_MAX_SCAN_FILES:
+                            exhausted = True
+                            break
+                        child_sid = next((
+                            sid for sid in remaining
+                            if filename.endswith(f"-{sid}.jsonl")
+                        ), None)
+                        if child_sid is None:
+                            continue
+                        path = os.path.realpath(
+                            os.path.join(directory, filename))
+                        try:
+                            inside_root = os.path.commonpath(
+                                (root, path)) == root
+                        except ValueError:
+                            inside_root = False
+                        if not inside_root:
+                            continue
+                        found[(profile_id, child_sid)] = (path, archived)
+                        remaining.remove(child_sid)
+                    if exhausted or not remaining:
+                        break
+                if exhausted or not remaining:
+                    break
+            if exhausted:
+                log.warning(
+                    "Codex fork catalog rollout scan reached its bound",
+                    max_files=self.CODEX_FORK_CATALOG_MAX_SCAN_FILES,
+                )
+                break
+        return found
 
     def _bounded_codex_profile_catalog(
         self, candidates: list[dict],
@@ -17909,6 +18081,8 @@ class WrapperMachine:
                 await self._codex_rpc_for_wire(sid, "thread/name/set", {
                     "threadId": sid, "name": cmd.title,
                 })
+                await asyncio.to_thread(
+                    self._codex_forks.set_title, sid, cmd.title)
                 if work_record is not None:
                     await asyncio.to_thread(
                         self._work.for_engine(engine).update_title,
@@ -19956,6 +20130,11 @@ class WrapperMachine:
             request_id=cmd.request_id,
             to=cmd.client_id,
         )
+        # A successful fork mutates the native catalog. Drop any parent-only
+        # snapshot before publishing the child: otherwise the refresh below can
+        # immediately erase the newly focused child from the browser and make a
+        # later fork target whichever session the sidebar selects instead.
+        self._invalidate_codex_session_catalog()
         await self.transport.send(event)
         try:
             await self._list_codex_sessions(cmd)
@@ -20819,6 +20998,9 @@ class WrapperMachine:
             request_id=cmd.request_id,
             to=cmd.client_id,
         )
+        # Worktree forks enter the same native catalog as same-cwd forks. Keep
+        # both publication paths on the same cache-generation boundary.
+        self._invalidate_codex_session_catalog()
         await self.transport.send(event)
         try:
             await self._list_codex_sessions(cmd)

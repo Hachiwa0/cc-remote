@@ -159,6 +159,34 @@ def test_fork_journal_aliases_same_unresolved_identity_to_one_canonical(tmp_path
     assert later["thread_source"] == "cc-remote-fork:request-later"
 
 
+def test_fork_journal_lists_unique_completed_results_newest_first(tmp_path):
+    journal = CodexForkJournal(tmp_path)
+    journal.begin("request-old", "parent", "turn-old", "/repo")
+    journal.claim_submission("request-old")
+    journal.begin("request-alias", "parent", "turn-old", "/repo")
+    journal.complete("request-alias", "child-old")
+    journal.begin("request-new", "parent", "turn-new", "/repo")
+    journal.complete("request-new", "child-new")
+    assert journal.set_title("child-old", "Renamed fork") is True
+    assert journal.set_title("not-a-fork", "Ignored") is False
+
+    results = journal.completed_results(10)
+
+    assert [entry["session_id"] for entry in results] == [
+        "child-new",
+        "child-old",
+    ]
+    assert len({entry["thread_source"] for entry in results}) == 2
+    old_result = next(
+        entry for entry in results if entry["session_id"] == "child-old")
+    assert old_result["title"] == "Renamed fork"
+    assert old_result["title_updated_at"] >= old_result["created_at"]
+    reloaded = CodexForkJournal(tmp_path)
+    assert reloaded.completed_results(10)[1]["title"] == "Renamed fork"
+    with pytest.raises(ForkJournalError, match="invalid completed"):
+        journal.completed_results(0)
+
+
 def test_fork_journal_rejects_orphaned_alias_on_reload(tmp_path):
     journal = CodexForkJournal(tmp_path)
     journal.begin("request-old", "parent", "turn-1", "/repo")
