@@ -18,7 +18,7 @@ import { Icon } from "../icons";
 import {
   clientSlashesFor, CODEX_PROMPTS, isKnownCodeOnlySlash, slashToken,
   matchCommands, matchSkills, parseSlash, skillToken,
-  modelsFor, effortsFor, permsFor,
+  modelsFor, effortNameForDisplay, permsFor,
   permissionProfileLabel, type Catalog,
 } from "../data";
 import { CommandSheet } from "./CommandSheet";
@@ -634,11 +634,7 @@ export function Composer(p: Props) {
     ? (MODELS_E.find((m) => m.id === p.model)
       || { id: p.model, name: p.model, ds: "", ic: "cpu" })
     : null;
-  const EFFORTS_E = effortsFor(p.engine, model?.id, p.catalog);
-  const effort = p.effort
-    ? (EFFORTS_E.find((e) => e.id === p.effort)
-      || { id: p.effort, name: p.effort, ds: "", ic: "gauge3" })
-    : null;
+  const effortName = effortNameForDisplay(p.effort);
   const perm = p.perm
     ? (PERMS_E.find((x) => x.id === p.perm)
       || { id: p.perm, name: p.perm, short: p.perm, ds: "", ic: "shield" })
@@ -828,7 +824,7 @@ export function Composer(p: Props) {
                   </button>
                   <button type="button" onClick={() => setSheetKind("efforts")}
                     disabled={locked}>
-                    <span>思考强度</span><b>{effort?.name ?? "读取中"}</b>
+                    <span>思考强度</span><b>{effortName ?? "读取中"}</b>
                   </button>
                   <button type="button" onClick={() => { p.onContext(); setCtxOpen((o) => !o); }}>
                     <span>会话上下文</span><b>{p.contextReport?.available === false
@@ -912,8 +908,8 @@ export function Composer(p: Props) {
             <button className="hint-ctl" onClick={() => setSheetKind("efforts")}
               disabled={locked}
               title={deferredClaudeControls
-                ? `Remote 接管后思考强度：${effort?.name ?? "读取中"}；不是${externalClaudeOwner}当前强度`
-                : "思考强度"}>{effort?.name ?? "强度读取中"}</button>
+                ? `Remote 接管后思考强度：${effortName ?? "读取中"}；不是${externalClaudeOwner}当前强度`
+                : "思考强度"}>{effortName ?? "强度读取中"}</button>
             {p.engine === "codex" && p.collaborationMode === "plan" && (
               <button
                 className="hint-ctl collaboration-chip plan"

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from types import SimpleNamespace
 
 from cc_remote.codex_daemon_restart import (
@@ -121,6 +122,33 @@ class _EvictedDuringReconnectSdk(_InterruptedSharedSdk):
         self.reconnect_started.set()
         await self.release_reconnect.wait()
         self.live = True
+
+    async def disconnect(self) -> None:
+        self.disconnects += 1
+        self.live = False
+
+
+class _EvictedDuringEffortPublishSdk(_InterruptedSharedSdk):
+    def __init__(self) -> None:
+        super().__init__()
+        self.effort = None
+        self.applied_effort = None
+        self.display_effort = None
+        self.display_effort_model = None
+        self.display_effort_cwd = None
+        self.display_effort_generation = None
+        self._display_effort_retry_at = None
+        self._cwd = "/tmp"
+        self._generation = 2
+        self._thread_settings_revision = 0
+        self.effort_resolution_started = asyncio.Event()
+        self.release_effort_resolution = asyncio.Event()
+        self.disconnects = 0
+
+    async def configured_default_effort(self):
+        self.effort_resolution_started.set()
+        await self.release_effort_resolution.wait()
+        return "medium"
 
     async def disconnect(self) -> None:
         self.disconnects += 1
@@ -1766,6 +1794,8 @@ def test_idle_status_reconnects_changed_daemon_generation(monkeypatch):
         ctx.engine = "codex"
         ctx.space = "code"
         ctx.sdk = _SharedSdk()
+        ctx.sdk.effort = "medium"
+        ctx.announced_effort = "high"
         ctx.state = "idle"
         ctx.codex_daemon_epoch = "a" * 32
         machine.sessions[ctx.key] = ctx
@@ -1800,6 +1830,11 @@ def test_idle_status_reconnects_changed_daemon_generation(monkeypatch):
         assert isinstance(result, StatusReport)
         assert ctx.sdk.reconnects == 1
         assert ctx.codex_daemon_epoch == "b" * 32
+        effort_events = [
+            event for event in transport.sent if isinstance(event, Effort)
+        ]
+        assert [event.effort for event in effort_events] == ["medium"]
+        assert ctx.announced_effort == "medium"
         assert transport.sent[-1].to == "browser"
         assert transport.sent[-1].request_id == "usage-refresh"
 
@@ -1843,6 +1878,135 @@ def test_generation_reconnect_does_not_revive_evicted_context(monkeypatch):
         assert sdk.reconnects == 1
         assert sdk.disconnects == 2
         assert sdk.live is False
+
+    asyncio.run(go())
+
+
+def test_generation_reconnect_drops_effort_resolved_after_eviction(monkeypatch):
+    async def go() -> None:
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        sdk = _EvictedDuringEffortPublishSdk()
+        ctx.sdk = sdk
+        ctx.announced_effort = "high"
+        ctx.codex_daemon_epoch = "a" * 32
+        machine.sessions[ctx.key] = ctx
+        ready = CodexDaemonRestartState(
+            epoch="b" * 32,
+            phase="ready",
+            updated_at=1.0,
+            deadline_at=2.0,
+        )
+
+        async def restart_state(*, wait, interrupt_event):
+            assert wait is True
+            assert interrupt_event is ctx.interrupt_event
+            return ready
+
+        monkeypatch.setattr(machine, "_codex_restart_state", restart_state)
+        reconnect = asyncio.create_task(machine._ensure_codex_daemon_generation(
+            ctx, reason="background status refresh"))
+        await asyncio.wait_for(
+            sdk.effort_resolution_started.wait(), timeout=1.0)
+
+        # The proxy connected, then the status command lost its resident route
+        # while its nullable effort was still resolving from config/read.
+        assert machine.sessions.pop(ctx.key) is ctx
+        sdk.release_effort_resolution.set()
+
+        assert await asyncio.wait_for(reconnect, timeout=1.0) is False
+        assert sdk.disconnects == 1
+        assert sdk.live is False
+        assert ctx.codex_daemon_epoch == "a" * 32
+        assert not any(isinstance(event, Effort) for event in transport.sent)
+        assert ctx.announced_effort == "high"
+
+    asyncio.run(go())
+
+
+def test_generation_reconnect_drops_effort_when_evicted_at_emit_lock(monkeypatch):
+    async def go() -> None:
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        sdk = _EvictedDuringEffortPublishSdk()
+        sdk.live = True
+        sdk.display_effort = "medium"
+        sdk.display_effort_model = sdk.model
+        sdk.display_effort_cwd = os.path.realpath(sdk._cwd)
+        sdk.display_effort_generation = sdk._generation
+        ctx.sdk = sdk
+        ctx.announced_model = sdk.model
+        ctx.announced_effort = "high"
+        machine.sessions[ctx.key] = ctx
+
+        # Hold the serialization boundary until publish has completed its first
+        # residency check. Eviction at this exact point must not append an old
+        # Effort frame to the detached replay ring.
+        await ctx.emit_lock.acquire()
+        publishing = asyncio.create_task(
+            machine._publish_codex_model_effort(
+                ctx, require_resident=True))
+        for _ in range(20):
+            if getattr(ctx.emit_lock, "_waiters", None):
+                break
+            await asyncio.sleep(0)
+        assert getattr(ctx.emit_lock, "_waiters", None)
+        assert machine.sessions.pop(ctx.key) is ctx
+        ctx.emit_lock.release()
+
+        assert await asyncio.wait_for(publishing, timeout=1.0) is False
+        assert not any(isinstance(event, Effort) for event in transport.sent)
+        assert ctx.announced_effort == "high"
+
+    asyncio.run(go())
+
+
+def test_generation_reconnect_finishes_pair_then_fails_if_evicted_during_send(
+    monkeypatch,
+):
+    async def go() -> None:
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        sdk = _EvictedDuringEffortPublishSdk()
+        sdk.live = True
+        sdk.display_effort = "medium"
+        sdk.display_effort_model = sdk.model
+        sdk.display_effort_cwd = os.path.realpath(sdk._cwd)
+        sdk.display_effort_generation = sdk._generation
+        ctx.sdk = sdk
+        ctx.announced_model = "gpt-old"
+        ctx.announced_effort = "high"
+        machine.sessions[ctx.key] = ctx
+        original_send = transport.send
+        evicted = False
+
+        async def send(event):
+            nonlocal evicted
+            await original_send(event)
+            if isinstance(event, Model) and not evicted:
+                evicted = True
+                assert machine.sessions.pop(ctx.key) is ctx
+
+        transport.send = send
+        published = await machine._publish_codex_model_effort(
+            ctx, require_resident=True)
+
+        assert published is False
+        assert [
+            (event.type, getattr(event, "model", None),
+             getattr(event, "effort", None))
+            for event in transport.sent
+            if isinstance(event, (Model, Effort))
+        ] == [
+            ("model", sdk.model, None),
+            ("effort", None, "medium"),
+        ]
 
     asyncio.run(go())
 

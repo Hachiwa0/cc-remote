@@ -14,6 +14,7 @@ import difflib
 import json
 import os
 import re
+import stat
 import time
 import uuid
 from dataclasses import dataclass
@@ -1073,6 +1074,49 @@ def transcript_path(session_id: str) -> str | None:
         return None
     except Exception:
         return None
+
+
+def transcript_presence(session_id: str) -> bool | None:
+    """Return exact Claude transcript presence, preserving lookup uncertainty.
+
+    ``transcript_path`` intentionally collapses every filesystem failure into
+    ``None`` for ordinary history fallbacks. Engine ownership migration cannot:
+    an unreadable catalog is not proof that the same UUID belongs to Codex.
+    """
+    if not _SAFE_SESSION_ID.fullmatch(session_id):
+        return None
+    try:
+        root = claude_projects_dir().resolve()
+        entries = os.scandir(root)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return None
+    scanned = 0
+    try:
+        with entries:
+            for entry in entries:
+                try:
+                    if entry.is_symlink():
+                        return None
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                except OSError:
+                    return None
+                scanned += 1
+                if scanned > _MAX_TRANSCRIPT_MATCHES:
+                    return None
+                candidate = os.path.join(entry.path, f"{session_id}.jsonl")
+                try:
+                    info = os.lstat(candidate)
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    return None
+                return True if stat.S_ISREG(info.st_mode) else None
+    except OSError:
+        return None
+    return False
 
 
 def _bounded_jsonl_lines(file):

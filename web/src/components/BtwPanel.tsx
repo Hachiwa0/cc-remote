@@ -27,7 +27,9 @@ import {
   type SendMode,
 } from "../composer-submit";
 import { canEnqueueQuery, type QueueCapacity } from "../runtime-drain";
-import { effortsFor, modelsFor, type Catalog } from "../data";
+import {
+  effortNameForDisplay, modelsFor, type Catalog,
+} from "../data";
 import { QueuedQueryChip } from "./QueuedQueryDialog";
 import type { InlineImageAsset } from "../inline-image-assets";
 
@@ -227,11 +229,7 @@ export function BtwPanel(p: Props) {
     ? (modelList.find((candidate) => candidate.id === p.rt?.model)
       ?? { id: p.rt.model, name: p.rt.model, ds: "", ic: "cpu" })
     : null;
-  const effortList = effortsFor(p.engine, model?.id, p.catalog);
-  const effort = p.rt?.effort
-    ? (effortList.find((candidate) => candidate.id === p.rt?.effort)
-      ?? { id: p.rt.effort, name: p.rt.effort, ds: "", ic: "gauge3" })
-    : null;
+  const effortName = effortNameForDisplay(p.rt?.effort);
   const stopping = runtimeBusy && !hasText;
   const interruptSettling = isInterruptSettling(submitState);
   const primaryIsInterrupt = p.engine !== "codex";
@@ -366,7 +364,7 @@ export function BtwPanel(p: Props) {
           <button className="hint-ctl" onClick={() => setSheetKind("models")}
             disabled={busy}>{model?.name ?? "模型读取中"}</button>
           <button className="hint-ctl" onClick={() => setSheetKind("efforts")}
-            disabled={busy}>{effort?.name ?? "强度读取中"}</button>
+            disabled={busy}>{effortName ?? "强度读取中"}</button>
         </div>
       </div>
       <CommandSheet

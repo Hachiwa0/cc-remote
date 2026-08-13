@@ -1556,12 +1556,20 @@ def test_requested_codex_summary_falls_back_only_for_unsupported_capability(
         mm, "codex_rollout_path", lambda _sid: str(rollout))
 
     class Unsupported:
+        def __init__(self):
+            self.calls = 0
+
         async def summary_page(self, *_args, **_kwargs):
+            self.calls += 1
             raise CodexHistoryUnsupported("old app-server")
+
+        def invalidate_thread(self, _sid):
+            return None
 
     async def run():
         machine, _transport = _mk_machine()
-        machine._codex_history = Unsupported()
+        official = Unsupported()
+        machine._codex_history = official
         ctx = _mk_ctx("unsupported-summary", "unsupported-summary")
         ctx.engine = "codex"
         machine.sessions[ctx.key] = ctx
@@ -1585,6 +1593,23 @@ def test_requested_codex_summary_falls_back_only_for_unsupported_capability(
         )
         assert history.error is None
         assert len(fallback_calls) == 1
+        assert official.calls == 1
+        assert machine._codex_rollout_history_active(
+            "unsupported-summary") is True
+
+        # The first rollout page owns its stable turn-id cursor. Every older
+        # summary page in the same revision must remain on rollout instead of
+        # handing that id to the official reader's opaque cursor table.
+        await machine._build_requested_history(
+            "unsupported-summary",
+            before="rollout-turn-id",
+            limit=12,
+            cwd=None,
+            detail="summary",
+        )
+        assert len(fallback_calls) == 2
+        assert fallback_calls[-1][1]["before"] == "rollout-turn-id"
+        assert official.calls == 1
 
     asyncio.run(run())
 

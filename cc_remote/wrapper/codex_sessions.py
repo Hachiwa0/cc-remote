@@ -11,7 +11,9 @@ from importlib import import_module
 import json
 import math
 import os
+from pathlib import Path
 import re
+import sqlite3
 from typing import Any, Optional
 
 from cc_remote.log import logger
@@ -41,6 +43,7 @@ _LIST_PAGE_SIZE = 100
 _LIST_MAX_PER_ARCHIVE_STATE = 200
 _LIST_MAX_PAGES = 20
 _THREAD_STATUSES = frozenset({"notLoaded", "idle", "systemError", "active"})
+_STATE_DB = re.compile(r"^state_(\d+)\.sqlite$")
 
 
 def _codex_home(codex_home: str | os.PathLike[str] | None = None) -> str:
@@ -211,6 +214,65 @@ def codex_rollout_path(
         if codex_home is None
         else _rollout_path(session_id, codex_home=codex_home)
     )
+
+
+def codex_session_presence(
+    session_id: str,
+    *,
+    codex_home: str | os.PathLike[str] | None = None,
+) -> bool | None:
+    """Read one exact native thread id without collapsing I/O failure.
+
+    The app-server SQLite catalog is authoritative for active and archived
+    threads. ``None`` means ownership is unknown and callers must not infer a
+    different engine from absence.
+    """
+    if not isinstance(session_id, str) or not _SAFE_SESSION_ID.fullmatch(
+        session_id
+    ):
+        return None
+    home = _codex_home(codex_home)
+    config_path = os.path.join(home, "config.toml")
+    try:
+        if os.path.getsize(config_path) > _CONFIG_MAX_BYTES:
+            return None
+        with open(config_path, "rb") as stream:
+            config = tomllib.load(stream)
+    except FileNotFoundError:
+        config = {}
+    except Exception:
+        return None
+    sqlite_home = config.get("sqlite_home")
+    if sqlite_home is None:
+        sqlite_root = home
+    elif isinstance(sqlite_home, str) and sqlite_home.strip():
+        sqlite_root = os.path.expanduser(sqlite_home)
+        if not os.path.isabs(sqlite_root):
+            sqlite_root = os.path.join(home, sqlite_root)
+        sqlite_root = os.path.realpath(sqlite_root)
+    else:
+        return None
+    try:
+        candidates = [
+            (int(match.group(1)), os.path.join(sqlite_root, entry.name))
+            for entry in os.scandir(sqlite_root)
+            if entry.is_file(follow_symlinks=False)
+            and (match := _STATE_DB.fullmatch(entry.name)) is not None
+        ]
+    except OSError:
+        return None
+    if not candidates:
+        return None
+    db_path = max(candidates, key=lambda item: item[0])[1]
+    try:
+        uri = f"{Path(db_path).resolve().as_uri()}?mode=ro"
+        with sqlite3.connect(uri, uri=True, timeout=1.0) as connection:
+            row = connection.execute(
+                "SELECT 1 FROM threads WHERE id=? LIMIT 1", (session_id,)
+            ).fetchone()
+    except (OSError, sqlite3.Error):
+        return None
+    return row is not None
 
 
 def codex_model(

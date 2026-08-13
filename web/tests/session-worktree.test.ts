@@ -8,6 +8,8 @@ import {
 } from "../src/protocol.ts";
 import {
   canForkTurn,
+  FORK_FOCUS_REFRESH_MS,
+  forkFocusLeaseSession,
   isSessionMigrationBlockedByState,
   isTerminalSessionMigrationError,
   isWorktreeForkNameValid,
@@ -19,6 +21,7 @@ import {
   normalizeWorktreeForkName,
   reconcileOpenMigrationSession,
   sessionMenuCapabilities,
+  withoutForkFocusPlaceholder,
   WORKTREE_FORK_NAME_MAX,
 } from "../src/session-worktree.ts";
 
@@ -119,6 +122,64 @@ assert.equal(matchesSessionMigrationRequest(
   pendingMigration, "migration-1", "codex-other"), false);
 assert.equal(matchesSessionMigrationRequest(
   null, "migration-1", "codex-parent"), false);
+
+const focusLease = {
+  requestId: "fork-request",
+  parentSessionId: "codex-parent",
+  childSessionId: "codex-child",
+  engine: "codex" as const,
+  space: "code" as const,
+  machineId: "machine-1",
+  cwd: "/repo",
+  gitBranch: "feature/fork",
+  codexProfileId: "primary",
+  refreshAt: 1_000 + FORK_FOCUS_REFRESH_MS,
+};
+assert.deepEqual(
+  forkFocusLeaseSession(
+    focusLease, [codex], "machine-1", "codex", "code"),
+  {
+    session_id: "codex-child",
+    summary: "派生会话",
+    cwd: "/repo",
+    git_branch: "feature/fork",
+    engine: "codex",
+    space: "code",
+    forked_from_id: "codex-parent",
+    codex_profile_id: "primary",
+    state: "idle",
+    provisional_fork: true,
+  },
+  "a transient empty catalog keeps the exact fork child visible",
+);
+assert.equal(forkFocusLeaseSession(
+  focusLease, [{ session_id: "codex-child" }],
+  "machine-1", "codex", "code"), null,
+  "the authoritative child row releases the placeholder lease",
+);
+assert.equal(forkFocusLeaseSession(
+  focusLease, [codex], "machine-2", "codex", "code"), null);
+assert.equal(forkFocusLeaseSession(
+  focusLease, [codex], "machine-1", "claude", "code"), null);
+assert.equal(forkFocusLeaseSession(
+  focusLease, [codex], "machine-1", "codex", "work"), null);
+assert.deepEqual(withoutForkFocusPlaceholder(
+  [forkFocusLeaseSession(
+    focusLease, [codex], "machine-1", "codex", "code",
+  )!, codex],
+  focusLease,
+), [codex], "clearing the refresh lease removes only its exact provisional row");
+assert.deepEqual(withoutForkFocusPlaceholder(
+  [{
+    ...focusLease,
+    session_id: focusLease.childSessionId,
+    summary: "authoritative child",
+    engine: focusLease.engine,
+    space: focusLease.space,
+  }, codex] as SessionInfo[],
+  { ...focusLease, parentSessionId: "another-parent" },
+).map((session) => session.session_id), [focusLease.childSessionId, "codex-parent"],
+"a mismatched lease cannot remove an authoritative child");
 const openMigration = {
   ...codex,
   cwd: "/repo/original",

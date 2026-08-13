@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 
+from cc_remote.codex_profiles import CodexProfileRegistry
 from cc_remote.protocol import (
     AcknowledgeCompletion,
     CommandAck,
@@ -27,6 +29,22 @@ def _success(turn_id: str) -> TurnEnd:
             subtype="success", duration_ms=10, is_error=False
         ),
     )
+
+
+def _install_two_codex_profiles(machine) -> None:
+    state = machine.cfg.state_dir
+    machine._codex_profiles = CodexProfileRegistry.from_json(json.dumps({
+        "primary": {
+            "label": "Primary",
+            "home": str(state / "primary-home"),
+            "default": True,
+        },
+        "secondary": {
+            "label": "Secondary",
+            "home": str(state / "secondary-home"),
+        },
+    }))
+    machine._codex_profiles_explicit = True
 
 
 def test_presentation_protocol_round_trips_exact_receipt_ids():
@@ -180,7 +198,7 @@ def test_cold_session_completion_can_be_acknowledged_without_resume():
     async def run():
         machine, transport = _mk_machine()
         machine._session_presentation.mark_completion(
-            "cold-session", "turn-1"
+            "claude", "cold-session", "turn-1"
         )
 
         await machine._process_command(AcknowledgeCompletion(
@@ -206,11 +224,13 @@ def test_cold_session_completion_can_be_acknowledged_without_resume():
 def test_cold_session_catalog_carries_durable_completion_receipts(monkeypatch):
     async def run():
         machine, _ = _mk_machine()
-        machine._session_presentation.mark_completion("cold-seen", "turn-1")
+        machine._session_presentation.mark_completion(
+            "codex", "cold-seen", "turn-1")
         machine._session_presentation.acknowledge_completion(
-            "cold-seen", "turn-1"
+            "codex", "cold-seen", "turn-1"
         )
-        machine._session_presentation.mark_completion("cold-unread", "turn-2")
+        machine._session_presentation.mark_completion(
+            "codex", "cold-unread", "turn-2")
         monkeypatch.setattr(
             machine, "_prime_codex_sidebar_watches", lambda _raw: None
         )
@@ -242,6 +262,176 @@ def test_cold_session_catalog_carries_durable_completion_receipts(monkeypatch):
         assert unread.completion_id == "turn-2"
         assert unread.completion_unread is True
         assert unread.completion_revision == 1
+
+    asyncio.run(run())
+
+
+def test_codex_catalog_claims_only_unambiguous_v1_receipt(
+    monkeypatch,
+):
+    async def run():
+        machine, _ = _mk_machine()
+        path = machine._session_presentation.path
+        path.write_text(json.dumps({
+            "version": 1,
+            "sessions": {
+                "legacy-native": {
+                    "completion_id": "legacy-turn",
+                    "completion_unread": True,
+                    "completion_revision": 1,
+                    "dismissed_goal_id": None,
+                    "updated_at": 1,
+                },
+            },
+        }), encoding="utf-8")
+        machine._session_presentation = type(
+            machine._session_presentation)(path.parent)
+        _install_two_codex_profiles(machine)
+        monkeypatch.setattr(
+            "cc_remote.wrapper.machine.transcript_presence",
+            lambda _sid: False,
+        )
+        monkeypatch.setattr(
+            "cc_remote.wrapper.machine.codex_session_presence",
+            lambda _sid, **kwargs: str(
+                kwargs.get("codex_home", "")
+            ).endswith("secondary-home"),
+        )
+        monkeypatch.setattr(
+            machine, "_prime_codex_sidebar_watches", lambda _raw: None)
+
+        event = await machine._send_codex_session_list(
+            SimpleNamespace(
+                space="code", client_id="phone", cmd_id="legacy-list"
+            ),
+            [{
+                "session_id": "secondary@legacy-native",
+                "native_session_id": "legacy-native",
+                "codex_profile_id": "secondary",
+                "codex_profile_label": "Secondary",
+                "summary": "legacy",
+                "cwd": "/repo",
+                "status": "idle",
+            }],
+        )
+
+        assert event.sessions[0].completion_id == "legacy-turn"
+        assert machine._session_presentation.legacy_ids() == frozenset()
+        assert machine._session_presentation.get(
+            "codex", "secondary@legacy-native"
+        ).completion_id == "legacy-turn"
+
+    asyncio.run(run())
+
+
+def test_codex_catalog_keeps_v1_receipt_quarantined_when_claude_is_unknown(
+    monkeypatch,
+):
+    async def run():
+        machine, _ = _mk_machine()
+        path = machine._session_presentation.path
+        path.write_text(json.dumps({
+            "version": 1,
+            "sessions": {
+                "legacy-native": {
+                    "completion_id": "legacy-turn",
+                    "completion_unread": True,
+                    "completion_revision": 1,
+                    "dismissed_goal_id": None,
+                    "updated_at": 1,
+                },
+            },
+        }), encoding="utf-8")
+        machine._session_presentation = type(
+            machine._session_presentation)(path.parent)
+        _install_two_codex_profiles(machine)
+        monkeypatch.setattr(
+            "cc_remote.wrapper.machine.transcript_presence",
+            lambda _sid: None,
+        )
+        monkeypatch.setattr(
+            "cc_remote.wrapper.machine.codex_session_presence",
+            lambda _sid, **kwargs: str(
+                kwargs.get("codex_home", "")
+            ).endswith("secondary-home"),
+        )
+        monkeypatch.setattr(
+            machine, "_prime_codex_sidebar_watches", lambda _raw: None)
+
+        event = await machine._send_codex_session_list(
+            SimpleNamespace(
+                space="code", client_id="phone", cmd_id="unknown-list"
+            ),
+            [{
+                "session_id": "secondary@legacy-native",
+                "native_session_id": "legacy-native",
+                "codex_profile_id": "secondary",
+                "codex_profile_label": "Secondary",
+                "summary": "legacy",
+                "cwd": "/repo",
+                "status": "idle",
+            }],
+        )
+
+        assert event.sessions[0].completion_id is None
+        assert machine._session_presentation.legacy_ids() == frozenset({
+            "legacy-native",
+        })
+
+    asyncio.run(run())
+
+
+def test_codex_catalog_keeps_v1_receipt_quarantined_for_duplicate_profiles(
+    monkeypatch,
+):
+    async def run():
+        machine, _ = _mk_machine()
+        path = machine._session_presentation.path
+        path.write_text(json.dumps({
+            "version": 1,
+            "sessions": {
+                "legacy-native": {
+                    "completion_id": "legacy-turn",
+                    "completion_unread": True,
+                    "completion_revision": 1,
+                    "dismissed_goal_id": None,
+                    "updated_at": 1,
+                },
+            },
+        }), encoding="utf-8")
+        machine._session_presentation = type(
+            machine._session_presentation)(path.parent)
+        _install_two_codex_profiles(machine)
+        monkeypatch.setattr(
+            "cc_remote.wrapper.machine.transcript_presence",
+            lambda _sid: False,
+        )
+        monkeypatch.setattr(
+            "cc_remote.wrapper.machine.codex_session_presence",
+            lambda _sid, **_kwargs: True,
+        )
+        profiles = list(machine._codex_profiles)
+        monkeypatch.setattr(
+            machine, "_prime_codex_sidebar_watches", lambda _raw: None)
+
+        await machine._send_codex_session_list(
+            SimpleNamespace(
+                space="code", client_id="phone", cmd_id="duplicate-list"
+            ),
+            [{
+                "session_id": "legacy-native",
+                "native_session_id": "legacy-native",
+                "codex_profile_id": profiles[0].id,
+                "codex_profile_label": profiles[0].label,
+                "summary": "legacy",
+                "cwd": "/repo",
+                "status": "idle",
+            }],
+        )
+
+        assert machine._session_presentation.legacy_ids() == frozenset({
+            "legacy-native",
+        })
 
     asyncio.run(run())
 
@@ -350,13 +540,13 @@ def test_profiled_codex_receipts_use_the_routed_session_id():
         machine.sessions[ctx.key] = ctx
 
         await machine._emit(ctx, _success("turn-profiled"))
-        assert machine._session_presentation_fields(wire_sid) == {
+        assert machine._session_presentation_fields("codex", wire_sid) == {
             "completion_id": "turn-profiled",
             "completion_unread": True,
             "completion_revision": 1,
         }
         assert machine._session_presentation.get(
-            "native-session"
+            "codex", "native-session"
         ).completion_revision == 0
 
         await machine._handle_acknowledge_completion(
@@ -368,7 +558,7 @@ def test_profiled_codex_receipts_use_the_routed_session_id():
             )
         )
         assert machine._session_presentation.get(
-            wire_sid
+            "codex", wire_sid
         ).completion_unread is False
 
         initial = await machine._handle_get_goal(GetGoal(
@@ -384,10 +574,10 @@ def test_profiled_codex_receipts_use_the_routed_session_id():
         ))
         assert dismissed.dismissed is True
         assert machine._session_presentation.get(
-            wire_sid
+            "codex", wire_sid
         ).dismissed_goal_id == initial.goal_id
         assert machine._session_presentation.get(
-            "native-session"
+            "codex", "native-session"
         ).dismissed_goal_id is None
         assert all(
             message.sid == wire_sid

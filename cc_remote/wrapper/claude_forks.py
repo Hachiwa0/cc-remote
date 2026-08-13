@@ -42,7 +42,9 @@ _MAX_CWD_BYTES = 4096
 _MAX_ERROR_CHARS = 512
 _STATUSES = {
     "intent", "alias", "submitted", "uncertain", "complete", "rejected",
+    "delete_pending", "deleted",
 }
+_CHILD_STATUSES = {"complete", "delete_pending", "deleted"}
 _IDENTITY_FIELDS = ("parent_session_id", "cutoff_message_id", "cwd")
 _ALLOWED_ENTRY_FIELDS = {
     *_IDENTITY_FIELDS,
@@ -157,9 +159,11 @@ class ClaudeForkJournal:
         if status_value != "alias" and canonical_id is not None:
             # Resolved aliases keep canonical_request_id, so only unresolved
             # non-alias roots are forbidden here.
-            if status_value not in {"complete", "rejected"}:
+            if status_value not in {
+                "complete", "delete_pending", "deleted", "rejected",
+            }:
                 raise ValueError("invalid Claude fork alias status")
-        if status_value == "complete":
+        if status_value in _CHILD_STATUSES:
             _safe_id(entry.get("session_id"), "forked session id")
         elif entry.get("session_id") is not None:
             raise ValueError("unresolved Claude fork has a child session id")
@@ -216,11 +220,13 @@ class ClaudeForkJournal:
             compatible = {
                 "alias": {"intent", "submitted", "uncertain"},
                 "complete": {"complete"},
+                "delete_pending": {"delete_pending"},
+                "deleted": {"deleted"},
                 "rejected": {"rejected"},
             }
             if canonical.get("status") not in compatible.get(entry.get("status"), set()):
                 raise ValueError("Claude fork alias and root states differ")
-            if (entry.get("status") == "complete"
+            if (entry.get("status") in _CHILD_STATUSES
                     and entry.get("session_id") != canonical.get("session_id")):
                 raise ValueError("Claude fork aliases have different children")
             if (entry.get("status") == "rejected"
@@ -316,6 +322,9 @@ class ClaudeForkJournal:
                 if candidate.get("marker") == marker
             ]
             statuses = {candidate.get("status") for _, candidate in group}
+            # Deleted children are durable replay tombstones.  Compacting one
+            # could resurrect a cached SessionForked event after restart, so a
+            # journal full of tombstones must fail closed.
             if statuses == {"complete"}:
                 children = {candidate.get("session_id") for _, candidate in group}
                 if len(children) == 1:
@@ -345,6 +354,93 @@ class ClaudeForkJournal:
                 raise ClaudeForkJournalError(
                     "canonical fork intent is missing")
             return dict(canonical)
+
+    def child_entry(self, session_id: str) -> Optional[dict[str, Any]]:
+        """Return the strongest durable lifecycle record for one fork child."""
+        session_id = _safe_id(session_id, "forked session id")
+        rank = {"complete": 1, "delete_pending": 2, "deleted": 3}
+        with self._lock:
+            candidates = [
+                value for value in self.entries.values()
+                if value.get("session_id") == session_id
+                and value.get("status") in rank
+            ]
+            if not candidates:
+                return None
+            return dict(max(candidates, key=lambda value: rank[value["status"]]))
+
+    def begin_delete(self, session_id: str) -> Optional[str]:
+        """Persist deletion intent before the native child is touched."""
+        session_id = _safe_id(session_id, "forked session id")
+        with self._lock:
+            matches = [
+                (key, value) for key, value in self.entries.items()
+                if value.get("session_id") == session_id
+                and value.get("status") in _CHILD_STATUSES
+            ]
+            if not matches:
+                return None
+            target = "deleted" if any(
+                value.get("status") == "deleted" for _, value in matches
+            ) else "delete_pending"
+            updated = OrderedDict(self.entries)
+            changed = False
+            for key, value in matches:
+                if value.get("status") == target:
+                    continue
+                pending = dict(value)
+                pending["status"] = target
+                updated[key] = pending
+                changed = True
+            if changed:
+                self._persist(updated)
+                self.entries = updated
+            return target
+
+    def finish_delete(self, session_id: str) -> bool:
+        """Turn every pending reference to a child into a replay tombstone."""
+        session_id = _safe_id(session_id, "forked session id")
+        with self._lock:
+            matches = [
+                (key, value) for key, value in self.entries.items()
+                if value.get("session_id") == session_id
+                and value.get("status") in {"delete_pending", "deleted"}
+            ]
+            if not matches:
+                return False
+            updated = OrderedDict(self.entries)
+            changed = False
+            for key, value in matches:
+                if value.get("status") == "deleted":
+                    continue
+                deleted = dict(value)
+                deleted["status"] = "deleted"
+                updated[key] = deleted
+                changed = True
+            if changed:
+                self._persist(updated)
+                self.entries = updated
+            return True
+
+    def abort_delete(self, session_id: str) -> bool:
+        """Restore a child after a proven native deletion failure."""
+        session_id = _safe_id(session_id, "forked session id")
+        with self._lock:
+            matches = [
+                (key, value) for key, value in self.entries.items()
+                if value.get("session_id") == session_id
+                and value.get("status") == "delete_pending"
+            ]
+            if not matches:
+                return False
+            updated = OrderedDict(self.entries)
+            for key, value in matches:
+                restored = dict(value)
+                restored["status"] = "complete"
+                updated[key] = restored
+            self._persist(updated)
+            self.entries = updated
+            return True
 
     def claim_submission(self, request_id: str) -> bool:
         """Persist the at-most-once boundary; only one alias may return true."""
@@ -402,6 +498,11 @@ class ClaudeForkJournal:
                 raise ClaudeForkJournalError("rejected fork request cannot complete")
             if status_value == "intent":
                 raise ClaudeForkJournalError("fork submission was not claimed")
+            if status_value in {"delete_pending", "deleted"}:
+                if canonical.get("session_id") != session_id:
+                    raise ClaudeForkJournalError(
+                        "deleted fork request resolved to another child session")
+                return dict(self.entries[request_id])
             if (status_value == "complete"
                     and canonical.get("session_id") != session_id):
                 raise ClaudeForkJournalError(
@@ -426,7 +527,7 @@ class ClaudeForkJournal:
         bounded = str(message or "Claude SDK rejected the fork")[:_MAX_ERROR_CHARS]
         with self._lock:
             _, canonical = self._canonical(request_id)
-            if canonical.get("status") == "complete":
+            if canonical.get("status") in _CHILD_STATUSES:
                 raise ClaudeForkJournalError("completed fork request cannot reject")
             updated = OrderedDict(self.entries)
             marker = canonical["marker"]

@@ -72,6 +72,7 @@ from cc_remote.wrapper.work_prompt import (
     WORK_BASE_INSTRUCTIONS,
     WORK_DEVELOPER_INSTRUCTIONS,
 )
+from cc_remote.wrapper.work_context import recover_codex_context_usage
 
 log = logger("cc_remote.wrapper.codex_handle")
 
@@ -79,6 +80,7 @@ _REQ_TIMEOUT = 60.0
 _APPROVAL_TIMEOUT = 5 * 60.0
 _MAX_SERVER_REQUEST_TASKS = 32
 _THREAD_SETTINGS_NOTIFY_TIMEOUT = 1.0
+_CONFIGURED_DEFAULT_EFFORT_CACHE_SECONDS = 30.0
 _OWNED_TURN_IDS_MAX = 512
 _STATUS_RATE_LIMIT_MAX = 16
 _STATUS_USAGE_BUCKET_SCAN_MAX = 4096
@@ -1342,6 +1344,7 @@ class CodexHandle:
         self._reader: Optional[asyncio.Task] = None
         self._stderr_task: Optional[asyncio.Task] = None
         self._thread_settings_updated = asyncio.Event()
+        self._thread_settings_revision = 0
         # Human approval can take minutes.  It must not block the sole stdout
         # reader, which still has to consume turn/interrupt and other RPC replies.
         # Keep detached request handlers generation-owned and cancel them on
@@ -1379,6 +1382,7 @@ class CodexHandle:
         self._http_provider_repair_stop = asyncio.Event()
         self.last_token_usage: Optional[dict] = None
         self.context_window: Optional[int] = None
+        self._rollout_context_recovery_attempted = False
         self.app_server_version: Optional[str] = None
         self.last_thread_status: Optional[dict] = None
         self.last_rate_limits: Optional[dict] = None
@@ -1422,6 +1426,32 @@ class CodexHandle:
             else codex_effort(codex_home=self.codex_home)
         )         # low | medium | high | xhigh
         self.applied_effort = self.effort                   # keep machine's spawn-time check a no-op
+        # UI projection may be ``model-default`` when app-server reports a null
+        # thread override and its effective config has no explicit fallback.
+        # Query must continue to use only ``effort``; never send that display
+        # sentinel to turn/start.
+        self.display_effort: Optional[str] = self.effort
+        self.display_effort_model: Optional[str] = (
+            self.model if self.display_effort else None
+        )
+        self.display_effort_cwd: Optional[str] = (
+            os.path.realpath(self._cwd)
+            if self.display_effort and isinstance(self._cwd, str) and self._cwd
+            else None
+        )
+        self.display_effort_generation: Optional[int] = (
+            self._generation if self.display_effort else None
+        )
+        self._display_effort_retry_at: Optional[float] = None
+        # A null thread override falls through to app-server's effective config
+        # before the selected model's catalog default. Cache that read per cwd
+        # and app-server generation; it is presentation state only and must not
+        # become a turn/start override.
+        self._configured_default_effort: Optional[str] = None
+        self._configured_default_effort_cwd: Optional[str] = None
+        self._configured_default_effort_generation: Optional[int] = None
+        self._configured_default_effort_read_at: Optional[float] = None
+        self._configured_default_effort_known = False
         # Work is governed by its per-process named permission profile. It must
         # never fall back to interactive escalation outside that profile, even
         # when a resumed native thread persisted a Code-time approval policy.
@@ -1672,6 +1702,26 @@ class CodexHandle:
         self._discard_managed_compaction_continuation()
         self.last_token_usage = None
         self.context_window = None
+        self._rollout_context_recovery_attempted = False
+        self._configured_default_effort = None
+        self._configured_default_effort_cwd = None
+        self._configured_default_effort_generation = None
+        self._configured_default_effort_read_at = None
+        self._configured_default_effort_known = False
+        if self.effort:
+            self.display_effort = self.effort
+            self.display_effort_model = self.model
+            self.display_effort_cwd = (
+                os.path.realpath(self._cwd)
+                if isinstance(self._cwd, str) and self._cwd else None
+            )
+            self.display_effort_generation = self._generation
+        else:
+            self.display_effort = None
+            self.display_effort_model = None
+            self.display_effort_cwd = None
+            self.display_effort_generation = None
+        self._display_effort_retry_at = None
         self._stderr_task = asyncio.create_task(
             self._drain_stderr(proc, generation))
         try:
@@ -1844,6 +1894,7 @@ class CodexHandle:
                 )
                 self._work_config = _work_thread_config(
                     skills_response, config_response)
+                self._remember_configured_default_effort(config_response)
 
             if fork and resume_id:
                 # ephemeral /btw fork: inherits resume_id's context into a throwaway
@@ -3516,6 +3567,7 @@ class CodexHandle:
         Granular approval objects are preserved in ``approval_policy`` while the
         current UI receives their lossless-compatible ``on-request`` projection.
         """
+        self._thread_settings_revision += 1
         cwd = settings.get("cwd")
         if (isinstance(cwd, str) and os.path.isabs(cwd)
                 and 0 < len(cwd) <= 4096):
@@ -3531,9 +3583,22 @@ class CodexHandle:
             if effort is None:
                 self.effort = None
                 self.applied_effort = None
+                self.display_effort = None
+                self.display_effort_model = None
+                self.display_effort_cwd = None
+                self.display_effort_generation = None
+                self._display_effort_retry_at = None
             elif isinstance(effort, str) and effort:
                 self.effort = effort[:64]
                 self.applied_effort = self.effort
+                self.display_effort = self.effort
+                self.display_effort_model = self.model
+                self.display_effort_cwd = (
+                    os.path.realpath(self._cwd)
+                    if isinstance(self._cwd, str) and self._cwd else None
+                )
+                self.display_effort_generation = self._generation
+                self._display_effort_retry_at = None
 
         approval = settings.get("approvalPolicy")
         if self.work_mode:
@@ -3582,6 +3647,60 @@ class CodexHandle:
         elif active_key in settings:
             self.permission_profile = None
 
+    def _remember_configured_default_effort(
+        self,
+        response: object,
+        *,
+        cwd: Optional[str] = None,
+        generation: Optional[int] = None,
+    ) -> Optional[str]:
+        if not isinstance(response, dict):
+            raise RuntimeError("codex config/read returned an invalid response")
+        config = response.get("config")
+        if not isinstance(config, dict):
+            raise RuntimeError("codex config/read returned an invalid response")
+        raw = config.get("model_reasoning_effort")
+        if raw is not None and (
+            not isinstance(raw, str) or not raw or len(raw) > 64
+        ):
+            raise RuntimeError(
+                "codex config/read returned an invalid reasoning effort")
+        resolved_cwd = os.path.realpath(cwd or self._cwd)
+        resolved_generation = (
+            self._generation if generation is None else generation)
+        # config/read is asynchronous. A cwd migration or reconnect may finish
+        # while the old request is in flight; never label that old response as
+        # belonging to the new scope. The caller separately revalidates before
+        # using the returned value as a display projection.
+        if (os.path.realpath(self._cwd) == resolved_cwd
+                and self._generation == resolved_generation):
+            self._configured_default_effort = raw
+            self._configured_default_effort_cwd = resolved_cwd
+            self._configured_default_effort_generation = resolved_generation
+            self._configured_default_effort_read_at = time.monotonic()
+            self._configured_default_effort_known = True
+        return raw
+
+    async def configured_default_effort(self) -> Optional[str]:
+        """Read the effective config fallback for a null thread override."""
+        cwd = os.path.realpath(self._cwd)
+        generation = self._generation
+        if (
+            self._configured_default_effort_known
+            and self._configured_default_effort_cwd == cwd
+            and self._configured_default_effort_generation == generation
+            and self._configured_default_effort_read_at is not None
+            and time.monotonic() - self._configured_default_effort_read_at
+                < _CONFIGURED_DEFAULT_EFFORT_CACHE_SECONDS
+        ):
+            return self._configured_default_effort
+        response = await self._request("config/read", {
+            "cwd": cwd,
+            "includeLayers": False,
+        })
+        return self._remember_configured_default_effort(
+            response, cwd=cwd, generation=generation)
+
     async def set_model(self, model: str) -> None:
         if not isinstance(model, str) or not model:
             raise ValueError("Codex model must be non-empty")
@@ -3623,7 +3742,7 @@ class CodexHandle:
         )
         return effective
 
-    async def set_effort(self, effort: str) -> None:
+    async def set_effort(self, effort: str) -> bool:
         if not isinstance(effort, str) or not effort:
             raise ValueError("Codex effort must be non-empty")
         authoritative = await self._update_thread_settings(
@@ -3631,8 +3750,17 @@ class CodexHandle:
         if not authoritative:
             self.effort = effort
             self.applied_effort = effort
+            self.display_effort = effort
+            self.display_effort_model = self.model
+            self.display_effort_cwd = (
+                os.path.realpath(self._cwd)
+                if isinstance(self._cwd, str) and self._cwd else None
+            )
+            self.display_effort_generation = self._generation
+            self._display_effort_retry_at = None
         log.info("codex thread effort set", requested=effort,
                  applied=self.effort)
+        return authoritative
 
     async def set_service_tier(self, tier: Optional[str]) -> None:
         normalized = tier if tier and tier != "default" else None
@@ -4261,14 +4389,48 @@ class CodexHandle:
         # recent turn's full token count ≈ current context depth (what the codex TUI
         # gauges); `total` is the cumulative session sum (over-counts context). Use
         # `last` for the "context full?" reading, falling back to `total`.
+        if (self.work_mode and self.thread_id and self.last_token_usage is None
+                and not self._rollout_context_recovery_attempted):
+            recovery_thread_id = self.thread_id
+            recovery_generation = self._generation
+            self._rollout_context_recovery_attempted = True
+            recovered = await asyncio.to_thread(
+                recover_codex_context_usage,
+                recovery_thread_id,
+                codex_home=self.codex_home,
+            )
+            # The stdout reader may have installed a live notification while
+            # the bounded file read was in flight. A reconnect/resume can also
+            # replace the handle's thread; never install that old file sample
+            # into a new app-server generation or native session.
+            if (self.last_token_usage is None
+                    and self.thread_id == recovery_thread_id
+                    and self._generation == recovery_generation
+                    and isinstance(recovered, dict)):
+                self.last_token_usage = recovered
+                window = recovered.get("modelContextWindow")
+                if isinstance(window, int) and not isinstance(window, bool):
+                    self.context_window = window
+            elif (self.last_token_usage is None
+                    and self.thread_id == recovery_thread_id
+                    and self._generation == recovery_generation):
+                # Missing/replaced/truncated rollouts are transient while Codex
+                # is flushing or rotating the file. Let a later explicit
+                # context read retry; a successful recovery or live
+                # tokenUsage notification still permanently ends cold reads
+                # for this process generation.
+                self._rollout_context_recovery_attempted = False
         u = self.last_token_usage if isinstance(self.last_token_usage, dict) else {}
         last = u.get("last") if isinstance(u.get("last"), dict) else {}
         total = u.get("total") if isinstance(u.get("total"), dict) else {}
-        used = last.get("totalTokens")
+        used = _nonnegative_int(last.get("totalTokens"))
         if used is None:
-            used = total.get("totalTokens")
+            used = _nonnegative_int(total.get("totalTokens"))
         # server value (captured in _dispatch) wins; else the config-declared window.
-        win = self.context_window or u.get("modelContextWindow") or (
+        win = _nonnegative_int(self.context_window)
+        if not win:
+            win = _nonnegative_int(u.get("modelContextWindow"))
+        win = win or (
             codex_context_window() if self.codex_home is None
             else codex_context_window(codex_home=self.codex_home)
         )
@@ -6126,7 +6288,8 @@ def _runtime_event_key(event: RuntimeEvent) -> str:
 
 
 def _nonnegative_int(value: Any) -> Optional[int]:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+    if (isinstance(value, bool) or not isinstance(value, int) or value < 0
+            or value > MAX_SAFE_WIRE_INTEGER):
         return None
     return value
 

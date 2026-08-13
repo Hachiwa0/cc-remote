@@ -13,6 +13,7 @@ from cc_remote.wrapper.session_ctx import SessionContext
 from cc_remote.wrapper.ringbuffer import RingBuffer
 from cc_remote.wrapper.work_context import (
     initial_work_context_baseline,
+    recover_codex_context_usage,
     recover_work_context_baseline,
     work_context_metrics,
 )
@@ -123,6 +124,187 @@ def test_codex_work_baseline_uses_the_default_profile_home(
         codex_home=str(tmp_path / "profile-home"),
     ) == 321
     assert homes == [str(tmp_path / "profile-home")]
+
+
+def test_codex_context_usage_recovers_newest_bounded_profile_tail(
+    tmp_path: Path, monkeypatch,
+):
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_bytes(
+        b"x" * (4 * 1024 * 1024) + b"\n"
+        b'{"type":"event_msg","payload":{"type":"token_count","info":{'
+        b'"last_token_usage":{"total_tokens":103658,"input_tokens":103000},'
+        b'"model_context_window":258400}}}\n'
+        b'{"type":"event_msg","payload":{"type":"token_count","info":{'
+        b'"last_token_usage":{"total_tokens":104321,"input_tokens":103500},'
+        b'"model_context_window":258400}}}\n'
+    )
+    calls = []
+
+    def path(session_id, *, codex_home=None):
+        calls.append((session_id, codex_home))
+        return str(rollout)
+
+    monkeypatch.setattr(work_context_module, "codex_rollout_path", path)
+    usage = recover_codex_context_usage(
+        "native-session", codex_home=str(tmp_path / "profile"))
+    assert usage == {
+        "last": {"totalTokens": 104321, "inputTokens": 103500},
+        "modelContextWindow": 258400,
+    }
+    assert calls == [("native-session", str(tmp_path / "profile"))]
+
+
+def test_codex_context_usage_keeps_complete_record_at_tail_boundary(
+    tmp_path: Path, monkeypatch,
+):
+    rollout = tmp_path / "rollout.jsonl"
+    record = (
+        b'{"type":"event_msg","payload":{"type":"token_count","info":{'
+        b'"last_token_usage":{"total_tokens":777},'
+        b'"model_context_window":1000}}}\n'
+    )
+    rollout.write_bytes(
+        b"x" * (work_context_module._CONTEXT_TAIL_SCAN_BYTES - len(record) - 1)
+        + b"\n" + record
+    )
+    monkeypatch.setattr(
+        work_context_module, "codex_rollout_path",
+        lambda *_args, **_kwargs: str(rollout))
+
+    assert recover_codex_context_usage("native-session") == {
+        "last": {"totalTokens": 777},
+        "modelContextWindow": 1000,
+    }
+
+
+def test_codex_context_usage_recovery_fails_closed(tmp_path: Path, monkeypatch):
+    rollout = tmp_path / "rollout.jsonl"
+    monkeypatch.setattr(
+        work_context_module, "codex_rollout_path", lambda *_args, **_kwargs: str(rollout))
+
+    for record in (
+        b'["valid json, but not a rollout object"]\n',
+        b'{"type":"event_msg","payload":{"type":"token_count","info":{'
+        b'"last_token_usage":{"total_tokens":true},'
+        b'"model_context_window":258400}}}\n',
+        b'{"type":"event_msg","payload":{"type":"token_count","info":{'
+        b'"last_token_usage":{"total_tokens":123},'
+        b'"model_context_window":-1}}}\n',
+        b'{"type":"event_msg","payload":{"type":"token_count","info":{'
+        b'"last_token_usage":{"total_tokens":123},'
+        b'"model_context_window":9007199254740992}}}\n',
+        b'{broken json}\n',
+    ):
+        rollout.write_bytes(record)
+        assert recover_codex_context_usage("native-session") is None
+
+
+def test_codex_context_usage_ignores_concurrent_append(
+    tmp_path: Path, monkeypatch,
+):
+    rollout = tmp_path / "rollout.jsonl"
+    original = (
+        b'{"type":"event_msg","payload":{"type":"token_count","info":{'
+        b'"last_token_usage":{"total_tokens":321},'
+        b'"model_context_window":1000}}}\n'
+    )
+    appended = (
+        b'{"type":"event_msg","payload":{"type":"token_count","info":{'
+        b'"last_token_usage":{"total_tokens":654},'
+        b'"model_context_window":1000}}}\n'
+    )
+    rollout.write_bytes(original)
+    real_open = open
+
+    class AppendingReader:
+        def __init__(self, stream):
+            self._stream = stream
+            self._appended = False
+
+        def __enter__(self):
+            self._stream.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._stream.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self._stream, name)
+
+        def read(self, size=-1):
+            data = self._stream.read(size)
+            if not self._appended:
+                self._appended = True
+                with real_open(rollout, "ab") as writer:
+                    writer.write(appended)
+            return data
+
+    def growing_open(path, mode="r", *args, **kwargs):
+        stream = real_open(path, mode, *args, **kwargs)
+        return AppendingReader(stream) if mode == "rb" else stream
+
+    monkeypatch.setattr(work_context_module, "open", growing_open, raising=False)
+    monkeypatch.setattr(
+        work_context_module, "codex_rollout_path",
+        lambda *_args, **_kwargs: str(rollout))
+
+    assert recover_codex_context_usage("native-session") == {
+        "last": {"totalTokens": 321},
+        "modelContextWindow": 1000,
+    }
+
+
+def test_codex_context_usage_rejects_concurrent_path_replacement(
+    tmp_path: Path, monkeypatch,
+):
+    rollout = tmp_path / "rollout.jsonl"
+    replacement = tmp_path / "replacement.jsonl"
+    original = (
+        b'{"type":"event_msg","payload":{"type":"token_count","info":{'
+        b'"last_token_usage":{"total_tokens":321},'
+        b'"model_context_window":1000}}}\n'
+    )
+    replacement.write_bytes(
+        b'{"type":"event_msg","payload":{"type":"token_count","info":{'
+        b'"last_token_usage":{"total_tokens":654},'
+        b'"model_context_window":1000}}}\n'
+    )
+    rollout.write_bytes(original)
+    real_open = open
+
+    class ReplacingReader:
+        def __init__(self, stream):
+            self._stream = stream
+            self._replaced = False
+
+        def __enter__(self):
+            self._stream.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._stream.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self._stream, name)
+
+        def read(self, size=-1):
+            data = self._stream.read(size)
+            if not self._replaced:
+                self._replaced = True
+                replacement.replace(rollout)
+            return data
+
+    def replacing_open(path, mode="r", *args, **kwargs):
+        stream = real_open(path, mode, *args, **kwargs)
+        return ReplacingReader(stream) if mode == "rb" else stream
+
+    monkeypatch.setattr(work_context_module, "open", replacing_open, raising=False)
+    monkeypatch.setattr(
+        work_context_module, "codex_rollout_path",
+        lambda *_args, **_kwargs: str(rollout))
+
+    assert recover_codex_context_usage("native-session") is None
 
 
 def test_work_registry_persists_context_baseline_once(tmp_path: Path):

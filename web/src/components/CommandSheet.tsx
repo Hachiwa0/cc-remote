@@ -1,5 +1,5 @@
 import {
-  isCmd, commandsFor, modelsFor, effortsFor, permsFor,
+  isCmd, commandsFor, modelsFor, effortsFor, effortIsSelectable, permsFor,
   permissionProfilesFor,
   type Cmd, type CmdGroup, type Catalog,
 } from "../data";
@@ -163,7 +163,9 @@ export function CommandSheet({
             EFFORTS.map((ef) => (
               <button
                 key={ef.id}
-                className={"cmd" + (ef.id === currentEffort ? " sel" : "")}
+                className={"cmd" + (
+                  effortIsSelectable(currentEffort) && ef.id === currentEffort
+                    ? " sel" : "")}
                 onClick={() => onPickEffort?.(ef.id)}
               >
                 <span className="cmd-ic"><Icon name={ef.ic} size={17} /></span>
@@ -171,7 +173,7 @@ export function CommandSheet({
                   <span className="cmd-nm">{ef.name}</span>
                   <span className="cmd-ds">{ef.ds}</span>
                 </span>
-                {ef.id === currentEffort
+                {effortIsSelectable(currentEffort) && ef.id === currentEffort
                   ? <span className="cmd-check"><Icon name="check" size={19} /></span>
                   : <span className="cmd-kbd" />}
               </button>

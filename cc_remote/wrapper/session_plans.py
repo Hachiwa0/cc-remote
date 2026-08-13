@@ -16,7 +16,7 @@ import re
 import stat
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
 from cc_remote.protocol import TurnPlan
@@ -133,7 +133,39 @@ class SessionPlanStore:
     def __init__(self, state_dir: Path):
         self.path = Path(state_dir) / "session-plans.json"
         self._lock = threading.RLock()
-        self._plans = self._load()
+        self._plans, self._profile_revision = self._load()
+
+    def migrate_profile_sessions(
+        self,
+        transform: Callable[[str], str],
+        *,
+        profile_revision: int,
+    ) -> int:
+        """Atomically translate Codex Plan keys once per topology revision."""
+        if (
+            isinstance(profile_revision, bool)
+            or not isinstance(profile_revision, int)
+            or profile_revision < 1
+        ):
+            raise SessionPlanStoreError("invalid Codex profile revision")
+        with self._lock:
+            if self._profile_revision >= profile_revision:
+                return 0
+            updated: OrderedDict[str, SessionPlanSnapshot] = OrderedDict()
+            migrated = 0
+            for session_id, snapshot in self._plans.items():
+                target = _session_id(transform(session_id))
+                existing = updated.get(target)
+                if existing is not None and existing != snapshot:
+                    raise SessionPlanStoreError(
+                        "Codex Plan profile migration collides")
+                updated[target] = snapshot
+                migrated += target != session_id
+            self._persist_bounded(
+                updated, profile_revision=profile_revision)
+            self._plans = updated
+            self._profile_revision = profile_revision
+            return migrated
 
     def get(self, session_id: str) -> SessionPlanSnapshot | None:
         session_id = _session_id(session_id)
@@ -212,7 +244,9 @@ class SessionPlanStore:
             self._plans = updated
             return True
 
-    def _load(self) -> OrderedDict[str, SessionPlanSnapshot]:
+    def _load(
+        self,
+    ) -> tuple[OrderedDict[str, SessionPlanSnapshot], int]:
         try:
             info = self.path.lstat()
             if not stat.S_ISREG(info.st_mode) or info.st_size > _MAX_FILE_BYTES:
@@ -221,18 +255,31 @@ class SessionPlanStore:
             if len(raw_bytes) > _MAX_FILE_BYTES:
                 raise ValueError("session plan store exceeds size limit")
             raw = json.loads(raw_bytes.decode("utf-8"))
-            if not isinstance(raw, dict) or set(raw) != {"version", "plans"}:
+            if not isinstance(raw, dict) or set(raw) not in (
+                {"version", "plans"},
+                {"version", "profile_revision", "plans"},
+            ):
                 raise ValueError("session plan store has an invalid envelope")
-            if raw.get("version") != 1 or not isinstance(raw.get("plans"), dict):
+            if raw.get("version") not in {1, 2} or not isinstance(
+                raw.get("plans"), dict
+            ):
                 raise ValueError("session plan store version is unsupported")
+            profile_revision = raw.get("profile_revision", 0)
+            if (
+                isinstance(profile_revision, bool)
+                or not isinstance(profile_revision, int)
+                or profile_revision < 0
+                or (raw.get("version") == 1 and profile_revision != 0)
+            ):
+                raise ValueError("session plan profile revision is invalid")
             loaded: OrderedDict[str, SessionPlanSnapshot] = OrderedDict()
             for session_id, value in raw["plans"].items():
                 loaded[_session_id(session_id)] = _snapshot(value)
             if len(loaded) > _MAX_ENTRIES:
                 raise ValueError("session plan store has too many entries")
-            return loaded
+            return loaded, profile_revision
         except FileNotFoundError:
-            return OrderedDict()
+            return OrderedDict(), 0
         except Exception as exc:
             raise SessionPlanStoreError(
                 "session plan store is unreadable") from exc
@@ -240,9 +287,12 @@ class SessionPlanStore:
     @staticmethod
     def _payload(
         plans: OrderedDict[str, SessionPlanSnapshot],
+        *,
+        profile_revision: int,
     ) -> bytes:
         return json.dumps({
-            "version": 1,
+            "version": 2,
+            "profile_revision": profile_revision,
             "plans": {
                 session_id: snapshot.as_dict()
                 for session_id, snapshot in plans.items()
@@ -252,12 +302,19 @@ class SessionPlanStore:
     def _persist_bounded(
         self,
         plans: OrderedDict[str, SessionPlanSnapshot],
+        *,
+        profile_revision: int | None = None,
     ) -> None:
         bounded = OrderedDict(plans)
-        payload = self._payload(bounded)
+        revision = (
+            self._profile_revision
+            if profile_revision is None else profile_revision
+        )
+        payload = self._payload(bounded, profile_revision=revision)
         while len(payload) > _MAX_FILE_BYTES and len(bounded) > 1:
             bounded.popitem(last=False)
-            payload = self._payload(bounded)
+            payload = self._payload(
+                bounded, profile_revision=revision)
         if len(payload) > _MAX_FILE_BYTES:
             raise SessionPlanStoreError("session plan store exceeds size limit")
         # Propagate LRU evictions back to the caller's replacement map.

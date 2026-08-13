@@ -263,6 +263,8 @@ export interface SessionInfo {
   completion_id?: string | null;
   completion_unread?: boolean | null;
   completion_revision?: number | null;
+  /** Browser-only row used while the native fork catalog catches up. */
+  provisional_fork?: boolean;
 }
 export interface ListSessions extends Base { type: "list_sessions"; engine?: Engine; space?: Space }
 export interface SwitchSession extends Base { type: "switch_session"; session_id: string; engine?: Engine; space?: Space }

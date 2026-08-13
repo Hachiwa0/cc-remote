@@ -311,15 +311,12 @@
 .goal-cancel { color:var(--dim); background:var(--raised); }
 .goal-primary { min-width:96px; color:#fff; background:var(--accent); }
 .goal-primary:disabled { opacity:.42; }
-@media (min-width:720px) {
-  .goal-sheet.sheet { left:50%; right:auto; top:calc(var(--app-offset-top,0px) + 16px);
-    bottom:calc(var(--keyboard-inset,0px) + 16px); width:min(560px,calc(100vw - 32px));
-    height:fit-content; max-height:min(740px,calc(var(--app-height,100dvh) - 32px));
-    margin-block:auto; border:1px solid var(--border-strong); border-radius:18px;
-    opacity:0; transform:translateX(-50%) translateY(12px) scale(.985); }
-  .goal-sheet.sheet.show { opacity:1; transform:translateX(-50%) scale(1); }
-  .goal-sheet .sheet-grip { display:none; }
-}
+.goal-sheet.sheet { right:auto; bottom:auto; height:fit-content;
+  border:1px solid var(--border-strong); border-radius:18px; opacity:0;
+  transform:translate(-50%,calc(-50% + 12px)) scale(.985);
+  transition:transform .22s var(--ease),opacity .18s var(--ease); }
+.goal-sheet.sheet.show { opacity:1; transform:translate(-50%,-50%) scale(1); }
+.goal-sheet .sheet-grip { display:none; }
 @media (max-width:700px) {
   .goal-chip-wrap { max-width:calc(100% - 20px); margin-bottom:6px; }
   .goal-chip-objective { max-width:42vw; }

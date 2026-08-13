@@ -21,9 +21,13 @@ import {
   mergeAuthoritativeTurnDetail,
   mergeDetailWithLiveTail,
   mergeInitialHistory,
+  reconcileProvenCompactionOrphans,
   restoreCachedTurnDetails,
   restoreObservedLiveTurnDetails,
 } from "../src/history-merge.ts";
+import {
+  reconcileBoundCompactionOrphan as reconcileCompactionOnlyOrphan,
+} from "../src/compaction-orphans.ts";
 import {
   HISTORY_INITIAL_PAGE,
   HISTORY_MORE_PAGE,
@@ -105,6 +109,8 @@ import {
 import {
   clientSlashesFor,
   commandsFor,
+  effortIsSelectable,
+  effortNameForDisplay,
   isKnownCodeOnlySlash,
   matchCommands,
   matchSkills,
@@ -115,6 +121,29 @@ import {
   permsFor,
   skillToken,
 } from "../src/data.ts";
+
+function testEffortPresentation(): void {
+  assert.equal(
+    effortNameForDisplay("model-default"),
+    "模型默认",
+    "an unresolved official model default must not remain in loading state",
+  );
+  assert.equal(
+    effortNameForDisplay(""),
+    null,
+    "an unseeded effort must retain the loading label instead of painting blank",
+  );
+  assert.equal(
+    effortNameForDisplay("xhigh"),
+    "xhigh",
+    "ordinary effort labels retain the raw CLI/config id contract",
+  );
+  assert.equal(effortIsSelectable("model-default"), false,
+    "the model-default display sentinel is never a selectable effort override");
+  assert.equal(effortIsSelectable("high"), true,
+    "ordinary effort ids remain selectable");
+}
+testEffortPresentation();
 import {
   createMobileViewportSync,
   type MobileViewportBindings,
@@ -1185,6 +1214,9 @@ assert.match(historyAppSource,
   /displayHistoryProjection\(\s*state\.historyRecovery,\s*focusedSid,\s*rt,\s*state\.historyBrowse,\s*state\.retainedHistoryBrowse,\s*\)/,
   "ChatView must select retained recovery, browse, then live runtime without rebuilding rt.turns");
 assert.match(historyAppSource,
+  /<ChatView key=\{`\$\{activeScopeKey\}\\u0000\$\{focusedSid \?\? ""\}`\}/,
+  "session switches must remount ChatView so scroll and disclosure state cannot leak between sessions");
+assert.match(historyAppSource,
   /new HistoryPageCache\(\)/,
   "deep-history pages must use their independent best-effort IndexedDB");
 assert.match(historyAppSource,
@@ -1197,13 +1229,13 @@ assert.match(historyAppSource,
   /return \(\) => \{[\s\S]{0,260}historyRequests\.clear\(\);\s*clearHistoryDetailRequests\(\);/,
   "WebSocket cleanup must release frozen detail loading rows");
 assert.match(historyAppSource,
-  /const browseWaiters\s*=\s*historyRequestsRef\.current\.complete\(msg\)/,
+  /const completedHistory\s*=\s*historyRequestsRef\.current\.complete\(msg\);[\s\S]{0,120}const browseWaiters\s*=\s*completedHistory\.matched/,
   "History.before must consume request-time browse authority instead of current UI state");
 assert.match(historyAppSource,
   /await historyPageCacheRef\.current\.getPage[\s\S]{0,400}acceptsCachedNewerPage\(current, frozen\)/,
   "a deferred cached-newer read must revalidate the current browse authority");
 assert.match(historyAppSource,
-  /if \(msg\.before\)[\s\S]{0,1600}return;/,
+  /if \(msg\.before\) \{[\s\S]{0,2800}History\.before is display-only[\s\S]{0,220}return;/,
   "every History.before path must terminate before the generic live reducer");
 assert.match(historyAppSource,
   /browseMode=\{historyView\.browsing\}/);
@@ -1928,6 +1960,278 @@ assert.deepEqual(
   ["history-older-compact", "live-shared-compact"],
   "a live tail pairs with the latest history occurrence without hiding older compaction",
 );
+
+function testCompactionOrphanHelpers() {
+const orphanCompactionBlock = {
+  kind: "process" as const,
+  item_id: "orphan-compaction",
+  processKind: "compaction" as const,
+  phase: "end" as const,
+  status: "succeeded" as const,
+  turn_id: compactNativeTurnId,
+  title: "压缩上下文",
+  done: true,
+};
+const compactionOrphanOwner: Turn = {
+  id: "bound-compaction-user",
+  clientMsgId: "bound-compaction-client",
+  prompt: "继续修复问题",
+  blocks: [{
+    kind: "text", message_id: "bound-compaction-final",
+    channel: "final", text: "已经修好", done: true,
+  }],
+  done: true,
+  doneTs: 22_000,
+  durationMs: 1_200,
+};
+const compactionOnlyOrphan: Turn = {
+  id: "orphan-compaction-row",
+  prompt: "",
+  blocks: [orphanCompactionBlock],
+  done: false,
+};
+const directOrphanRepaired = reconcileCompactionOnlyOrphan(
+  [compactionOnlyOrphan, compactionOrphanOwner],
+  ["bound-compaction-client"],
+  compactNativeTurnId,
+);
+assert.equal(directOrphanRepaired.length, 1,
+  "one exact binding absorbs one compaction-only live row");
+assert.deepEqual({
+  id: directOrphanRepaired[0].id,
+  done: directOrphanRepaired[0].done,
+  doneTs: directOrphanRepaired[0].doneTs,
+  durationMs: directOrphanRepaired[0].durationMs,
+}, {
+  id: "bound-compaction-user", done: true, doneTs: 22_000, durationMs: 1_200,
+}, "moving a compact marker cannot inherit the orphan lifecycle");
+assert.deepEqual(
+  directOrphanRepaired[0].blocks.map((block) => block.kind === "process"
+    ? block.item_id : block.message_id),
+  ["orphan-compaction", "bound-compaction-final"],
+  "a newly bound compact marker renders before the answer rather than as a trailing 已处理 row",
+);
+assert.deepEqual(
+  directOrphanRepaired[0].blocks.map((block) => block.liveOrder),
+  [0, 1],
+  "moving a live compact marker rebases chronology without duplicate orders",
+);
+assert.deepEqual(
+  reconcileCompactionOnlyOrphan(
+    directOrphanRepaired,
+    ["bound-compaction-client"],
+    compactNativeTurnId,
+  ),
+  directOrphanRepaired,
+  "repeated binding reconciliation is idempotent",
+);
+
+const spilledCompactionOwner: Turn = {
+  ...compactionOrphanOwner,
+  id: "spilled-compaction-owner",
+  clientMsgId: "spilled-compaction-client",
+  blocks: [{ ...compactionOrphanOwner.blocks[0], liveOrder: 1 }],
+  liveBlocksSpilled: true,
+  liveSpillBlocks: [{
+    kind: "process", item_id: "spilled-before-compaction",
+    processKind: "command", phase: "end", status: "succeeded",
+    title: "运行命令", done: true, liveOrder: 0,
+  }],
+  nextLiveBlockOrder: 2,
+};
+const spilledCompactionRepaired = reconcileCompactionOnlyOrphan(
+  [compactionOnlyOrphan, spilledCompactionOwner],
+  ["spilled-compaction-client"],
+  compactNativeTurnId,
+)[0];
+assert.deepEqual([
+  spilledCompactionRepaired.blocks.map((block) => block.liveOrder),
+  spilledCompactionRepaired.liveSpillBlocks?.map((block) => block.liveOrder),
+  spilledCompactionRepaired.nextLiveBlockOrder,
+], [[0, 2], [1], 3],
+"live compaction insertion shifts the bounded spill archive without collisions");
+assert.deepEqual(
+  mergeDetailWithLiveTail(
+    spilledCompactionRepaired.liveSpillBlocks ?? [],
+    spilledCompactionRepaired.blocks,
+  ).map((block) => block.kind === "text"
+    ? block.message_id : block.kind === "tool"
+      ? block.tool_use_id : block.item_id),
+  ["orphan-compaction", "spilled-before-compaction", "bound-compaction-final"],
+  "the final spill/live render follows the repaired cross-slice chronology",
+);
+
+const ambiguousCompactionOrphans = reconcileCompactionOnlyOrphan([
+  compactionOrphanOwner,
+  compactionOnlyOrphan,
+  {
+    ...compactionOnlyOrphan,
+    id: "second-orphan-compaction-row",
+    blocks: [{ ...orphanCompactionBlock, item_id: "second-orphan-compaction" }],
+  },
+], ["bound-compaction-client"], compactNativeTurnId);
+assert.equal(ambiguousCompactionOrphans.length, 3,
+  "two compaction-only candidates fail closed instead of guessing an owner");
+assert.equal(reconcileCompactionOnlyOrphan([
+  compactionOrphanOwner,
+  { ...compactionOnlyOrphan, done: true },
+], ["bound-compaction-client"], compactNativeTurnId).length, 2,
+"a completed live row needs canonical History proof before it can be absorbed");
+assert.equal(reconcileCompactionOnlyOrphan([
+  compactionOrphanOwner,
+  { ...compactionOnlyOrphan,
+    id: "multiple-live-compaction-row",
+    blocks: [
+      orphanCompactionBlock,
+      { ...orphanCompactionBlock, item_id: "second-live-compaction" },
+    ] },
+], ["bound-compaction-client"], compactNativeTurnId).length, 2,
+"more than one live compaction marker is ambiguous and must fail closed");
+
+const ownerWithExistingCompaction: Turn = {
+  ...compactionOrphanOwner,
+  blocks: [{ ...orphanCompactionBlock, item_id: "already-owned-compaction" }],
+};
+assert.equal(reconcileCompactionOnlyOrphan([
+  ownerWithExistingCompaction,
+  compactionOnlyOrphan,
+], ["bound-compaction-client"], compactNativeTurnId).length, 2,
+"a distinct second compaction in one native task must wait for History ordering proof");
+const exactDuplicateCompaction = reconcileCompactionOnlyOrphan([
+  ownerWithExistingCompaction,
+  {
+    ...compactionOnlyOrphan,
+    blocks: [{ ...orphanCompactionBlock,
+      item_id: "already-owned-compaction" }],
+  },
+], ["bound-compaction-client"], compactNativeTurnId);
+assert.equal(exactDuplicateCompaction.length, 1,
+  "an exact process item duplicate can be removed without guessing occurrence order");
+assert.equal(exactDuplicateCompaction[0].blocks.length, 1,
+  "exact duplicate reconciliation never paints a second compaction marker");
+
+for (const [label, candidate] of ([
+  ["ordinary promptless assistant", {
+    ...compactionOnlyOrphan,
+    id: "promptless-assistant",
+    blocks: [{ kind: "text" as const, message_id: "assistant-final",
+      channel: "final" as const, text: "automatic answer", done: true }],
+  }],
+  ["goal continuation", {
+    ...compactionOnlyOrphan,
+    id: "goal-continuation",
+    forkPointId: compactNativeTurnId,
+  }],
+  ["optimistic steer", {
+    ...compactionOnlyOrphan,
+    id: "optimistic-steer-row",
+    clientMsgId: "optimistic-steer-row",
+    prompt: "change direction",
+  }],
+  ["ordinary process", {
+    ...compactionOnlyOrphan,
+    id: "ordinary-process-row",
+    blocks: [{ ...orphanCompactionBlock,
+      item_id: "ordinary-process", processKind: "command" as const }],
+  }],
+  ["detail-bearing compaction", {
+    ...compactionOnlyOrphan,
+    id: "detail-compaction-row",
+    detailProjection: {
+      segments: [], blocks: [], capped: false, hasMore: false,
+      oldestCursor: null, hasNewer: false, newerCursor: null,
+    },
+  }],
+] satisfies Array<[string, Turn]>)) {
+  assert.equal(reconcileCompactionOnlyOrphan(
+    [compactionOrphanOwner, candidate],
+    ["bound-compaction-client"],
+    compactNativeTurnId,
+  ).length, 2, `${label} is not a disposable compact orphan`);
+}
+
+const canonicalCompactionOwner: Turn = {
+  id: "canonical-compaction-user",
+  forkPointId: compactNativeTurnId,
+  prompt: "继续修复问题",
+  blocks: [{
+    ...orphanCompactionBlock,
+    item_id: "canonical-compaction",
+    summary: "canonical summary",
+  }, {
+    kind: "text", message_id: "canonical-compaction-final",
+    channel: "final", text: "done", done: true,
+  }],
+  done: true,
+  doneTs: 30_000,
+  durationMs: 2_000,
+};
+const completedCachedOrphan: Turn = {
+  ...compactionOnlyOrphan,
+  id: "completed-cached-compaction-orphan",
+  done: true,
+  doneTs: 99_000,
+  durationMs: 50_000,
+  blocks: [{
+    ...orphanCompactionBlock,
+    item_id: "cached-compaction",
+    summary: "stale cached summary",
+  }],
+};
+const completedCachedMultiCompactionOrphan: Turn = {
+  ...completedCachedOrphan,
+  id: "completed-cached-multi-compaction-orphan",
+  blocks: [
+    ...completedCachedOrphan.blocks,
+    { ...orphanCompactionBlock, item_id: "second-stale-cached-compaction",
+      summary: "second stale cached summary" },
+  ],
+};
+const canonicalOrphanRepaired = reconcileProvenCompactionOrphans([
+  canonicalCompactionOwner,
+  completedCachedMultiCompactionOrphan,
+]);
+assert.equal(canonicalOrphanRepaired.length, 1,
+  "canonical History repairs a completed cache orphan after the binding left replay");
+assert.deepEqual({
+  doneTs: canonicalOrphanRepaired[0].doneTs,
+  durationMs: canonicalOrphanRepaired[0].durationMs,
+  compactions: canonicalOrphanRepaired[0].blocks.filter((block) =>
+    block.kind === "process" && block.processKind === "compaction").length,
+  summary: canonicalOrphanRepaired[0].blocks[0].kind === "process"
+    ? canonicalOrphanRepaired[0].blocks[0].summary : null,
+}, {
+  doneTs: 30_000,
+  durationMs: 2_000,
+  compactions: 1,
+  summary: "canonical summary",
+}, "History keeps lifecycle and completed process payload authority");
+assert.deepEqual(
+  canonicalOrphanRepaired[0].blocks,
+  canonicalCompactionOwner.blocks,
+  "canonical History never reimports extra compactions from a stale cache row",
+);
+assert.deepEqual(
+  reconcileProvenCompactionOrphans(canonicalOrphanRepaired),
+  canonicalOrphanRepaired,
+  "repeated canonical History repair is idempotent",
+);
+assert.equal(reconcileProvenCompactionOrphans([
+  canonicalCompactionOwner,
+  { ...canonicalCompactionOwner, id: "same-native-steer-owner",
+    prompt: "another steer" },
+  completedCachedOrphan,
+]).length, 3,
+"two visible owners of one native task make cache repair ambiguous");
+
+return { orphanCompactionBlock, canonicalCompactionOwner, completedCachedOrphan };
+}
+const {
+  orphanCompactionBlock,
+  canonicalCompactionOwner,
+  completedCachedOrphan,
+} = testCompactionOrphanHelpers();
+
 const sharedTaskSegments = mergeInitialHistory([], [{
   id: "steer-segment-one",
   prompt: "first",
@@ -7367,6 +7671,7 @@ try {
     (block: { kind: string; processKind?: string }) =>
       block.kind === "process" && block.processKind === "compaction"), true);
 
+  const testCompactionReducerRaces = () => {
   // A compact marker can reach the live optimistic row before the next
   // authoritative History head binds that row's native user-message id. The
   // reducer must reconcile those two identities instead of painting the same
@@ -7434,6 +7739,396 @@ try {
   assert.equal(compactDuplicateTurns[0].blocks.some(
     (block: { kind: string; processKind?: string }) =>
       block.kind === "process" && block.processKind === "compaction"), true);
+
+  const cachedCompactionSid = "canonical-history-repairs-cached-compaction";
+  const cachedCompactionOwner = {
+    ...canonicalCompactionOwner,
+    id: "cached-history-owner",
+    forkPointId: "cached-history-native",
+    blocks: [{ ...orphanCompactionBlock,
+      item_id: "cached-history-canonical-compact",
+      turn_id: "cached-history-native" }, {
+      kind: "text" as const,
+      message_id: "cached-history-final",
+      channel: "final" as const,
+      text: "canonical answer",
+      done: true,
+    }],
+  };
+  const cachedCompactionOrphan = {
+    ...completedCachedOrphan,
+    id: "cached-history-orphan",
+    blocks: [{ ...orphanCompactionBlock,
+      item_id: "cached-history-stale-compact",
+      turn_id: "cached-history-native" }],
+  };
+  let cachedCompactionState = reduce({
+    ...initialState,
+    focusedSid: cachedCompactionSid,
+    sessions: [{ session_id: cachedCompactionSid,
+      engine: "codex" as const, space: "code" as const }],
+  }, {
+    type: "hydrate_cache",
+    sid: cachedCompactionSid,
+    turns: [cachedCompactionOwner, cachedCompactionOrphan],
+    revision: "cached-history-revision",
+    generation: "cached-history-generation",
+  });
+  cachedCompactionState = reduce(cachedCompactionState, {
+    type: "event", event: event({
+      type: "history", sid: cachedCompactionSid,
+      session_id: cachedCompactionSid,
+      revision: "cached-history-revision",
+      generation: "cached-history-generation",
+      build_seq: 1,
+      live_seq: 1,
+      detail: "summary",
+      in_progress: false,
+      has_more: true,
+      oldest_id: "cached-history-cursor",
+      newest_id: "cached-history-owner",
+      events: [],
+      turns: [cachedCompactionOwner],
+    }),
+  });
+  assert.deepEqual(cachedCompactionState.runtimes[cachedCompactionSid].turns.map(
+    (turn: Turn) => turn.id), ["cached-history-owner"],
+  "the real first-page reducer repairs a completed IndexedDB compact orphan");
+  assert.equal(cachedCompactionState.runtimes[cachedCompactionSid].hasMore, true,
+    "cache self-heal preserves authoritative moving-head pagination");
+  assert.equal(cachedCompactionState.runtimes[cachedCompactionSid].oldestId,
+    "cached-history-cursor",
+    "cache self-heal preserves the authoritative older-page cursor");
+  cachedCompactionState = reduce(cachedCompactionState, {
+    type: "event", event: event({
+      type: "history", sid: cachedCompactionSid,
+      session_id: cachedCompactionSid,
+      revision: "cached-history-revision",
+      generation: "cached-history-generation",
+      build_seq: 2,
+      live_seq: 1,
+      detail: "summary",
+      in_progress: false,
+      has_more: true,
+      oldest_id: "cached-history-cursor",
+      newest_id: "cached-history-owner",
+      events: [],
+      turns: [cachedCompactionOwner],
+    }),
+  });
+  assert.equal(cachedCompactionState.runtimes[cachedCompactionSid].turns.length, 1,
+    "repeated first-page History remains idempotent after cache self-heal");
+
+  const orphanRaceProcess = (sid: string, nativeTurnId: string) => event({
+    type: "process", sid, item_id: `${sid}-compaction`,
+    kind: "compaction", phase: "end", status: "succeeded",
+    turn_id: nativeTurnId, title: "压缩上下文", seq: 10,
+  });
+  const assertCompactionRaceRepaired = (
+    label: string,
+    orderedEvents: ServerEvent[],
+    sid: string,
+    messageId: string,
+  ) => {
+    let raceState = {
+      ...initialState,
+      focusedSid: sid,
+      runtimes: { [sid]: { ...createRuntime(), state: "running" as const } },
+    };
+    for (const raceEvent of orderedEvents) {
+      raceState = reduce(raceState, { type: "event", event: raceEvent });
+    }
+    const turns = raceState.runtimes[sid].turns;
+    assert.equal(turns.length, 1, `${label} leaves one visible user row`);
+    assert.equal(turns[0].id, messageId);
+    assert.equal(turns[0].prompt, "继续修复问题");
+    assert.deepEqual(turns[0].blocks.flatMap((block: Block) =>
+      block.kind === "process" ? [block.processKind] : []),
+    ["compaction"], `${label} retains exactly one compact disclosure`);
+    assert.equal(turns[0].done, false,
+      `${label} keeps the user turn lifecycle rather than the orphan lifecycle`);
+    assert.deepEqual(
+      raceState.runtimes[sid].liveDetailTurnIds,
+      [messageId],
+      `${label} transfers observed detail ownership to the surviving row`,
+    );
+  };
+
+  for (const order of [
+    ["process", "user", "binding"],
+    ["process", "binding", "user"],
+    ["binding", "user", "process"],
+  ] as const) {
+    const sid = `compact-orphan-${order.join("-")}`;
+    const messageId = `${sid}-message`;
+    const nativeTurnId = `${sid}-native`;
+    const frames: Record<(typeof order)[number], ServerEvent> = {
+      process: orphanRaceProcess(sid, nativeTurnId),
+      user: event({ type: "user_msg", sid, msg_id: messageId,
+        prompt: "继续修复问题", seq: 11 }),
+      binding: event({ type: "turn_binding", sid, msg_id: messageId,
+        turn_id: nativeTurnId, seq: 9 }),
+    };
+    assertCompactionRaceRepaired(
+      order.join(" → "),
+      order.map((name) => frames[name]),
+      sid,
+      messageId,
+    );
+  }
+
+  const ownerBeforeOrphanSid = "compact-owner-before-orphan";
+  const ownerBeforeOrphanMessage = "compact-owner-before-orphan-message";
+  const ownerBeforeOrphanNative = "compact-owner-before-orphan-native";
+  let ownerBeforeOrphan = {
+    ...initialState,
+    focusedSid: ownerBeforeOrphanSid,
+    runtimes: {
+      [ownerBeforeOrphanSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        legacyLiveFallbackBlocked: true,
+        turns: [{
+          id: ownerBeforeOrphanMessage,
+          clientMsgId: ownerBeforeOrphanMessage,
+          prompt: "继续修复问题",
+          blocks: [],
+          done: false,
+        }],
+        liveDetailTurnIds: [],
+      },
+    },
+  };
+  const ownerBeforeOrphanRuntime = ownerBeforeOrphan.runtimes[
+    ownerBeforeOrphanSid];
+  const generatedOrphan = {
+    id: ownerBeforeOrphanNative,
+    prompt: "",
+    done: false,
+    blocks: [{ ...orphanCompactionBlock,
+      item_id: "owner-before-orphan-compact",
+      turn_id: ownerBeforeOrphanNative }],
+  };
+  ownerBeforeOrphan = {
+    ...ownerBeforeOrphan,
+    runtimes: {
+      ...ownerBeforeOrphan.runtimes,
+      [ownerBeforeOrphanSid]: {
+        ...ownerBeforeOrphanRuntime,
+        turns: [...ownerBeforeOrphanRuntime.turns, generatedOrphan],
+        liveDetailTurnIds: [generatedOrphan.id],
+      },
+    },
+  };
+  ownerBeforeOrphan = reduce(ownerBeforeOrphan, {
+    type: "event", event: event({
+      type: "turn_binding", sid: ownerBeforeOrphanSid,
+      msg_id: ownerBeforeOrphanMessage,
+      turn_id: ownerBeforeOrphanNative, seq: 11,
+    }),
+  });
+  assert.deepEqual(
+    ownerBeforeOrphan.runtimes[ownerBeforeOrphanSid].liveDetailTurnIds,
+    [ownerBeforeOrphanMessage],
+    "detail ownership follows the surviving user row when it precedes the orphan",
+  );
+
+  // Cache migrations can leave two legitimate rows with the same presentation
+  // id but distinct canonical aliases. Runtime bookkeeping must follow the
+  // exact removed object, not infer deletion from that colliding display id.
+  const collidingOrphanSid = "compact-orphan-colliding-display-id";
+  const collidingDisplayId = "shared-optimistic-display";
+  const collidingOwnerMessage = "colliding-owner-message";
+  const collidingNative = "colliding-compaction-native";
+  let collidingOrphanState = {
+    ...initialState,
+    focusedSid: collidingOrphanSid,
+    runtimes: {
+      [collidingOrphanSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        legacyLiveFallbackBlocked: true,
+        turns: [{
+          id: collidingDisplayId,
+          historyTurnId: "legitimate-canonical-row",
+          prompt: "unrelated legitimate row",
+          blocks: [],
+          done: true,
+        }, {
+          id: collidingOwnerMessage,
+          clientMsgId: collidingOwnerMessage,
+          prompt: "continue",
+          blocks: [],
+          done: false,
+        }, {
+          id: collidingDisplayId,
+          prompt: "",
+          blocks: [{ ...orphanCompactionBlock,
+            item_id: "colliding-compaction-item",
+            turn_id: collidingNative }],
+          done: false,
+        }],
+        hydratedCacheTurnIds: [collidingDisplayId],
+        liveDetailTurnIds: [collidingDisplayId],
+        liveOwner: { turnId: collidingDisplayId, seq: 29 },
+      },
+    },
+  };
+  collidingOrphanState = reduce(collidingOrphanState, {
+    type: "event", event: event({
+      type: "turn_binding", sid: collidingOrphanSid,
+      msg_id: collidingOwnerMessage, turn_id: collidingNative, seq: 30,
+    }),
+  });
+  assert.deepEqual(
+    collidingOrphanState.runtimes[collidingOrphanSid].turns.map(
+      (turn: Turn) => [turn.id, turn.historyTurnId, turn.prompt]),
+    [
+      [collidingDisplayId, "legitimate-canonical-row", "unrelated legitimate row"],
+      [collidingOwnerMessage, undefined, "continue"],
+    ],
+    "orphan reconciliation preserves a legitimate row with a colliding display id",
+  );
+  assert.deepEqual(
+    collidingOrphanState.runtimes[collidingOrphanSid].hydratedCacheTurnIds,
+    [collidingDisplayId, collidingOwnerMessage],
+    "a colliding retained cache id stays valid while orphan provenance transfers",
+  );
+  assert.deepEqual(
+    collidingOrphanState.runtimes[collidingOrphanSid].liveDetailTurnIds,
+    [collidingDisplayId, collidingOwnerMessage],
+    "a colliding retained id stays observed while exact orphan detail transfers",
+  );
+  assert.deepEqual(
+    collidingOrphanState.runtimes[collidingOrphanSid].liveOwner,
+    { turnId: collidingOwnerMessage, seq: 30 },
+    "live ownership follows the exact removed orphan despite a display-id collision",
+  );
+
+  const completedBeforeBindingSid = "compact-orphan-completed-before-binding";
+  const completedBeforeBindingMessage =
+    "compact-orphan-completed-before-binding-message";
+  const completedBeforeBindingNative =
+    "compact-orphan-completed-before-binding-native";
+  let completedBeforeBinding = {
+    ...initialState,
+    focusedSid: completedBeforeBindingSid,
+    runtimes: {
+      [completedBeforeBindingSid]: {
+        ...createRuntime(), state: "running" as const,
+      },
+    },
+  };
+  for (const completedEvent of [
+    orphanRaceProcess(completedBeforeBindingSid, completedBeforeBindingNative),
+    event({ type: "turn_end", sid: completedBeforeBindingSid,
+      turn_id: completedBeforeBindingNative, seq: 11,
+      result: { subtype: "success", duration_ms: 700, is_error: false } }),
+    event({ type: "user_msg", sid: completedBeforeBindingSid,
+      msg_id: completedBeforeBindingMessage,
+      prompt: "继续修复问题", seq: 12 }),
+    event({ type: "turn_binding", sid: completedBeforeBindingSid,
+      msg_id: completedBeforeBindingMessage,
+      turn_id: completedBeforeBindingNative, seq: 13 }),
+  ]) {
+    completedBeforeBinding = reduce(completedBeforeBinding, {
+      type: "event", event: completedEvent,
+    });
+  }
+  const completedBeforeBindingTurns =
+    completedBeforeBinding.runtimes[completedBeforeBindingSid].turns;
+  assert.equal(completedBeforeBindingTurns.length, 1,
+    "a TurnEnd which wins the race still cannot strand a compact-only row");
+  assert.equal(completedBeforeBindingTurns[0].id,
+    completedBeforeBindingMessage);
+  assert.equal(completedBeforeBindingTurns[0].done, true,
+    "the existing exact terminal binding remains authoritative after reconciliation");
+  assert.equal(completedBeforeBindingTurns[0].historyTurnId,
+    completedBeforeBindingNative,
+    "the completed native shell remains the History/detail lookup authority");
+
+  const terminalOrphanSid = "compact-orphan-after-final";
+  const terminalOrphanMessage = "compact-orphan-after-final-message";
+  const terminalOrphanNative = "compact-orphan-after-final-native";
+  let terminalOrphanState = {
+    ...initialState,
+    focusedSid: terminalOrphanSid,
+    runtimes: {
+      [terminalOrphanSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        liveDetailTurnIds: [terminalOrphanNative],
+      },
+    },
+  };
+  for (const terminalEvent of [
+    orphanRaceProcess(terminalOrphanSid, terminalOrphanNative),
+    event({ type: "assistant_msg_start", sid: terminalOrphanSid,
+      message_id: "terminal-orphan-final", channel: "final", seq: 11 }),
+    event({ type: "delta", sid: terminalOrphanSid,
+      message_id: "terminal-orphan-final", channel: "final",
+      text: "已经完成", seq: 12 }),
+    event({ type: "assistant_msg_end", sid: terminalOrphanSid,
+      message_id: "terminal-orphan-final", channel: "final", seq: 13 }),
+    event({ type: "turn_end", sid: terminalOrphanSid,
+      turn_id: terminalOrphanNative, seq: 14,
+      result: { subtype: "success", duration_ms: 800, is_error: false } }),
+    event({ type: "user_msg", sid: terminalOrphanSid,
+      msg_id: terminalOrphanMessage, prompt: "继续修复问题", seq: 15 }),
+    event({ type: "turn_binding", sid: terminalOrphanSid,
+      msg_id: terminalOrphanMessage, turn_id: terminalOrphanNative, seq: 16 }),
+    event({ type: "turn_binding", sid: terminalOrphanSid,
+      msg_id: terminalOrphanMessage, turn_id: terminalOrphanNative, seq: 16 }),
+  ]) {
+    terminalOrphanState = reduce(terminalOrphanState, {
+      type: "event", event: terminalEvent,
+    });
+  }
+  const terminalOrphanTurns =
+    terminalOrphanState.runtimes[terminalOrphanSid].turns;
+  assert.equal(terminalOrphanTurns.length, 1,
+    "the existing exact binding path may join the user and assistant rows once");
+  assert.equal(terminalOrphanTurns[0].prompt, "继续修复问题");
+  assert.equal(terminalOrphanTurns.filter((turn: Turn) =>
+    !turn.prompt && turn.blocks.every((block) => block.kind === "process"
+      && block.processKind === "compaction")).length, 0,
+  "final plus repeated binding leaves no standalone compaction-only row");
+  assert.equal(terminalOrphanTurns.some((turn: Turn) => turn.blocks.some(
+    (block) => block.kind === "text" && block.text === "已经完成")), true,
+  "ordinary promptless assistant content remains visible");
+
+  const ambiguousRaceSid = "compact-orphan-ambiguous-live";
+  const ambiguousRaceNative = "compact-orphan-ambiguous-native";
+  let ambiguousRaceState = {
+    ...initialState,
+    focusedSid: ambiguousRaceSid,
+    runtimes: {
+      [ambiguousRaceSid]: {
+        ...createRuntime(), state: "running" as const,
+        turns: [{
+          id: "ambiguous-orphan-one", prompt: "", done: false,
+          blocks: [{ ...orphanCompactionBlock,
+            item_id: "ambiguous-live-one", turn_id: ambiguousRaceNative }],
+        }, {
+          id: "ambiguous-orphan-two", prompt: "", done: false,
+          blocks: [{ ...orphanCompactionBlock,
+            item_id: "ambiguous-live-two", turn_id: ambiguousRaceNative }],
+        }],
+      },
+    },
+  };
+  ambiguousRaceState = reduce(ambiguousRaceState, {
+    type: "event", event: event({ type: "user_msg", sid: ambiguousRaceSid,
+      msg_id: "ambiguous-live-user", prompt: "continue", seq: 20 }),
+  });
+  ambiguousRaceState = reduce(ambiguousRaceState, {
+    type: "event", event: event({ type: "turn_binding", sid: ambiguousRaceSid,
+      msg_id: "ambiguous-live-user", turn_id: ambiguousRaceNative, seq: 21 }),
+  });
+  assert.equal(ambiguousRaceState.runtimes[ambiguousRaceSid].turns.length, 3,
+    "the reducer keeps every row when more than one compact orphan qualifies");
+  };
+  testCompactionReducerRaces();
 
   const fallbackHistory = reduce({
     ...liveHistory,
@@ -7623,6 +8318,80 @@ try {
   "correlated pagination is display-only and never prepends into runtime");
   assert.deepEqual(orderedHistory.historyBrowse?.turns.map(
     (turn: { id: string }) => turn.id), ["older-page", "new"]);
+
+  const testCrossPageCompactionRepair = () => {
+  // A polluted completed projection can span the byte boundary between the
+  // newest page and one older page. The canonical owner in one segment proves
+  // exactly one compact-only orphan in the other segment, while page keys and
+  // cursors must remain usable after the visible row is absorbed.
+  const compactBrowseSid = "compact-orphan-across-browse-pages";
+  const compactBrowseNative = "compact-browse-native";
+  const compactBrowseOwner: Turn = {
+    id: "compact-browse-owner",
+    forkPointId: compactBrowseNative,
+    prompt: "continue long work",
+    done: true,
+    blocks: [{ ...orphanCompactionBlock,
+      item_id: "compact-browse-canonical", turn_id: compactBrowseNative }],
+  };
+  let compactBrowse = reduce({
+    ...initialState,
+    focusedSid: compactBrowseSid,
+    runtimes: {
+      [compactBrowseSid]: {
+        ...createRuntime(),
+        turns: [compactBrowseOwner],
+        historyRevision: "compact-browse-rev",
+        historyGeneration: "compact-browse-generation",
+        hasMore: true,
+        oldestId: "compact-browse-cursor",
+      },
+    },
+  }, {
+    type: "begin_history_browse",
+    sid: compactBrowseSid,
+    scopeKey: "machine-a:code:codex",
+    revision: "compact-browse-rev",
+    generation: "compact-browse-generation",
+    viewId: "compact-browse-view",
+    basePageKey: "compact-browse-head",
+  });
+  compactBrowse = reduce(compactBrowse, {
+    type: "install_history_browse_page",
+    sid: compactBrowseSid,
+    scopeKey: "machine-a:code:codex",
+    revision: "compact-browse-rev",
+    generation: "compact-browse-generation",
+    viewId: "compact-browse-view",
+    windowEpoch: compactBrowse.historyBrowse!.windowEpoch,
+    before: "compact-browse-cursor",
+    page: {
+      pageKey: "compact-browse-older",
+      turns: [{
+        ...completedCachedOrphan,
+        id: "compact-browse-orphan",
+        blocks: [{ ...orphanCompactionBlock,
+          item_id: "compact-browse-stale", turn_id: compactBrowseNative }],
+      }],
+      hasOlder: false,
+      olderCursor: "compact-browse-floor",
+      newerPageKey: "compact-browse-head",
+    },
+  });
+  assert.deepEqual(compactBrowse.historyBrowse?.turns.map(
+    (turn: Turn) => turn.id), ["compact-browse-owner"],
+  "older-page materialization repairs a proven cross-page compact orphan");
+  assert.deepEqual(compactBrowse.historyBrowse?.loadedPageKeys,
+    ["compact-browse-older", "compact-browse-head"],
+  "absorbing the only row does not erase page-link authority");
+  assert.equal(compactBrowse.historyBrowse?.hasOlder, false);
+  assert.equal(compactBrowse.historyBrowse?.olderCursor,
+    "compact-browse-floor");
+  assert.equal(compactBrowse.runtimes[compactBrowseSid].turns.length, 1,
+    "browse repair remains display-only and does not mutate the live runtime");
+  };
+  testCrossPageCompactionRepair();
+
   orderedHistory = reduce(orderedHistory, { type: "event", event: event({
     type: "history", sid: orderedHistorySid, session_id: orderedHistorySid,
     revision: "ordered-rev-new", generation: "wrapper-one",
@@ -12148,6 +12917,13 @@ try {
           liveTaskId: "shared-steer-task",
           blocks: [],
           done: false,
+        }, {
+          id: "stale-binding-compaction-orphan",
+          prompt: "",
+          blocks: [{ ...orphanCompactionBlock,
+            item_id: "stale-binding-compaction",
+            turn_id: "shared-steer-task" }],
+          done: false,
         }],
       },
     },
@@ -12162,6 +12938,12 @@ try {
       turn_id: "shared-steer-task",
     }),
   });
+  assert.equal(
+    staleBindingState.runtimes[staleBindingSid].turns.some((turn: Turn) =>
+      turn.id === "stale-binding-compaction-orphan"),
+    true,
+    "a stale predecessor binding cannot claim or delete an ambiguous compaction",
+  );
   staleBindingState = reduce(staleBindingState, {
     type: "event",
     event: event({
@@ -12172,12 +12954,15 @@ try {
       channel: "final",
     }),
   });
-  assert.equal(staleBindingState.runtimes[staleBindingSid].turns.length, 2);
-  assert.equal(staleBindingState.runtimes[staleBindingSid].turns[0].done, true);
+  assert.equal(staleBindingState.runtimes[staleBindingSid].turns.length, 3);
+  assert.equal(staleBindingState.runtimes[staleBindingSid].turns.find(
+    (turn: Turn) => turn.id === "initial-message")?.done, true);
+  const currentSteer = staleBindingState.runtimes[staleBindingSid].turns.find(
+    (turn: Turn) => turn.id === "current-steer");
   assert.equal(
-    staleBindingState.runtimes[staleBindingSid].turns[1].blocks[0].kind
+    currentSteer?.blocks[0].kind
       === "text"
-      ? staleBindingState.runtimes[staleBindingSid].turns[1].blocks[0].message_id
+      ? currentSteer.blocks[0].message_id
       : null,
     "current-steer-answer",
     "an older binding cannot reopen the completed predecessor",
@@ -13925,6 +14710,45 @@ try {
   });
   assert.equal(refocusedPlan?.block.item_id, "structured-plan",
     "A -> B -> A navigation retains the Plan omitted by full turn detail");
+  assert.equal(planCache.resolve({
+    machineId: "machine-b",
+    engine: "codex",
+    space: "code",
+    sid: "plan-session-a",
+    runtime: null,
+    history: null,
+    runtimeTurns: [planOwnerAfterDetail],
+    historyTurns: [planOwnerAfterDetail],
+    recovering: true,
+    runtimeLoading: true,
+  }), null,
+  "the same native sid on another machine cannot inherit a retained Plan");
+  assert.equal(planCache.resolve({
+    machineId: "legacy",
+    engine: "claude",
+    space: "code",
+    sid: "plan-session-a",
+    runtime: null,
+    history: null,
+    runtimeTurns: [planOwnerAfterDetail],
+    historyTurns: [planOwnerAfterDetail],
+    recovering: true,
+    runtimeLoading: true,
+  }), null,
+  "the same sid on another engine cannot inherit a retained Plan");
+  assert.equal(planCache.resolve({
+    machineId: "legacy",
+    engine: "codex",
+    space: "work",
+    sid: "plan-session-a",
+    runtime: null,
+    history: null,
+    runtimeTurns: [planOwnerAfterDetail],
+    historyTurns: [planOwnerAfterDetail],
+    recovering: true,
+    runtimeLoading: true,
+  }), null,
+  "the same sid in Work cannot inherit Code's retained Plan");
   assert.equal(planProgressPresentation(refocusedPlan!.block).progressLabel,
     "1 / 2");
   assert.equal(refocusedPlan?.needsDetail, false,

@@ -37,6 +37,7 @@ from cc_remote.protocol import (
     SessionList,
     StateEvent,
     SwitchSession,
+    ForkSession,
     Takeover,
     TakeoverState,
     UserMsg,
@@ -1044,6 +1045,87 @@ def test_metadata_only_claude_session_can_be_deleted_by_exact_global_id(
         assert not transcript.exists()
         assert not [message for message in transport.sent
                     if isinstance(message, Error)]
+
+    asyncio.run(run())
+
+
+def test_deleted_claude_fork_retry_only_acks_without_resurrecting(monkeypatch):
+    async def run():
+        machine, transport = _mk_machine()
+        parent = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        cutoff = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        child = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        cwd = "/repo/component"
+        machine._claude_forks.begin(
+            "fork-request", parent, cutoff, cwd)
+        machine._claude_forks.claim_submission("fork-request")
+        machine._claude_forks.complete("fork-request", child)
+        forked = machine_module.SessionForked(
+            parent_session_id=parent,
+            session_id=child,
+            cwd=cwd,
+            target="same_cwd",
+            last_turn_id=cutoff,
+            request_id="fork-request",
+            to="client-1",
+        )
+        machine._remember_command("client-1", "fork-cmd", (forked,))
+        machine._claude_forks.begin_delete(child)
+        machine._claude_forks.finish_delete(child)
+
+        async def not_codex(_sid):
+            return False
+
+        machine._is_codex_session = not_codex
+        await machine._process_command(ForkSession(
+            session_id=parent,
+            request_id="fork-request",
+            last_turn_id=cutoff,
+            cmd_id="fork-cmd",
+            client_id="client-1",
+        ))
+
+        assert [message.type for message in transport.sent] == ["command_ack"]
+
+    asyncio.run(run())
+
+
+def test_failed_claude_fork_delete_restores_complete_journal(monkeypatch):
+    async def run():
+        machine, transport = _mk_machine()
+        child = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        parent = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        cutoff = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        machine._claude_forks.begin(
+            "fork-request", parent, cutoff, "/repo/component")
+        machine._claude_forks.claim_submission("fork-request")
+        machine._claude_forks.complete("fork-request", child)
+
+        async def not_codex(_sid):
+            return False
+
+        machine._is_codex_session = not_codex
+        monkeypatch.setattr(
+            machine_module, "get_session_info",
+            lambda _sid: SimpleNamespace(cwd="/repo/component"),
+        )
+        monkeypatch.setattr(
+            machine_module, "delete_session",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("delete failed")),
+        )
+
+        result = await machine._handle_delete_session(DeleteSession(
+            session_id=child,
+            engine="claude",
+            space="code",
+            cmd_id="delete-child",
+            client_id="client-1",
+        ))
+
+        assert isinstance(result, Error)
+        assert machine._claude_forks.child_entry(child)["status"] == "complete"
+        assert transport.sent[-1] is result
 
     asyncio.run(run())
 
