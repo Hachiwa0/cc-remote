@@ -148,6 +148,12 @@ class SessionContext:
     btw_real_id: Optional[str] = None
     announced_model: Optional[str] = None
     announced_effort: Optional[str] = None
+    # Model/cwd/process changes and thread/settings notifications can arrive
+    # while config/read or model/list is resolving a nullable Codex effort.
+    # Serialize those presentation-only probes per resident session; the
+    # resolver still revalidates authoritative state after every await.
+    codex_effort_resolve_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock)
     announced_perm: Optional[str] = None
     announced_permission_profile: Optional[str] = None
     announced_web_search: Optional[str] = None

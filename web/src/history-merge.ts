@@ -6,6 +6,8 @@ import type {
   Turn,
   TurnDetailProjection,
 } from "./domain/conversation";
+import { reconcileProvenCompactionOrphans } from "./compaction-orphans.ts";
+export { reconcileProvenCompactionOrphans } from "./compaction-orphans.ts";
 
 function combineText(first: string, second: string): string {
   if (!first) return second;
@@ -291,21 +293,22 @@ export function mergeDetailWithLiveTail(
     preferCompletedDetailPayload ? "first" : "combine",
   );
 
-  const identity = (block: Block): string => block.kind === "text"
-    ? `text:${block.message_id}`
-    : block.kind === "tool"
-      ? `tool:${block.tool_use_id}`
-      : `process:${block.item_id}`;
-  const liveIdentities = filteredLive.map(identity);
-  const liveIds = new Set(liveIdentities);
-  const detailIdentities = filteredDetail.map(identity);
-  const liveOrders = filteredLive.map((block) => block.liveOrder);
-  const hasAuthoritativeLiveOrder = liveOrders.every(
-    (order): order is number => Number.isFinite(order),
-  )
-    && new Set(liveOrders).size === liveOrders.length
-    && liveIds.size === liveIdentities.length
-    && new Set(detailIdentities).size === detailIdentities.length;
+  // Spill archives and the bounded live row are two slices of one reducer
+  // chronology. Compaction repair may rebase both slices together, so their
+  // array concatenation is no longer chronological. If every merged block has
+  // one finite unique order, use that complete proof for the final render.
+  // Any source-only block without liveOrder deliberately keeps the existing
+  // detail-first behavior below.
+  const mergedOrders = merged.map((block) => block.liveOrder);
+  if (merged.length > 0
+      && mergedOrders.every(
+        (order): order is number => Number.isFinite(order),
+      )
+      && new Set(mergedOrders).size === merged.length) {
+    return [...merged].sort(
+      (left, right) => left.liveOrder! - right.liveOrder!);
+  }
+
   // Official Codex full/summary views can omit command/tool items while the
   // browser has already observed the complete interleaved live sequence. When
   // the source page is a subset of that live sequence, its array order is not a
@@ -313,18 +316,23 @@ export function mergeDetailWithLiveTail(
   // commentary. Keep the source payload merge above, but paint in the complete
   // live order. A genuine source superset (normal paged detail + live tail)
   // retains its source order and simply appends the new tail as before.
+  const liveIds = new Set(filteredLive.map(blockIdentity));
+  const liveOrders = filteredLive.map((block) => block.liveOrder);
   if (filteredLive.length > 0
-      && hasAuthoritativeLiveOrder
-      && detailIdentities.every((key) => liveIds.has(key))) {
-    const byId = new Map(merged.map((block) => [identity(block), block]));
+      && liveOrders.every((order): order is number => Number.isFinite(order))
+      && new Set(liveOrders).size === filteredLive.length
+      && liveIds.size === filteredLive.length
+      && new Set(filteredDetail.map(blockIdentity)).size === filteredDetail.length
+      && filteredDetail.every((block) => liveIds.has(blockIdentity(block)))) {
+    const byId = new Map(merged.map((block) => [blockIdentity(block), block]));
     const ordered = [...filteredLive]
       .sort((left, right) => left.liveOrder! - right.liveOrder!)
       .flatMap((block) => {
-      const key = identity(block);
-      const resolved = byId.get(key);
-      if (!resolved) return [];
-      byId.delete(key);
-      return [resolved];
+        const key = blockIdentity(block);
+        const resolved = byId.get(key);
+        if (!resolved) return [];
+        byId.delete(key);
+        return [resolved];
       });
     return [...ordered, ...byId.values()];
   }
@@ -351,6 +359,14 @@ function sharesExactTurnAlias(first: TurnIdentity, second: TurnIdentity): boolea
 
 function nativeTaskIdentity(turn: Turn): string | undefined {
   return turn.liveTaskId ?? turn.forkPointId ?? turn.codexTurnId;
+}
+
+function blockIdentity(block: Block): string {
+  return block.kind === "text"
+    ? `text:${block.message_id}`
+    : block.kind === "tool"
+      ? `tool:${block.tool_use_id}`
+      : `process:${block.item_id}`;
 }
 
 function compactionTurnAliases(turn: Turn): Set<string> {
@@ -658,6 +674,7 @@ function mergeTurn(
   preserveLiveOpen = false,
   completedTextAuthority: "first" | "second" | "combine" = "first",
   settledCanonicalText = false,
+  preserveCompleteLiveOrder = false,
 ): Turn {
   const historyImageRefs = history.imageRefs?.length
     ? history.imageRefs : undefined;
@@ -676,6 +693,32 @@ function mergeTurn(
   const liveOwnsLifecycle = preserveLiveOpen
     && history.interrupted !== true
     && history.error == null;
+  const blocks = mergeBlocks(
+    history.blocks,
+    live.blocks,
+    preserveLiveOpen,
+    false,
+    true,
+    completedTextAuthority,
+    settledCanonicalText,
+  );
+  if (preserveCompleteLiveOrder) {
+    const historyIds = history.blocks.map(blockIdentity);
+    const liveOrders = live.blocks.map((block) => block.liveOrder);
+    const liveIds = new Set(live.blocks.map(blockIdentity));
+    const mergedIds = blocks.map(blockIdentity);
+    if (liveOrders.every((order): order is number => Number.isFinite(order))
+        && new Set(liveOrders).size === live.blocks.length
+        && liveIds.size === live.blocks.length
+        && new Set(historyIds).size === historyIds.length
+        && new Set(mergedIds).size === mergedIds.length
+        && historyIds.every((identity) => liveIds.has(identity))) {
+      const byId = new Map(blocks.map((block) => [blockIdentity(block), block]));
+      blocks.splice(0, blocks.length, ...[...live.blocks]
+        .sort((left, right) => left.liveOrder! - right.liveOrder!)
+        .flatMap((block) => byId.get(blockIdentity(block)) ?? []));
+    }
+  }
   return {
     ...history,
     id: live.id,
@@ -684,15 +727,7 @@ function mergeTurn(
     forkPointId: history.forkPointId ?? live.forkPointId,
     checkpointId: history.checkpointId ?? live.checkpointId,
     prompt: history.prompt || live.prompt,
-    blocks: mergeBlocks(
-      history.blocks,
-      live.blocks,
-      preserveLiveOpen,
-      false,
-      true,
-      completedTextAuthority,
-      settledCanonicalText,
-    ),
+    blocks,
     // A transcript has no ResultMessage, so its EOF is represented by a
     // synthetic TurnEnd.  While this same live tail is still running, that
     // marker is only a snapshot boundary and must not close the turn early.
@@ -1192,6 +1227,8 @@ export function mergeInitialHistory(
       const historyTurn = merged[index];
       const bound = mergeTurn(
         historyTurn, liveTurn, isOpenLiveTail, "first", settledCodex,
+        !!options.preserveLiveTailOpen && !!options.reconcileReplayOrphans
+          && liveTurn === live[live.length - 1],
       );
       merged[index] = settledCodex
           && sharesExactTurnAlias(historyTurn, liveTurn)
@@ -1247,5 +1284,6 @@ export function mergeInitialHistory(
       result[duplicate] = mergeTurn(turn, result[duplicate]);
     }
   }
-  return result;
+  return options.reconcileReplayOrphans
+    ? reconcileProvenCompactionOrphans(result) : result;
 }

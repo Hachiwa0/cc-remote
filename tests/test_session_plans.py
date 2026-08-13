@@ -88,3 +88,20 @@ def test_session_plan_store_rejects_symlinks(tmp_path):
 
     with pytest.raises(SessionPlanStoreError):
         SessionPlanStore(tmp_path)
+
+
+def test_session_plan_profile_migration_is_replay_safe(tmp_path):
+    store = SessionPlanStore(tmp_path)
+    store.put("old@session-1", _plan())
+
+    assert store.migrate_profile_sessions(
+        lambda sid: sid.replace("old@", "new@", 1),
+        profile_revision=4,
+    ) == 1
+    assert store.migrate_profile_sessions(
+        lambda _sid: "must-not-run",
+        profile_revision=4,
+    ) == 0
+    restored = SessionPlanStore(tmp_path)
+    assert restored.get("old@session-1") is None
+    assert restored.get("new@session-1") is not None

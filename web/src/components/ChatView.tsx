@@ -113,6 +113,7 @@ interface RetainedMeasurementBoundary {
 }
 
 interface HistoryViewportPresentation {
+  sid: string | null;
   scope: string;
   authorityScope: string;
   generation: string | null;
@@ -147,7 +148,6 @@ function sameHistoryViewportPresentation(
 ): boolean {
   return left.scope === right.scope
     && left.authorityScope === right.authorityScope
-    && left.generation === right.generation
     && left.turns === right.turns
     && left.hasMore === right.hasMore
     && left.cursor === right.cursor
@@ -409,11 +409,12 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   // non-destructive recovery path. Deep-history browsing supplies an explicit
   // stable view id: revision/view changes reset, window paging does not.
   const resolvedHistoryViewId = historyViewId ?? historyViewRevision ?? "";
-  const scrollScope = historyViewId == null
+  const incomingScrollScope = historyViewId == null
     ? `${historyScopeKey ?? ""}\u0000${sid ?? ""}\u0000${resolvedHistoryViewId}`
     : `${historyScopeKey ?? ""}\u0000${sid ?? ""}\u0000${historyRevision ?? ""}\u0000${resolvedHistoryViewId}`;
   const incomingHistoryPresentation: HistoryViewportPresentation = {
-    scope: scrollScope,
+    sid,
+    scope: incomingScrollScope,
     authorityScope: [
       historyScopeKey ?? "", sid ?? "", historyRevision ?? "",
       historyGeneration ?? "",
@@ -443,9 +444,23 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     presentedHistory,
     incomingHistoryPresentation,
   );
-  const scopedPresentedHistory = presentedHistory.scope === scrollScope
+  // A revision/generation handoff can briefly expose an empty replacement.
+  // Keep the same session's complete old scope mounted until its rows arrive;
+  // same-authority rollback invalidation deliberately does not qualify.
+  const retainPendingHistory = loading && sid
+    && presentedHistory.sid === sid && presentedHistory.turns.length
+    && !incomingTurns.length
+    && presentedHistory.authorityScope
+      !== incomingHistoryPresentation.authorityScope;
+  const scopedPresentedHistory = retainPendingHistory
     ? presentedHistory
-    : transitionPresentation ?? incomingHistoryPresentation;
+    : (presentedHistory.scope === incomingScrollScope
+      ? presentedHistory
+      : transitionPresentation ?? incomingHistoryPresentation);
+  // Every scroll/virtualization transaction must use the presentation's own
+  // scope. During a pending empty handoff that is intentionally the old scope,
+  // never the incoming revision's scope.
+  const scrollScope = scopedPresentedHistory.scope;
   const {
     turns,
     hasMore,
@@ -458,6 +473,10 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
 
   useLayoutEffect(() => {
     const incoming = latestHistoryPresentationRef.current;
+    if (retainPendingHistory) {
+      pendingHistoryPresentationRef.current = incoming;
+      return;
+    }
     if (presentedHistory.scope !== incoming.scope) {
       const retained = acceptedHistoryViewportTransition(
         historyViewportLeaseRef.current,
@@ -492,7 +511,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     incomingBrowseMode, incomingHasMore, incomingHasNewer,
     incomingHistoryCursor, incomingHistoryWindowEpoch, incomingTurns,
     incomingHistoryPresentation.authorityScope,
-    presentedHistory, scrollScope,
+    incomingScrollScope, presentedHistory, retainPendingHistory,
   ]);
 
   const beginHistoryViewportLease = useCallback(() => {
@@ -1867,6 +1886,12 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   };
 
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    // Native keyboard scrolling can update scrollTop before React receives the
+    // preceding scroll event (and browsers may coalesce that event with the
+    // next key's movement). Use the physical position at this input boundary
+    // as the baseline so End -> Home still registers as historyward movement.
+    const el = scrollRef.current;
+    if (el) lastScrollTopRef.current = el.scrollTop;
     if (["ArrowUp", "PageUp", "Home"].includes(event.key)) {
       markUserScrollIntent("history");
     } else if (["ArrowDown", "PageDown", "End", " "].includes(event.key)) {

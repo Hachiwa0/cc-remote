@@ -26,6 +26,7 @@ _MAX_FILE_BYTES = 4 * 1024 * 1024
 _MAX_META_RECORD_BYTES = 1024 * 1024
 _SOURCE_PREFIX = "cc-remote-fork:"
 _PROFILE_META_KEY = "__cc_remote_profile__"
+_CHILD_STATUSES = {"complete", "delete_pending", "deleted"}
 
 
 class ForkJournalError(RuntimeError):
@@ -153,13 +154,15 @@ class CodexForkJournal:
             compatible = {
                 "alias": {"intent", "submitted", "uncertain"},
                 "complete": {"complete"},
+                "delete_pending": {"delete_pending"},
+                "deleted": {"deleted"},
                 "rejected": {"rejected"},
             }
             allowed_canonical = compatible.get(entry.get("status"))
             if (allowed_canonical is None
                     or canonical.get("status") not in allowed_canonical):
                 raise ValueError("fork alias and canonical states are inconsistent")
-            if (entry.get("status") == "complete"
+            if (entry.get("status") in _CHILD_STATUSES
                     and entry.get("session_id") != canonical.get("session_id")):
                 raise ValueError("fork alias and canonical child ids differ")
             if (entry.get("status") == "rejected"
@@ -193,12 +196,13 @@ class CodexForkJournal:
             raise ValueError("invalid fork cwd")
         if entry.get("status") not in {
             "intent", "alias", "submitted", "uncertain", "rejected", "complete",
+            "delete_pending", "deleted",
         }:
             raise ValueError("invalid fork status")
         if entry.get("status") == "alias" and canonical_request_id is None:
             raise ValueError("fork alias is missing its canonical request")
         session_id = entry.get("session_id")
-        if entry.get("status") == "complete" and (
+        if entry.get("status") in _CHILD_STATUSES and (
             not isinstance(session_id, str) or not _SAFE_ID.fullmatch(session_id)
         ):
             raise ValueError("invalid child session id")
@@ -354,6 +358,10 @@ class CodexForkJournal:
                 if candidate.get("thread_source") == source
             ]
             statuses = {candidate.get("status") for _, candidate in group}
+            # Deleted children are durable replay tombstones.  Compacting one
+            # would let a sufficiently old reliable fork command publish its
+            # cached SessionForked event again after a wrapper restart.  If
+            # tombstones fill the bounded journal, fail closed instead.
             if statuses == {"complete"}:
                 children = {candidate.get("session_id") for _, candidate in group}
                 if len(children) == 1:
@@ -377,8 +385,14 @@ class CodexForkJournal:
             existing = self.entries.get(request_id)
             if existing is None:
                 raise ForkJournalError("fork intent is missing")
-            if (existing.get("target") != "worktree"
-                    or existing.get("status") != "complete"):
+            if existing.get("target") != "worktree":
+                raise ForkJournalError(
+                    "only a completed worktree fork can finalize its name")
+            if existing.get("status") in {"delete_pending", "deleted"}:
+                # Deletion owns the child.  A reconciler racing that deletion
+                # must terminate quietly instead of retrying title work forever.
+                return dict(existing)
+            if existing.get("status") != "complete":
                 raise ForkJournalError(
                     "only a completed worktree fork can finalize its name")
             source = existing.get("thread_source")
@@ -401,6 +415,11 @@ class CodexForkJournal:
             raise ForkJournalError("rejected fork request cannot complete")
         if not isinstance(session_id, str) or not _SAFE_ID.fullmatch(session_id):
             raise ForkJournalError("invalid forked session id")
+        if existing.get("status") in {"delete_pending", "deleted"}:
+            if existing.get("session_id") != session_id:
+                raise ForkJournalError(
+                    "deleted fork request resolved to another child session")
+            return dict(existing)
         if (existing.get("status") == "complete"
                 and existing.get("session_id") != session_id):
             raise ForkJournalError("fork request resolved to two child sessions")
@@ -519,6 +538,97 @@ class CodexForkJournal:
             self.entries = updated
             return True
 
+    def child_entry(self, session_id: str) -> Optional[dict[str, Any]]:
+        """Return the strongest durable lifecycle record for one fork child."""
+        if not isinstance(session_id, str) or not _SAFE_ID.fullmatch(session_id):
+            raise ForkJournalError("invalid forked session id")
+        rank = {"complete": 1, "delete_pending": 2, "deleted": 3}
+        with self._lock:
+            candidates = [
+                value for value in self.entries.values()
+                if value.get("session_id") == session_id
+                and value.get("status") in rank
+            ]
+            if not candidates:
+                return None
+            return dict(max(candidates, key=lambda value: rank[value["status"]]))
+
+    def begin_delete(self, session_id: str) -> Optional[str]:
+        """Persist deletion intent before the native child is touched."""
+        if not isinstance(session_id, str) or not _SAFE_ID.fullmatch(session_id):
+            raise ForkJournalError("invalid forked session id")
+        with self._lock:
+            matches = [
+                (key, value) for key, value in self.entries.items()
+                if value.get("session_id") == session_id
+                and value.get("status") in _CHILD_STATUSES
+            ]
+            if not matches:
+                return None
+            target = "deleted" if any(
+                value.get("status") == "deleted" for _, value in matches
+            ) else "delete_pending"
+            updated = OrderedDict(self.entries)
+            changed = False
+            for key, value in matches:
+                if value.get("status") == target:
+                    continue
+                pending = dict(value)
+                pending["status"] = target
+                updated[key] = pending
+                changed = True
+            if changed:
+                self._persist(updated)
+                self.entries = updated
+            return target
+
+    def finish_delete(self, session_id: str) -> bool:
+        """Turn every pending reference to a child into a replay tombstone."""
+        if not isinstance(session_id, str) or not _SAFE_ID.fullmatch(session_id):
+            raise ForkJournalError("invalid forked session id")
+        with self._lock:
+            matches = [
+                (key, value) for key, value in self.entries.items()
+                if value.get("session_id") == session_id
+                and value.get("status") in {"delete_pending", "deleted"}
+            ]
+            if not matches:
+                return False
+            updated = OrderedDict(self.entries)
+            changed = False
+            for key, value in matches:
+                if value.get("status") == "deleted":
+                    continue
+                deleted = dict(value)
+                deleted["status"] = "deleted"
+                updated[key] = deleted
+                changed = True
+            if changed:
+                self._persist(updated)
+                self.entries = updated
+            return True
+
+    def abort_delete(self, session_id: str) -> bool:
+        """Restore a child after a proven native deletion failure."""
+        if not isinstance(session_id, str) or not _SAFE_ID.fullmatch(session_id):
+            raise ForkJournalError("invalid forked session id")
+        with self._lock:
+            matches = [
+                (key, value) for key, value in self.entries.items()
+                if value.get("session_id") == session_id
+                and value.get("status") == "delete_pending"
+            ]
+            if not matches:
+                return False
+            updated = OrderedDict(self.entries)
+            for key, value in matches:
+                restored = dict(value)
+                restored["status"] = "complete"
+                updated[key] = restored
+            self._persist(updated)
+            self.entries = updated
+            return True
+
     def _set_status(
         self, request_id: str, status: str, **fields: Any,
     ) -> dict[str, Any]:
@@ -529,7 +639,7 @@ class CodexForkJournal:
         canonical = self.entries.get(canonical_id)
         if canonical is None:
             raise ForkJournalError("canonical fork intent is missing")
-        if canonical.get("status") == "complete":
+        if canonical.get("status") in _CHILD_STATUSES:
             return dict(existing)
         if canonical.get("status") == "rejected" and status != "rejected":
             raise ForkJournalError("rejected fork request cannot be resubmitted")

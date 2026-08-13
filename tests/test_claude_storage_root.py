@@ -12,7 +12,7 @@ from claude_agent_sdk import (
 )
 
 from cc_remote.claude_paths import claude_config_dir, claude_projects_dir
-from cc_remote.wrapper.stream import transcript_path
+from cc_remote.wrapper.stream import transcript_path, transcript_presence
 
 
 SESSION_ID = "11111111-1111-4111-8111-111111111111"
@@ -98,8 +98,10 @@ def test_settings_only_provider_switch_keeps_one_claude_catalog(
             SESSION_ID,
         )] == ["user", "assistant"]
         assert transcript_path(SESSION_ID) == str(source.resolve())
+        assert transcript_presence(SESSION_ID) is True
 
     assert transcript_path(SESSION_ID) != str(decoy.resolve())
+    assert transcript_presence("22222222-2222-4222-8222-222222222222") is False
 
 
 def test_default_claude_root_remains_home_scoped(monkeypatch, tmp_path):
@@ -131,3 +133,17 @@ def test_relative_claude_root_keeps_transcript_watcher_aligned(
     sessions = list_sessions(limit=20)
     assert [item.session_id for item in sessions] == [SESSION_ID]
     assert transcript_path(SESSION_ID) == str(source.resolve())
+    assert transcript_presence(SESSION_ID) is True
+
+
+def test_transcript_presence_preserves_unreadable_catalog_uncertainty(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+
+    def unavailable(_path):
+        raise PermissionError("catalog unavailable")
+
+    monkeypatch.setattr("cc_remote.wrapper.stream.os.scandir", unavailable)
+    assert transcript_presence(SESSION_ID) is None

@@ -39,6 +39,7 @@ import {
   mergeAuthoritativeTurnDetail, mergeDetailWithLiveTail, mergeInitialHistory,
   restoreCachedTurnDetails, restoreObservedLiveTurnDetails,
 } from "./history-merge";
+import { reconcileBoundCompactionOrphanDetailed } from "./compaction-orphans.ts";
 import {
   installTurnDetailProjectionPage,
 } from "./history-detail-projection";
@@ -469,6 +470,7 @@ export type Action =
   | { type: "clear_all_btw" }
   | { type: "clear_session_list" }
   | { type: "restore_session_list"; sessions: SessionInfo[] }
+  | { type: "drop_fork_placeholder"; sid: string; parentSid: string }
   | { type: "set_session_pinned"; sid: string; pinned: boolean }
   | { type: "focus_session"; sid: string }
   | { type: "turn_detail_requested"; sid: string; turnId: string; before?: string | null; autoLoad?: boolean }
@@ -656,6 +658,55 @@ function turnsShareIdentityAlias(
   const firstAliases = new Set(turnIdentityAliases(first));
   return turnIdentityAliases(second).some((alias) =>
     firstAliases.has(alias));
+}
+
+function reconcileBoundCompactionOrphan(
+  runtime: SessionRuntime,
+  turns: Turn[],
+  msgIds: readonly (string | null | undefined)[],
+  nativeTurnId: string | null | undefined,
+): Turn[] {
+  if (!nativeTurnId) return turns;
+  const aliases = msgIds.filter((value): value is string => !!value);
+  const reconciliation = reconcileBoundCompactionOrphanDetailed(
+    turns, aliases, nativeTurnId);
+  const repaired = reconciliation.turns;
+  if (repaired.length === turns.length) return turns;
+  const owner = reconciliation.owner;
+  const orphan = reconciliation.orphan;
+  if (!owner || !orphan) return turns;
+  const orphanAliases = new Set(turnIdentityAliases(orphan));
+  // liveOwner stores an identity, not an object reference. If a distinct
+  // retained row shares the orphan's display id, that id is still a valid
+  // owner and must not be moved merely because the removed object used it too.
+  // A later ordered binding can supersede it normally. Transfer only when the
+  // identity disappeared with the exact orphan object.
+  if (runtime.liveOwner && !repaired.some((turn) =>
+    turnHasIdentityAlias(turn, runtime.liveOwner!.turnId))) {
+    runtime.liveOwner = { ...runtime.liveOwner, turnId: owner.id };
+  }
+  const hydratedIds = runtime.hydratedCacheTurnIds.flatMap((id) => {
+    const retained = repaired.some((turn) => turnHasIdentityAlias(turn, id));
+    // Hydrated ids gate provisional detail restoration just like live-detail
+    // ids below. Transfer the exact removed orphan's cache provenance to its
+    // surviving owner, while preserving a distinct row whose display id only
+    // happens to collide with that orphan.
+    if (!orphanAliases.has(id)) return retained ? [id] : [];
+    return retained ? [id, owner.id] : [owner.id];
+  });
+  runtime.hydratedCacheTurnIds = [...new Set(hydratedIds)].filter((id) =>
+    repaired.some((turn) => turnHasIdentityAlias(turn, id)));
+  const detailIds = runtime.liveDetailTurnIds.flatMap((id) => {
+    const retained = repaired.some((turn) => turnHasIdentityAlias(turn, id));
+    // Display ids can collide across cache migrations. Preserve a still-valid
+    // colliding id, but also transfer the removed live orphan's observation to
+    // its exact surviving owner instead of trying to infer deletion by id.
+    if (!orphanAliases.has(id)) return retained ? [id] : [];
+    return retained ? [id, owner.id] : [owner.id];
+  });
+  runtime.liveDetailTurnIds = [...new Set(detailIds)].filter((id) =>
+    repaired.some((turn) => turnHasIdentityAlias(turn, id)));
+  return repaired;
 }
 
 function pendingOptimisticSteerIndex(
@@ -2027,6 +2078,23 @@ export function reduce(state: AppState, action: Action): AppState {
         historyRecovery: null, historyBrowse: null,
         retainedHistoryBrowse: null,
       };
+    case "drop_fork_placeholder": {
+      const sessions = state.sessions.filter((session) => !(
+        session.provisional_fork
+        && session.session_id === action.sid
+        && session.forked_from_id === action.parentSid
+      ));
+      if (sessions.length === state.sessions.length) return state;
+      const focused = state.focusedSid === action.sid;
+      return {
+        ...state,
+        sessions,
+        focusedSid: focused ? null : state.focusedSid,
+        historyRecovery: focused ? null : state.historyRecovery,
+        historyBrowse: focused ? null : state.historyBrowse,
+        retainedHistoryBrowse: focused ? null : state.retainedHistoryBrowse,
+      };
+    }
     case "set_session_pinned": {
       const sessions = setSessionPinned(state.sessions, action.sid, action.pinned);
       return sessions === state.sessions ? state : { ...state, sessions };
@@ -4532,7 +4600,15 @@ function reduceEvent(
             ts: stamp,
           });
         }
-        rt.turns = turns;
+        const binding = rt.pendingLiveBinding;
+        const boundNativeTurnId = binding
+          && acceptedIds.has(binding.msgId) ? binding.turnId : undefined;
+        rt.turns = reconcileBoundCompactionOrphan(
+          rt,
+          turns,
+          [e.msg_id, e.client_msg_id],
+          boundNativeTurnId,
+        );
       });
       const sessions = e.sid
         ? bumpSessionActivity(next.sessions, e.sid, Math.round(e.ts * 1000))
@@ -4916,7 +4992,7 @@ function reduceEvent(
         if (rt.acceptancePending === e.msg_id) {
           clearAcceptance(rt);
         }
-        const turns = cloneTurns(rt.turns);
+        let turns = cloneTurns(rt.turns);
         const seq = typeof e.seq === "number" ? e.seq : 0;
         const binding = {
           msgId: e.msg_id,
@@ -4943,6 +5019,14 @@ function reduceEvent(
           bindAuthoritativeActiveHistoryHead(
             rt, turns, e.msg_id, e.turn_id, seq);
         }
+        // A native Codex task may contain multiple visible steer rows. Once a
+        // newer row owns that task, an older delayed binding cannot prove which
+        // row a standalone compaction belongs to; leave it for canonical
+        // History instead of moving it into the completed predecessor.
+        if (bindingCanSupersedeOwner) {
+          turns = reconcileBoundCompactionOrphan(
+            rt, turns, [e.msg_id], e.turn_id);
+        }
         const exact = turns.filter((turn) =>
           turnHasIdentityAlias(turn, e.msg_id));
         if (exact.length === 1) {
@@ -4968,14 +5052,17 @@ function reduceEvent(
               && authoritativeCandidates.length === 1) {
             const authoritative = authoritativeCandidates[0];
             const authoritativeIndex = turns.indexOf(authoritative);
-            const merged = mergeInitialHistory(
-              [authoritative], [owner])[0] ?? owner;
-            merged.forkPointId = e.turn_id;
-            const first = Math.min(ownerIndex, authoritativeIndex);
-            const second = Math.max(ownerIndex, authoritativeIndex);
-            turns.splice(second, 1);
-            turns.splice(first, 1, merged);
-            rt.liveOwner = { turnId: merged.id, seq };
+            const mergedTurns = mergeInitialHistory(
+              [authoritative], [owner]);
+            if (mergedTurns.length === 1) {
+              const merged = mergedTurns[0];
+              merged.forkPointId = e.turn_id;
+              const first = Math.min(ownerIndex, authoritativeIndex);
+              const second = Math.max(ownerIndex, authoritativeIndex);
+              turns.splice(second, 1);
+              turns.splice(first, 1, merged);
+              rt.liveOwner = { turnId: merged.id, seq };
+            }
           }
         }
         if (boundCompletedTurns) replaceWithBoundedTurns(rt, turns);

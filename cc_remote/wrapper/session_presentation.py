@@ -16,12 +16,48 @@ import re
 import stat
 import threading
 import time
+from typing import Callable, Literal
 from uuid import uuid4
 
 
-_WIRE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
+_WIRE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,255}$")
 _MAX_ENTRIES = 4096
 _MAX_FILE_BYTES = 16 * 1024 * 1024
+_ENGINES = frozenset({"claude", "codex"})
+_LEGACY_ENGINE = "legacy"
+
+
+def _engine(value: object) -> Literal["claude", "codex"]:
+    if value not in _ENGINES:
+        raise SessionPresentationStoreError(
+            "session presentation engine is invalid")
+    return value  # type: ignore[return-value]
+
+
+def _scope_key(engine: str, session_id: str) -> str:
+    clean_engine = _engine(engine)
+    clean_id = _wire_id(session_id)
+    assert clean_id is not None
+    return f"{clean_engine}\0{clean_id}"
+
+
+def _legacy_scope_key(session_id: str) -> str:
+    clean_id = _wire_id(session_id)
+    assert clean_id is not None
+    return f"{_LEGACY_ENGINE}\0{clean_id}"
+
+
+def _split_persisted_scope_key(key: str) -> tuple[str, str]:
+    try:
+        engine, session_id = key.split("\0", 1)
+    except ValueError as exc:
+        raise SessionPresentationStoreError(
+            "session presentation scope is invalid") from exc
+    clean_id = _wire_id(session_id)
+    assert clean_id is not None
+    if engine == _LEGACY_ENGINE:
+        return engine, clean_id
+    return _engine(engine), clean_id
 
 
 class SessionPresentationStoreError(RuntimeError):
@@ -111,31 +147,103 @@ class SessionPresentationStore:
     def __init__(self, state_dir: Path):
         self.path = Path(state_dir) / "session-presentation.json"
         self._lock = threading.RLock()
-        self._sessions = self._load()
+        self._sessions, self._profile_revision = self._load()
 
-    def get(self, session_id: str) -> SessionPresentationSnapshot:
-        session_id = _wire_id(session_id)  # type: ignore[assignment]
-        assert session_id is not None
+    def get(
+        self, engine: str, session_id: str,
+    ) -> SessionPresentationSnapshot:
+        key = _scope_key(engine, session_id)
         with self._lock:
-            snapshot = self._sessions.get(session_id)
+            snapshot = self._sessions.get(key)
             if snapshot is None:
                 return SessionPresentationSnapshot()
-            self._sessions.move_to_end(session_id)
+            self._sessions.move_to_end(key)
             return snapshot
+
+    def completion_engine(
+        self, session_id: str, completion_id: str,
+    ) -> Literal["claude", "codex"] | None:
+        """Resolve an engine-less legacy acknowledgement without guessing.
+
+        Protocol v34 predates engine-scoped completion commands. A cold
+        acknowledgement can still be routed safely because it echoes the exact
+        completion identity. If both engine scopes somehow contain that same
+        identity, fail closed and let a later resident acknowledgement resolve
+        it instead of clearing the wrong receipt.
+        """
+        completion_id = _wire_id(completion_id)  # type: ignore[assignment]
+        assert completion_id is not None
+        matches: list[Literal["claude", "codex"]] = []
+        with self._lock:
+            for engine in ("claude", "codex"):
+                snapshot = self._sessions.get(_scope_key(engine, session_id))
+                if (
+                    snapshot is not None
+                    and snapshot.completion_id == completion_id
+                ):
+                    matches.append(engine)
+        return matches[0] if len(matches) == 1 else None
+
+    def legacy_ids(self) -> frozenset[str]:
+        """Return ambiguous v1 ids still waiting for native ownership proof."""
+        with self._lock:
+            return frozenset(
+                session_id
+                for key in self._sessions
+                for engine, session_id in [_split_persisted_scope_key(key)]
+                if engine == _LEGACY_ENGINE
+            )
+
+    def claim_legacy(
+        self,
+        engine: str,
+        session_id: str,
+        target_session_id: str | None = None,
+    ) -> SessionPresentationSnapshot | None:
+        """Move one quarantined v1 receipt after its engine is proven.
+
+        Discovery is deliberately external to this store: callers must first
+        establish that exactly one native engine owns the id.  If a newer
+        engine-scoped receipt already exists, keep that generation and retire
+        the older ambiguous projection instead of overwriting it.
+        """
+        # Validate the source independently; otherwise a caller-supplied target
+        # could bypass the persisted legacy-key identity check.
+        session_id = str(_wire_id(session_id))
+        target_id = session_id if target_session_id is None else target_session_id
+        target = _scope_key(engine, target_id)
+        legacy = _legacy_scope_key(session_id)
+        with self._lock:
+            snapshot = self._sessions.get(legacy)
+            if snapshot is None:
+                return self._sessions.get(target)
+            updated = OrderedDict(self._sessions)
+            updated.pop(legacy, None)
+            current = updated.get(target)
+            if current is None or snapshot.updated_at > current.updated_at:
+                updated.pop(target, None)
+                updated[target] = snapshot
+                claimed = snapshot
+            else:
+                claimed = current
+            self._persist_bounded(updated)
+            self._sessions = updated
+            return claimed
 
     def mark_completion(
         self,
+        engine: str,
         session_id: str,
         completion_id: str | None = None,
     ) -> SessionPresentationSnapshot:
-        session_id = _wire_id(session_id)  # type: ignore[assignment]
+        key = _scope_key(engine, session_id)
         completion_id = _wire_id(
             completion_id or f"completion-{uuid4().hex}"
         )
         assert session_id is not None and completion_id is not None
         with self._lock:
             current = self._sessions.get(
-                session_id, SessionPresentationSnapshot()
+                key, SessionPresentationSnapshot(),
             )
             if (
                 current.completion_id == completion_id
@@ -143,7 +251,7 @@ class SessionPresentationStore:
             ):
                 return current
             return self._replace_locked(
-                session_id,
+                key,
                 replace(
                     current,
                     completion_id=completion_id,
@@ -155,15 +263,16 @@ class SessionPresentationStore:
 
     def acknowledge_completion(
         self,
+        engine: str,
         session_id: str,
         completion_id: str,
     ) -> SessionPresentationSnapshot:
-        session_id = _wire_id(session_id)  # type: ignore[assignment]
+        key = _scope_key(engine, session_id)
         completion_id = _wire_id(completion_id)  # type: ignore[assignment]
-        assert session_id is not None and completion_id is not None
+        assert completion_id is not None
         with self._lock:
             current = self._sessions.get(
-                session_id, SessionPresentationSnapshot()
+                key, SessionPresentationSnapshot(),
             )
             # A delayed acknowledgement for turn N must never clear the unread
             # receipt for a newer turn N+1.
@@ -173,7 +282,7 @@ class SessionPresentationStore:
             ):
                 return current
             return self._replace_locked(
-                session_id,
+                key,
                 replace(
                     current,
                     completion_unread=False,
@@ -184,18 +293,18 @@ class SessionPresentationStore:
 
     def clear_completion(
         self,
+        engine: str,
         session_id: str,
     ) -> SessionPresentationSnapshot:
-        session_id = _wire_id(session_id)  # type: ignore[assignment]
-        assert session_id is not None
+        key = _scope_key(engine, session_id)
         with self._lock:
             current = self._sessions.get(
-                session_id, SessionPresentationSnapshot()
+                key, SessionPresentationSnapshot(),
             )
             if current.completion_id is None and not current.completion_unread:
                 return current
             return self._replace_locked(
-                session_id,
+                key,
                 replace(
                     current,
                     completion_id=None,
@@ -207,20 +316,21 @@ class SessionPresentationStore:
 
     def dismiss_goal(
         self,
+        engine: str,
         session_id: str,
         goal_id: str,
     ) -> SessionPresentationSnapshot:
-        session_id = _wire_id(session_id)  # type: ignore[assignment]
+        key = _scope_key(engine, session_id)
         goal_id = _wire_id(goal_id)  # type: ignore[assignment]
-        assert session_id is not None and goal_id is not None
+        assert goal_id is not None
         with self._lock:
             current = self._sessions.get(
-                session_id, SessionPresentationSnapshot()
+                key, SessionPresentationSnapshot(),
             )
             if current.dismissed_goal_id == goal_id:
                 return current
             return self._replace_locked(
-                session_id,
+                key,
                 replace(
                     current,
                     dismissed_goal_id=goal_id,
@@ -228,19 +338,20 @@ class SessionPresentationStore:
                 ),
             )
 
-    def reconcile_goal(self, session_id: str, goal_id: str | None) -> bool:
+    def reconcile_goal(
+        self, engine: str, session_id: str, goal_id: str | None,
+    ) -> bool:
         """Return whether *goal_id* is hidden, clearing stale generations."""
-        session_id = _wire_id(session_id)  # type: ignore[assignment]
+        key = _scope_key(engine, session_id)
         goal_id = _wire_id(goal_id, optional=True)  # type: ignore[assignment]
-        assert session_id is not None
         with self._lock:
             current = self._sessions.get(
-                session_id, SessionPresentationSnapshot()
+                key, SessionPresentationSnapshot(),
             )
             dismissed = current.dismissed_goal_id
             if dismissed is not None and dismissed != goal_id:
                 current = self._replace_locked(
-                    session_id,
+                    key,
                     replace(
                         current,
                         dismissed_goal_id=None,
@@ -249,51 +360,101 @@ class SessionPresentationStore:
                 )
             return goal_id is not None and current.dismissed_goal_id == goal_id
 
-    def move(self, old_session_id: str, session_id: str) -> None:
+    def move(
+        self, engine: str, old_session_id: str, session_id: str,
+    ) -> None:
         old_session_id = _wire_id(old_session_id)  # type: ignore[assignment]
         session_id = _wire_id(session_id)  # type: ignore[assignment]
         assert old_session_id is not None and session_id is not None
         if old_session_id == session_id:
             return
+        old_key = _scope_key(engine, old_session_id)
+        key = _scope_key(engine, session_id)
         with self._lock:
-            snapshot = self._sessions.get(old_session_id)
+            snapshot = self._sessions.get(old_key)
             if snapshot is None:
                 return
             updated = OrderedDict(self._sessions)
-            updated.pop(old_session_id, None)
-            target = updated.get(session_id)
+            updated.pop(old_key, None)
+            target = updated.get(key)
             if target is None or snapshot.updated_at >= target.updated_at:
-                updated.pop(session_id, None)
-                updated[session_id] = snapshot
+                updated.pop(key, None)
+                updated[key] = snapshot
             self._persist_bounded(updated)
             self._sessions = updated
 
-    def delete(self, session_id: str) -> None:
-        session_id = _wire_id(session_id)  # type: ignore[assignment]
-        assert session_id is not None
+    def delete(self, engine: str, session_id: str) -> None:
+        key = _scope_key(engine, session_id)
         with self._lock:
-            if session_id not in self._sessions:
+            if key not in self._sessions:
                 return
             updated = OrderedDict(self._sessions)
-            updated.pop(session_id, None)
+            updated.pop(key, None)
             self._persist_bounded(updated)
             self._sessions = updated
 
     def _replace_locked(
         self,
-        session_id: str,
+        key: str,
         snapshot: SessionPresentationSnapshot,
     ) -> SessionPresentationSnapshot:
         updated = OrderedDict(self._sessions)
-        updated.pop(session_id, None)
-        updated[session_id] = snapshot
+        updated.pop(key, None)
+        updated[key] = snapshot
         while len(updated) > _MAX_ENTRIES:
             updated.popitem(last=False)
         self._persist_bounded(updated)
         self._sessions = updated
         return snapshot
 
-    def _load(self) -> OrderedDict[str, SessionPresentationSnapshot]:
+    def migrate_codex_profile_sessions(
+        self,
+        transform: Callable[[str], str],
+        *,
+        profile_revision: int,
+    ) -> int:
+        """Translate only explicitly Codex-owned presentation scopes."""
+        if (
+            isinstance(profile_revision, bool)
+            or not isinstance(profile_revision, int)
+            or profile_revision < 1
+        ):
+            raise SessionPresentationStoreError(
+                "invalid Codex profile revision")
+        with self._lock:
+            if self._profile_revision >= profile_revision:
+                return 0
+            updated: OrderedDict[str, SessionPresentationSnapshot] = (
+                OrderedDict()
+            )
+            migrated = 0
+            for key, snapshot in self._sessions.items():
+                engine, session_id = _split_persisted_scope_key(key)
+                target_id = (
+                    str(_wire_id(transform(session_id)))
+                    if engine == "codex" else session_id
+                )
+                target = (
+                    _legacy_scope_key(target_id)
+                    if engine == _LEGACY_ENGINE
+                    else _scope_key(engine, target_id)
+                )
+                existing = updated.get(target)
+                if existing is not None and existing != snapshot:
+                    raise SessionPresentationStoreError(
+                        "presentation profile migration collides")
+                updated[target] = snapshot
+                migrated += target != key
+            self._persist_bounded(
+                updated, profile_revision=profile_revision)
+            self._sessions = updated
+            self._profile_revision = profile_revision
+            return migrated
+
+    def _load(self) -> tuple[
+        OrderedDict[str, SessionPresentationSnapshot],
+        int,
+    ]:
         try:
             info = self.path.lstat()
             if not stat.S_ISREG(info.st_mode) or info.st_size > _MAX_FILE_BYTES:
@@ -304,28 +465,56 @@ class SessionPresentationStore:
             if len(raw_bytes) > _MAX_FILE_BYTES:
                 raise ValueError("session presentation store exceeds size limit")
             raw = json.loads(raw_bytes.decode("utf-8"))
-            if not isinstance(raw, dict) or set(raw) != {"version", "sessions"}:
+            if not isinstance(raw, dict) or set(raw) not in (
+                {"version", "sessions"},
+                {"version", "profile_revision", "sessions"},
+            ):
                 raise ValueError(
                     "session presentation store has an invalid envelope"
                 )
-            if raw.get("version") != 1 or not isinstance(
+            if raw.get("version") not in {1, 2, 3} or not isinstance(
                 raw.get("sessions"), dict
             ):
                 raise ValueError(
                     "session presentation store version is unsupported"
                 )
+            profile_revision = raw.get("profile_revision", 0)
+            if (
+                isinstance(profile_revision, bool)
+                or not isinstance(profile_revision, int)
+                or profile_revision < 0
+                or (raw.get("version") == 1 and profile_revision != 0)
+            ):
+                raise ValueError(
+                    "session presentation profile revision is invalid")
             loaded: OrderedDict[
                 str, SessionPresentationSnapshot
             ] = OrderedDict()
             for session_id, value in raw["sessions"].items():
-                clean_id = _wire_id(session_id)
-                assert clean_id is not None
-                loaded[clean_id] = _snapshot(value)
+                snapshot = _snapshot(value)
+                if raw.get("version") == 1:
+                    clean_id = _wire_id(session_id)
+                    assert clean_id is not None
+                    # v1 did not record the engine. The old multi-account wire
+                    # form has a provable Codex owner; retain every ambiguous
+                    # bare id in quarantine until the native stores prove a
+                    # unique owner. Dropping it here permanently loses unread
+                    # completion and dismissed Goal state.
+                    if "@" in clean_id:
+                        loaded[_scope_key("codex", clean_id)] = snapshot
+                    else:
+                        loaded[_legacy_scope_key(clean_id)] = snapshot
+                else:
+                    engine, _clean_id = _split_persisted_scope_key(session_id)
+                    if raw.get("version") == 2 and engine == _LEGACY_ENGINE:
+                        raise ValueError(
+                            "v2 session presentation scope cannot be legacy")
+                    loaded[session_id] = snapshot
             if len(loaded) > _MAX_ENTRIES:
                 raise ValueError("session presentation store has too many entries")
-            return loaded
+            return loaded, profile_revision
         except FileNotFoundError:
-            return OrderedDict()
+            return OrderedDict(), 0
         except Exception as exc:
             raise SessionPresentationStoreError(
                 "session presentation store is unreadable"
@@ -334,10 +523,13 @@ class SessionPresentationStore:
     @staticmethod
     def _payload(
         sessions: OrderedDict[str, SessionPresentationSnapshot],
+        *,
+        profile_revision: int,
     ) -> bytes:
         return json.dumps(
             {
-                "version": 1,
+                "version": 3,
+                "profile_revision": profile_revision,
                 "sessions": {
                     session_id: snapshot.as_dict()
                     for session_id, snapshot in sessions.items()
@@ -350,12 +542,19 @@ class SessionPresentationStore:
     def _persist_bounded(
         self,
         sessions: OrderedDict[str, SessionPresentationSnapshot],
+        *,
+        profile_revision: int | None = None,
     ) -> None:
         bounded = OrderedDict(sessions)
-        payload = self._payload(bounded)
+        revision = (
+            self._profile_revision
+            if profile_revision is None else profile_revision
+        )
+        payload = self._payload(bounded, profile_revision=revision)
         while len(payload) > _MAX_FILE_BYTES and len(bounded) > 1:
             bounded.popitem(last=False)
-            payload = self._payload(bounded)
+            payload = self._payload(
+                bounded, profile_revision=revision)
         if len(payload) > _MAX_FILE_BYTES:
             raise SessionPresentationStoreError(
                 "session presentation store exceeds size limit"

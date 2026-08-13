@@ -47,6 +47,12 @@ class _DeleteRecorder:
         self.calls.append((self.kind, sid))
 
 
+class _PresentationDeleteRecorder(_DeleteRecorder):
+    def delete(self, engine: str, sid: str) -> None:
+        assert engine == "codex"
+        self.calls.append((self.kind, sid))
+
+
 class _PinRecorder:
     def __init__(self, calls: list[tuple]) -> None:
         self.calls = calls
@@ -456,7 +462,7 @@ def test_confirmed_descendant_delete_evicts_both_resident_contexts(
             cleanup_calls,
         )
         machine._session_plans = _DeleteRecorder("plan", cleanup_calls)
-        machine._session_presentation = _DeleteRecorder(
+        machine._session_presentation = _PresentationDeleteRecorder(
             "presentation",
             cleanup_calls,
         )
@@ -643,7 +649,7 @@ def test_confirmed_descendant_delete_evicts_resident_btw_by_native_id(
             cleanup_calls,
         )
         machine._session_plans = _DeleteRecorder("plan", cleanup_calls)
-        machine._session_presentation = _DeleteRecorder(
+        machine._session_presentation = _PresentationDeleteRecorder(
             "presentation",
             cleanup_calls,
         )
@@ -717,7 +723,7 @@ def test_confirmed_cold_descendant_delete_cleans_all_metadata(
             cleanup_calls,
         )
         machine._session_plans = _DeleteRecorder("plan", cleanup_calls)
-        machine._session_presentation = _DeleteRecorder(
+        machine._session_presentation = _PresentationDeleteRecorder(
             "presentation",
             cleanup_calls,
         )

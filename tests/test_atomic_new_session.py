@@ -300,6 +300,61 @@ def test_spawn_bootstrap_missing_session_still_falls_back_to_fresh(
     asyncio.run(run())
 
 
+def test_spawn_bootstrap_disconnects_failed_resume_before_fresh_retry(
+        monkeypatch, tmp_path):
+    class RetryClaude:
+        permission_mode = "bypassPermissions"
+        effort = None
+        applied_effort = None
+        model = None
+
+        def __init__(self, *_args, **_kwargs):
+            self.connect_args = []
+            self.disconnects = 0
+
+        @staticmethod
+        def preflight(_binary):
+            return None
+
+        async def connect(self, **kwargs):
+            self.connect_args.append(kwargs)
+            if kwargs["resume_id"] is not None:
+                raise RuntimeError("partial resume failed")
+
+        async def disconnect(self):
+            self.disconnects += 1
+
+    async def run():
+        machine, transport = _mk_machine()
+        monkeypatch.setattr(machine_module, "SdkHandle", RetryClaude)
+        monkeypatch.setattr(
+            machine_module,
+            "get_session_info",
+            lambda _sid: type("Info", (), {"cwd": str(tmp_path)})(),
+        )
+        monkeypatch.setattr(machine_module, "save_session_id", lambda *_args: None)
+        machine._watch_session = lambda _sid: None
+        machine._prime_claude_ownership = lambda _sid: asyncio.sleep(0)
+        machine._load_history = lambda *_args: asyncio.sleep(0)
+
+        ctx = await machine._spawn(
+            resume_id="resume-bootstrap",
+            engine="claude",
+            bootstrap=True,
+        )
+
+        assert ctx is not None
+        assert ctx.session_id is None
+        assert [call["resume_id"] for call in ctx.sdk.connect_args] == [
+            "resume-bootstrap", None,
+        ]
+        assert ctx.sdk.disconnects == 1
+        assert not [message for message in transport.sent
+                    if message.type == "error"]
+
+    asyncio.run(run())
+
+
 def test_blank_new_session_does_not_start_a_turn():
     async def run():
         machine, transport = _mk_machine()

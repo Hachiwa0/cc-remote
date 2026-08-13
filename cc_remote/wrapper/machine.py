@@ -205,7 +205,7 @@ from cc_remote.wrapper.stream import (
     transcript_compact_history_page,
     recover_claude_delayed_retry_tail,
     transcript_internal_user_events,
-    transcript_timestamps, transcript_path,
+    transcript_timestamps, transcript_path, transcript_presence,
     translate_subagent_history, merge_subagent_history,
 )
 from cc_remote.wrapper.codex_handle import (
@@ -243,9 +243,14 @@ from cc_remote.wrapper.codex_history import (
 )
 from cc_remote.wrapper.codex_sessions import (
     list_codex_sessions, codex_session_cwd, codex_rollout_path, codex_model,
-    codex_session_settings,
+    codex_session_settings, codex_session_presence,
 )
-from cc_remote.wrapper.codex_models import codex_catalog, clamp_effort
+from cc_remote.wrapper.codex_models import (
+    MODEL_DEFAULT_EFFORT,
+    clamp_effort,
+    codex_catalog,
+    default_effort_for,
+)
 from cc_remote.wrapper.codex_rpc import (
     CodexRpcOutcomeUnknown, CodexRpcRejected, codex_rpc,
 )
@@ -309,6 +314,8 @@ CLAUDE_PERMISSION_MODES = frozenset({
 CODEX_PERMISSION_MODES = frozenset({"never", "on-request", "untrusted"})
 CODEX_COLLABORATION_MODES = frozenset({"default", "plan"})
 CODEX_FAST_SERVICE_TIERS = frozenset({"fast", "priority"})
+CODEX_EFFORT_RESOLVE_TIMEOUT_SECONDS = 1.0
+CODEX_EFFORT_RESOLVE_RETRY_SECONDS = 30.0
 _CLAUDE_OPUS_5_1M_ALIASES = frozenset({
     "opus",
     "opus[1m]",
@@ -966,8 +973,31 @@ def _session_model(ctx: SessionContext) -> Optional[str]:
 
 
 def _session_effort(ctx: SessionContext) -> Optional[str]:
-    """Return the live engine's desired reasoning strength, if known."""
-    value = getattr(ctx.sdk, "effort", None) or ctx.announced_effort
+    """Return the live engine's effective/display reasoning strength."""
+    explicit = getattr(ctx.sdk, "effort", None)
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+    if ctx.engine == "codex" and hasattr(ctx.sdk, "effort"):
+        display = getattr(ctx.sdk, "display_effort", None)
+        model = _session_model(ctx)
+        raw_cwd = getattr(ctx.sdk, "_cwd", None) or ctx.cwd
+        cwd = (
+            os.path.realpath(raw_cwd)
+            if isinstance(raw_cwd, str) and raw_cwd else None
+        )
+        if (
+            isinstance(display, str)
+            and display.strip()
+            and getattr(ctx.sdk, "display_effort_model", None) == model
+            and getattr(ctx.sdk, "display_effort_cwd", None) == cwd
+            and getattr(ctx.sdk, "display_effort_generation", None)
+                == getattr(ctx.sdk, "_generation", None)
+        ):
+            return display.strip()
+        # A normal Codex handle with an invalidated display projection must not
+        # fall back to the previously announced value from another cwd/process.
+        return None
+    value = getattr(ctx.sdk, "display_effort", None) or ctx.announced_effort
     return value.strip() if isinstance(value, str) and value.strip() else None
 
 
@@ -1539,6 +1569,11 @@ class WrapperMachine:
         self._codex_catalog_hint_tasks: set[asyncio.Task] = set()
         self._codex_catalog_hint_dirty = False
         self._codex_catalog_hint_last: tuple[str, str] | None = None
+        # A last-moment app-server reconnect can happen inside turn/start after
+        # the normal preflight resolved nullable effort. Refresh that display
+        # projection off the managed stream path so config/model catalog reads
+        # never delay draining an already-started turn.
+        self._codex_effort_publish_tasks: set[asyncio.Task] = set()
         # Catalog reads must never hold the serial command lane: a cold Codex
         # app-server startup can take tens of seconds on a very large store.
         self._session_list_command_tasks: set[asyncio.Task] = set()
@@ -1703,7 +1738,7 @@ class WrapperMachine:
         transition = self._codex_profile_transition
         if transition is not None and self._codex_profile_migration_ok:
             try:
-                self._migrate_codex_profile_state(transition)
+                self._migrate_codex_core_profile_state(transition)
             except Exception as exc:
                 self._codex_profile_migration_ok = False
                 self._codex_work_profile_migration_ok = False
@@ -1711,11 +1746,37 @@ class WrapperMachine:
                     "Codex profile state migration is incomplete",
                     error_type=type(exc).__name__,
                 )
-        if self._codex_profile_migration_ok:
+        if transition is not None and self._codex_profile_migration_ok:
             try:
-                # Schedule ownership was introduced after the account topology
-                # journal.  Repair it independently so an already-applied
-                # topology revision cannot leave legacy tasks unowned.
+                self._migrate_codex_work_profile_state(transition)
+            except Exception as exc:
+                self._codex_work_profile_migration_ok = False
+                log.warning(
+                    "Codex Work profile ownership migration is incomplete",
+                    error_type=type(exc).__name__,
+                )
+        presentation_migration_ok = self._codex_profile_migration_ok
+        if self._codex_profile_migration_ok:
+            # Plan and presentation files are rebuildable display caches. Keep
+            # their replay-safe revision migration outside both authorization
+            # gates: one malformed optional file must not disable Code or Work.
+            presentation_migration_ok = (
+                self._migrate_codex_presentation_profile_state(transition)
+            )
+        self._codex_presentation_profile_migration_ok = (
+            presentation_migration_ok
+        )
+        if (
+            self._codex_profile_migration_ok
+            and not self._codex_presentation_profile_migration_ok
+        ):
+            log.warning(
+                "Codex optional presentation state migration is incomplete"
+            )
+        if self._codex_work_profile_migration_ok:
+            try:
+                # Schedule ownership was introduced after the topology journal.
+                # Catch it up even when there is no pending topology transition.
                 self._work.for_engine("codex").assign_legacy_codex_profile(
                     self._codex_profiles.default.id
                 )
@@ -1725,7 +1786,12 @@ class WrapperMachine:
                     "Codex Work profile ownership migration is incomplete",
                     error_type=type(exc).__name__,
                 )
-        if self._codex_profile_migration_ok and transition is not None:
+        if (
+            self._codex_profile_migration_ok
+            and self._codex_work_profile_migration_ok
+            and self._codex_presentation_profile_migration_ok
+            and transition is not None
+        ):
             try:
                 self._codex_profile_topology.complete(
                     self._codex_profiles,
@@ -1739,10 +1805,10 @@ class WrapperMachine:
                     error_type=type(exc).__name__,
                 )
 
-    def _migrate_codex_profile_state(
+    def _migrate_codex_core_profile_state(
         self, transition: CodexProfileTopologyTransition,
     ) -> None:
-        """Apply one replay-safe topology revision across private stores."""
+        """Apply one replay-safe revision to authorization-critical stores."""
         revision = transition.revision
         transform = transition.wire_session_id
         self._codex_turn_leases.migrate_profile_sessions(
@@ -1764,11 +1830,59 @@ class WrapperMachine:
             transform,
             profile_revision=revision,
         )
+
+    def _migrate_codex_work_profile_state(
+        self, transition: CodexProfileTopologyTransition,
+    ) -> None:
+        """Move only Work ownership for one profile topology revision."""
         self._work.for_engine("codex").migrate_codex_profiles(
             transition.remaps,
             legacy_profile_id=transition.legacy_profile_id,
-            profile_revision=revision,
+            profile_revision=transition.revision,
         )
+
+    def _migrate_codex_presentation_profile_state(
+        self,
+        transition: CodexProfileTopologyTransition | None,
+    ) -> bool:
+        """Best-effort migration for optional Codex display projections."""
+        revision = self._codex_profile_revision
+        transform = (
+            transition.wire_session_id
+            if transition is not None else self._codex_plan_catch_up_id
+        )
+        complete = True
+        if self._session_plans is not None:
+            try:
+                self._session_plans.migrate_profile_sessions(
+                    transform, profile_revision=revision)
+            except Exception:
+                self._session_plans = None
+                complete = False
+                log.exception("session plan profile migration failed")
+        elif transition is not None:
+            complete = False
+        if self._session_presentation is not None:
+            try:
+                self._session_presentation.migrate_codex_profile_sessions(
+                    transform, profile_revision=revision)
+            except Exception:
+                self._session_presentation = None
+                complete = False
+                log.exception("session presentation profile migration failed")
+        elif transition is not None:
+            complete = False
+        return complete
+
+    def _codex_plan_catch_up_id(self, session_id: str) -> str:
+        """Namespace old Codex-only Plan ids after topology was already saved."""
+        if "@" in session_id or not self._codex_profiles.is_multi_profile:
+            return session_id
+        owner = self._codex_legacy_restart_profile_id
+        if owner is None:
+            raise SessionPlanStoreError(
+                "legacy Codex Plan owner is unavailable")
+        return self._codex_profiles.wire_session_id(owner, session_id)
 
     # ---- pool helpers ----
 
@@ -2057,13 +2171,14 @@ class WrapperMachine:
 
     def _session_presentation_fields(
         self,
+        engine: str,
         session_id: str,
     ) -> dict[str, object]:
         """Project a durable completion receipt into one cold catalog row."""
         if self._session_presentation is None:
             return {}
         try:
-            snapshot = self._session_presentation.get(session_id)
+            snapshot = self._session_presentation.get(engine, session_id)
         except SessionPresentationStoreError:
             log.warning(
                 "session completion receipt could not be listed",
@@ -2077,6 +2192,145 @@ class WrapperMachine:
             "completion_unread": snapshot.completion_unread,
             "completion_revision": snapshot.completion_revision,
         }
+
+    async def _claim_legacy_presentation_ids(
+        self,
+        claude_session_ids: set[str],
+        codex_session_ids: dict[str, str],
+    ) -> None:
+        """Claim v1 engine-less receipts only from a complete native witness.
+
+        The two catalogs are independent and may contain the same UUID. A
+        receipt moves only when exactly one engine proves ownership; ambiguous
+        or failed discovery remains quarantined for a later listing.
+        """
+        store = self._session_presentation
+        if store is None:
+            return
+        try:
+            legacy_ids = await asyncio.to_thread(store.legacy_ids)
+            for session_id in legacy_ids:
+                in_claude = session_id in claude_session_ids
+                codex_target = codex_session_ids.get(session_id)
+                in_codex = codex_target is not None
+                if in_claude == in_codex:
+                    continue
+                await asyncio.to_thread(
+                    store.claim_legacy,
+                    "claude" if in_claude else "codex",
+                    session_id,
+                    session_id if in_claude else codex_target,
+                )
+        except SessionPresentationStoreError:
+            log.warning("legacy session presentation ownership claim failed")
+
+    async def _claim_legacy_presentation_from_claude_catalog(
+        self,
+        claude_session_ids: set[str],
+    ) -> None:
+        store = self._session_presentation
+        if store is None:
+            return
+        try:
+            legacy_ids = await asyncio.to_thread(store.legacy_ids)
+            if not legacy_ids:
+                return
+            codex_ids: dict[str, str] = {}
+            # Only rows the Claude catalog can render need a collision probe.
+            # This caps exact SQLite lookups to the bounded native page rather
+            # than probing once for every quarantined receipt.
+            for session_id in legacy_ids & claude_session_ids:
+                matches: list[str] = []
+                uncertain = False
+                for profile in self._codex_profiles:
+                    home = self._codex_home(profile)
+                    presence = await asyncio.to_thread(
+                        codex_session_presence,
+                        session_id,
+                        **({} if home is None else {"codex_home": home}),
+                    )
+                    if presence is True:
+                        matches.append(self._codex_wire_sid(
+                            profile, session_id))
+                    elif presence is None:
+                        uncertain = True
+                # More than one account owning the same native UUID is also
+                # ambiguous, even though the engine family is the same.
+                if uncertain:
+                    claude_session_ids.discard(session_id)
+                elif len(matches) == 1:
+                    codex_ids[session_id] = matches[0]
+                elif len(matches) > 1:
+                    claude_session_ids.discard(session_id)
+            await self._claim_legacy_presentation_ids(
+                claude_session_ids, codex_ids)
+        except Exception as exc:
+            log.warning(
+                "legacy presentation Codex ownership probe failed",
+                error_type=type(exc).__name__,
+            )
+
+    async def _claim_legacy_presentation_from_codex_catalog(
+        self,
+        raw: list[dict],
+    ) -> None:
+        store = self._session_presentation
+        if store is None:
+            return
+        try:
+            legacy_ids = await asyncio.to_thread(store.legacy_ids)
+            if not legacy_ids:
+                return
+            listed_native_ids: set[str] = set()
+            for row in raw:
+                native_id = row.get("native_session_id")
+                if isinstance(native_id, str) and native_id in legacy_ids:
+                    listed_native_ids.add(native_id)
+            codex_ids: dict[str, str] = {}
+            unknown_codex_ids: set[str] = set()
+            duplicate_codex_ids: set[str] = set()
+            for session_id in listed_native_ids:
+                matches: list[str] = []
+                for profile in self._codex_profiles:
+                    home = self._codex_home(profile)
+                    presence = await asyncio.to_thread(
+                        codex_session_presence,
+                        session_id,
+                        **({} if home is None else {"codex_home": home}),
+                    )
+                    if presence is True:
+                        matches.append(self._codex_wire_sid(
+                            profile, session_id))
+                    elif presence is None:
+                        unknown_codex_ids.add(session_id)
+                if session_id in unknown_codex_ids:
+                    continue
+                if len(matches) == 1:
+                    codex_ids[session_id] = matches[0]
+                elif len(matches) > 1:
+                    duplicate_codex_ids.add(session_id)
+            claude_ids: set[str] = set()
+            unknown_claude_ids: set[str] = set()
+            for session_id in listed_native_ids:
+                presence = await asyncio.to_thread(
+                    transcript_presence, session_id)
+                if presence is True:
+                    claude_ids.add(session_id)
+                elif presence is None:
+                    unknown_claude_ids.add(session_id)
+            for session_id in unknown_claude_ids:
+                codex_ids.pop(session_id, None)
+            # Duplicate native UUIDs across Codex profiles cannot map one v1
+            # bare receipt to a unique wire id; keep those quarantined.
+            claude_ids.difference_update(
+                duplicate_codex_ids | unknown_codex_ids)
+            await self._claim_legacy_presentation_ids(
+                claude_ids, codex_ids)
+        except Exception as exc:
+            log.warning(
+                "legacy presentation Claude ownership probe failed",
+                error_type=type(exc).__name__,
+            )
 
     def _history_revision(self, sid: str) -> str:
         return f"{self.instance_id}-{self._history_revision_epochs.get(sid, 0)}"
@@ -2127,9 +2381,21 @@ class WrapperMachine:
         return self._codex_rollout_history_revisions.get(
             sid) == self._history_revision(sid)
 
-    def _activate_codex_rollout_history(self, sid: str) -> str:
-        """Start one clean rollout generation after a proven official omission."""
-        self._bump_history_revision(sid)
+    def _activate_codex_rollout_history(
+        self,
+        sid: str,
+        *,
+        advance_revision: bool = True,
+    ) -> str:
+        """Pin summary pagination to rollout for one History revision.
+
+        A proven omission changes an already-visible source family and needs a
+        fresh browser/index revision. A capability rejection happens before an
+        official page exists, so it can retain the current rollout cache while
+        still pinning all subsequent cursors to the same reader.
+        """
+        if advance_revision:
+            self._bump_history_revision(sid)
         # Drop official page cursors, locators and detail rows before any
         # rollout page can be requested under the new revision.
         self._invalidate_codex_history(sid)
@@ -2969,7 +3235,6 @@ class WrapperMachine:
                 can_takeover=False,
             )
             return False
-        await self._sync_external_control(ctx, watch)
         return True
 
     async def _codex_restart_state(
@@ -3578,6 +3843,36 @@ class WrapperMachine:
                             error_type=type(exc).__name__,
                         )
                 return False
+            if connected:
+                # thread/resume adopted the replacement daemon's authoritative
+                # settings, but a status/background reconnect may not launch a
+                # turn afterwards. Publish a changed nullable effort here so the
+                # browser cannot retain the previous daemon/account's chip until
+                # some unrelated command happens to refresh it.
+                if not self._is_resident_context(ctx):
+                    try:
+                        await ctx.sdk.disconnect()
+                    except Exception as exc:
+                        log.warning(
+                            "failed to disconnect evicted Codex shared proxy",
+                            session_id=ctx.session_id,
+                            error_type=type(exc).__name__,
+                        )
+                    return False
+                await self._sync_external_control(
+                    ctx, self._watch.get(self._ctx_wire_sid(ctx) or ""))
+                if not await self._publish_codex_model_effort(
+                    ctx, require_resident=True,
+                ):
+                    try:
+                        await ctx.sdk.disconnect()
+                    except Exception as exc:
+                        log.warning(
+                            "failed to disconnect evicted Codex shared proxy",
+                            session_id=ctx.session_id,
+                            error_type=type(exc).__name__,
+                        )
+                    return False
             if state is None:
                 return connected
             if connected:
@@ -4978,6 +5273,12 @@ class WrapperMachine:
             self._codex_catalog_hint_tasks.clear()
             self._codex_catalog_hint_dirty = False
             self._codex_catalog_hint_last = None
+            effort_tasks = list(self._codex_effort_publish_tasks)
+            for task in effort_tasks:
+                task.cancel()
+            if effort_tasks:
+                await asyncio.gather(*effort_tasks, return_exceptions=True)
+            self._codex_effort_publish_tasks.clear()
             history_tasks = list(self._history_command_tasks.values())
             for task in history_tasks:
                 task.cancel()
@@ -5804,6 +6105,7 @@ class WrapperMachine:
                 try:
                     dismissed = await asyncio.to_thread(
                         self._session_presentation.reconcile_goal,
+                        ctx.engine,
                         msg.sid,
                         goal_id,
                     )
@@ -5902,6 +6204,7 @@ class WrapperMachine:
                     try:
                         snapshot = await asyncio.to_thread(
                             self._session_presentation.mark_completion,
+                            ctx.engine,
                             sid,
                             msg.turn_id,
                         )
@@ -6879,6 +7182,79 @@ class WrapperMachine:
                 replay.generation = self.instance_id
         return replay
 
+    async def _fork_entry_for_cached_command(
+        self, cmd, cached_responses: tuple[object, ...],
+    ) -> Optional[dict]:
+        """Resolve the one journal entry owned by a cached fork command.
+
+        Request ids are browser-generated and therefore cannot be treated as a
+        cross-engine namespace.  Match the command's parent/target and its
+        cached child before consulting a deletion tombstone; an unrelated
+        journal collision must never suppress or resurrect this response.
+        """
+        request_id = getattr(cmd, "request_id", None)
+        requested_parent = getattr(cmd, "session_id", None)
+        if not isinstance(request_id, str) or not isinstance(
+            requested_parent, str
+        ):
+            return None
+        resolved_parent = (
+            self._resolve_session_alias(requested_parent) or requested_parent)
+        parents = {requested_parent, resolved_parent}
+        target = (
+            "worktree" if cmd.type == "fork_session_worktree" else "same_cwd")
+        cached = next((
+            response for response in cached_responses
+            if isinstance(response, SessionForked)
+            and response.request_id == request_id
+            and response.parent_session_id in parents
+            and response.target == target
+        ), None)
+        child = getattr(cached, "session_id", None)
+        journals = (
+            (self._codex_forks,)
+            if target == "worktree"
+            else (self._codex_forks, self._claude_forks)
+        )
+        candidates: list[tuple[str, dict]] = []
+        for engine, journal in zip(
+            (("codex",) if target == "worktree" else ("codex", "claude")),
+            journals,
+        ):
+            try:
+                entry = await asyncio.to_thread(journal.get, request_id)
+            except (ForkJournalError, ClaudeForkJournalError):
+                continue
+            if not entry:
+                continue
+            if entry.get("parent_session_id") not in parents:
+                continue
+            if entry.get("target", "same_cwd") != target:
+                continue
+            if isinstance(child, str) and entry.get("session_id") != child:
+                continue
+            candidates.append((engine, entry))
+        if len(candidates) == 1:
+            return candidates[0][1]
+        if len(candidates) > 1:
+            ctx = self._ctx_for(resolved_parent)
+            if ctx is not None:
+                matched = next((
+                    entry for engine, entry in candidates
+                    if engine == ctx.engine
+                ), None)
+                if matched is not None:
+                    return matched
+            statuses = {entry.get("status") for _, entry in candidates}
+            if len(statuses) == 1:
+                return candidates[0][1]
+            log.warning(
+                "ambiguous cross-engine cached fork journal collision",
+                request_id=request_id,
+                parent_session_id=resolved_parent,
+            )
+        return None
+
     async def _process_command(self, cmd) -> None:
         """Deduplicate reliable client commands and ACK completed handlers.
 
@@ -6892,6 +7268,17 @@ class WrapperMachine:
         seen, cached_responses = (
             self._command_seen(client_id, cmd_id) if reliable else (False, ()))
         if seen:
+            if cmd.type in {"fork_session", "fork_session_worktree"}:
+                entry = await self._fork_entry_for_cached_command(
+                    cmd, cached_responses)
+                if entry and entry.get("status") in {
+                    "delete_pending", "deleted",
+                }:
+                    # Cached command responses predate the durable child
+                    # tombstone. ACK the reliable retry but do not replay its
+                    # now-deleted SessionForked navigation frame.
+                    await self._send_command_ack(client_id, cmd_id)
+                    return
             if cmd.type in self.SAFE_RETRY_COMMANDS:
                 # The original one-shot response may have died on the same link as
                 # its ACK. Safe reads and idempotent reconciliations are re-run
@@ -7180,7 +7567,7 @@ class WrapperMachine:
                 if not ctx.btw and self._session_presentation is not None:
                     try:
                         presentation = await asyncio.to_thread(
-                            self._session_presentation.get, sid
+                            self._session_presentation.get, ctx.engine, sid
                         )
                     except SessionPresentationStoreError:
                         log.warning(
@@ -7227,24 +7614,40 @@ class WrapperMachine:
                             to=cmd.client_id,
                             route_id=getattr(cmd, "route_id", None),
                         ))
-                model = _session_model(ctx)
-                if model:
-                    ctx.announced_model = model
-                    await self.transport.send(Model(
-                        model=model,
-                        sid=sid,
-                        to=cmd.client_id,
-                        route_id=getattr(cmd, "route_id", None),
-                    ))
-                effort = _session_effort(ctx)
-                if effort:
-                    ctx.announced_effort = effort
-                    await self.transport.send(Effort(
-                        effort=effort,
-                        sid=sid,
-                        to=cmd.client_id,
-                        route_id=getattr(cmd, "route_id", None),
-                    ))
+                # Hello must remain a no-probe fast path, but model and effort
+                # still form one settings snapshot. Capture both before the first
+                # transport await, finish that pair even if native settings move
+                # while it is sent, then send one complete replacement pair.
+                settings_authority = None
+                for _attempt in range(3):
+                    settings_authority = (
+                        self._codex_model_effort_authority(ctx)
+                        if ctx.engine == "codex" else None
+                    )
+                    model = _session_model(ctx)
+                    effort = _session_effort(ctx)
+                    if ctx.engine == "codex" and not effort:
+                        effort = MODEL_DEFAULT_EFFORT
+                    if model:
+                        ctx.announced_model = model
+                        await self.transport.send(Model(
+                            model=model,
+                            sid=sid,
+                            to=cmd.client_id,
+                            route_id=getattr(cmd, "route_id", None),
+                        ))
+                    if effort:
+                        ctx.announced_effort = effort
+                        await self.transport.send(Effort(
+                            effort=effort,
+                            sid=sid,
+                            to=cmd.client_id,
+                            route_id=getattr(cmd, "route_id", None),
+                        ))
+                    if (ctx.engine != "codex"
+                            or self._codex_model_effort_authority(ctx)
+                            == settings_authority):
+                        break
                 if ctx.engine == "codex":
                     await self.transport.send(CollaborationMode(
                         mode=getattr(ctx.sdk, "collaboration_mode", "default"),
@@ -10094,9 +10497,16 @@ class WrapperMachine:
                 # parser. This is a capability fallback, never a response/error
                 # fallback: auth, timeout and malformed official data must stay
                 # visible instead of being mistaken for empty history.
+                # Pin the *summary page family* to rollout for this revision.
+                # Otherwise the newest rollout page advertises a stable turn-id
+                # cursor which the next request incorrectly hands back to the
+                # generation-local official cursor table.
+                revision = self._activate_codex_rollout_history(
+                    sid, advance_revision=False)
                 log.info(
                     "official Codex history unsupported; using rollout",
                     session_id=sid,
+                    revision=revision,
                 )
             except (
                 CodexHistoryCursorError,
@@ -12447,22 +12857,21 @@ class WrapperMachine:
             await ctx.sdk.set_model(cmd.model)
             await self._refresh_pending_claude_work_baseline(ctx)
             await self._persist_claude_session_controls(ctx)
+            if ctx.engine == "codex":
+                # Model and nullable effort form one authoritative app-server
+                # settings snapshot. Resolution may await config/read or the
+                # model catalog, so publish them together only after rechecking
+                # that authority; emitting Model first can pair an old model
+                # with a newer thread/settings effort during that await.
+                responses: list[object] = []
+                await self._publish_codex_model_effort(
+                    ctx, force=True, published=responses)
+                return tuple(responses)
             applied_model = getattr(ctx.sdk, "model", None) or cmd.model
             ctx.announced_model = applied_model
             model_event = Model(model=applied_model)
             await self._emit(ctx, model_event)
-            responses = [model_event]
-            if ctx.engine == "codex":
-                # thread/settings/updated is authoritative. app-server may adjust
-                # effort when the selected model cannot use the old level; never
-                # overwrite that decision with a Web-side guess or stale chip.
-                applied = getattr(ctx.sdk, "effort", None)
-                if applied and applied != ctx.announced_effort:
-                    ctx.announced_effort = applied
-                    effort_event = Effort(effort=applied)
-                    await self._emit(ctx, effort_event)
-                    responses.append(effort_event)
-            return tuple(responses)
+            return (model_event,)
         except Exception as e:
             log.exception("set_model failed", error=str(e))
             error = (
@@ -12472,6 +12881,176 @@ class WrapperMachine:
             )
             await self._emit(ctx, error)
             return error
+
+    async def _resolve_codex_session_effort(
+        self,
+        ctx: SessionContext,
+        *,
+        preferred: Optional[str] = None,
+    ) -> Optional[str]:
+        if ctx.engine != "codex":
+            return _session_effort(ctx)
+        async with ctx.codex_effort_resolve_lock:
+            return await self._resolve_codex_session_effort_locked(
+                ctx, preferred=preferred)
+
+    async def _resolve_codex_session_effort_locked(
+        self,
+        ctx: SessionContext,
+        *,
+        preferred: Optional[str] = None,
+    ) -> Optional[str]:
+        """Resolve app-server's nullable thread effort into a stable readout.
+
+        ``reasoningEffort: null`` means "no thread override", not "the control
+        is still loading". Prefer a wrapper-owned explicit choice (notably BTW's
+        low setting), then app-server's effective configured fallback. If no
+        configured level exists, publish a truthful model-default sentinel while
+        leaving ``sdk.effort`` unset so turn/start keeps following app-server.
+        """
+        # Some replay-only contexts intentionally carry no live Codex control
+        # adapter. They can still stream their ring, but there is no app-server
+        # state to resolve or mutable handle on which to cache presentation.
+        if not hasattr(ctx.sdk, "effort"):
+            return ctx.announced_effort
+        sdk = ctx.sdk
+        model = _session_model(ctx)
+        raw_cwd = getattr(sdk, "_cwd", None) or ctx.cwd
+        display_cwd = (
+            os.path.realpath(raw_cwd)
+            if isinstance(raw_cwd, str) and raw_cwd else None
+        )
+        display_generation = getattr(sdk, "_generation", None)
+        settings_revision = getattr(sdk, "_thread_settings_revision", None)
+        requested = preferred.strip() if isinstance(preferred, str) else ""
+        explicit = bool(requested)
+        current = getattr(sdk, "effort", None)
+        if not explicit and isinstance(current, str) and current.strip():
+            current = current.strip()
+            setattr(sdk, "display_effort", current)
+            setattr(sdk, "display_effort_model", model)
+            setattr(sdk, "display_effort_cwd", display_cwd)
+            setattr(sdk, "display_effort_generation", display_generation)
+            setattr(sdk, "_display_effort_retry_at", None)
+            return current
+
+        cached = getattr(sdk, "display_effort", None)
+        if (not explicit and isinstance(cached, str) and cached.strip()
+                and getattr(sdk, "display_effort_model", None) == model
+                and getattr(sdk, "display_effort_cwd", None) == display_cwd
+                and getattr(sdk, "display_effort_generation", None)
+                    == display_generation):
+            cached = cached.strip()
+            retry_at = getattr(sdk, "_display_effort_retry_at", None)
+            if retry_at is None or (isinstance(retry_at, (int, float))
+                    and asyncio.get_running_loop().time() < retry_at):
+                return cached
+
+        profile = self._codex_profile_for_ctx(ctx)
+        home = self._codex_home(profile)
+        kwargs = {} if home is None else {"codex_home": home}
+        resolved: Optional[str] = None
+        if explicit:
+            try:
+                resolved = await asyncio.wait_for(
+                    clamp_effort(
+                        model, requested, **kwargs),
+                    timeout=CODEX_EFFORT_RESOLVE_TIMEOUT_SECONDS,
+                )
+            except Exception as exc:
+                # The wrapper will send this exact explicit choice on the next
+                # turn. Catalog availability must not erase a user's setting.
+                log.warning(
+                    "Codex explicit effort could not be catalog-clamped",
+                    model=model,
+                    requested=requested,
+                    error_type=type(exc).__name__,
+                )
+                resolved = requested
+        else:
+            configured_default = getattr(
+                sdk, "configured_default_effort", None)
+            if callable(configured_default):
+                try:
+                    configured = await asyncio.wait_for(
+                        configured_default(),
+                        timeout=CODEX_EFFORT_RESOLVE_TIMEOUT_SECONDS,
+                    )
+                    if isinstance(configured, str) and configured.strip():
+                        resolved = configured
+                except Exception as exc:
+                    log.warning(
+                        "Codex configured effort could not be resolved",
+                        model=model,
+                        error_type=type(exc).__name__,
+                    )
+            if not resolved:
+                try:
+                    resolved = await asyncio.wait_for(
+                        default_effort_for(model, **kwargs),
+                        timeout=CODEX_EFFORT_RESOLVE_TIMEOUT_SECONDS,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "Codex model-default effort could not be resolved",
+                        model=model,
+                        error_type=type(exc).__name__,
+                    )
+
+        current_raw_cwd = getattr(sdk, "_cwd", None) or ctx.cwd
+        current_cwd = (
+            os.path.realpath(current_raw_cwd)
+            if isinstance(current_raw_cwd, str) and current_raw_cwd else None
+        )
+        authority_changed = (
+            ctx.sdk is not sdk
+            or _session_model(ctx) != model
+            or current_cwd != display_cwd
+            or getattr(sdk, "_generation", None) != display_generation
+            or getattr(sdk, "_thread_settings_revision", None)
+                != settings_revision
+        )
+        if authority_changed:
+            # A newer thread/settings snapshot or a new model/cwd/process owns
+            # the readout. Never install the completed old probe, and never
+            # reapply ``preferred`` over that newer authority. A concrete live
+            # value wins immediately; nullable state truthfully falls back to
+            # model-default until the next scoped probe resolves it.
+            return _session_effort(ctx) or MODEL_DEFAULT_EFFORT
+
+        if isinstance(resolved, str) and resolved.strip():
+            resolved = resolved.strip()
+            # A concrete configured default is presentation state, not a thread
+            # override. Keep sdk.effort null unless the caller supplied an
+            # explicit choice; otherwise turn/start would silently pin the
+            # current config and stop following later app-server defaults.
+            if explicit:
+                sdk.effort = resolved
+                sdk.applied_effort = resolved
+            setattr(sdk, "display_effort", resolved)
+            setattr(sdk, "display_effort_model", model)
+            setattr(sdk, "display_effort_cwd", display_cwd)
+            setattr(sdk, "display_effort_generation", display_generation)
+            setattr(
+                sdk,
+                "_display_effort_retry_at",
+                None if explicit else (
+                    asyncio.get_running_loop().time()
+                    + CODEX_EFFORT_RESOLVE_RETRY_SECONDS
+                ),
+            )
+            return resolved
+        setattr(sdk, "display_effort", MODEL_DEFAULT_EFFORT)
+        setattr(sdk, "display_effort_model", model)
+        setattr(sdk, "display_effort_cwd", display_cwd)
+        setattr(sdk, "display_effort_generation", display_generation)
+        setattr(
+            sdk,
+            "_display_effort_retry_at",
+            asyncio.get_running_loop().time()
+            + CODEX_EFFORT_RESOLVE_RETRY_SECONDS,
+        )
+        return MODEL_DEFAULT_EFFORT
 
     async def _apply_codex_effort(self, ctx, effort: Optional[str]) -> Optional[str]:
         """Clamp `effort` to what ctx's codex model supports and apply it to the live
@@ -12494,8 +13073,16 @@ class WrapperMachine:
             return applied
         # Persist through app-server's official thread setting. turn/start repeats
         # it defensively, but a restart/eviction no longer loses the selection.
-        await ctx.sdk.set_effort(applied)
-        return getattr(ctx.sdk, "effort", None) or applied
+        authoritative_update = await ctx.sdk.set_effort(applied)
+        # A real thread/settings/updated snapshot may clamp or otherwise adjust
+        # the requested level. Honor that authoritative value; only isolated
+        # fakes/older servers which left no value need the requested fallback.
+        authoritative = getattr(ctx.sdk, "effort", None)
+        if authoritative_update is True:
+            return await self._resolve_codex_session_effort(ctx)
+        if isinstance(authoritative, str) and authoritative.strip():
+            return await self._resolve_codex_session_effort(ctx)
+        return await self._resolve_codex_session_effort(ctx, preferred=applied)
 
     async def _handle_set_effort(self, cmd):
         # cc SDK: effort is a spawn-time flag (--effort), so record it and let
@@ -12624,16 +13211,12 @@ class WrapperMachine:
             # corresponding turn_context until the next turn starts.  Reading the
             # rollout here would therefore put an old model/effort back into the
             # handle (and Web) just after a successful Remote or TUI switch.
-            model = getattr(ctx.sdk, "model", None)
-            if (isinstance(model, str) and model
-                    and ctx.announced_model != model):
-                ctx.announced_model = model
-                await self._emit(ctx, Model(model=model))
-            effort = getattr(ctx.sdk, "effort", None)
-            if (isinstance(effort, str) and effort
-                    and ctx.announced_effort != effort):
-                ctx.announced_effort = effort
-                await self._emit(ctx, Effort(effort=effort))
+            # Model and effort are one app-server settings snapshot.  Resolving a
+            # nullable effort can await config/read, during which a newer native
+            # settings notification may replace both fields.  Publish the pair
+            # through the authority-checked path instead of mixing the model
+            # captured before that await with the effort captured afterwards.
+            await self._publish_codex_model_effort(ctx)
             approval = getattr(ctx.sdk, "approval", None)
             if (approval in CODEX_PERMISSION_MODES
                     and ctx.announced_perm != approval):
@@ -12666,14 +13249,12 @@ class WrapperMachine:
         model = settings.get("model")
         if isinstance(model, str) and model and ctx.sdk.model != model:
             ctx.sdk.model = model
-            ctx.announced_model = model
-            await self._emit(ctx, Model(model=model))
         effort = settings.get("effort")
         if isinstance(effort, str) and effort and ctx.sdk.effort != effort:
             ctx.sdk.effort = effort
             ctx.sdk.applied_effort = effort
-            ctx.announced_effort = effort
-            await self._emit(ctx, Effort(effort=effort))
+            setattr(ctx.sdk, "display_effort", effort)
+        await self._publish_codex_model_effort(ctx)
         approval = settings.get("approval_policy")
         if (ctx.space != "work" and approval in CODEX_PERMISSION_MODES
                 and ctx.sdk.approval != approval):
@@ -13012,10 +13593,171 @@ class WrapperMachine:
             await self._emit(ctx, error)
             return error
 
+    @staticmethod
+    def _codex_model_effort_authority(
+        ctx: SessionContext,
+    ) -> tuple[object, ...]:
+        """Identity of one live Codex model/effort settings snapshot."""
+        sdk = ctx.sdk
+        raw_cwd = getattr(sdk, "_cwd", None) or ctx.cwd
+        cwd = (
+            os.path.realpath(raw_cwd)
+            if isinstance(raw_cwd, str) and raw_cwd else None
+        )
+        # Include both the native settings revision and the actual display
+        # fields. Real Codex handles advance the revision, while lightweight
+        # adapters/tests may only replace their public values.
+        return (
+            id(sdk),
+            _session_model(ctx),
+            cwd,
+            getattr(sdk, "_generation", None),
+            getattr(sdk, "_thread_settings_revision", None),
+            getattr(sdk, "effort", None),
+            getattr(sdk, "display_effort", None),
+            getattr(sdk, "display_effort_model", None),
+            getattr(sdk, "display_effort_cwd", None),
+            getattr(sdk, "display_effort_generation", None),
+        )
+
+    async def _publish_codex_model_effort(
+        self,
+        ctx: SessionContext,
+        *,
+        require_resident: bool = False,
+        resolve_effort: bool = True,
+        force: bool = False,
+        published: Optional[list[object]] = None,
+    ) -> bool:
+        """Publish model/effort adopted by the current app-server generation."""
+        def authority() -> tuple[object, ...]:
+            return self._codex_model_effort_authority(ctx)
+
+        async def publish_snapshot(
+            model: Optional[str],
+            effort: Optional[str],
+        ) -> None:
+            # Model and effort are one display snapshot. Holding emit_lock keeps
+            # these frames adjacent to every other wrapper event, but app-server
+            # notifications may still mutate the handle while transport.send()
+            # yields. Finish the captured pair before observing that mutation;
+            # the caller will then publish a complete replacement pair.
+            publish_pair = bool(model and effort and (
+                force
+                or ctx.announced_model != model
+                or ctx.announced_effort != effort
+            ))
+            if publish_pair:
+                ctx.announced_model = model
+                model_event = Model(model=model)
+                await self._emit_locked(ctx, model_event)
+                if published is not None:
+                    published.append(model_event)
+
+                ctx.announced_effort = effort
+                effort_event = Effort(effort=effort)
+                await self._emit_locked(ctx, effort_event)
+                if published is not None:
+                    published.append(effort_event)
+                return
+
+            # Replay-only/lightweight adapters can lack one side of the pair.
+            # Preserve the useful control without inventing a model id.
+            if model and (force or ctx.announced_model != model):
+                ctx.announced_model = model
+                model_event = Model(model=model)
+                await self._emit_locked(ctx, model_event)
+                if published is not None:
+                    published.append(model_event)
+            if effort and (force or ctx.announced_effort != effort):
+                ctx.announced_effort = effort
+                effort_event = Effort(effort=effort)
+                await self._emit_locked(ctx, effort_event)
+                if published is not None:
+                    published.append(effort_event)
+
+        # Resolving a nullable effort can await config/read and model/list. Do
+        # not publish the model before that await: thread/settings/updated may
+        # replace both values in the meantime, which would otherwise put an old
+        # Model and a new Effort next to each other on the wire. Retry a moving
+        # authority a few times. Once a stable snapshot is selected, always
+        # finish its complete pair before checking for a newer authority.
+        for _attempt in range(3):
+            if require_resident and not self._is_resident_context(ctx):
+                return False
+            starting_authority = authority()
+            effort = (
+                (await self._resolve_codex_session_effort(ctx))
+                if resolve_effort else _session_effort(ctx)
+            ) or MODEL_DEFAULT_EFFORT
+            if require_resident and not self._is_resident_context(ctx):
+                return False
+            model = _session_model(ctx)
+            resolved_authority = authority()
+            if resolved_authority != starting_authority:
+                continue
+            async with ctx.emit_lock:
+                if require_resident and not self._is_resident_context(ctx):
+                    return False
+                if authority() != resolved_authority:
+                    continue
+                await publish_snapshot(model, effort)
+                # Eviction cannot cancel an in-flight transport write. Finish the
+                # selected complete pair, then tell the reconnect caller that the
+                # context no longer owns a resident route.
+                if require_resident and not self._is_resident_context(ctx):
+                    return False
+                if authority() == resolved_authority:
+                    return True
+
+        # Sustained churn can invalidate every asynchronous probe before it is
+        # publishable. A reliable SetModel must not be ACKed with an empty
+        # response cache in that case. Take one non-awaiting, truthful snapshot:
+        # a null override is represented as model-default, and any subsequent
+        # refresh can replace this complete pair normally.
+        if require_resident and not self._is_resident_context(ctx):
+            return False
+        async with ctx.emit_lock:
+            if require_resident and not self._is_resident_context(ctx):
+                return False
+            await publish_snapshot(
+                _session_model(ctx),
+                _session_effort(ctx) or MODEL_DEFAULT_EFFORT,
+            )
+            if require_resident and not self._is_resident_context(ctx):
+                return False
+        log.warning(
+            "Codex model/effort published a bounded fallback during settings churn",
+            session_id=ctx.session_id,
+        )
+        return True
+
+    def _schedule_codex_model_effort_publish(
+        self, ctx: SessionContext,
+    ) -> None:
+        """Resolve a reconnected turn's nullable effort without blocking it."""
+        async def publish() -> None:
+            try:
+                await self._publish_codex_model_effort(
+                    ctx, require_resident=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning(
+                    "Codex model/effort background refresh failed",
+                    session_id=ctx.session_id,
+                    error_type=type(exc).__name__,
+                )
+
+        task = asyncio.create_task(publish())
+        self._codex_effort_publish_tasks.add(task)
+        task.add_done_callback(self._codex_effort_publish_tasks.discard)
+
     async def _republish_codex_execution_controls(
         self, ctx: SessionContext,
     ) -> None:
         """Reassert the controls proven by a recovered Codex connection."""
+        await self._publish_codex_model_effort(ctx)
         permission_mode = _session_permission_mode(ctx)
         if permission_mode in CODEX_PERMISSION_MODES:
             ctx.announced_perm = permission_mode
@@ -13056,6 +13798,11 @@ class WrapperMachine:
             await ctx.sdk.set_web_search(cmd.mode)
             await self._stamp_codex_daemon_epoch(ctx)
             await self._persist_codex_session_controls(ctx)
+            # set_web_search resumes the app-server and may adopt a different
+            # authoritative model/null effort from that generation. Publish
+            # those coupled controls before the requested search result so the
+            # Web UI never keeps the pre-reconnect chip indefinitely.
+            await self._publish_codex_model_effort(ctx)
             applied = _session_web_search(ctx)
             if applied not in CODEX_WEB_SEARCH_MODES:
                 raise RuntimeError(
@@ -14256,6 +15003,7 @@ class WrapperMachine:
             )
             try:
                 await ctx.sdk.force_reconnect(ctx.session_id, ctx.cwd)
+                await self._publish_codex_model_effort(ctx)
             except Exception as exc:
                 log.exception(
                     "codex review reconnect failed", error=str(exc))
@@ -14832,10 +15580,14 @@ class WrapperMachine:
             if goal_id is not None and goal_id == cmd.goal_id:
                 await asyncio.to_thread(
                     self._session_presentation.dismiss_goal,
+                    ctx.engine,
                     self._ctx_wire_sid(ctx) or ctx.key,
                     goal_id,
                 )
-            event = GoalState(goal=goal)
+            event = GoalState(
+                goal=goal,
+                request_id=getattr(cmd, "cmd_id", None),
+            )
             await self._emit(ctx, event)
             return event
         except SessionPresentationStoreError:
@@ -14880,8 +15632,25 @@ class WrapperMachine:
                 if ctx is not None
                 else sid
             )
+            engine = ctx.engine if ctx is not None else (
+                await asyncio.to_thread(
+                    self._session_presentation.completion_engine,
+                    session_id,
+                    cmd.completion_id,
+                )
+            )
+            if engine is None:
+                error = Error(
+                    code=ERR_PROTOCOL,
+                    message="无法确认该任务完成状态所属的引擎，请打开会话后重试",
+                    request_id=getattr(cmd, "cmd_id", None),
+                    to=getattr(cmd, "client_id", None),
+                )
+                await self._emit_to_sid(sid, error)
+                return error
             snapshot = await asyncio.to_thread(
                 self._session_presentation.acknowledge_completion,
+                engine,
                 session_id,
                 cmd.completion_id,
             )
@@ -16795,6 +17564,14 @@ class WrapperMachine:
                 self._work.for_engine("claude").records_by_session)
             pinned_ids = (self._session_pins.ids("claude")
                           if self._session_pins is not None else frozenset())
+            await self._claim_legacy_presentation_from_claude_catalog({
+                info.session_id
+                for info in infos
+                if (
+                    info.session_id not in blocked
+                    and info.session_id not in private_btw_ids
+                )
+            })
             sessions = []
             for info in infos:
                 record = work_records.get(info.session_id)
@@ -16821,7 +17598,7 @@ class WrapperMachine:
                     state=resident_state.get(info.session_id),
                     engine="claude", space=space,
                     work_id=record.work_id if record else None,
-                    **self._session_presentation_fields(info.session_id),
+                    **self._session_presentation_fields("claude", info.session_id),
                 ))
             if space == "code" and self._claude_broker_enabled:
                 # `claude-remote new` reserves the native session UUID before
@@ -16859,7 +17636,7 @@ class WrapperMachine:
                                 pinned=broker_sid in pinned_ids,
                                 engine="claude",
                                 space="code",
-                                **self._session_presentation_fields(broker_sid),
+                                **self._session_presentation_fields("claude", broker_sid),
                             ))
                             known.add(broker_sid)
             for session in sessions:
@@ -17368,6 +18145,7 @@ class WrapperMachine:
     ) -> None:
         """Filter and route one already-read native Codex catalog."""
         try:
+            await self._claim_legacy_presentation_from_codex_catalog(raw)
             self._prime_codex_sidebar_watches(raw)
             resident_state = {
                 c.key: c.state for c in self.sessions.values()
@@ -17506,7 +18284,7 @@ class WrapperMachine:
                     native_session_id=native_sid,
                     codex_profile_id=row.get("codex_profile_id"),
                     codex_profile_label=row.get("codex_profile_label"),
-                    **self._session_presentation_fields(wire_sid),
+                    **self._session_presentation_fields("codex", wire_sid),
                 ))
             for session in sessions:
                 self._remember_notification_title(
@@ -17635,6 +18413,8 @@ class WrapperMachine:
                 )
                 await self._emit_to_sid(sid, error)
                 return error
+        if ctx.engine == "codex":
+            await self._resolve_codex_session_effort(ctx)
         self.focused_sid = ctx.key
         # A newly-spawned session isn't tracked by the client yet — send its
         # snapshot + full replay so the client builds a runtime for it (else the
@@ -17661,6 +18441,7 @@ class WrapperMachine:
             try:
                 presentation = await asyncio.to_thread(
                     self._session_presentation.get,
+                    ctx.engine,
                     self._ctx_wire_sid(ctx) or ctx.key,
                 )
             except SessionPresentationStoreError:
@@ -17721,9 +18502,10 @@ class WrapperMachine:
                 model_event = Model(model=ctx.sdk.model)
                 await self._emit(ctx, model_event)
                 cached_responses.append(model_event)
-            if ctx.sdk.effort:
-                ctx.announced_effort = ctx.sdk.effort
-                effort_event = Effort(effort=ctx.sdk.effort)
+            effort = _session_effort(ctx)
+            if effort:
+                ctx.announced_effort = effort
+                effort_event = Effort(effort=effort)
                 await self._emit(ctx, effort_event)
                 cached_responses.append(effort_event)
             # Snapshot/SessionFocus has now created the browser runtime. Release
@@ -17850,7 +18632,8 @@ class WrapperMachine:
             if self._session_presentation is not None:
                 try:
                     await asyncio.to_thread(
-                        self._session_presentation.move, old_key, route_sid
+                        self._session_presentation.move,
+                        ctx.engine, old_key, route_sid,
                     )
                 except SessionPresentationStoreError:
                     log.warning(
@@ -18410,10 +19193,20 @@ class WrapperMachine:
         else:
             await self._delete_codex_client_message_ids(codex_alias_path)
         await self._drop_preview_session(engine, sid)
+        if engine == "codex" and self._session_plans is not None:
+            try:
+                await asyncio.to_thread(self._session_plans.delete, sid)
+            except SessionPlanStoreError:
+                # The native thread and Work registry row are already gone.
+                # This cache is optional presentation state, so cleanup is
+                # best-effort and must not turn a successful delete into a
+                # misleading product failure.
+                log.warning(
+                    "stale Codex Work plan cleanup failed", session_id=sid)
         if self._session_presentation is not None:
             try:
                 await asyncio.to_thread(
-                    self._session_presentation.delete, sid
+                    self._session_presentation.delete, engine, sid
                 )
             except SessionPresentationStoreError:
                 log.warning(
@@ -19323,6 +20116,43 @@ class WrapperMachine:
                 )
                 await self.transport.send(error)
                 return error
+        fork_journal = (
+            self._codex_forks if engine == "codex" else self._claude_forks)
+        fork_delete_state = None
+        try:
+            fork_delete_state = await asyncio.to_thread(
+                fork_journal.begin_delete, sid)
+        except (ForkJournalError, ClaudeForkJournalError):
+            # A completed fork may still have reliable command retries in a
+            # browser outbox. Deleting its native child without first recording
+            # a replay tombstone could make that old command publish
+            # SessionForked again after restart, so fail closed before mutation.
+            log.exception(
+                "fork deletion intent journal failed",
+                engine=engine,
+                session_id=sid,
+            )
+            error = Error(
+                code=ERR_INTERNAL,
+                message="无法安全记录派生会话删除状态，未执行删除",
+                sid=sid,
+                to=getattr(cmd, "client_id", None),
+            )
+            await self.transport.send(error)
+            return error
+
+        async def abort_fork_delete() -> None:
+            if fork_delete_state != "delete_pending":
+                return
+            try:
+                await asyncio.to_thread(fork_journal.abort_delete, sid)
+            except (ForkJournalError, ClaudeForkJournalError):
+                log.exception(
+                    "fork deletion intent rollback failed",
+                    engine=engine,
+                    session_id=sid,
+                )
+
         if engine == "codex":
             assert ctx is not None
             try:
@@ -19345,6 +20175,10 @@ class WrapperMachine:
                             error_type=type(exc).__name__,
                         )
             if isinstance(delete_result, Error):
+                if delete_result.message != (
+                    "会话删除结果暂时无法确认，请刷新后重试"
+                ):
+                    await abort_fork_delete()
                 return delete_result
             deleted_sids = delete_result
             if transient_codex_ctx:
@@ -19359,6 +20193,7 @@ class WrapperMachine:
                         engine=engine,
                         session_id=sid,
                     )
+                    await abort_fork_delete()
                     return await self._send_code_delete_error(
                         cmd,
                         sid,
@@ -19377,6 +20212,7 @@ class WrapperMachine:
                     engine=engine,
                     session_id=sid,
                 )
+                await abort_fork_delete()
                 return await self._send_code_delete_error(
                     cmd,
                     sid,
@@ -19384,6 +20220,19 @@ class WrapperMachine:
                     "会话删除失败，请刷新后重试",
                 )
             deleted_sids = (sid,)
+
+        if fork_delete_state is not None:
+            try:
+                await asyncio.to_thread(fork_journal.finish_delete, sid)
+            except (ForkJournalError, ClaudeForkJournalError):
+                # Native deletion already succeeded. Keep delete_pending as a
+                # fail-closed tombstone: replay suppression treats it exactly
+                # like deleted and the next explicit delete can finalize it.
+                log.exception(
+                    "fork deletion tombstone finalization failed",
+                    engine=engine,
+                    session_id=sid,
+                )
         if engine == "claude":
             await self._delete_claude_client_message_ids(sid)
         else:
@@ -19417,6 +20266,7 @@ class WrapperMachine:
                 try:
                     await asyncio.to_thread(
                         self._session_presentation.delete,
+                        engine,
                         deleted_sid,
                     )
                 except SessionPresentationStoreError:
@@ -19536,6 +20386,7 @@ class WrapperMachine:
                     cwd=ctx.cwd,
                     reason=f"external transcript change before {action}",
                 )
+                await self._publish_codex_model_effort(ctx)
                 ctx.needs_reload = False
             except Exception as exc:
                 log.warning(
@@ -19770,7 +20621,8 @@ class WrapperMachine:
             if self._session_presentation is not None:
                 try:
                     presentation = await asyncio.to_thread(
-                        self._session_presentation.clear_completion, sid
+                        self._session_presentation.clear_completion,
+                        ctx.engine, sid,
                     )
                     if presentation.completion_revision > 0:
                         await self._emit(
@@ -20692,7 +21544,9 @@ class WrapperMachine:
             # failed local preflight/persist attempt has nothing to reconcile.
             # Submitted/uncertain requests keep their lock for the background
             # reconciler and reliable retry path.
-            or effective_status in {"intent", "complete", "rejected"}
+            or effective_status in {
+                "intent", "complete", "delete_pending", "deleted", "rejected",
+            }
         )
         if (terminal_or_unrecorded
                 and (task is None or task.done())
@@ -20779,7 +21633,8 @@ class WrapperMachine:
                     if client_id and cmd_id:
                         self._remember_command(
                             client_id, cmd_id,
-                            (event.model_copy(deep=True),),
+                            ((event.model_copy(deep=True),)
+                             if event is not None else ()),
                         )
                         await self._send_command_ack(client_id, cmd_id)
                     return
@@ -20964,7 +21819,7 @@ class WrapperMachine:
 
     async def _finish_same_cwd_fork(
         self, cmd, sid: str, cwd: str, child_session_id: str,
-    ) -> SessionForked | Error:
+    ) -> SessionForked | Error | None:
         try:
             await asyncio.to_thread(
                 self._codex_forks.complete, cmd.request_id, child_session_id)
@@ -20988,6 +21843,11 @@ class WrapperMachine:
         try:
             entry = await asyncio.to_thread(
                 self._codex_forks.get, cmd.request_id)
+            if entry and entry.get("status") in {
+                "delete_pending", "deleted",
+            }:
+                self._uncertain_codex_forks.pop(cmd.request_id, None)
+                return None
             await self._inherit_codex_fork_controls(
                 child_session_id, (entry or {}).get("controls"))
         except Exception as exc:
@@ -21003,6 +21863,13 @@ class WrapperMachine:
             raise _ForkOutcomeUncertain(
                 "fork controls are not durably inherited") from exc
         self._uncertain_codex_forks.pop(cmd.request_id, None)
+        entry = await asyncio.to_thread(
+            self._codex_forks.get, cmd.request_id)
+        if entry and entry.get("status") in {"delete_pending", "deleted"}:
+            # The native deletion owns this child now. Reliable retries and a
+            # background reconciler still complete/ACK the original command,
+            # but must never resurrect its SessionForked navigation event.
+            return None
         event = SessionForked(
             parent_session_id=sid,
             session_id=child_session_id,
@@ -21019,6 +21886,7 @@ class WrapperMachine:
         self._invalidate_codex_session_catalog()
         await self.transport.send(event)
         try:
+            self._invalidate_codex_session_catalog()
             await self._list_codex_sessions(cmd)
         except Exception as exc:
             # The correlated fork result is already durable and delivered. A
@@ -21096,7 +21964,9 @@ class WrapperMachine:
         lock = self._claude_fork_locks.get(request_id)
         terminal_or_unrecorded = (
             entry is None
-            or entry.get("status") in {"complete", "rejected"}
+            or entry.get("status") in {
+                "complete", "delete_pending", "deleted", "rejected",
+            }
         )
         if (terminal_or_unrecorded
                 and (task is None or task.done())
@@ -21174,7 +22044,9 @@ class WrapperMachine:
                         continue
                     if client_id and cmd_id:
                         self._remember_command(
-                            client_id, cmd_id, (event.model_copy(deep=True),))
+                            client_id, cmd_id,
+                            ((event.model_copy(deep=True),)
+                             if event is not None else ()))
                         await self._send_command_ack(client_id, cmd_id)
                     return
             await self._send_session_fork_error(
@@ -21196,7 +22068,7 @@ class WrapperMachine:
     async def _finish_claude_fork(
         self, cmd, sid: str, cwd: str, child_session_id: str,
         title: Optional[str],
-    ) -> SessionForked:
+    ) -> Optional[SessionForked]:
         try:
             await asyncio.to_thread(
                 self._claude_forks.complete, cmd.request_id, child_session_id)
@@ -21217,6 +22089,11 @@ class WrapperMachine:
         try:
             fork_entry = await asyncio.to_thread(
                 self._claude_forks.get, cmd.request_id)
+            if fork_entry and fork_entry.get("status") in {
+                "delete_pending", "deleted",
+            }:
+                self._uncertain_claude_forks.pop(cmd.request_id, None)
+                return None
             await self._inherit_claude_fork_controls(
                 child_session_id, (fork_entry or {}).get("controls"))
         except Exception as exc:
@@ -21233,6 +22110,12 @@ class WrapperMachine:
                 "Claude fork controls are not durably inherited") from exc
 
         self._uncertain_claude_forks.pop(cmd.request_id, None)
+        fork_entry = await asyncio.to_thread(
+            self._claude_forks.get, cmd.request_id)
+        if fork_entry and fork_entry.get("status") in {
+            "delete_pending", "deleted",
+        }:
+            return None
         # The marker must remain list-visible until the child id is durable.
         # Replace only that exact marker: after SessionForked is delivered, an
         # ACK-loss retry must never overwrite a title the user chose meanwhile.
@@ -21249,6 +22132,13 @@ class WrapperMachine:
         except Exception as exc:
             log.warning("Claude fork title finalization failed",
                         session_id=child_session_id, error=str(exc))
+
+        fork_entry = await asyncio.to_thread(
+            self._claude_forks.get, cmd.request_id)
+        if fork_entry and fork_entry.get("status") in {
+            "delete_pending", "deleted",
+        }:
+            return None
 
         event = SessionForked(
             parent_session_id=sid,
@@ -21360,6 +22250,8 @@ class WrapperMachine:
 
         assert entry is not None
 
+        if canonical_status in {"delete_pending", "deleted"}:
+            return None
         if canonical_status == "complete":
             return await self._finish_claude_fork(
                 cmd, sid, source_cwd,
@@ -21569,6 +22461,8 @@ class WrapperMachine:
             return await self._send_session_fork_error(
                 cmd, ERR_INTERNAL, f"无法记录派生请求: {exc}")
 
+        if entry.get("status") in {"delete_pending", "deleted"}:
+            return None
         if entry.get("status") == "complete":
             child = entry.get("session_id")
             return await self._finish_same_cwd_fork(
@@ -21812,7 +22706,7 @@ class WrapperMachine:
         marker: str,
         *,
         freshly_confirmed: bool = False,
-    ) -> SessionForked:
+    ) -> Optional[SessionForked]:
         """Durably publish one worktree fork without replaying its mutation."""
         try:
             await asyncio.to_thread(
@@ -21839,6 +22733,11 @@ class WrapperMachine:
         try:
             entry = await asyncio.to_thread(
                 self._codex_forks.get, cmd.request_id)
+            if entry and entry.get("status") in {
+                "delete_pending", "deleted",
+            }:
+                self._uncertain_codex_forks.pop(cmd.request_id, None)
+                return None
             await self._inherit_codex_fork_controls(
                 child_session_id, (entry or {}).get("controls"))
         except Exception as exc:
@@ -21853,6 +22752,12 @@ class WrapperMachine:
             )
             raise _ForkOutcomeUncertain(
                 "worktree fork controls are not durably inherited") from exc
+
+        entry = await asyncio.to_thread(
+            self._codex_forks.get, cmd.request_id)
+        if entry and entry.get("status") in {"delete_pending", "deleted"}:
+            self._uncertain_codex_forks.pop(cmd.request_id, None)
+            return None
 
         try:
             await self._finalize_codex_worktree_fork_name(
@@ -21870,6 +22775,10 @@ class WrapperMachine:
                 "worktree fork name state is not durable") from exc
 
         self._uncertain_codex_forks.pop(cmd.request_id, None)
+        entry = await asyncio.to_thread(
+            self._codex_forks.get, cmd.request_id)
+        if entry and entry.get("status") in {"delete_pending", "deleted"}:
+            return None
         event = SessionForked(
             parent_session_id=sid,
             session_id=child_session_id,
@@ -21885,6 +22794,7 @@ class WrapperMachine:
         self._invalidate_codex_session_catalog()
         await self.transport.send(event)
         try:
+            self._invalidate_codex_session_catalog()
             await self._list_codex_sessions(cmd)
         except Exception as exc:
             log.warning(
@@ -22106,6 +23016,8 @@ class WrapperMachine:
                 cmd, ERR_INTERNAL, f"无法记录派生请求: {exc}")
         controls = dict(fork_entry.get("controls") or {})
         marker = fork_entry["thread_source"]
+        if fork_entry.get("status") in {"delete_pending", "deleted"}:
+            return None
         if fork_entry.get("status") == "rejected":
             if spec.created:
                 await asyncio.to_thread(rollback_worktree, spec)
@@ -22779,6 +23691,7 @@ class WrapperMachine:
         resolves from current settings, then falls back to the curated default;
         omitted Codex controls retain native defaults."""
         explicit_claude_model = engine == "claude" and model is not None
+        explicit_codex_effort = engine == "codex" and effort is not None
         codex_profile = (
             self._codex_profile(codex_profile_id)
             if engine == "codex" else None
@@ -23372,6 +24285,13 @@ class WrapperMachine:
                 await ctx.sdk.connect(
                     resume_id=resume_id, cwd=target_cwd)
         except CodexProfileDaemonUnavailable as e:
+            try:
+                await ctx.sdk.disconnect()
+            except Exception:
+                log.warning(
+                    "failed Codex profile spawn cleanup failed",
+                    profile_id=codex_profile.id if codex_profile else None,
+                )
             log.warning(
                 "required Codex profile daemon unavailable",
                 profile_id=codex_profile.id if codex_profile else None,
@@ -23390,16 +24310,57 @@ class WrapperMachine:
                 log.warning("resume failed, starting a fresh session", error=str(e))
                 ctx.session_id = None
                 try:
+                    # SdkHandle.connect() may fail after assigning a partially
+                    # connected client. Tear that generation down before the
+                    # documented bootstrap resume→fresh retry reuses the handle.
+                    await ctx.sdk.disconnect()
+                except Exception:
+                    log.warning("bootstrap resume cleanup failed")
+                try:
                     await ctx.sdk.connect(resume_id=None, cwd=target_cwd)
                 except Exception as e2:
                     log.exception("fresh connect also failed", error=str(e2))
+                    try:
+                        await ctx.sdk.disconnect()
+                    except Exception:
+                        log.warning("failed fresh spawn cleanup failed")
                     await reject(ERR_CC_CRASH, "会话连接未完成，请稍后重试。")
                     return None
             else:
                 log.exception("connect failed", error=str(e))
+                try:
+                    await ctx.sdk.disconnect()
+                except Exception:
+                    log.warning("failed spawn cleanup failed")
                 await reject(ERR_CC_CRASH, "会话连接未完成，请稍后重试。")
                 return None
-        await self._stamp_codex_daemon_epoch(ctx)
+        try:
+            if engine == "codex":
+                await self._resolve_codex_session_effort(
+                    ctx,
+                    # A rollout value only bridges older/incomplete resume
+                    # replies. If app-server authoritatively clears the thread
+                    # override, do not promote the rollout value back into an
+                    # explicit next-turn setting.
+                    preferred=effort if explicit_codex_effort else None,
+                )
+            await self._stamp_codex_daemon_epoch(ctx)
+        except asyncio.CancelledError:
+            try:
+                await ctx.sdk.disconnect()
+            except Exception:
+                log.warning("cancelled spawn cleanup failed")
+            raise
+        except Exception as e:
+            # The handle is connected but not resident yet. A failed effort or
+            # daemon-epoch probe would otherwise orphan its private child/proxy.
+            log.exception("post-connect spawn initialization failed", error=str(e))
+            try:
+                await ctx.sdk.disconnect()
+            except Exception:
+                log.warning("post-connect spawn cleanup failed")
+            await reject(ERR_CC_CRASH, "会话连接未完成，请稍后重试。")
+            return None
 
         if (ctx.space == "work" and ctx.work_context_baseline_pending
                 and ctx.work_context_baseline_tokens is None):
@@ -23519,8 +24480,11 @@ class WrapperMachine:
         # them (the client already reflects its own pick optimistically).
         if model:
             ctx.announced_model = model
-        if effort:
-            ctx.announced_effort = effort
+        initial_effort = (
+            _session_effort(ctx) if engine == "codex" else effort
+        )
+        if initial_effort:
+            ctx.announced_effort = initial_effort
         # Codex knows its real id at connect time. Claude still uses a temporary
         # key until its first init/result message exposes the SDK session id.
         key = (
@@ -23590,10 +24554,47 @@ class WrapperMachine:
             raise _BtwSpawnFailure(
                 ERR_INTERNAL, "这个会话还没有上下文,先发一条消息再开 btw")
         engine = parent.engine
+        parent_space = parent.space
+        work_record = None
+        if parent_space == "work":
+            if not parent.work_id:
+                raise _BtwSpawnFailure(
+                    ERR_AUTH, "Work 会话注册信息不存在，无法打开 btw")
+            try:
+                work_record = await asyncio.to_thread(
+                    self._work.for_engine(engine).get_by_work_id,
+                    parent.work_id,
+                )
+            except Exception as exc:
+                log.warning(
+                    "Work btw registry lookup failed",
+                    engine=engine,
+                    work_id=parent.work_id,
+                    error_type=type(exc).__name__,
+                )
+                raise _BtwSpawnFailure(
+                    ERR_INTERNAL, "Work 会话状态无法确认，请稍后重试。") from exc
+            if (
+                work_record is None
+                or work_record.session_id != parent_id
+                or os.path.realpath(work_record.cwd)
+                    != os.path.realpath(parent.cwd)
+                or not self._work.for_engine(engine).contains_cwd(
+                    work_record.cwd)
+            ):
+                raise _BtwSpawnFailure(
+                    ERR_AUTH, "Work 会话目录或账号归属不一致，已拒绝打开 btw")
         codex_profile = (
             self._codex_profile_for_ctx(parent)
             if engine == "codex" else None
         )
+        if (
+            work_record is not None
+            and engine == "codex"
+            and work_record.codex_profile_id != codex_profile.id
+        ):
+            raise _BtwSpawnFailure(
+                ERR_AUTH, "Codex Work 会话不属于当前账号，已拒绝打开 btw")
         if engine != "codex":
             try:
                 SdkHandle.preflight(self.cfg.claude_bin)
@@ -23619,18 +24620,39 @@ class WrapperMachine:
         if engine == "codex":
             codex_handle_kwargs = {
                 "cwd": parent.cwd,
-                "daemon_mode": getattr(
-                    self.cfg, "codex_daemon_mode", "auto"),
+                "daemon_mode": (
+                    "off" if parent_space == "work" else
+                    getattr(self.cfg, "codex_daemon_mode", "auto")
+                ),
                 "daemon_manager": self._codex_daemon_for_profile(
                     codex_profile),
             }
+            if parent_space == "work":
+                codex_handle_kwargs["work_mode"] = True
             codex_home = self._codex_home(codex_profile)
             if codex_home is not None:
                 codex_handle_kwargs["codex_home"] = codex_home
             sdk = CodexHandle(self.cfg, **codex_handle_kwargs)
         else:
             sdk = SdkHandle(self.cfg)
-        if engine != "codex":
+        if engine != "codex" and parent_space == "work":
+            assert work_record is not None
+            sdk.work_mode = True
+            try:
+                sdk.work_settings_path = await asyncio.to_thread(
+                    self._work.for_engine("claude").ensure_claude_policy,
+                    work_record,
+                )
+            except Exception as exc:
+                log.warning(
+                    "Claude Work btw policy preparation failed",
+                    work_id=parent.work_id,
+                    error_type=type(exc).__name__,
+                )
+                raise _BtwSpawnFailure(
+                    ERR_INTERNAL, "Work 隔离策略无法建立，请稍后重试。") from exc
+            sdk.permission_mode = "acceptEdits"
+        elif engine != "codex":
             sdk.permission_mode = getattr(
                 parent.sdk, "permission_mode", "bypassPermissions")
         # /btw is a quick side question — run the fork at LOW effort so the first
@@ -23642,17 +24664,25 @@ class WrapperMachine:
             buffer=RingBuffer(self.cfg.ring_max_events, self.cfg.ring_max_bytes),
             cwd=parent.cwd, engine=engine,
             codex_profile_id=(codex_profile.id if codex_profile else None),
+            space=parent_space,
+            work_id=parent.work_id if parent_space == "work" else None,
             btw=True, parent_sid=(parent.key or parent_id),
             owner_client_id=owner_client_id)
         if engine != "codex":
             self._configure_claude_sdk_callbacks(ctx, ctx.sdk)
         else:
-            ctx.sdk.approval = parent.sdk.approval
-            ctx.sdk.approval_policy = parent.sdk.approval_policy
-            ctx.sdk.permission_profile = parent.sdk.permission_profile
-            ctx.sdk.web_search_override = (
-                parent.sdk.web_search_override)
-            ctx.sdk.web_search = parent.sdk.web_search
+            if parent_space == "work":
+                ctx.sdk.approval = "never"
+                ctx.sdk.permission_profile = "cc_remote_work"
+                ctx.sdk.web_search_override = None
+                ctx.sdk.web_search = "cached"
+            else:
+                ctx.sdk.approval = parent.sdk.approval
+                ctx.sdk.approval_policy = parent.sdk.approval_policy
+                ctx.sdk.permission_profile = parent.sdk.permission_profile
+                ctx.sdk.web_search_override = (
+                    parent.sdk.web_search_override)
+                ctx.sdk.web_search = parent.sdk.web_search
             ctx.sdk.approval_callback = (
                 lambda method, params: self._on_codex_approval(
                     ctx, method, params))
@@ -23670,13 +24700,37 @@ class WrapperMachine:
             ctx.sdk.runtime_event_callback = (
                 lambda event: self._on_codex_runtime_event(ctx, event))
         try:
-            await ctx.sdk.connect(resume_id=parent_id, cwd=parent.cwd, fork=True)
+            await ctx.sdk.connect(
+                resume_id=parent_id, cwd=parent.cwd, fork=True)
+            if engine == "codex":
+                if parent_space == "work":
+                    # A fork response may echo settings persisted by a former
+                    # Code incarnation. Work's private process remains
+                    # authoritative.
+                    ctx.sdk.approval = "never"
+                    ctx.sdk.permission_profile = "cc_remote_work"
+                await self._resolve_codex_session_effort(
+                    ctx, preferred="low")
+            await self._stamp_codex_daemon_epoch(ctx)
+        except asyncio.CancelledError:
+            try:
+                await ctx.sdk.disconnect()
+            except Exception:
+                log.warning("btw fork cancellation cleanup failed")
+            raise
         except Exception as e:
-            log.exception("btw fork connect failed", error=str(e))
+            # connect() can fail after starting a private app-server/SDK child,
+            # and the post-connect effort probe can fail too. The context is not
+            # resident yet, so no later pool cleanup can reach that partial
+            # handle; close it here before returning the correlated rejection.
+            try:
+                await ctx.sdk.disconnect()
+            except Exception:
+                log.warning("btw fork failure cleanup failed")
+            log.exception("btw fork initialization failed", error=str(e))
             raise _BtwSpawnFailure(
                 ERR_CC_CRASH, "临时侧边会话暂时无法打开，请稍后重试。"
             ) from e
-        await self._stamp_codex_daemon_epoch(ctx)
         key = f"btw-{uuid4().hex}"
         self.sessions[key] = ctx
         ctx.key = key
@@ -24337,6 +25391,7 @@ class WrapperMachine:
         codex_overflow_repair_turn_id: Optional[str] = None
         codex_restart_watch_task: Optional[asyncio.Task] = None
         codex_handoff_to_spontaneous = False
+        codex_query_reconnected = False
         native_turn_id: Optional[str] = None
         if not is_codex:
             ctx.claude_last_activity_at = asyncio.get_running_loop().time()
@@ -24795,6 +25850,7 @@ class WrapperMachine:
                     await ctx.sdk.force_reconnect(
                         resume_id=ctx.session_id, cwd=ctx.cwd,
                         reason="external transcript change")
+                    await self._publish_codex_model_effort(ctx)
                     ctx.needs_reload = False
                 else:
                     # Clear first so a watcher that observes a new external write
@@ -25009,6 +26065,7 @@ class WrapperMachine:
                                 resume_id=ctx.session_id, cwd=ctx.cwd,
                                 reason="external transcript change at final preflight",
                             )
+                            await self._publish_codex_model_effort(ctx)
                             ctx.needs_reload = False
                             if (ctx.interrupt_event.is_set()
                                     or ctx.state == "interrupting"):
@@ -25039,6 +26096,7 @@ class WrapperMachine:
                                 ))
                                 await self._set_idle_after_managed_turn(ctx)
                                 return
+                    await self._resolve_codex_session_effort(ctx)
                     await self._begin_codex_checkpoint(ctx)
                     if ctx.interrupt_event.is_set() or ctx.state == "interrupting":
                         await self._abort_codex_checkpoint(ctx)
@@ -25049,10 +26107,18 @@ class WrapperMachine:
                         )))
                         await self._set_idle_after_managed_turn(ctx)
                         return
+                    query_generation = getattr(ctx.sdk, "_generation", None)
                     native_turn_id = await ctx.sdk.query(
                         prompt,
                         images=img_paths,
                         client_user_message_id=ctx.active_msg_id,
+                    )
+                    current_query_generation = getattr(
+                        ctx.sdk, "_generation", None)
+                    codex_query_reconnected = bool(
+                        isinstance(query_generation, int)
+                        and isinstance(current_query_generation, int)
+                        and current_query_generation != query_generation
                     )
                     # CodexHandle marks turn/start failure by raising with
                     # turn_active=False. Reaching here is the authoritative
@@ -25108,17 +26174,13 @@ class WrapperMachine:
             if is_codex:
                 collaboration_mode = getattr(
                     ctx.sdk, "collaboration_mode", "default")
-                if ctx.announced_model != ctx.sdk.model:
-                    ctx.announced_model = ctx.sdk.model
-                    await self._emit(ctx, Model(model=ctx.announced_model))
-                effort = getattr(ctx.sdk, "effort", None)
-                if isinstance(effort, str) and effort:
-                    if ctx.announced_effort != effort:
-                        ctx.announced_effort = effort
-                        await self._emit(ctx, Effort(effort=effort))
-                elif ctx.announced_effort is not None:
-                    ctx.announced_effort = None
-                    await self._emit(ctx, Effort(effort=""))
+                # query() can repair a dead app-server and adopt a new complete
+                # settings snapshot. Do not derive effort after awaiting the
+                # Model send: a settings notification in that gap would mix two
+                # authorities. This fast publication never probes config/catalog;
+                # a nullable effort is represented truthfully as model-default.
+                await self._publish_codex_model_effort(
+                    ctx, resolve_effort=False)
                 if ctx.announced_collaboration_mode != collaboration_mode:
                     ctx.announced_collaboration_mode = collaboration_mode
                     await self._emit(ctx, CollaborationMode(
@@ -25126,6 +26188,8 @@ class WrapperMachine:
                 await self._emit(ctx, Fast(
                     on=_codex_fast_on(ctx.sdk.service_tier)))
             reader_task = asyncio.create_task(reader(queue, reader_exc))
+            if codex_query_reconnected and _session_effort(ctx) is None:
+                self._schedule_codex_model_effort_publish(ctx)
             while True:
                 msg = await next_turn_message()
                 if isinstance(msg, CodexSteerFence):
@@ -25295,6 +26359,8 @@ class WrapperMachine:
             timed_out_spontaneous_turn = ctx.codex_spontaneous_turn_id
             try:
                 await ctx.sdk.force_reconnect(ctx.session_id, ctx.cwd)
+                if is_codex:
+                    await self._publish_codex_model_effort(ctx)
             except Exception as e:
                 log.exception("force reconnect failed", error=str(e))
                 await self._emit(ctx, Error(

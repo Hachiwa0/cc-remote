@@ -46,6 +46,10 @@ _lock = asyncio.Lock()
 # Cost/latency order, low -> high. Used only to clamp an unsupported request DOWN
 # to something the model accepts; unknown levels sort last so they never win.
 EFFORT_ORDER = ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
+# Wire/display sentinel used only when app-server explicitly selected the
+# model's default but model/list is temporarily unavailable. It is never sent
+# back to turn/start as a reasoning effort.
+MODEL_DEFAULT_EFFORT = "model-default"
 
 
 def _rank(effort: str) -> int:
@@ -190,6 +194,20 @@ async def efforts_for(
         if m["id"] == model:
             return m["efforts"]
     return []
+
+
+async def default_effort_for(
+    model: Optional[str],
+    *,
+    codex_home: str | None = None,
+) -> Optional[str]:
+    if not model:
+        return None
+    for candidate in await codex_catalog(codex_home=codex_home):
+        if candidate["id"] == model:
+            value = candidate.get("default_effort")
+            return value if isinstance(value, str) and value else None
+    return None
 
 
 async def clamp_effort(

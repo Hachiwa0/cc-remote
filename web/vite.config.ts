@@ -27,7 +27,10 @@ export default defineConfig({
             },
             {
               name: "initial-vendor",
-              test: /node_modules[\\/]/,
+              // Keep small, shared projection primitives out of the entry
+              // without adding a fifth startup request. They have no UI side
+              // effects and change only with the bounded-history contract.
+              test: /node_modules[\\/]|src[\\/](?:compaction-orphans|history-browse|history-requests|runtime-bounds)\.ts$/,
               tags: ["$initial"],
               priority: 10,
             },

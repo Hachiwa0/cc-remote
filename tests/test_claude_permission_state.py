@@ -784,6 +784,53 @@ def test_claude_btw_inherits_parent_permission_before_connect(monkeypatch):
     asyncio.run(go())
 
 
+def test_claude_work_btw_reuses_registered_policy_and_work_identity(monkeypatch):
+    class FakeHandle:
+        @staticmethod
+        def preflight(_path):
+            return None
+
+        def __init__(self, _cfg):
+            self.permission_mode = "bypassPermissions"
+            self.effort = "max"
+            self.work_mode = False
+            self.work_settings_path = None
+            self.connected = None
+
+        async def connect(self, **kwargs):
+            self.connected = kwargs
+
+        async def disconnect(self):
+            return None
+
+    async def go():
+        monkeypatch.setattr(machine_module, "SdkHandle", FakeHandle)
+        machine, _ = _mk_machine()
+        store = machine._work.for_engine("claude")
+        record = store.create_session()
+        store.bind_session(record.work_id, "parent-work")
+        parent = _mk_ctx("parent-work", "parent-work")
+        parent.cwd = record.cwd
+        parent.space = "work"
+        parent.work_id = record.work_id
+        parent.sdk = SimpleNamespace(permission_mode="bypassPermissions")
+        machine.sessions[parent.key] = parent
+
+        fork = await machine._spawn_btw(
+            parent, owner_client_id="client-1")
+
+        assert fork.space == "work"
+        assert fork.work_id == record.work_id
+        assert fork.sdk.work_mode is True
+        assert fork.sdk.permission_mode == "acceptEdits"
+        assert fork.sdk.work_settings_path.endswith(f"{record.work_id}.json")
+        assert fork.sdk.connected == {
+            "resume_id": "parent-work", "cwd": record.cwd, "fork": True,
+        }
+
+    asyncio.run(go())
+
+
 def test_open_btw_emits_its_permission_frame():
     async def go():
         machine, transport = _mk_machine()

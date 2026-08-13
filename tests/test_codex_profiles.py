@@ -31,9 +31,12 @@ from cc_remote.wrapper.codex_forks import CodexForkJournal
 from cc_remote.wrapper.codex_turn_leases import CodexTurnLeaseStore
 from cc_remote.wrapper.process_scan import ProcessIdentity
 from cc_remote.wrapper.session_pins import SessionPinStore
+from cc_remote.wrapper.session_plans import SessionPlanStore
+from cc_remote.wrapper.session_presentation import SessionPresentationStore
 from cc_remote.wrapper.machine import WrapperMachine, _CodexHistoryProfiles
 from cc_remote.wrapper.ringbuffer import RingBuffer
 from cc_remote.wrapper.session_ctx import SessionContext
+from cc_remote.workspaces import WorkRegistry
 
 
 def _profiles(primary: Path, stack: Path) -> str:
@@ -1725,6 +1728,98 @@ def test_profile_remap_retries_do_not_apply_completed_store_twice(
         "primary@same-native-id").permission_profile == ":stack"
     assert not (
         tmp_path / "state" / "codex-profile-transition.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("store_type", "method_name", "attribute"),
+    [
+        (SessionPlanStore, "migrate_profile_sessions", "_session_plans"),
+        (
+            SessionPresentationStore,
+            "migrate_codex_profile_sessions",
+            "_session_presentation",
+        ),
+    ],
+)
+def test_optional_presentation_migration_does_not_disable_codex_or_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    store_type,
+    method_name: str,
+    attribute: str,
+) -> None:
+    machine, _transport = _machine(tmp_path)
+    state = tmp_path / "state"
+    previous = json.loads(
+        (state / "codex-profile-topology.json").read_text(encoding="utf-8")
+    )
+    renamed_profiles = {}
+    for profile in previous["profiles"]:
+        target = "renamed" if profile["id"] == "primary" else profile["id"]
+        renamed_profiles[target] = {
+            "label": target,
+            "home": profile["home"],
+            "default": profile["id"] == previous["default_id"],
+        }
+
+    def fail_optional(self, transform, *, profile_revision):
+        raise RuntimeError("simulated optional cache failure")
+
+    monkeypatch.setattr(store_type, method_name, fail_optional)
+    cfg = WrapperConfig()
+    cfg.state_dir = state
+    cfg.claude_work_root = tmp_path / "work" / "claude"
+    cfg.codex_work_root = tmp_path / "work" / "codex"
+    cfg.codex_profiles_json = json.dumps(renamed_profiles)
+
+    migrated = WrapperMachine(cfg, _StubTransport())
+
+    assert migrated._codex_profile_migration_ok
+    assert migrated._codex_work_profile_migration_ok
+    assert not migrated._codex_presentation_profile_migration_ok
+    assert getattr(migrated, attribute) is None
+    assert migrated._codex_profile().id == "renamed"
+    assert (state / "codex-profile-transition.json").exists()
+    # The pending transition is retained so the optional projection can catch
+    # up after restart without revoking access to the already-migrated engines.
+    assert machine._codex_profiles.default.id == "primary"
+
+
+def test_work_profile_migration_failure_does_not_disable_codex_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _machine(tmp_path)
+    state = tmp_path / "state"
+    previous = json.loads(
+        (state / "codex-profile-topology.json").read_text(encoding="utf-8")
+    )
+    renamed_profiles = {}
+    for profile in previous["profiles"]:
+        target = "renamed" if profile["id"] == "primary" else profile["id"]
+        renamed_profiles[target] = {
+            "label": target,
+            "home": profile["home"],
+            "default": profile["id"] == previous["default_id"],
+        }
+
+    def fail_work(*_args, **_kwargs):
+        raise RuntimeError("simulated Work ownership failure")
+
+    monkeypatch.setattr(
+        WorkRegistry, "migrate_codex_profiles", fail_work)
+    cfg = WrapperConfig()
+    cfg.state_dir = state
+    cfg.claude_work_root = tmp_path / "work" / "claude"
+    cfg.codex_work_root = tmp_path / "work" / "codex"
+    cfg.codex_profiles_json = json.dumps(renamed_profiles)
+
+    migrated = WrapperMachine(cfg, _StubTransport())
+
+    assert migrated._codex_profile_migration_ok
+    assert not migrated._codex_work_profile_migration_ok
+    assert migrated._codex_profile().id == "renamed"
+    assert (state / "codex-profile-transition.json").exists()
 
 
 def test_v1_topology_is_upgraded_before_old_checkpoint_is_opened(

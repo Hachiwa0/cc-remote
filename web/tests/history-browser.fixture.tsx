@@ -1074,6 +1074,7 @@ function HistoryConversationBrowserFixture() {
   const longProfile = params.has("long-profile");
   const manyProfiles = params.has("many-profiles");
   const recoveryReplacement = params.has("recovery-replace");
+  const pendingRevisionReplacement = params.has("pending-revision-replace");
   const deepBrowse = params.has("deep-browse");
   const runtimeBrowse = params.has("runtime-browse");
   const generationShift = params.has("generation-shift");
@@ -1182,6 +1183,10 @@ function HistoryConversationBrowserFixture() {
   const [historyGeneration, setHistoryGeneration] =
     useState("fixture-generation-1");
   const [historyViewRevision, setHistoryViewRevision] = useState("revision-1");
+  const [historyTransitionPending, setHistoryTransitionPending] =
+    useState(false);
+  const [sessionAuthorityScope, setSessionAuthorityScope] =
+    useState("fixture-authority-a");
   const [historyViewId, setHistoryViewId] = useState(
     deepBrowse ? "browse-1" : "runtime",
   );
@@ -1586,7 +1591,7 @@ function HistoryConversationBrowserFixture() {
     });
   };
 
-  const replaceHistoryRevision = () => {
+  const replaceHistoryRevision = (shiftAuthority = false) => {
     if (recoveryReplacement) {
       setSessions((current) => {
         const session = current[sid];
@@ -1610,6 +1615,11 @@ function HistoryConversationBrowserFixture() {
       { length: 24 },
       (_, index) => finalTurn(`r${index + 1}`, 3),
     );
+    setHistoryTransitionPending(pendingRevisionReplacement);
+    if (shiftAuthority) {
+      setSessionAuthorityScope((current) => current === "fixture-authority-a"
+        ? "fixture-authority-b" : "fixture-authority-a");
+    }
     setSessions((current) => ({
       ...current,
       [sid]: {
@@ -1633,7 +1643,8 @@ function HistoryConversationBrowserFixture() {
           pagesLoaded: 0,
         },
       }));
-    }, 0);
+      setHistoryTransitionPending(false);
+    }, pendingRevisionReplacement ? 400 : 0);
   };
 
   return (
@@ -1644,6 +1655,12 @@ function HistoryConversationBrowserFixture() {
         <output data-testid="newest-turn-id">{
           active.turns[active.turns.length - 1]?.id ?? ""
         }</output>
+        <output data-testid="history-transition-state">{
+          historyTransitionPending ? "pending" : "ready"
+        }</output>
+        <output data-testid="session-authority-scope">{
+          sessionAuthorityScope
+        }</output>
         <button data-testid="switch-session" type="button"
           onClick={() => setSid((current) => current.endsWith("-a")
             ? "history-browser-session-b" : "history-browser-session-a")}>
@@ -1653,9 +1670,15 @@ function HistoryConversationBrowserFixture() {
           append
         </button>
         <button data-testid="replace-revision" type="button"
-          onClick={replaceHistoryRevision}>
+          onClick={() => replaceHistoryRevision()}>
           replace revision
         </button>
+        {pendingRevisionReplacement && (
+          <button data-testid="replace-authority" type="button"
+            onClick={() => replaceHistoryRevision(true)}>
+            replace authority
+          </button>
+        )}
         {generationShift && (
           <button data-testid="shift-generation" type="button"
             onClick={() => setHistoryGeneration((current) =>
@@ -1828,9 +1851,11 @@ function HistoryConversationBrowserFixture() {
         </div>
       ) : (
         <ChatView
+          key={sessionAuthorityScope}
           sid={sid}
           turns={active.turns}
           engine={timelineEngine}
+          loading={historyTransitionPending}
           hasMore={active.hasMore}
           historyRevision={historyRevision}
           historyViewRevision={historyViewRevision}
@@ -1972,7 +1997,8 @@ export function HistoryBrowserFixture() {
     return <GoalUiFixture status={params.get("goal-status")}
       withPlan={params.has("plan")} hidden={params.has("goal-hidden")}
       longGoal={params.has("goal-long")}
-      newerTurn={params.has("goal-next-turn")} />;
+      newerTurn={params.has("goal-next-turn")}
+      longPlan={params.has("plan-long")} />;
   }
   if (params.has("header-menu")) {
     return <UsageActivityBrowserFixture
@@ -2172,12 +2198,14 @@ function PlanUiFixture({ mode }: { mode: string }) {
   );
 }
 
-function GoalUiFixture({ status, withPlan, hidden, longGoal, newerTurn }: {
+function GoalUiFixture({ status, withPlan, hidden, longGoal, newerTurn,
+  longPlan }: {
   status: string | null;
   withPlan: boolean;
   hidden: boolean;
   longGoal: boolean;
   newerTurn: boolean;
+  longPlan: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [revealed, setRevealed] = useState(!hidden && status !== "none");
@@ -2208,11 +2236,18 @@ function GoalUiFixture({ status, withPlan, hidden, longGoal, newerTurn }: {
       status: "running",
       title: "计划",
       explanation: "让任务进度始终可以从会话底部查看。",
-      plan: [
-        { step: "定位计划状态", status: "completed" },
-        { step: "实现固定入口", status: "inProgress" },
-        { step: "完成浏览器回归", status: "pending" },
-      ],
+      plan: longPlan
+        ? Array.from({ length: 28 }, (_, index) => ({
+            step: `验证计划弹层内部滚动 ${index + 1}`,
+            status: index < 2
+              ? "completed" as const
+              : index === 2 ? "inProgress" as const : "pending" as const,
+          }))
+        : [
+            { step: "定位计划状态", status: "completed" },
+            { step: "实现固定入口", status: "inProgress" },
+            { step: "完成浏览器回归", status: "pending" },
+          ],
       done: false,
     },
     detailLoading: false,
@@ -2229,8 +2264,12 @@ function GoalUiFixture({ status, withPlan, hidden, longGoal, newerTurn }: {
     }] : [],
   );
   return (
-    <main style={{ height: "100dvh", display: "flex", flexDirection: "column" }}>
-      <div data-testid="goal-fixture-content" style={{ flex: 1 }} />
+    <main className="pane"
+      style={{ height: "100dvh", display: "flex", flexDirection: "column" }}>
+      <div className="thread-shell" style={{ flexDirection: "row" }}>
+        <div data-testid="goal-fixture-spacer" style={{ width: 0 }} />
+        <div data-testid="goal-fixture-content" style={{ flex: 1 }} />
+      </div>
       <output data-testid="plan-detail-requests">{planDetailRequests}</output>
       <GoalPanel engine="codex" goal={goal} revealed={revealed} open={open}
         loading={loading} completedGoalRetired={completedGoalRetired} plan={plan}
@@ -2238,7 +2277,10 @@ function GoalUiFixture({ status, withPlan, hidden, longGoal, newerTurn }: {
         onOpen={() => setOpen(true)} onClose={() => setOpen(false)}
         onDismiss={() => setRevealed(false)} onSave={() => setOpen(false)}
         onClear={() => setRevealed(false)} />
-      <div className="composer"><div className="composer-in" /></div>
+      <div className="composer" data-testid="goal-fixture-composer"
+        style={{ height: 48 }}>
+        <div className="composer-in" />
+      </div>
     </main>
   );
 }
