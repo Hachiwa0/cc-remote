@@ -51,7 +51,10 @@ import { CapabilitiesSheet, type HookDraft, type SkillDraft } from "./components
 import { TerminalControl } from "./components/TerminalControl";
 import { DeviceSheet, type PairingState, type RemoteDevice } from "./components/DeviceSheet";
 import { HeaderMenu } from "./components/HeaderMenu";
-import { codexProfilePresentation } from "./codex-profile-presentation";
+import {
+  codexProfileIdForSession,
+  codexProfilePresentation,
+} from "./codex-profile-presentation";
 import { parseGoalCommand } from "./goal-command";
 import {
   dismissGoalUi,
@@ -214,10 +217,15 @@ import {
   planFollowsCompletedGoal,
   SessionPlanProgressCache,
 } from "./plan-progress";
+import {
+  ENGINE_SPACES_KEY,
+  LEGACY_SPACE_KEY,
+  readEngineSpaces,
+  rememberEngineSpace,
+} from "./surface-preferences";
 
 const THEME_KEY = "cc_remote_theme";
 const ENGINE_KEY = "cc_remote_engine";  // which backend the NEXT new session uses
-const SPACE_KEY = "cc_remote_space";
 const MACHINE_KEY = "cc_remote_machine";
 const GoalPanel = lazy(() => import("./components/GoalPanel").then(
   ({ GoalPanel: Panel }) => ({ default: Panel }),
@@ -259,10 +267,11 @@ function catalogForEngineProfile(
 export default function App() {
   const [theme, setTheme] = useState<DiffTheme>(
     () => normalizeDiffTheme(localStorage.getItem(THEME_KEY)));
-  const [engine, setEngine] = useState<Engine>(
-    () => normalizeEngine(localStorage.getItem(ENGINE_KEY)));
-  const [space, setSpace] = useState<Space>(
-    () => localStorage.getItem(SPACE_KEY) === "work" ? "work" : "code");
+  const initialEngineRef = useRef(normalizeEngine(localStorage.getItem(ENGINE_KEY)));
+  const initialSpacesRef = useRef(readEngineSpaces(localStorage, initialEngineRef.current));
+  const [engine, setEngine] = useState<Engine>(initialEngineRef.current);
+  const [space, setSpace] = useState<Space>(initialSpacesRef.current[initialEngineRef.current]);
+  const spacesByEngineRef = useRef<Record<Engine, Space>>(initialSpacesRef.current);
   const [authed, setAuthed] = useState(false);
   const [authReady, setAuthReady] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -776,7 +785,8 @@ export default function App() {
     (session) => session.session_id === focusedSid);
   const focusedEngine = (focusedSession?.engine ?? engine) as "claude" | "codex";
   const focusedCodexProfileId = focusedEngine === "codex"
-    ? focusedSession?.codex_profile_id ?? state.defaultCodexProfileId
+    ? focusedSession?.codex_profile_id
+      ?? codexProfileIdForSession(focusedSid, state.defaultCodexProfileId)
     : null;
   const focusedWorkProfile = space === "work" && !state.newChat
     && focusedEngine === "codex" && focusedSession?.codex_profile_id
@@ -1395,8 +1405,11 @@ export default function App() {
   }, [engine, space]);
   useEffect(() => {
     document.documentElement.setAttribute("data-space", space);
-    localStorage.setItem(SPACE_KEY, space);
-  }, [space]);
+    localStorage.setItem(LEGACY_SPACE_KEY, space);
+    spacesByEngineRef.current = rememberEngineSpace(
+      spacesByEngineRef.current, engine, space);
+    localStorage.setItem(ENGINE_SPACES_KEY, JSON.stringify(spacesByEngineRef.current));
+  }, [engine, space]);
   useEffect(() => {
     if (newChatCwd === null || state.connState !== "connected"
         || !state.wrapperOnline || newChatCodexProfileMissing) return;
@@ -1638,14 +1651,18 @@ export default function App() {
   const toggleEngine = () => {
     cancelPendingNotificationTarget();
     const nextEngine: Engine = engine === "codex" ? "claude" : "codex";
+    const nextSpace = spacesByEngineRef.current[nextEngine];
     pendingCreateRef.current = null;
     setCreateError(null);
     setStatusOpenSid(null);
     setUsageActivityOpen(false);
     setWorkArtifactsOpen(false);
     setWorkProjectId(null);
-    prepareSurfaceSwitch(nextEngine, space);
+    prepareSurfaceSwitch(nextEngine, nextSpace);
+    engineRef.current = nextEngine;
+    spaceRef.current = nextSpace;
     setEngine(nextEngine);
+    setSpace(nextSpace);
     if (isMobile()) setSidebarOpen(false);
   };
 
@@ -1659,6 +1676,7 @@ export default function App() {
     setForkWorktreeError(null);
     setWorkArtifactsOpen(false);
     prepareSurfaceSwitch(engine, next);
+    spaceRef.current = next;
     setSpace(next);
   };
 
@@ -2453,6 +2471,10 @@ export default function App() {
               ? stateRef.current.sessions.find(
                 (session) => session.session_id === msg.parent_session_id,
               )?.codex_profile_id
+                ?? codexProfileIdForSession(
+                  msg.parent_session_id,
+                  stateRef.current.defaultCodexProfileId,
+                )
               : undefined;
             startForkFocusLease({
               requestId: msg.request_id,

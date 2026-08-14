@@ -482,6 +482,48 @@ class CodexForkJournal:
                 return None
             return dict(max(candidates, key=lambda value: rank[value["status"]]))
 
+    def completed_children(
+        self, limit: int = _MAX_ENTRIES,
+    ) -> list[dict[str, Any]]:
+        """Return newest unique, live fork children for catalog repair.
+
+        Aliased reliable commands can point at the same native child.  Expose
+        each child once, and never expose deletion-owned lifecycle states.  The
+        caller still verifies the exact child in its owning Codex state DB
+        before placing it in a public session list.
+        """
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ForkJournalError("invalid completed child limit")
+        bounded = min(limit, _MAX_ENTRIES)
+        rank = {"complete": 1, "delete_pending": 2, "deleted": 3}
+        with self._lock:
+            strongest: dict[str, str] = {}
+            for value in self.entries.values():
+                child = value.get("session_id")
+                status = value.get("status")
+                if not isinstance(child, str) or status not in rank:
+                    continue
+                previous = strongest.get(child)
+                if previous is None or rank[status] > rank[previous]:
+                    strongest[child] = status
+
+            children: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            for value in reversed(self.entries.values()):
+                child = value.get("session_id")
+                if not isinstance(child, str) or child in seen:
+                    continue
+                status = value.get("status")
+                if status not in rank:
+                    continue
+                seen.add(child)
+                if strongest.get(child) != "complete":
+                    continue
+                children.append(dict(value))
+                if len(children) >= bounded:
+                    break
+            return children
+
     def begin_delete(self, session_id: str) -> Optional[str]:
         """Persist deletion intent before the native child is touched."""
         if not isinstance(session_id, str) or not _SAFE_ID.fullmatch(session_id):

@@ -2,12 +2,35 @@ import assert from "node:assert/strict";
 import { createServer } from "vite";
 
 import type { ServerEvent } from "../src/protocol.ts";
-import { mergeInitialHistory } from "../src/history-merge.ts";
+import {
+  mergeInitialHistory,
+  restoreCachedTurnDetails,
+} from "../src/history-merge.ts";
 import type { Block, Turn } from "../src/reducer.ts";
 
 const blockIdentity = (block: Block): string => block.kind === "text"
   ? block.message_id
   : block.kind === "tool" ? block.tool_use_id : block.item_id;
+
+const settledCachedProcess = restoreCachedTurnDetails([{
+  id: "settled-cache-summary", prompt: "done already", done: true,
+  detailEventCount: 1, detailLoaded: false, blocks: [],
+}], [{
+  id: "settled-cache-summary", prompt: "done already", done: true,
+  blocks: [{
+    kind: "process", item_id: "stale-open-cache-process",
+    processKind: "command", phase: "start", status: "running",
+    title: "old command", done: false,
+  }],
+}])[0];
+assert.equal(settledCachedProcess.detailProjection?.blocks[0]?.done, true,
+  "a completed summary closes a stale open process restored from IndexedDB");
+assert.equal(
+  settledCachedProcess.detailProjection?.blocks[0]?.kind === "process"
+    ? settledCachedProcess.detailProjection.blocks[0].status : null,
+  "succeeded",
+  "a stale cached child cannot restart the working spark after refresh",
+);
 
 const interleavedLiveBlocks: Block[] = [
   { kind: "text", message_id: "ordered-comment-a", text: "A", done: true,

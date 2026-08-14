@@ -591,6 +591,12 @@ function cloneTurns(turns: Turn[]): Turn[] {
     ...t,
     blocks: t.blocks.map((b) => ({ ...b })),
     liveSpillBlocks: t.liveSpillBlocks?.map((b) => ({ ...b })),
+    detailProjection: t.detailProjection
+      ? {
+          ...t.detailProjection,
+          blocks: t.detailProjection.blocks.map((block) => ({ ...block })),
+        }
+      : undefined,
   }));
 }
 
@@ -917,6 +923,36 @@ function remapExplicitLiveTaskOwner(
     : null;
 }
 
+function remapTurnProvenanceIds(
+  ids: readonly string[],
+  previousTurns: readonly Turn[],
+  turns: readonly Turn[],
+): string[] {
+  return [...new Set(ids.flatMap((id) => {
+    const directOwners = turns.filter((turn) =>
+      turnHasIdentityAlias(turn, id));
+    if (directOwners.length === 1) return [directOwners[0].id];
+    // Legacy cache migrations can leave a colliding display id on two real
+    // rows. Preserve that still-valid provenance exactly as before; only an id
+    // which disappeared with a collapsed projection needs block-id remapping.
+    if (directOwners.length > 1) return [id];
+    const source = previousTurns.filter((turn) =>
+      turnHasIdentityAlias(turn, id));
+    if (source.length !== 1) return [];
+    const stableBlockIds = new Set(source[0].blocks.map((block) =>
+      block.kind === "text" ? `message:${block.message_id}`
+        : block.kind === "tool" ? `tool:${block.tool_use_id}`
+          : `process:${block.item_id}`));
+    if (stableBlockIds.size === 0) return [];
+    const blockOwners = turns.filter((turn) => turn.blocks.some(
+      (block) => stableBlockIds.has(
+        block.kind === "text" ? `message:${block.message_id}`
+          : block.kind === "tool" ? `tool:${block.tool_use_id}`
+            : `process:${block.item_id}`)));
+    return blockOwners.length === 1 ? [blockOwners[0].id] : [];
+  }))].slice(-MAX_LIVE_DETAIL_TURN_IDS);
+}
+
 function findCurrentUnownedLiveOwner(
   runtime: SessionRuntime, turns: Turn[],
 ): Turn | undefined {
@@ -1228,7 +1264,31 @@ function finishOpenBlocks(
   status: "succeeded" | "failed" | "interrupted",
   isError: boolean,
 ): void {
-  for (const block of mutableTurnBlocks(turn)) {
+  finishOpenBlockList(mutableTurnBlocks(turn), status, isError);
+  if (turn.detailProjection) {
+    finishOpenBlockList(turn.detailProjection.blocks, status, isError);
+  }
+}
+
+/** Close only one newly-installed detail projection. A completed turn may have
+ * acquired real background process events after TurnEnd; a late old
+ * TurnDetail response must not close those live blocks again. */
+function finishOpenDetailBlocks(
+  turn: Turn,
+  status: "succeeded" | "failed" | "interrupted",
+  isError: boolean,
+): void {
+  if (turn.detailProjection) {
+    finishOpenBlockList(turn.detailProjection.blocks, status, isError);
+  }
+}
+
+function finishOpenBlockList(
+  blocks: Block[],
+  status: "succeeded" | "failed" | "interrupted",
+  isError: boolean,
+): void {
+  for (const block of blocks) {
     if (block.kind === "text") {
       block.done = true;
     } else if (block.kind === "process" && !block.done) {
@@ -3393,6 +3453,7 @@ function reduceEvent(
           // repairs a provisional live terminal (notably after compaction)
           // while leaving Claude's transcript-only lifecycle untouched.
           newestHistoryId: e.newest_id ?? null,
+          activeOwnerId: base.liveOwner?.turnId ?? null,
           reconcileReplayOrphans: true,
         }, settledHistory
           && state.sessions.find((session) =>
@@ -3571,6 +3632,8 @@ function reduceEvent(
       let pendingLiveBinding = base.pendingLiveBinding;
       let liveOwner = boundHistoryOwner
         ?? remapExplicitLiveTaskOwner(base.liveOwner, turns);
+      const liveDetailTurnIds = remapTurnProvenanceIds(
+        base.liveDetailTurnIds, base.turns, turns);
       if (pendingLiveBinding
           && pendingLiveBinding.generation !== nextOrderingGeneration) {
         pendingLiveBinding = null;
@@ -3676,6 +3739,7 @@ function reduceEvent(
                 : false,
             hydratedCacheTurnIds: acceptsControlState
               ? [] : base.hydratedCacheTurnIds,
+            liveDetailTurnIds,
             // A first-page History can finish after a live thread-settings
             // notification.  Its transcript snapshot then contains the old
             // model/effort even though its narrative rows are still useful.
@@ -3808,6 +3872,12 @@ function reduceEvent(
             },
             installed.projection,
           );
+          if (next.done) {
+            const status = next.interrupted
+              ? "interrupted" : next.error ? "failed" : "succeeded";
+            finishOpenDetailBlocks(
+              next, status, status !== "succeeded");
+          }
           if (continuedLiveSpillRefreshDue(next)
               && next.detailLoading !== true) {
             next.detailRestorePending = true;

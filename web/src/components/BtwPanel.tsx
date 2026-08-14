@@ -32,6 +32,12 @@ import {
 } from "../data";
 import { QueuedQueryChip } from "./QueuedQueryDialog";
 import type { InlineImageAsset } from "../inline-image-assets";
+import {
+  composePastePrompt,
+  LONG_PASTE_THRESHOLD,
+  makeComposerPaste,
+} from "../composer-pastes";
+import { PasteCards } from "./PasteCards";
 
 interface Props {
   sid?: string;
@@ -100,7 +106,7 @@ export function BtwPanel(p: Props) {
     ? "draining" : runtimeState;
   const runtimeBusy = isComposerBusy(submitState);
   const busy = !!p.opening || runtimeBusy;
-  const hasText = input.trim().length > 0;
+  const hasText = input.trim().length > 0 || draft.pastes.length > 0;
 
   const updateDraft = useCallback((
     update: (current: ComposerDraft) => ComposerDraft,
@@ -119,7 +125,7 @@ export function BtwPanel(p: Props) {
     }));
   }, [updateDraft]);
   const clearDraft = useCallback(() => {
-    updateDraft(() => ({ input: "", images: [], files: [] }));
+    updateDraft(() => ({ input: "", images: [], files: [], pastes: [] }));
   }, [updateDraft]);
 
   useLayoutEffect(() => {
@@ -170,7 +176,12 @@ export function BtwPanel(p: Props) {
 
   const submit = (value = taRef.current?.value ?? input) => {
     if (p.opening || !p.sid) return;
-    const prompt = value.trim();
+    const composed = composePastePrompt(draft.pastes, value.trim());
+    if (!composed.ok) {
+      flash(`消息内容超过上限（最多 ${composed.maxChars.toLocaleString()} 个字符）`);
+      return;
+    }
+    const prompt = composed.prompt;
     const query: PendingQuery = { prompt };
     if (runtimeBusy) {
       const action = classifyBusySubmit(
@@ -216,7 +227,7 @@ export function BtwPanel(p: Props) {
       const value = taRef.current?.value ?? input;
       // Stopping is an explicit button action. Empty Enter goes through submit
       // and remains a no-op.
-      if (runtimeBusy && !value.trim()) {
+      if (runtimeBusy && !value.trim() && draft.pastes.length === 0) {
         if (runtimeState === "running") p.onInterrupt();
         return;
       }
@@ -299,6 +310,15 @@ export function BtwPanel(p: Props) {
             ))}
           </div>
         )}
+        {draft.pastes.length > 0 && (
+          <div className="attach show btw-pastes">
+            <PasteCards pastes={draft.pastes}
+              disabled={!!p.opening || !p.sid}
+              onChange={(pastes) => updateDraft((current) => ({
+                ...current, pastes,
+              }))} />
+          </div>
+        )}
         {runtimeBusy && (
           <div className="btw-runbar">
             <div className="seg">
@@ -334,6 +354,18 @@ export function BtwPanel(p: Props) {
             onCompositionEnd={(event) => {
               imeSubmitRef.current.endComposition();
               setInput(event.currentTarget.value);
+            }}
+            onPaste={(event) => {
+              const text = event.clipboardData.getData("text/plain");
+              if (text.length <= LONG_PASTE_THRESHOLD) return;
+              event.preventDefault();
+              updateDraft((current) => ({
+                ...current,
+                pastes: [
+                  ...current.pastes,
+                  makeComposerPaste(text, crypto.randomUUID()),
+                ],
+              }));
             }}
             onKeyDown={(event) => {
               if (!imeSubmitRef.current.shouldSubmitKey({

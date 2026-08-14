@@ -21,6 +21,30 @@ from cc_remote.wrapper.codex_rpc import CodexRpcOutcomeUnknown, CodexRpcRejected
 from tests.test_multisession import _mk_ctx, _mk_machine
 
 
+@pytest.fixture(autouse=True)
+def _profile_model_catalog(monkeypatch):
+    """Keep fork tests independent of the developer machine's live catalog."""
+    async def catalog(*, codex_home=None):
+        return [
+            {
+                "id": "gpt-test",
+                "efforts": ["high"],
+                "default_effort": "high",
+                "is_default": True,
+            },
+            {
+                "id": "gpt-changed",
+                "efforts": ["high"],
+                "default_effort": "high",
+                "is_default": False,
+            },
+        ]
+
+    monkeypatch.setattr(machine_module, "codex_catalog", catalog)
+    monkeypatch.setattr(
+        machine_module, "codex_current_provider", lambda **_kwargs: "")
+
+
 def _ctx(state: str = "idle"):
     ctx = _mk_ctx("parent", "parent")
     ctx.engine = "codex"
@@ -186,6 +210,46 @@ def test_codex_same_cwd_fork_inherits_model_and_permissions_once(monkeypatch):
         assert child_choice.approval_policy == "never"
         assert child_choice.permission_profile == ":danger-full-access"
         assert len(calls) == 1
+
+    asyncio.run(run())
+
+
+def test_codex_fork_replaces_a_retired_parent_model(monkeypatch):
+    async def run():
+        machine, _ = _mk_machine()
+        parent = _ctx()
+        parent.sdk.model = "retired-model"
+        machine.sessions = {"parent": parent}
+        calls = []
+
+        async def catalog(*, codex_home=None):
+            return [{
+                "id": "current-default",
+                "efforts": ["low"],
+                "default_effort": "low",
+                "is_default": True,
+            }]
+
+        async def rpc(method, params, cwd=None):
+            calls.append((method, params, cwd))
+            return {"thread": {"id": "forked-thread"}}
+
+        async def is_codex(_sid): return True
+        async def list_sessions(_cmd): return None
+        monkeypatch.setattr(machine, "_is_codex_session", is_codex)
+        monkeypatch.setattr(machine, "_list_codex_sessions", list_sessions)
+        monkeypatch.setattr(machine_module, "codex_catalog", catalog)
+        monkeypatch.setattr(machine_module, "codex_rpc", rpc)
+        monkeypatch.setattr(
+            machine_module, "find_rollout_fork", lambda *_args: None)
+
+        result = await machine._handle_fork_session(
+            _command(last_turn_id="turn-2"))
+
+        assert result.session_id == "forked-thread"
+        assert calls[0][1]["model"] == "current-default"
+        assert machine._codex_forks.entries[
+            "request-1"]["controls"]["model"] == "current-default"
 
     asyncio.run(run())
 
@@ -647,6 +711,10 @@ def test_codex_worktree_fork_uses_persistent_rpc_and_returns_correlated_result(m
         assert result.session_id == "forked-thread"
         assert result.request_id == "request-1"
         assert result.to == "client-1"
+        assert any(
+            message.type == "session_list_invalidated"
+            for message in transport.sent
+        )
         assert transport.sent[-1] is result
         duplicate = await machine._handle_fork_session_worktree(_command())
         assert duplicate.session_id == "forked-thread"
