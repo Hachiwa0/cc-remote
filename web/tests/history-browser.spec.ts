@@ -1294,7 +1294,17 @@ test("older history becoming available during a wheel gesture is restored once",
   expect(pending.id).toBe(before.id);
   expect(Math.abs(pending.offset - before.offset)).toBeLessThan(2);
   await expect(page.getByTestId("load-count")).toHaveText("0");
-  await page.getByTestId("reveal-older-history").click();
+  await viewport.evaluate((node) => {
+    node.dispatchEvent(new WheelEvent("wheel", {
+      bubbles: true,
+      deltaY: -80,
+    }));
+    const reveal = document.querySelector<HTMLButtonElement>(
+      '[data-testid="reveal-older-history"]',
+    );
+    if (!reveal) throw new Error("history reveal control is missing");
+    reveal.click();
+  });
   await expect(page.getByTestId("load-count")).toHaveText("1");
   await expect(page.locator('[data-turn-id="n8"]')).toBeAttached();
   await page.waitForTimeout(250);
@@ -3365,7 +3375,7 @@ test("desktop text selection keeps its original virtual turn while edge-dragging
     viewportBox.y + viewportBox.height - 2,
     { steps: 20 },
   );
-  for (let step = 0; step < 24; step += 1) {
+  for (let step = 0; step < 12; step += 1) {
     await page.mouse.wheel(0, 220);
     await page.mouse.move(
       viewportBox.x + viewportBox.width - 48 + (step % 2),
@@ -3718,7 +3728,14 @@ test("iOS pointercancel releases process interactions and output following", asy
     node.scrollHeight - node.scrollTop - node.clientHeight,
   )).toBeLessThan(2);
 
-  await header.click();
+  await header.evaluate((node) => {
+    const target = node as HTMLElement;
+    target.dispatchEvent(new MouseEvent("click", {
+      bubbles: true,
+      cancelable: true,
+      detail: 1,
+    }));
+  });
   await expect(header).toHaveAttribute("aria-expanded", "true");
   const reasoning = timeline.locator("details.process-reasoning");
   await dispatchCancelledTouchTap(

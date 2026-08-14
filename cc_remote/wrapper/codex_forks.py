@@ -143,6 +143,13 @@ class CodexForkJournal:
             ):
                 raise ValueError(
                     "fork alias name state differs from its canonical root")
+            if (
+                entry.get("title") != canonical.get("title")
+                or entry.get("title_updated_at")
+                != canonical.get("title_updated_at")
+            ):
+                raise ValueError(
+                    "fork alias title differs from its canonical root")
             compatible = {
                 "alias": {"intent", "submitted", "uncertain"},
                 "complete": {"complete"},
@@ -230,6 +237,18 @@ class CodexForkJournal:
         name_finalized = entry.get("name_finalized")
         if name_finalized is not None and not isinstance(name_finalized, bool):
             raise ValueError("invalid fork name finalization state")
+        title = entry.get("title")
+        if title is not None and (
+            not isinstance(title, str) or not title or len(title) > 200
+        ):
+            raise ValueError("invalid fork title")
+        title_updated_at = entry.get("title_updated_at")
+        if title_updated_at is not None and (
+            title is None
+            or isinstance(title_updated_at, bool)
+            or not isinstance(title_updated_at, (int, float))
+        ):
+            raise ValueError("invalid fork title timestamp")
 
     def begin(
         self,
@@ -447,6 +466,58 @@ class CodexForkJournal:
         with self._lock:
             entry = self.entries.get(request_id)
             return dict(entry) if entry is not None else None
+
+    def completed_results(self, limit: int) -> list[dict[str, Any]]:
+        """Return newest unique completed forks for catalog recovery."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ForkJournalError("invalid completed fork result limit")
+        with self._lock:
+            results: list[dict[str, Any]] = []
+            seen_sources: set[str] = set()
+            for entry in reversed(tuple(self.entries.values())):
+                source = entry.get("thread_source")
+                if (
+                    entry.get("status") != "complete"
+                    or not isinstance(source, str)
+                    or source in seen_sources
+                ):
+                    continue
+                seen_sources.add(source)
+                results.append(dict(entry))
+                if len(results) >= limit:
+                    break
+            return results
+
+    def set_title(self, session_id: str, title: str) -> bool:
+        """Persist a renamed fork while its native catalog row is absent."""
+        if (
+            not isinstance(session_id, str)
+            or not _SAFE_ID.fullmatch(session_id)
+        ):
+            raise ForkJournalError("invalid forked session id")
+        if not isinstance(title, str) or not title or len(title) > 200:
+            raise ForkJournalError("invalid fork title")
+        with self._lock:
+            updated = OrderedDict(self.entries)
+            changed = False
+            updated_at = time.time()
+            for request_id, entry in tuple(updated.items()):
+                if (
+                    entry.get("status") != "complete"
+                    or entry.get("session_id") != session_id
+                ):
+                    continue
+                renamed = dict(entry)
+                renamed["title"] = title
+                renamed["title_updated_at"] = updated_at
+                updated[request_id] = renamed
+                changed = True
+            if not changed:
+                return False
+            self._validate_aliases(updated)
+            self._persist(updated)
+            self.entries = updated
+            return True
 
     def _set_status(
         self, request_id: str, status: str, **fields: Any,
