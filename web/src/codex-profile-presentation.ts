@@ -22,6 +22,21 @@ export interface CodexProfilePresentation {
   tone: number;
 }
 
+/** Resolve account ownership from the routing id while a fresh/forked row is
+ * still waiting for the authoritative catalog. Multi-profile Codex wire ids
+ * are always ``profile@native``; falling back to the default during this gap
+ * would paint the wrong account's model and capability catalogs. */
+export function codexProfileIdForSession(
+  sessionId: string | null | undefined,
+  defaultProfileId: string | null | undefined,
+): string | null {
+  if (!sessionId) return defaultProfileId ?? null;
+  const separator = sessionId.indexOf("@");
+  return separator > 0
+    ? sessionId.slice(0, separator)
+    : defaultProfileId ?? null;
+}
+
 export function codexProfilePresentation(
   profiles: readonly CodexProfileInfo[],
   defaultProfileId: string | null | undefined,

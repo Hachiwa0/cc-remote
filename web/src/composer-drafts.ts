@@ -1,16 +1,20 @@
 import type { Engine, QueryFile, QueryImg, Space } from "./protocol";
+import type { ComposerPaste } from "./composer-pastes";
+
+export type { ComposerPaste } from "./composer-pastes";
 
 export interface ComposerDraft {
   input: string;
   images: QueryImg[];
   files: QueryFile[];
+  pastes: ComposerPaste[];
 }
 
 const MAX_DRAFTS = 32;
 const MAX_RETAINED_BYTES = 64 * 1024 * 1024;
 
 function emptyDraft(): ComposerDraft {
-  return { input: "", images: [], files: [] };
+  return { input: "", images: [], files: [], pastes: [] };
 }
 
 function cloneDraft(draft: ComposerDraft): ComposerDraft {
@@ -18,6 +22,7 @@ function cloneDraft(draft: ComposerDraft): ComposerDraft {
     input: draft.input,
     images: draft.images.map((image) => ({ ...image })),
     files: draft.files.map((file) => ({ ...file })),
+    pastes: draft.pastes.map((paste) => ({ ...paste })),
   };
 }
 
@@ -27,11 +32,13 @@ function draftBytes(draft: ComposerDraft): number {
     + draft.files.reduce(
       (total, file) => total + file.filename.length * 2 + file.data.length,
       0,
-    );
+    )
+    + draft.pastes.reduce((total, paste) => total + paste.text.length * 2, 0);
 }
 
 function isEmptyDraft(draft: ComposerDraft): boolean {
-  return !draft.input && draft.images.length === 0 && draft.files.length === 0;
+  return !draft.input && draft.images.length === 0 && draft.files.length === 0
+    && draft.pastes.length === 0;
 }
 
 export function composerDraftKey(

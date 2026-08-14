@@ -4251,6 +4251,90 @@ test("multi-line IME growth stays pinned during a Codex tool burst", async ({
   expect(result.worstDistance).toBeLessThanOrEqual(2);
 });
 
+test("long paste stays out of the textarea and remains editable before send", async ({
+  page,
+}) => {
+  await page.goto(
+    "/tests/history-browser.html?codex-live-burst=1&composer-live=1&composer-paste=1",
+  );
+  const input = page.locator(
+    '[data-testid="live-composer-shell"] .composer textarea',
+  );
+  const pasted = `Editable paste opening ${"content ".repeat(170)}`;
+  await input.evaluate((node, text) => {
+    const data = new DataTransfer();
+    data.setData("text/plain", text);
+    node.dispatchEvent(new ClipboardEvent("paste", {
+      bubbles: true,
+      cancelable: true,
+      clipboardData: data,
+    }));
+  }, pasted);
+  await expect(input).toHaveValue("");
+  const card = page.locator(
+    '[data-testid="live-composer-shell"] .paste-card',
+  );
+  await expect(card).toContainText("Editable paste opening");
+  await expect(card).toContainText(`${pasted.length} 字符`);
+  const box = await card.boundingBox();
+  expect(box?.width ?? 999).toBeLessThanOrEqual(302);
+
+  await card.locator(".paste-open").click();
+  const editor = page.getByRole("dialog", { name: "编辑粘贴内容" })
+    .getByRole("textbox");
+  await editor.fill("edited paste body");
+  await page.getByRole("button", { name: "保存" }).click();
+  await expect(card).toContainText("edited paste body");
+  await expect(input).toHaveValue("");
+
+  await input.fill("visible follow-up");
+  await page.locator(
+    '[data-testid="live-composer-shell"] .sendbtn',
+  ).click();
+  await expect(page.getByTestId("composer-paste-output"))
+    .toHaveText("edited paste body\n\nvisible follow-up");
+  await expect(card).toHaveCount(0);
+  await expect(input).toHaveValue("");
+});
+
+test("oversized edited paste stays in the draft instead of being cleared", async ({
+  page,
+}) => {
+  await page.goto(
+    "/tests/history-browser.html?codex-live-burst=1&composer-live=1&composer-paste=1",
+  );
+  const input = page.locator(
+    '[data-testid="live-composer-shell"] .composer textarea',
+  );
+  const seed = `oversized ${"seed ".repeat(205)}`;
+  await input.evaluate((node, text) => {
+    const data = new DataTransfer();
+    data.setData("text/plain", text);
+    node.dispatchEvent(new ClipboardEvent("paste", {
+      bubbles: true,
+      cancelable: true,
+      clipboardData: data,
+    }));
+  }, seed);
+  const card = page.locator(
+    '[data-testid="live-composer-shell"] .paste-card',
+  );
+  await card.locator(".paste-open").click();
+  await page.getByRole("dialog", { name: "编辑粘贴内容" })
+    .getByRole("textbox").fill("x".repeat(2 * 1024 * 1024));
+  await page.getByRole("button", { name: "保存" }).click();
+  await input.fill("tail");
+  await page.locator(
+    '[data-testid="live-composer-shell"] .sendbtn',
+  ).click();
+  await expect(page.locator(
+    '[data-testid="live-composer-shell"] .composer-notice',
+  )).toContainText("消息内容超过上限");
+  await expect(card).toHaveCount(1);
+  await expect(input).toHaveValue("tail");
+  await expect(page.getByTestId("composer-paste-output")).toHaveText("");
+});
+
 test("multi-line composer growth does not move a history reader", async ({
   page,
 }, testInfo) => {

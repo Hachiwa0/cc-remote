@@ -108,6 +108,7 @@ _WORK_MCP_SERVER_LIMIT = 128
 _WORK_PATH_MAX = 4096
 _WORK_NAME_MAX = 256
 _COMPACTION_CONTINUATION_GRACE_SECONDS = 5.0
+_COMPACTION_CONTINUATION_PROBE_TIMEOUT_SECONDS = 1.0
 _GOAL_PROMPT_CANDIDATE_TTL_SECONDS = 30.0
 _PROXY_HANDSHAKE_MAX = 16 * 1024
 _PROXY_HANDSHAKE_TIMEOUT = 5.0
@@ -481,6 +482,7 @@ class _CodexCompactionContinuation:
         "candidate_turn_id",
         "candidate_started",
         "candidate_size",
+        "probing",
         "settled",
         "expiry_task",
     )
@@ -508,6 +510,7 @@ class _CodexCompactionContinuation:
         self.candidate_turn_id: Optional[str] = None
         self.candidate_started: Optional[dict] = None
         self.candidate_size: Optional[int] = None
+        self.probing = False
         self.settled = asyncio.Event()
         self.settled.set()
         self.expiry_task: Optional[asyncio.Task] = None
@@ -1427,14 +1430,16 @@ class CodexHandle:
         # turn. Config.toml is read-only here and supplies fresh-thread defaults.
         # Codex equivalents of cc's model / effort / permission-mode. Defaults come
         # from ~/.codex/config.toml; the client overrides them via set_* .
-        self.model: Optional[str] = (
+        configured_model = (
             codex_model() if self.codex_home is None
             else codex_model(codex_home=self.codex_home)
         )
-        self.effort: Optional[str] = (
+        self.model: Optional[str] = configured_model or None
+        configured_effort = (
             codex_effort() if self.codex_home is None
             else codex_effort(codex_home=self.codex_home)
-        )         # low | medium | high | xhigh
+        )
+        self.effort: Optional[str] = configured_effort or None
         self.applied_effort = self.effort                   # keep machine's spawn-time check a no-op
         # UI projection may be ``model-default`` when app-server reports a null
         # thread override and its effective config has no explicit fallback.
@@ -2703,6 +2708,18 @@ class CodexHandle:
         item = params.get("item") if isinstance(params, dict) else None
         return isinstance(item, dict) and item.get("type") == "userMessage"
 
+    @staticmethod
+    def _notification_is_context_compaction(message: dict) -> bool:
+        """Recognize the current authoritative app-server compact item."""
+        if message.get("method") != "item/completed":
+            return False
+        params = message.get("params")
+        item = params.get("item") if isinstance(params, dict) else None
+        return (
+            isinstance(item, dict)
+            and item.get("type") == "contextCompaction"
+        )
+
     def _managed_compaction_fence_current(
         self,
         fence: Optional[_CodexCompactionContinuation] = None,
@@ -2725,6 +2742,7 @@ class CodexHandle:
         if (
             check_deadline
             and fence.awaiting_replacement
+            and not fence.probing
             and fence.deadline > 0
             and asyncio.get_running_loop().time() > fence.deadline
         ):
@@ -2797,7 +2815,11 @@ class CodexHandle:
         try:
             await asyncio.wait_for(
                 fence.settled.wait(),
-                timeout=remaining + 0.25,
+                timeout=(
+                    remaining
+                    + _COMPACTION_CONTINUATION_PROBE_TIMEOUT_SECONDS
+                    + 0.25
+                ),
             )
         except asyncio.TimeoutError:
             if self._managed_compaction_continuation is fence:
@@ -2812,7 +2834,58 @@ class CodexHandle:
                 fence.deadline - asyncio.get_running_loop().time(),
             )
             await asyncio.sleep(delay)
-            if self._managed_compaction_continuation is fence:
+            if (
+                self._managed_compaction_continuation is not fence
+                or not fence.awaiting_replacement
+                or not self._managed_compaction_fence_current(
+                    fence, check_deadline=False)
+            ):
+                return
+            fence.probing = True
+            still_running = False
+            try:
+                still_running = await asyncio.wait_for(
+                    self._probe_managed_compaction_continuation(fence),
+                    timeout=(
+                        _COMPACTION_CONTINUATION_PROBE_TIMEOUT_SECONDS
+                    ),
+                )
+            except asyncio.TimeoutError:
+                pass
+            except Exception as exc:
+                log.warning(
+                    "Codex compaction continuation probe failed",
+                    error_type=type(exc).__name__,
+                )
+            finally:
+                fence.probing = False
+
+            if self._managed_compaction_continuation is not fence:
+                return
+            if (
+                still_running
+                and fence.awaiting_replacement
+                and self._managed_compaction_fence_current(
+                    fence, check_deadline=False)
+            ):
+                # The official status endpoints prove that the exact native
+                # turn is still in progress. Drop only the compact-interrupt
+                # shell; the eventual real terminal remains authoritative.
+                fence.awaiting_replacement = False
+                fence.suppressed_terminal = None
+                fence.suppressed_size = None
+                fence.settled.set()
+                fence.expiry_task = None
+                self._compaction_continuation_turn_id = None
+                return
+            # ``_request`` replies are dispatched by the sole stdout reader.
+            # A continuation item may therefore have confirmed this fence
+            # while the final probe reply was being delivered. Never replay
+            # the previously suppressed terminal after that confirmation.
+            if (
+                fence.awaiting_replacement
+                and not fence.settled.is_set()
+            ):
                 await self._release_managed_compaction_continuation()
         except asyncio.CancelledError:
             return
@@ -2821,6 +2894,50 @@ class CodexHandle:
                 "Codex compaction continuation expiry failed",
                 error_type=type(exc).__name__,
             )
+
+    async def _probe_managed_compaction_continuation(
+        self, fence: _CodexCompactionContinuation,
+    ) -> bool:
+        """Prove once that a compact-interrupted native turn is still active.
+
+        This runs only in the detached expiry task. Never await these requests
+        from ``_dispatch``: their replies are consumed by the same stdout reader.
+        """
+        if not self._managed_compaction_fence_current(
+            fence, check_deadline=False,
+        ):
+            return False
+        response = await self._request("thread/read", {
+            "threadId": fence.thread_id,
+            "includeTurns": False,
+        })
+        thread = response.get("thread") if isinstance(response, dict) else None
+        status = thread.get("status") if isinstance(thread, dict) else None
+        if (
+            not isinstance(thread, dict)
+            or thread.get("id") != fence.thread_id
+            or not isinstance(status, dict)
+            or status.get("type") != "active"
+            or not self._managed_compaction_fence_current(
+                fence, check_deadline=False)
+        ):
+            return False
+        page = await self._request("thread/turns/list", {
+            "threadId": fence.thread_id,
+            "cursor": None,
+            "limit": 1,
+            "sortDirection": "desc",
+            "itemsView": "notLoaded",
+        })
+        turns = page.get("data") if isinstance(page, dict) else None
+        latest = turns[0] if isinstance(turns, list) and len(turns) == 1 else None
+        return bool(
+            isinstance(latest, dict)
+            and latest.get("id") == fence.native_turn_id
+            and latest.get("status") == "inProgress"
+            and self._managed_compaction_fence_current(
+                fence, check_deadline=False)
+        )
 
     def _arm_managed_compaction_continuation(
         self, native_turn_id: str,
@@ -2871,6 +2988,7 @@ class CodexHandle:
             or not fence.awaiting_replacement
             or not self._managed_compaction_fence_current(fence)
             or _notification_turn_id(message) != fence.native_turn_id
+            or self._notification_is_context_compaction(message)
             or message.get("method") in {
                 "turn/completed", "thread/compacted", "error",
             }
@@ -5937,7 +6055,10 @@ class CodexHandle:
         if method == "turn/completed" and review_execution_frame:
             self._review_execution_turn_id = None
             return
-        if method == "thread/compacted":
+        if (
+            method == "thread/compacted"
+            or self._notification_is_context_compaction(m)
+        ):
             # This notification has already passed exact thread/turn routing.
             # Freeze its native owner now; a later different turn cannot inherit
             # the continuation right.

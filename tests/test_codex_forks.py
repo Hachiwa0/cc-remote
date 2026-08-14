@@ -75,12 +75,15 @@ def test_fork_child_delete_lifecycle_survives_restart_and_can_abort(tmp_path):
     journal.begin("request-1", "parent", "turn-1", "/repo")
     journal.claim_submission("request-1")
     journal.complete("request-1", "child")
+    assert journal.completed_children() == [journal.get("request-1")]
 
     assert journal.begin_delete("child") == "delete_pending"
+    assert journal.completed_children() == []
     assert CodexForkJournal(tmp_path).child_entry("child")["status"] == (
         "delete_pending")
     assert journal.abort_delete("child") is True
     assert journal.child_entry("child")["status"] == "complete"
+    assert journal.completed_children() == [journal.get("request-1")]
 
     assert journal.begin_delete("child") == "delete_pending"
     assert journal.finish_delete("child") is True
@@ -88,6 +91,23 @@ def test_fork_child_delete_lifecycle_survives_restart_and_can_abort(tmp_path):
     assert reloaded.child_entry("child")["status"] == "deleted"
     assert reloaded.complete("request-1", "child")["status"] == "deleted"
     assert reloaded.begin_delete("child") == "deleted"
+
+
+def test_completed_children_never_overrides_a_stronger_child_tombstone(tmp_path):
+    journal = CodexForkJournal(tmp_path)
+    journal.begin("request-old", "parent-old", "turn-old", "/repo")
+    journal.complete("request-old", "same-child")
+    journal.begin_delete("same-child")
+    journal.finish_delete("same-child")
+
+    # Distinct source groups are individually valid journal records. Even if a
+    # malformed upstream reconciliation later associates another completed
+    # request with the same native child, deletion remains the strongest owner.
+    journal.begin("request-new", "parent-new", "turn-new", "/repo")
+    journal.complete("request-new", "same-child")
+
+    assert journal.child_entry("same-child")["status"] == "deleted"
+    assert journal.completed_children() == []
 
 
 def test_rollout_marker_recovery_scans_active_and_archived_with_bounds(tmp_path):

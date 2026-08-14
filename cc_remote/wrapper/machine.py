@@ -242,8 +242,9 @@ from cc_remote.wrapper.codex_history import (
     CodexOfficialHistory,
 )
 from cc_remote.wrapper.codex_sessions import (
-    list_codex_sessions, codex_session_cwd, codex_rollout_path, codex_model,
-    codex_session_settings, codex_session_presence,
+    list_codex_sessions, codex_exact_catalog_rows, codex_session_cwd,
+    codex_rollout_path, codex_model, codex_effort, codex_session_settings,
+    codex_session_presence, codex_current_provider,
 )
 from cc_remote.wrapper.codex_models import (
     MODEL_DEFAULT_EFFORT,
@@ -1001,6 +1002,68 @@ def _session_effort(ctx: SessionContext) -> Optional[str]:
     return value.strip() if isinstance(value, str) and value.strip() else None
 
 
+def _history_control_rows(
+    sid: str,
+    ctx: Optional[SessionContext],
+    *,
+    fallback_model: Optional[str] = None,
+    allow_fallback_model: bool = False,
+) -> list[dict]:
+    """Return the one authoritative model/effort pair for a newest page.
+
+    Transcript control rows describe an earlier point in the conversation.  A
+    resident engine (including an ephemeral BTW fork) instead owns the current
+    settings readout.  Build that pair once at the History envelope boundary so
+    cached and freshly translated pages cannot order an old row after it and
+    silently roll the browser back on refresh.
+    """
+    model = _session_model(ctx) if ctx is not None else None
+    if (
+        model is None
+        and allow_fallback_model
+        and isinstance(fallback_model, str)
+        and fallback_model.strip()
+    ):
+        model = fallback_model.strip()
+    effort = _session_effort(ctx) if ctx is not None else None
+    if ctx is not None and ctx.engine == "codex" and not effort:
+        # A null app-server thread override is a real model-default state.  It
+        # must replace any stale rollout effort instead of leaving the browser
+        # on its previously painted concrete value.
+        effort = MODEL_DEFAULT_EFFORT
+
+    rows: list[dict] = []
+    if model:
+        rows.append(Model(model=model, sid=sid).model_dump(mode="json"))
+    if effort:
+        rows.append(Effort(effort=effort, sid=sid).model_dump(mode="json"))
+    return rows
+
+
+def _replace_history_control_rows(
+    rows: list[dict] | tuple[dict, ...],
+    controls: list[dict],
+) -> list[dict]:
+    """Install one control row per kind before the narrative projection.
+
+    A resident value replaces every transcript/cache copy of the same kind.
+    When one side is unavailable (notably a cold, non-resident cache hit), keep
+    only the newest source value instead of erasing the best known readout.
+    """
+    selected = {
+        row.get("type"): dict(row)
+        for row in rows
+        if row.get("type") in {"model", "effort"}
+    }
+    selected.update({row.get("type"): dict(row) for row in controls})
+    return [
+        *(selected[kind] for kind in ("model", "effort")
+          if kind in selected),
+        *(dict(row) for row in rows
+          if row.get("type") not in {"model", "effort"}),
+    ]
+
+
 def _codex_compaction_continuation_ids(
     ctx: Optional[SessionContext],
 ) -> list[str]:
@@ -1032,6 +1095,22 @@ def _codex_catalog_sort_key(value: object) -> float:
     return parsed if math.isfinite(parsed) else -1.0
 
 
+def _codex_catalog_default_model(models: list[dict]) -> Optional[str]:
+    """Return one normalized catalog default without crossing profiles."""
+    available = [
+        item for item in models
+        if isinstance(item.get("id"), str) and item["id"]
+    ]
+    if not available:
+        return None
+    return next((
+        item["id"] for item in available if item.get("is_default")
+    ), available[0]["id"])
+
+
+_CODEX_CATALOG_PRIORITY = "_cc_remote_catalog_priority"
+
+
 class _BtwSpawnFailure(Exception):
     """Expected /btw rejection that must be correlated and ACKed."""
 
@@ -1048,6 +1127,10 @@ class _SpawnFailure(Exception):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+class _UnsupportedCodexModel(ValueError):
+    """An explicit model is absent from the selected account's catalog."""
 
 
 class _ForkOutcomeUncertain(RuntimeError):
@@ -1909,6 +1992,52 @@ class WrapperMachine:
             # cannot silently split from the app-server child environment.
             return None
         return str(profile.home)
+
+    async def _resolve_codex_profile_model(
+        self,
+        profile: CodexProfile,
+        candidate: Optional[str],
+        *,
+        explicit: bool = False,
+        catalog: Optional[list[dict]] = None,
+    ) -> tuple[Optional[str], bool]:
+        """Resolve a model inside exactly one Codex account namespace.
+
+        A non-empty catalog proves availability. Explicit unavailable choices
+        fail closed; implicit/retired values follow that account's advertised
+        default. An empty catalog is read uncertainty, so preserve a supplied
+        config/session value and let app-server apply its native default when
+        no value exists. The boolean reports whether a supplied value changed.
+        """
+        if catalog is None:
+            home = self._codex_home(profile)
+            catalog = (
+                await codex_catalog()
+                if home is None
+                else await codex_catalog(codex_home=home)
+            )
+        catalog_ids = {
+            item["id"] for item in catalog
+            if isinstance(item.get("id"), str) and item["id"]
+        }
+        if candidate and (not catalog_ids or candidate in catalog_ids):
+            return candidate, False
+        if candidate and explicit and catalog_ids:
+            raise _UnsupportedCodexModel(candidate)
+        if candidate and catalog_ids:
+            home = self._codex_home(profile)
+            provider = await asyncio.to_thread(
+                codex_current_provider,
+                **({} if home is None else {"codex_home": home}),
+            )
+            if provider and provider != "openai":
+                # Custom providers can intentionally use ids absent from
+                # OpenAI's entitlement-filtered model/list. Config and rollout
+                # remain authoritative inside that already-selected provider;
+                # only official/implicit OpenAI ids are treated as retired.
+                return candidate, False
+        fallback = _codex_catalog_default_model(catalog)
+        return fallback, fallback != candidate
 
     def _codex_spawn_profile_kwargs(
         self, profile: Optional[CodexProfile],
@@ -9259,10 +9388,7 @@ class WrapperMachine:
             # full-history callers hydrate each bounded turn from the
             # source-complete detail table instead of reparsing the rollout or
             # receiving a silently lossy summary page.
-            cached_full_events = [
-                dict(row) for row in indexed_page.events
-                if row.get("type") in {"model", "effort"}
-            ]
+            cached_full_events = []
             for turn in indexed_page.turns:
                 turn_id = turn.get("id")
                 if not isinstance(turn_id, str):
@@ -9293,27 +9419,19 @@ class WrapperMachine:
                     codex_client_aliases,
                     turns=False,
                 )
-            if before is None and ctx is not None:
-                live_model = _session_model(ctx)
-                live_effort = _session_effort(ctx)
-                if live_model:
-                    cached_events = [
-                        row for row in cached_events
-                        if row.get("type") != "model"
-                    ]
-                    cached_events.insert(
-                        0, Model(model=live_model, sid=sid).model_dump(mode="json"))
-                if live_effort:
-                    cached_events = [
-                        row for row in cached_events
-                        if row.get("type") != "effort"
-                    ]
-                    model_rows = 1 if cached_events and (
-                        cached_events[0].get("type") == "model") else 0
-                    cached_events.insert(
-                        model_rows,
-                        Effort(effort=live_effort, sid=sid).model_dump(mode="json"),
-                    )
+            if before is None:
+                cached_events = _replace_history_control_rows(
+                    cached_events,
+                    _history_control_rows(sid, ctx),
+                )
+            else:
+                # Older cache schemas could persist transcript control rows on
+                # pagination pages. Deep history is narrative-only and must
+                # match the fresh-build path, which never mutates live controls.
+                cached_events = [
+                    row for row in cached_events
+                    if row.get("type") not in {"model", "effort"}
+                ]
             log.info(
                 "history index hit", session_id=sid,
                 events=len(cached_events), before=bool(before), limit=limit,
@@ -9736,23 +9854,36 @@ class WrapperMachine:
         # Prepend live control readouts only on the newest page (initial load).
         # Claude's SDK model is the selected alias; its transcript may instead
         # contain a proxy's raw upstream model and must not replace that alias.
-        authoritative_model = _session_model(ctx) if ctx is not None else None
-        history_model = authoritative_model or mdl
-        control_rows: list[dict] = []
-        if (before is None and history_model
-                and (authoritative_model or is_codex_hist
-                     or history_model.startswith("claude-"))):
-            model_event = Model(model=history_model, sid=sid)
-            control_rows.append(model_event.model_dump(mode="json"))
-        history_effort = _session_effort(ctx) if ctx is not None else None
-        if before is None and history_effort:
-            effort_event = Effort(effort=history_effort, sid=sid)
-            control_rows.append(effort_event.model_dump(mode="json"))
+        history_model = (
+            _session_model(ctx) if ctx is not None else None
+        ) or mdl
+        control_rows = (
+            _history_control_rows(
+                sid,
+                ctx,
+                fallback_model=history_model,
+                allow_fallback_model=bool(
+                    is_codex_hist
+                    or (
+                        isinstance(history_model, str)
+                        and history_model.startswith("claude-")
+                    )
+                ),
+            )
+            if before is None else []
+        )
 
         def make_history(selected: list[list], effective_start: int) -> History:
-            payload: list[dict] = [row.copy() for row in control_rows]
+            narrative: list[dict] = []
             for group in selected:
-                payload.extend(ev.model_dump(mode="json") for ev in group)
+                narrative.extend(ev.model_dump(mode="json") for ev in group)
+            payload = (
+                _replace_history_control_rows(narrative, control_rows)
+                if before is None else [
+                    row for row in narrative
+                    if row.get("type") not in {"model", "effort"}
+                ]
+            )
             oldest_id = _tid(selected[0]) if selected else None
             if (source_window_oldest_cursor is not None
                     and selected
@@ -12440,18 +12571,45 @@ class WrapperMachine:
         default_effort = None
         defaults_cwd = None
         if engine == "codex":
-            # config.toml's `model` = what a NEW session (and the terminal codex)
-            # starts on. Only offer it if the catalog actually has it, so a stale
-            # config can't preselect a model that isn't there.
-            cfg_model = await asyncio.to_thread(
-                codex_model,
-                "",
-                **({} if codex_home is None else {
-                    "codex_home": codex_home,
-                }),
+            # Report the same profile-scoped defaults _spawn will apply. A stale
+            # configured model follows this account's catalog default; an empty
+            # catalog preserves config because availability is then unknown.
+            cfg_model, cfg_effort = await asyncio.gather(
+                asyncio.to_thread(
+                    codex_model,
+                    "",
+                    **({} if codex_home is None else {
+                        "codex_home": codex_home,
+                    }),
+                ),
+                asyncio.to_thread(
+                    codex_effort,
+                    "",
+                    **({} if codex_home is None else {
+                        "codex_home": codex_home,
+                    }),
+                ),
             )
-            if cfg_model and any(m["id"] == cfg_model for m in models):
-                default_model = cfg_model
+            default_model, _ = await self._resolve_codex_profile_model(
+                codex_profile,
+                cfg_model or None,
+                catalog=models,
+            )
+            selected = next((
+                item for item in models
+                if item.get("id") == default_model
+            ), None)
+            supported_efforts = (
+                selected.get("efforts") if isinstance(selected, dict) else []
+            )
+            if cfg_effort and (
+                not supported_efforts or cfg_effort in supported_efforts
+            ):
+                default_effort = cfg_effort
+            elif isinstance(selected, dict):
+                value = selected.get("default_effort")
+                if isinstance(value, str) and value:
+                    default_effort = value
         elif engine in {"cc", "claude"}:
             defaults_cwd = getattr(cmd, "cwd", None) or self.cfg.cc_cwd
             default_model, default_effort = (
@@ -17692,12 +17850,6 @@ class WrapperMachine:
             return
 
         now = time.monotonic()
-        cutoff = now - self.CODEX_THREAD_STARTED_HINT_TTL_SECONDS
-        while self._codex_thread_started_hints:
-            first_key = next(iter(self._codex_thread_started_hints))
-            if self._codex_thread_started_hints[first_key] > cutoff:
-                break
-            self._codex_thread_started_hints.popitem(last=False)
         key = (profile.id, native_thread_id)
         if key in self._codex_thread_started_hints:
             self._codex_thread_started_hints.move_to_end(key)
@@ -17771,7 +17923,33 @@ class WrapperMachine:
                 row for row in cached[1]
                 if row.get("codex_profile_id") in failed_profile_ids
             ]
-            raw = self._bounded_codex_profile_catalog([*raw, *stale_rows])
+            # _read_codex_profile_catalog returns public rows with its internal
+            # retention marker stripped. Restore that marker only for exact
+            # candidates before this second cache merge; otherwise 400 newer
+            # stale rows can evict an old but currently resident session while
+            # thread/list is unavailable.
+            exact_candidates = self._codex_exact_catalog_candidates()
+            prioritized_raw: list[dict] = []
+            for row in raw:
+                item = dict(row)
+                profile_id = item.get("codex_profile_id")
+                native_sid = item.get("native_session_id")
+                if (
+                    isinstance(profile_id, str)
+                    and profile_id in failed_profile_ids
+                    and isinstance(native_sid, str)
+                ):
+                    info = exact_candidates.get(profile_id, {}).get(native_sid)
+                    priority = int((info or {}).get("priority") or 0)
+                    if priority:
+                        item[_CODEX_CATALOG_PRIORITY] = priority
+                prioritized_raw.append(item)
+            raw = self._bounded_codex_profile_catalog([
+                *prioritized_raw, *stale_rows,
+            ])
+        # Exact state-DB repair above is authoritative. Keep the rollout-backed
+        # overlay as a bounded compatibility fallback for app-server versions
+        # whose state DB has not materialized a just-forked child yet.
         raw = await asyncio.to_thread(
             self._overlay_completed_codex_forks, raw)
         self._codex_session_profile_errors = profile_errors
@@ -17949,6 +18127,133 @@ class WrapperMachine:
                 break
         return found
 
+    def _codex_exact_catalog_candidates(
+        self,
+    ) -> dict[str, dict[str, dict[str, object]]]:
+        """Return exact native ids whose owning profile may need list repair.
+
+        Resident sessions cover the create/list race.  The durable fork journal
+        covers reconnects where app-server still addresses a child through
+        ``thread/read`` but omits its empty-preview row from ``thread/list``.
+        Profile-scoped native CLI start hints cover the same preview race before
+        a foreign TUI thread enters the ordinary catalog. Parent and child must
+        resolve through the same profile namespace; a malformed or stale
+        cross-profile record is never repaired into either account's public
+        catalog.
+        """
+        candidates: dict[str, dict[str, dict[str, object]]] = {
+            profile.id: {} for profile in self._codex_profiles
+        }
+
+        def candidate(profile_id: str, native_sid: str) -> dict[str, object]:
+            return candidates[profile_id].setdefault(native_sid, {
+                "forked_from_id": None,
+                "priority": 0,
+                "created_at": 0.0,
+                "hinted": False,
+                "hint_fresh": False,
+                "resident": False,
+            })
+
+        now_wall = time.time()
+        try:
+            # Collect through the journal's own hard bound, then let exact DB
+            # lookup and the final account-fair catalog bound select rows. A
+            # global 400-entry cut here would let one busy account starve every
+            # hidden fork belonging to a quieter sibling profile.
+            completed = self._codex_forks.completed_children()
+        except ForkJournalError as exc:
+            log.warning(
+                "Codex fork catalog repair journal unavailable",
+                error_type=type(exc).__name__,
+            )
+            completed = []
+        for entry in completed:
+            child_wire = entry.get("session_id")
+            parent_wire = entry.get("parent_session_id")
+            if not isinstance(child_wire, str) or not isinstance(parent_wire, str):
+                continue
+            try:
+                child_profile, child_native = self._codex_target(child_wire)
+                parent_profile, _parent_native = self._codex_target(parent_wire)
+            except ValueError:
+                continue
+            if child_profile.id != parent_profile.id:
+                log.warning(
+                    "cross-profile Codex fork catalog record ignored",
+                    child_profile_id=child_profile.id,
+                    parent_profile_id=parent_profile.id,
+                )
+                continue
+            info = candidate(child_profile.id, child_native)
+            if info.get("forked_from_id") is None:
+                info["forked_from_id"] = parent_wire
+            created_at = entry.get("created_at")
+            if (
+                isinstance(created_at, (int, float))
+                and not isinstance(created_at, bool)
+                and math.isfinite(created_at)
+                and created_at >= 0
+            ):
+                info["created_at"] = max(
+                    float(info.get("created_at") or 0.0),
+                    float(created_at),
+                )
+                if now_wall - created_at <= self.CODEX_THREAD_STARTED_HINT_TTL_SECONDS:
+                    info["priority"] = max(
+                        int(info.get("priority") or 0), 1)
+
+        now_monotonic = time.monotonic()
+        for (profile_id, native_sid), hinted_at in tuple(
+            self._codex_thread_started_hints.items()
+        ):
+            if profile_id not in candidates:
+                continue
+            try:
+                self._codex_wire_sid(profile_id, native_sid)
+            except ValueError:
+                continue
+            info = candidate(profile_id, native_sid)
+            info["hinted"] = True
+            info["hint_fresh"] = (
+                isinstance(hinted_at, (int, float))
+                and not isinstance(hinted_at, bool)
+                and math.isfinite(hinted_at)
+                and now_monotonic - hinted_at
+                <= self.CODEX_THREAD_STARTED_HINT_TTL_SECONDS
+            )
+            if (
+                isinstance(hinted_at, (int, float))
+                and not isinstance(hinted_at, bool)
+                and math.isfinite(hinted_at)
+            ):
+                # Priority already separates hints from journal/resident rows.
+                # Preserve monotonic hint order within this class so the exact
+                # SQLite read's 512-id bound selects the newest starts first.
+                info["created_at"] = float(hinted_at)
+            info["priority"] = max(
+                int(info.get("priority") or 0), 2)
+
+        for ctx in self.sessions.values():
+            if ctx.engine != "codex" or ctx.btw or not ctx.session_id:
+                continue
+            try:
+                profile = self._codex_profile_for_ctx(ctx)
+                wire_sid = self._codex_wire_sid(profile, ctx.session_id)
+                routed_profile, native_sid = self._codex_target(wire_sid)
+            except (RuntimeError, ValueError):
+                continue
+            if routed_profile.id != profile.id:
+                continue
+            info = candidate(profile.id, native_sid)
+            info["resident"] = True
+            info["priority"] = 3
+            info["created_at"] = max(
+                float(info.get("created_at") or 0.0),
+                now_wall,
+            )
+        return candidates
+
     def _bounded_codex_profile_catalog(
         self, candidates: list[dict],
     ) -> list[dict]:
@@ -17966,12 +18271,14 @@ class WrapperMachine:
             ):
                 continue
             seen.add((profile_id, session_id))
-            buckets[profile_id].append(item)
+            buckets[profile_id].append(dict(item))
         rows_by_profile = list(buckets.values())
         for profile_rows in rows_by_profile:
             profile_rows.sort(
-                key=lambda row: _codex_catalog_sort_key(
-                    row.get("last_modified")),
+                key=lambda row: (
+                    int(row.get(_CODEX_CATALOG_PRIORITY) or 0),
+                    _codex_catalog_sort_key(row.get("last_modified")),
+                ),
                 reverse=True,
             )
 
@@ -17987,14 +18294,18 @@ class WrapperMachine:
                 remaining = True
                 item = profile_rows[index]
                 indices[position] += 1
+                public_item = {
+                    key: value for key, value in item.items()
+                    if key != _CODEX_CATALOG_PRIORITY
+                }
                 encoded_size = len(json.dumps(
-                    item,
+                    public_item,
                     ensure_ascii=False,
                     separators=(",", ":"),
                 ).encode("utf-8")) + 64
                 if row_bytes + encoded_size > self.CODEX_SESSION_LIST_MAX_BYTES:
                     continue
-                rows.append(item)
+                rows.append(public_item)
                 row_bytes += encoded_size
                 if len(rows) >= self.CODEX_SESSION_LIST_MAX_ROWS:
                     break
@@ -18023,9 +18334,12 @@ class WrapperMachine:
             200,
             math.ceil(self.CODEX_SESSION_LIST_MAX_ROWS / (2 * profile_count)),
         ))
+        exact_candidates = self._codex_exact_catalog_candidates()
 
         async def read(profile: CodexProfile):
             home = self._codex_home(profile)
+            profile_candidates = exact_candidates.get(profile.id, {})
+            list_error: Optional[Exception] = None
             try:
                 rows = (
                     await list_codex_sessions(per_state_limit)
@@ -18034,7 +18348,8 @@ class WrapperMachine:
                         per_state_limit, codex_home=home)
                 )
             except Exception as exc:
-                return profile, None, exc
+                rows = []
+                list_error = exc
             normalized: list[dict] = []
             for row in rows:
                 if not isinstance(row, dict):
@@ -18060,8 +18375,202 @@ class WrapperMachine:
                             profile, parent)
                     except ValueError:
                         item["forked_from_id"] = None
+                candidate_info = profile_candidates.get(native_sid)
+                if candidate_info is not None:
+                    priority = int(candidate_info.get("priority") or 0)
+                    if priority:
+                        item[_CODEX_CATALOG_PRIORITY] = priority
                 normalized.append(item)
-            return profile, normalized, None
+
+            # Once the official list itself exposes a foreign CLI thread, its
+            # bounded hint has completed its job. Exact-DB repairs deliberately
+            # retain the hint so a still-hidden row survives later refreshes.
+            if list_error is None:
+                for native_sid in (
+                    row.get("native_session_id") for row in normalized
+                ):
+                    if isinstance(native_sid, str):
+                        self._codex_thread_started_hints.pop(
+                            (profile.id, native_sid), None)
+
+            # ``thread/list`` can temporarily (and for an empty-preview fork,
+            # indefinitely) omit a thread which remains present in this exact
+            # account's authoritative state DB.  Repair only wrapper-owned
+            # resident/fork ids.  Never scan sibling homes or merge by a bare
+            # UUID, even when two profiles contain the same native id.
+            listed_native_ids = {
+                row.get("native_session_id")
+                for row in normalized
+                if isinstance(row.get("native_session_id"), str)
+            }
+            missing_native_ids = sorted(
+                (
+                    native_sid for native_sid in profile_candidates
+                    if native_sid not in listed_native_ids
+                ),
+                key=lambda native_sid: (
+                    int(profile_candidates[native_sid].get("priority") or 0),
+                    float(
+                        profile_candidates[native_sid].get("created_at") or 0.0
+                    ),
+                ),
+                reverse=True,
+            )
+            if missing_native_ids:
+                exact_rows = await asyncio.to_thread(
+                    codex_exact_catalog_rows,
+                    missing_native_ids,
+                    **({} if home is None else {"codex_home": home}),
+                )
+                if exact_rows is None:
+                    log.warning(
+                        "Codex exact catalog repair unavailable",
+                        profile_id=profile.id,
+                    )
+                else:
+                    for row in exact_rows:
+                        native_sid = row.get("session_id")
+                        if not isinstance(native_sid, str):
+                            continue
+                        try:
+                            wire_sid = self._codex_wire_sid(
+                                profile, native_sid)
+                        except ValueError:
+                            continue
+                        item = dict(row)
+                        item.update({
+                            "session_id": wire_sid,
+                            "native_session_id": native_sid,
+                            "codex_profile_id": profile.id,
+                            "codex_profile_label": profile.label,
+                        })
+                        candidate_info = profile_candidates.get(native_sid, {})
+                        priority = int(candidate_info.get("priority") or 0)
+                        if priority:
+                            item[_CODEX_CATALOG_PRIORITY] = priority
+                        parent_wire = candidate_info.get("forked_from_id")
+                        if isinstance(parent_wire, str):
+                            item["forked_from_id"] = parent_wire
+                            if not item.get("summary") and not item.get(
+                                "first_prompt"
+                            ):
+                                item["summary"] = "派生会话"
+                        normalized.append(item)
+
+            materialized_native_ids = {
+                row.get("native_session_id")
+                for row in normalized
+                if isinstance(row.get("native_session_id"), str)
+            }
+            # ``thread/started`` is an account-scoped, source-filtered native
+            # event. During the very small state-DB commit gap it is sufficient
+            # to keep a fresh CLI row discoverable; older hints remain gated by
+            # an exact DB hit so an externally deleted thread cannot live forever.
+            for native_sid, candidate_info in profile_candidates.items():
+                if (
+                    native_sid in materialized_native_ids
+                    or not candidate_info.get("hint_fresh")
+                ):
+                    continue
+                try:
+                    wire_sid = self._codex_wire_sid(profile, native_sid)
+                except ValueError:
+                    continue
+                normalized.append({
+                    "session_id": wire_sid,
+                    "native_session_id": native_sid,
+                    "summary": "新会话",
+                    "first_prompt": None,
+                    "cwd": None,
+                    "last_modified": str(time.time()),
+                    "git_branch": None,
+                    "forked_from_id": candidate_info.get("forked_from_id"),
+                    "status": None,
+                    "tag": None,
+                    "codex_profile_id": profile.id,
+                    "codex_profile_label": profile.label,
+                    _CODEX_CATALOG_PRIORITY: 2,
+                })
+                materialized_native_ids.add(native_sid)
+
+            # A just-started resident is stronger evidence than a lagging DB
+            # projection: thread/start already returned its durable id and this
+            # wrapper owns the live handle.  Keep that exact profile-scoped row
+            # visible even if the state DB is briefly locked or has not exposed
+            # its metadata transaction yet. Ephemeral BTW contexts are excluded
+            # from candidates above and can never reach this public catalog.
+            materialized_by_native = {
+                row["native_session_id"]: row
+                for row in normalized
+                if isinstance(row.get("native_session_id"), str)
+            }
+            for ctx in self.sessions.values():
+                if (
+                    ctx.engine != "codex"
+                    or ctx.btw
+                    or not ctx.session_id
+                ):
+                    continue
+                try:
+                    resident_profile = self._codex_profile_for_ctx(ctx)
+                    wire_sid = self._codex_wire_sid(
+                        resident_profile, ctx.session_id)
+                except (RuntimeError, ValueError):
+                    continue
+                if resident_profile.id != profile.id:
+                    continue
+                title = self._notification_titles.get(wire_sid)
+                existing = materialized_by_native.get(ctx.session_id)
+                if existing is not None:
+                    existing[_CODEX_CATALOG_PRIORITY] = 3
+                    existing["cwd"] = ctx.cwd
+                    if title and not existing.get("summary"):
+                        existing["summary"] = title
+                    if title and not existing.get("first_prompt"):
+                        existing["first_prompt"] = title
+                    continue
+                try:
+                    rollout_path = self._codex_rollout_for_wire(wire_sid)
+                    modified = (
+                        os.path.getmtime(rollout_path)
+                        if rollout_path else time.time()
+                    )
+                except OSError:
+                    modified = time.time()
+                normalized.append({
+                    "session_id": wire_sid,
+                    "native_session_id": ctx.session_id,
+                    "summary": title,
+                    "first_prompt": title,
+                    "cwd": ctx.cwd,
+                    "last_modified": str(modified),
+                    "git_branch": None,
+                    "forked_from_id": profile_candidates.get(
+                        ctx.session_id, {}
+                    ).get("forked_from_id"),
+                    "status": None,
+                    "tag": None,
+                    "codex_profile_id": profile.id,
+                    "codex_profile_label": profile.label,
+                    _CODEX_CATALOG_PRIORITY: 3,
+                })
+                materialized_by_native[ctx.session_id] = normalized[-1]
+
+            # Current app-server state DB versions can also omit forkedFromId
+            # on an otherwise listed child.  The same durable, same-profile
+            # journal record repairs only that relationship metadata.
+            for item in normalized:
+                if item.get("forked_from_id"):
+                    continue
+                native_sid = item.get("native_session_id")
+                candidate_info = (
+                    profile_candidates.get(native_sid, {})
+                    if isinstance(native_sid, str) else {}
+                )
+                parent_wire = candidate_info.get("forked_from_id")
+                if isinstance(parent_wire, str):
+                    item["forked_from_id"] = parent_wire
+            return profile, normalized, list_error
 
         results = await asyncio.gather(*(
             read(profile) for profile in self._codex_profiles
@@ -18069,15 +18578,14 @@ class WrapperMachine:
         rows_by_profile: list[list[dict]] = []
         errors: list[tuple[str, str]] = []
         for profile, profile_rows, error in results:
+            rows_by_profile.append(profile_rows or [])
             if error is not None:
                 errors.append((profile.id, "会话列表暂不可用"))
                 log.warning(
                     "Codex profile catalog unavailable",
                     profile_id=profile.id,
-                error_type=type(error).__name__,
+                    error_type=type(error).__name__,
                 )
-                continue
-            rows_by_profile.append(profile_rows or [])
         return self._bounded_codex_profile_catalog([
             item for profile_rows in rows_by_profile for item in profile_rows
         ]), tuple(errors)
@@ -18652,6 +19160,18 @@ class WrapperMachine:
                 old_key=old_key, session_id=route_sid, cwd=ctx.cwd))
             self._rekey_cached_create_responses(
                 old_key, route_sid, ctx.cwd)
+        if ctx.engine == "codex":
+            try:
+                # SessionRekey repairs clients which saw the temporary runtime.
+                # Other connected clients need a catalog hint so the new real
+                # id enters their sidebar during the same in-flight first turn.
+                await self._invalidate_session_list("codex", ctx.space)
+            except Exception as exc:
+                log.warning(
+                    "new Codex session list invalidation failed",
+                    session_id=route_sid,
+                    error_type=type(exc).__name__,
+                )
         if ctx.engine == "claude":
             # The real id becomes visible before the first turn necessarily ends.
             # Start ownership monitoring at capture so a terminal resume during
@@ -21719,6 +22239,8 @@ class WrapperMachine:
         model = (
             _session_model(ctx) if ctx is not None else None
         ) or settings.get("model")
+        model, _ = await self._resolve_codex_profile_model(
+            codex_profile, model)
         approval: Optional[str] = None
         granular_approval = bool(settings.get("approval_policy_granular"))
         if ctx is not None:
@@ -21884,6 +22406,18 @@ class WrapperMachine:
         # immediately erase the newly focused child from the browser and make a
         # later fork target whichever session the sidebar selects instead.
         self._invalidate_codex_session_catalog()
+        try:
+            # Publish the read hint before the correlated result. The creating
+            # client may therefore materialize the child before installing its
+            # focus lease, while reliable-command replay still keeps
+            # SessionForked adjacent to its eventual ACK.
+            await self._invalidate_session_list("codex", "code")
+        except Exception as exc:
+            log.warning(
+                "forked session list invalidation failed",
+                session_id=child_session_id,
+                error_type=type(exc).__name__,
+            )
         await self.transport.send(event)
         try:
             self._invalidate_codex_session_catalog()
@@ -22545,7 +23079,10 @@ class WrapperMachine:
         }
         parent_model = (entry.get("controls") or {}).get("model")
         if isinstance(parent_model, str) and parent_model:
-            params["model"] = parent_model
+            parent_model, _ = await self._resolve_codex_profile_model(
+                codex_profile, parent_model)
+            if parent_model:
+                params["model"] = parent_model
         parent_approval = (entry.get("controls") or {}).get(
             "approval_policy")
         if parent_approval in CODEX_PERMISSION_MODES:
@@ -22792,6 +23329,18 @@ class WrapperMachine:
         # Worktree forks enter the same native catalog as same-cwd forks. Keep
         # both publication paths on the same cache-generation boundary.
         self._invalidate_codex_session_catalog()
+        try:
+            # Match same-cwd forks: every connected client needs the read hint
+            # before the creating client receives its correlated navigation
+            # event. The child is already durable in the profile-scoped fork
+            # journal, so an immediate catalog read can repair thread/list.
+            await self._invalidate_session_list("codex", "code")
+        except Exception as exc:
+            log.warning(
+                "worktree fork session list invalidation failed",
+                session_id=child_session_id,
+                error_type=type(exc).__name__,
+            )
         await self.transport.send(event)
         try:
             self._invalidate_codex_session_catalog()
@@ -23122,7 +23671,10 @@ class WrapperMachine:
             params["lastTurnId"] = cmd.last_turn_id
         parent_model = controls.get("model")
         if parent_model:
-            params["model"] = parent_model
+            parent_model, _ = await self._resolve_codex_profile_model(
+                codex_profile, parent_model)
+            if parent_model:
+                params["model"] = parent_model
         parent_approval = controls.get("approval_policy")
         if parent_approval in CODEX_PERMISSION_MODES:
             params["approvalPolicy"] = parent_approval
@@ -23691,6 +24243,7 @@ class WrapperMachine:
         resolves from current settings, then falls back to the curated default;
         omitted Codex controls retain native defaults."""
         explicit_claude_model = engine == "claude" and model is not None
+        explicit_codex_model = engine == "codex" and model is not None
         explicit_codex_effort = engine == "codex" and effort is not None
         codex_profile = (
             self._codex_profile(codex_profile_id)
@@ -24011,7 +24564,33 @@ class WrapperMachine:
             model, _default_effort = await self._claude_new_session_defaults(
                 target_cwd)
 
+        codex_resume_model_reconcile: Optional[str] = None
         if engine == "codex":
+            if not resume_id:
+                configured_model = await asyncio.to_thread(
+                    codex_model,
+                    "",
+                    **({} if self._codex_home(codex_profile) is None else {
+                        "codex_home": self._codex_home(codex_profile),
+                    }),
+                )
+                try:
+                    resolved_model, _ = (
+                        await self._resolve_codex_profile_model(
+                            codex_profile,
+                            model or configured_model or None,
+                            explicit=explicit_codex_model,
+                        )
+                    )
+                except _UnsupportedCodexModel:
+                    await reject(
+                        ERR_BAD_PROMPT,
+                        "所选模型不适用于当前 Codex 账号，请重新选择。",
+                        route="sid",
+                        sid=wire_resume_id,
+                    )
+                    return None
+                model = resolved_model
             codex_handle_kwargs = {
                 "cwd": target_cwd,
                 "daemon_mode": (
@@ -24162,6 +24741,25 @@ class WrapperMachine:
                 mode = prev.get("collaboration_mode")
                 if mode in CODEX_COLLABORATION_MODES:
                     sdk.collaboration_mode = mode
+                try:
+                    resolved_model, model_replaced = (
+                        await self._resolve_codex_profile_model(
+                            codex_profile,
+                            model,
+                            explicit=explicit_codex_model,
+                        )
+                    )
+                except _UnsupportedCodexModel:
+                    await reject(
+                        ERR_BAD_PROMPT,
+                        "所选模型不适用于当前 Codex 账号，请重新选择。",
+                        route="sid",
+                        sid=wire_resume_id,
+                    )
+                    return None
+                model = resolved_model
+                if model and (model_replaced or explicit_codex_model):
+                    codex_resume_model_reconcile = model
             if model:
                 sdk.model = model
                 # A stale client can ask for a level this model doesn't have (it used
@@ -24262,6 +24860,24 @@ class WrapperMachine:
                 )
                 if (
                     resume_id
+                    and codex_resume_model_reconcile
+                    and getattr(ctx.sdk, "model", None)
+                        != codex_resume_model_reconcile
+                ):
+                    # thread/resume can echo a retired model from the native
+                    # thread and overwrite the pre-connect fallback. Reconcile
+                    # only an explicit choice or a catalog-proven replacement,
+                    # then persist it through the official settings API before
+                    # the first resumed turn can start.
+                    await ctx.sdk.set_model(codex_resume_model_reconcile)
+                    if getattr(ctx.sdk, "model", None) != (
+                        codex_resume_model_reconcile
+                    ):
+                        raise RuntimeError(
+                            "Codex app-server did not confirm the replacement model"
+                        )
+                if (
+                    resume_id
                     and space == "code"
                     and (
                         not isinstance(getattr(ctx.sdk, "cwd", None), str)
@@ -24281,6 +24897,30 @@ class WrapperMachine:
                         )
                     ctx.cwd = effective_cwd
                     target_cwd = effective_cwd
+                if (resume_id and effort
+                        and not getattr(ctx.sdk, "effort", None)):
+                    # Some app-server versions return reasoningEffort=null on
+                    # thread/resume even though the rollout's last turn_context
+                    # records the session's explicit selection.  Null means the
+                    # resume response omitted an override; it must not demote a
+                    # max session to the model/config default after every page
+                    # refresh.  Restore only this session's already-clamped
+                    # bounded rollout value, after connect has installed the
+                    # authoritative model/cwd generation.
+                    ctx.sdk.effort = effort
+                    ctx.sdk.applied_effort = effort
+                    setattr(ctx.sdk, "display_effort", effort)
+                    setattr(ctx.sdk, "display_effort_model", ctx.sdk.model)
+                    setattr(
+                        ctx.sdk, "display_effort_cwd",
+                        os.path.realpath(
+                            getattr(ctx.sdk, "_cwd", None) or ctx.cwd),
+                    )
+                    setattr(
+                        ctx.sdk, "display_effort_generation",
+                        getattr(ctx.sdk, "_generation", None),
+                    )
+                    setattr(ctx.sdk, "_display_effort_retry_at", None)
             else:
                 await ctx.sdk.connect(
                     resume_id=resume_id, cwd=target_cwd)

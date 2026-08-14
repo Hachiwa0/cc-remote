@@ -3274,7 +3274,7 @@ def test_machine_forced_model_effort_publish_falls_back_after_probe_churn():
     asyncio.run(run())
 
 
-def test_codex_resume_does_not_promote_rollout_effort_after_authoritative_null(
+def test_codex_resume_restores_rollout_effort_after_nullable_resume(
         monkeypatch, tmp_path):
     class FakeCodexHandle:
         def __init__(self, _cfg, cwd=None, daemon_mode=None,
@@ -3304,6 +3304,8 @@ def test_codex_resume_does_not_promote_rollout_effort_after_authoritative_null(
             self.shared_daemon_affinity = False
             self.using_daemon_proxy = False
             self.preconnect_effort = None
+            self.preconnect_model = None
+            self.set_model_calls = []
 
         @property
         def approval(self):
@@ -3317,13 +3319,21 @@ def test_codex_resume_does_not_promote_rollout_effort_after_authoritative_null(
         async def connect(self, **kwargs):
             self.thread_id = kwargs["resume_id"]
             self.preconnect_effort = self.effort
-            # thread/resume is authoritative: null means no thread override.
+            self.preconnect_model = self.model
+            # Model the resume response echoing the retired native value over
+            # the wrapper's pre-connect catalog replacement.
+            self.model = "retired-model"
+            # Some app-server versions omit the effective override on resume.
             self.effort = None
             self.applied_effort = None
             self.display_effort = None
             self.display_effort_model = None
             self.display_effort_cwd = None
             self.display_effort_generation = None
+
+        async def set_model(self, model):
+            self.set_model_calls.append(model)
+            self.model = model
 
         async def configured_default_effort(self):
             return "medium"
@@ -3345,10 +3355,22 @@ def test_codex_resume_does_not_promote_rollout_effort_after_authoritative_null(
             machine_module,
             "codex_session_settings",
             lambda *_args, **_kwargs: {
-                "model": "gpt-test",
+                "model": "retired-model",
                 "effort": "high",
             },
         )
+
+        async def catalog(*, codex_home=None):
+            return [{
+                "id": "current-model",
+                "efforts": ["high"],
+                "default_effort": "high",
+                "is_default": True,
+            }]
+
+        monkeypatch.setattr(machine_module, "codex_catalog", catalog)
+        monkeypatch.setattr(
+            machine_module, "codex_current_provider", lambda **_kwargs: "")
 
         async def unchanged_effort(_model, effort, **_kwargs):
             return effort
@@ -3366,11 +3388,14 @@ def test_codex_resume_does_not_promote_rollout_effort_after_authoritative_null(
         )
 
         assert ctx is not None
+        assert ctx.sdk.preconnect_model == "current-model"
+        assert ctx.sdk.set_model_calls == ["current-model"]
+        assert ctx.sdk.model == "current-model"
         assert ctx.sdk.preconnect_effort == "high"
-        assert ctx.sdk.effort is None
-        assert ctx.sdk.applied_effort is None
-        assert ctx.sdk.display_effort == "medium"
-        assert ctx.announced_effort == "medium"
+        assert ctx.sdk.effort == "high"
+        assert ctx.sdk.applied_effort == "high"
+        assert ctx.sdk.display_effort == "high"
+        assert ctx.announced_effort == "high"
 
     asyncio.run(run())
 
@@ -3623,6 +3648,18 @@ def test_codex_config_defaults_use_only_top_level_toml_keys(
     assert codex_sessions_module.codex_effort() == "high"
     assert codex_sessions_module.codex_fast_enabled() is False
     assert codex_sessions_module.codex_web_search() == "live"
+
+
+def test_codex_handle_has_no_retired_model_or_effort_fallback(tmp_path):
+    handle = CodexHandle(_Cfg(), codex_home=str(tmp_path))
+
+    assert codex_sessions_module.codex_model(
+        codex_home=str(tmp_path)) == ""
+    assert codex_sessions_module.codex_effort(
+        codex_home=str(tmp_path)) == ""
+    assert handle.model is None
+    assert handle.effort is None
+    assert handle.applied_effort is None
 
 
 def test_codex_thread_settings_update_uses_official_01441_shapes():

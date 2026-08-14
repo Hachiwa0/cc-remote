@@ -456,6 +456,32 @@ function cloneDetailBlock(block: Block): Block {
   return { ...block };
 }
 
+/** A completed authoritative summary is the terminal fence for provisional
+ * detail restored from IndexedDB.  The cache may have been written between a
+ * child start and its final update; replaying that open bit after refresh makes
+ * an hour-old answer show a permanently animated "处理中" spark. */
+function cloneSettledCachedDetailBlock(block: Block, summary: Turn): Block {
+  const cloned = cloneDetailBlock(block);
+  if (cloned.kind === "text") {
+    cloned.done = true;
+  } else if (cloned.kind === "process" && !cloned.done) {
+    cloned.done = true;
+    if (!cloned.status || cloned.status === "running") {
+      cloned.status = summary.interrupted
+        ? "interrupted" : summary.error ? "failed" : "succeeded";
+    }
+  } else if (cloned.kind === "tool" && !cloned.done) {
+    cloned.done = true;
+    cloned.result ??= {
+      content: cloned.output ?? "",
+      is_error: !!summary.interrupted || !!summary.error,
+      status: summary.interrupted
+        ? "interrupted" : summary.error ? "failed" : "succeeded",
+    };
+  }
+  return cloned;
+}
+
 /** Paint only heavyweight blocks from a same-revision/generation browser
  * cache over an authoritative summary row.
  *
@@ -473,7 +499,7 @@ function installCachedDetailRestore(
       || (summary.detailEventCount ?? 0) <= 0) return summary;
   const source = cached.detailProjection?.blocks ?? cached.blocks;
   const blocks = source.filter((block) => !isFinalTextBlock(block))
-    .map(cloneDetailBlock);
+    .map((block) => cloneSettledCachedDetailBlock(block, summary));
   if (blocks.length === 0) return summary;
   return {
     ...summary,
@@ -702,6 +728,7 @@ function mergeTurn(
     completedTextAuthority,
     settledCanonicalText,
   );
+  const hasVisibleDetail = blocks.some((block) => !isFinalTextBlock(block));
   if (preserveCompleteLiveOrder) {
     const historyIds = history.blocks.map(blockIdentity);
     const liveOrders = live.blocks.map((block) => block.liveOrder);
@@ -758,8 +785,16 @@ function mergeTurn(
     // may legitimately contain no heavyweight blocks; it must not erase pages
     // which the user already expanded in this same revision.
     detailProjection,
-    detailLoaded: !!detailProjection
-      || !!live.detailLoaded || !!history.detailLoaded,
+    // A summary which still advertises deferred events cannot inherit a stale
+    // `detailLoaded=true` bit after the corresponding browser projection was
+    // evicted or invalidated.  That contradictory state hides the collapsed
+    // process affordance entirely (the final answer remains, but "已处理"
+    // disappears).  Keep loaded monotonic only while there is an actual detail
+    // projection or visible non-final payload to justify it.
+    detailLoaded: !!detailProjection || (hasVisibleDetail
+      && (!!live.detailLoaded || !!history.detailLoaded))
+      || ((history.detailEventCount ?? 0) <= 0
+        && (!!live.detailLoaded || !!history.detailLoaded)),
     detailLoading: live.detailLoading ?? history.detailLoading,
     detailError: live.detailError ?? history.detailError,
     detailHasMore: detailProjection
@@ -990,6 +1025,9 @@ export function mergeInitialHistory(
      * client/native user alias is still materializing. It also lets a terminal
      * page collapse the stale empty active shell left by an earlier snapshot. */
     newestHistoryId?: string | null;
+    /** Exact ordered live owner from TurnBinding/liveOwner. Array position is
+     * not ownership evidence after cache hydration and replay interleave. */
+    activeOwnerId?: string | null;
     /** A newest authoritative page may absorb a replay-created assistant row
      * only when native block identities prove that row belongs to one
      * canonical turn. Disabled for cache, pagination, re-key and detail merges. */
@@ -1028,6 +1066,14 @@ export function mergeInitialHistory(
   reserveMatches(sharesExactTurnAlias);
 
   reserveMatches(sameTurn);
+
+  const explicitActiveOwnerIndexes = options.activeOwnerId
+    ? live.flatMap((turn, index) =>
+        !turn.done && exactTurnAliases(turn).has(options.activeOwnerId!)
+          ? [index] : [])
+    : [];
+  const activeOwnerIndex = explicitActiveOwnerIndexes.length === 1
+    ? explicitActiveOwnerIndexes[0] : live.length - 1;
 
   const replayOrphanMatches = new Set<number>();
   const activeReplayMatches = new Set<number>();
@@ -1071,9 +1117,20 @@ export function mergeInitialHistory(
     for (let liveIndex = 0; liveIndex < live.length; liveIndex += 1) {
       if (matches[liveIndex] >= 0) continue;
       const candidate = live[liveIndex];
+      const candidatePrimaryKeyList = candidate.blocks.map(primaryBlockKey);
+      const candidatePrimaryKeys = [
+        ...new Set(candidatePrimaryKeyList),
+      ];
       const activeCandidate = authoritativeHistoryIndex >= 0
-        && liveIndex === live.length - 1
         && !candidate.done;
+      const exactActiveProjection = activeCandidate
+        && candidatePrimaryKeys.length > 0
+        && candidatePrimaryKeys.length === candidatePrimaryKeyList.length
+        && candidatePrimaryKeys.every((key) => {
+          const keyOwners = owners.get(key);
+          return keyOwners?.size === 1
+            && keyOwners.has(authoritativeHistoryIndex);
+        });
       if (!activeCandidate && (candidate.prompt
           || candidate.images?.length || candidate.imageRefs?.length
           || candidate.files?.length
@@ -1091,9 +1148,16 @@ export function mergeInitialHistory(
         const candidateNativeId = nativeTaskIdentity(candidate);
         if (candidateNativeId && historyNativeId
             && candidateNativeId !== historyNativeId) continue;
-        const keys = [...new Set(candidate.blocks.map(primaryBlockKey))];
-        const shared = keys.some((key) => owners.get(key)?.has(historyIndex));
-        const conflicts = keys.some((key) => {
+        // The physical tail is eligible with one shared native block because
+        // no later row can own current replay output. An older unfinished row
+        // may only join when every stable block id belongs uniquely to this
+        // canonical History turn; this is the safe self-heal path for an
+        // IndexedDB row which replay refreshed before TurnBinding created the
+        // current owner separately.
+        if (liveIndex !== activeOwnerIndex && !exactActiveProjection) continue;
+        const shared = candidatePrimaryKeys.some((key) =>
+          owners.get(key)?.has(historyIndex));
+        const conflicts = candidatePrimaryKeys.some((key) => {
           const keyOwners = owners.get(key);
           return keyOwners != null && (
             keyOwners.size !== 1 || !keyOwners.has(historyIndex)
@@ -1105,7 +1169,7 @@ export function mergeInitialHistory(
         if (!messageOwners || messageOwners.size !== 1) continue;
         historyIndex = [...messageOwners][0];
       }
-      if (used.has(historyIndex)) continue;
+      if (used.has(historyIndex) && !exactActiveProjection) continue;
       if (!activeCandidate) {
         // Several tool calls assembled from one assistant item legitimately
         // share its message id. Treat that repeated envelope id as corroborating
@@ -1124,16 +1188,41 @@ export function mergeInitialHistory(
       const candidates = claims.get(historyIndex) ?? [];
       candidates.push(liveIndex);
       claims.set(historyIndex, candidates);
-      if (activeCandidate) activeReplayMatches.add(liveIndex);
+      if (activeCandidate && liveIndex === activeOwnerIndex) {
+        activeReplayMatches.add(liveIndex);
+      }
     }
     for (const [historyIndex, liveIndexes] of claims) {
       // Two provisional rows claiming one native assistant item are ambiguous;
-      // do not absorb either into the canonical history row.
-      if (liveIndexes.length !== 1 || used.has(historyIndex)) continue;
-      const liveIndex = liveIndexes[0];
-      matches[liveIndex] = historyIndex;
+      // do not absorb either unless each unfinished projection consists only
+      // of stable blocks uniquely owned by this canonical History row. That
+      // stronger proof repairs a cache+replay duplicate without ever comparing
+      // prompt text, timestamps, or visible prose.
+      const safeLiveIndexes = liveIndexes.filter((liveIndex) => {
+        const candidate = live[liveIndex];
+        const primaryKeys = [
+          ...new Set(candidate.blocks.map(primaryBlockKey)),
+        ];
+        return !candidate.done && primaryKeys.length > 0
+          && primaryKeys.length === candidate.blocks.length
+          && primaryKeys.every((key) => {
+            const keyOwners = owners.get(key);
+            return keyOwners?.size === 1 && keyOwners.has(historyIndex);
+          });
+      });
+      const safeLiveIndexSet = new Set(safeLiveIndexes);
+      const everyClaimIsProven = liveIndexes.every((liveIndex) =>
+        safeLiveIndexSet.has(liveIndex)
+        || (liveIndex === activeOwnerIndex
+          && activeReplayMatches.has(liveIndex)));
+      if (liveIndexes.length !== 1 && !everyClaimIsProven) continue;
+      if (used.has(historyIndex)
+          && safeLiveIndexes.length !== liveIndexes.length) continue;
+      for (const liveIndex of liveIndexes) {
+        matches[liveIndex] = historyIndex;
+        replayOrphanMatches.add(liveIndex);
+      }
       used.add(historyIndex);
-      replayOrphanMatches.add(liveIndex);
     }
 
     // An item-free active snapshot cannot safely bind a local steer: several
@@ -1148,7 +1237,7 @@ export function mergeInitialHistory(
       const historyTurn = merged[authoritativeHistoryIndex];
       const duplicateCandidates: number[] = [];
       for (let liveIndex = 0; liveIndex < live.length; liveIndex += 1) {
-        if (matches[liveIndex] >= 0 || liveIndex !== live.length - 1) continue;
+        if (matches[liveIndex] >= 0 || liveIndex !== activeOwnerIndex) continue;
         const candidate = live[liveIndex];
         if (candidate.blocks.length === 0) continue;
         const historyNativeId = nativeTaskIdentity(historyTurn);
@@ -1184,7 +1273,7 @@ export function mergeInitialHistory(
       if (authoritativeHeadDuplicateMatches.has(liveIndex)) continue;
       if (activeReplayMatches.has(liveIndex)) {
         const preserveLiveOpen = !!options.preserveLiveTailOpen
-          && liveTurn === live[live.length - 1]
+          && liveIndex === activeOwnerIndex
           && !liveTurn.done;
         const bound = mergeTurn(
           merged[index], liveTurn, preserveLiveOpen,
@@ -1218,7 +1307,7 @@ export function mergeInitialHistory(
         continue;
       }
       const isOpenLiveTail = !!options.preserveLiveTailOpen
-        && liveTurn === live[live.length - 1]
+        && liveIndex === activeOwnerIndex
         // A newer authoritative history turn proves this local placeholder is
         // no longer the active tail (for example, same-task steering). Only the
         // matching newest history row may inherit an unfinished live state.
@@ -1228,7 +1317,7 @@ export function mergeInitialHistory(
       const bound = mergeTurn(
         historyTurn, liveTurn, isOpenLiveTail, "first", settledCodex,
         !!options.preserveLiveTailOpen && !!options.reconcileReplayOrphans
-          && liveTurn === live[live.length - 1],
+          && liveIndex === activeOwnerIndex,
       );
       merged[index] = settledCodex
           && sharesExactTurnAlias(historyTurn, liveTurn)
@@ -1246,7 +1335,8 @@ export function mergeInitialHistory(
     const index = matches[liveIndex];
     if (index < 0) continue;
     const liveTurn = live[liveIndex];
-    const preserveLiveOpen = !!options.preserveLiveTailOpen && !liveTurn.done;
+    const preserveLiveOpen = !!options.preserveLiveTailOpen
+      && liveIndex === activeOwnerIndex && !liveTurn.done;
     const bound = mergeTurn(merged[index], liveTurn, preserveLiveOpen);
     bound.blocks = mergeBlocks(
       merged[index].blocks,

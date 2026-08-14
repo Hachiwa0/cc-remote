@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { Icon } from "../icons";
 import type { PendingQuery } from "../reducer";
 
-const MAX_PROMPT_CHARS = 2 * 1024 * 1024;
+import { MAX_PROMPT_CHARS } from "../composer-pastes";
 
 export interface QueuedQueryEditor {
   sid: string;

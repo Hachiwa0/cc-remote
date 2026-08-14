@@ -32,6 +32,7 @@ from cc_remote.protocol import (
     TurnDetail, HistoryInvalidated,
     UserMsg, TurnSteered, AssistantMsgStart, AssistantMsgEnd, Delta,
     ProcessEvent, TurnPlan, TurnBinding, TurnEnd, TurnResult, Error,
+    Model, Effort,
     is_downstream,
 )
 from cc_remote.wrapper import machine as mm
@@ -4873,6 +4874,8 @@ def test_fresh_hello_replays_only_current_inflight_turn_after_snapshot():
 def test_get_history_returns_one_bulk_frame(monkeypatch):
     canned = [
         UserMsg(msg_id="u1", prompt="hi"),
+        Model(model="claude-old-model"),
+        Effort(effort="low"),
         AssistantMsgStart(message_id="a1"),
         Delta(message_id="a1", text="hello"),
         TurnEnd(result=TurnResult(subtype="success", duration_ms=0, is_error=False)),
@@ -4897,14 +4900,180 @@ def test_get_history_returns_one_bulk_frame(monkeypatch):
         assert hist.has_more is False
         assert hist.in_progress is True
         assert hist.oldest_id == "u1" and hist.newest_id == "u1"
-        # Current model + effort precede the translated transcript narrative.
-        assert [(event["type"], event.get("model") or event.get("effort"))
-                for event in hist.events[:2]] == [
+        # The newest page exposes one authoritative control pair. Older
+        # transcript control rows cannot override the current resident values.
+        controls = [
+            (event["type"], event.get("model") or event.get("effort"))
+            for event in hist.events
+            if event["type"] in {"model", "effort"}
+        ]
+        assert controls == [
                     ("model", "claude-opus-4-8"), ("effort", "max")]
         assert [e["type"] for e in hist.events[2:]] == [
             "user_msg", "assistant_msg_start", "delta", "turn_end"]
         # every event is stamped with the session id so the client routes them right
         assert all(e["sid"] == "sX" for e in hist.events)
+    asyncio.run(go())
+
+
+def test_history_current_controls_match_cache_and_non_cache_paths(
+        monkeypatch, tmp_path):
+    transcript = tmp_path / "current-controls.jsonl"
+    transcript.write_text("{}\n", encoding="utf-8")
+    canned = [
+        UserMsg(msg_id="u-current", prompt="hi"),
+        Model(model="claude-old-model"),
+        Effort(effort="low"),
+        Delta(message_id="a-current", text="hello"),
+        TurnEnd(result=TurnResult(
+            subtype="success", duration_ms=0, is_error=False)),
+    ]
+    monkeypatch.setattr(mm, "transcript_path", lambda _sid: str(transcript))
+    monkeypatch.setattr(
+        mm, "get_session_messages", lambda *_args, **_kwargs: ["message"])
+    monkeypatch.setattr(
+        mm, "translate_history",
+        lambda *_args, **_kwargs: [event.model_copy() for event in canned],
+    )
+    monkeypatch.setattr(mm, "last_assistant_model", lambda _msgs: None)
+
+    async def go():
+        machine, _ = _mk_machine()
+        machine._history_index = HistoryIndexStore(tmp_path / "state")
+        ctx = _mk_ctx("controls", "controls")
+        ctx.engine = "claude"
+        ctx.sdk = SimpleNamespace(model="claude-current", effort="max")
+        machine.sessions[ctx.key] = ctx
+
+        first = await machine._build_history(
+            "controls", limit=4, detail="full")
+        cached = await machine._build_history(
+            "controls", limit=4, detail="full")
+
+        def controls(history):
+            return [
+                (row["type"], row.get("model") or row.get("effort"))
+                for row in history.events
+                if row["type"] in {"model", "effort"}
+            ]
+
+        assert controls(first) == [
+            ("model", "claude-current"), ("effort", "max")]
+        assert controls(cached) == controls(first)
+        assert [row["type"] for row in cached.events[2:]] == [
+            "user_msg", "delta", "turn_end"]
+
+    asyncio.run(go())
+
+
+def test_codex_nullable_and_btw_history_controls_are_session_scoped():
+    def controls(history):
+        return [
+            (row["type"], row.get("model") or row.get("effort"))
+            for row in history.events
+            if row["type"] in {"model", "effort"}
+        ]
+
+    async def go():
+        machine, _ = _mk_machine()
+        main = _mk_ctx("main", "main")
+        main.engine = "codex"
+        main.sdk = SimpleNamespace(
+            model="gpt-main",
+            effort=None,
+            display_effort=None,
+            display_effort_model=None,
+            display_effort_cwd=None,
+            display_effort_generation=None,
+            _cwd=main.cwd,
+            _generation=1,
+        )
+        machine.sessions[main.key] = main
+        main_history = History(
+            session_id="main",
+            revision="main-r1",
+            events=mm._history_control_rows("main", main),
+        )
+        assert controls(main_history) == [
+            ("model", "gpt-main"),
+            ("effort", mm.MODEL_DEFAULT_EFFORT),
+        ]
+
+        btw = _mk_ctx("btw-main", "btw-main")
+        btw.engine = "codex"
+        btw.btw = True
+        btw.parent_sid = "main"
+        btw.sdk = SimpleNamespace(model="gpt-main", effort="low")
+        machine.sessions[btw.key] = btw
+        btw_history = History(
+            session_id="btw-main",
+            revision="btw-r1",
+            events=mm._history_control_rows("btw-main", btw),
+        )
+        assert controls(btw_history) == [
+            ("model", "gpt-main"), ("effort", "low")]
+
+        machine.sessions.pop(btw.key)
+        main_after_close = History(
+            session_id="main",
+            revision="main-r1",
+            events=mm._history_control_rows("main", main),
+        )
+        assert controls(main_after_close) == controls(main_history)
+
+    asyncio.run(go())
+
+
+def test_history_control_overlay_keeps_only_newest_missing_source_kind():
+    rows = [
+        {"type": "model", "model": "gpt-old", "sid": "cold"},
+        {"type": "effort", "effort": "low", "sid": "cold"},
+        {"type": "model", "model": "gpt-new", "sid": "cold"},
+        {"type": "effort", "effort": "high", "sid": "cold"},
+        {"type": "user_msg", "msg_id": "u1", "prompt": "hi"},
+    ]
+    normalized = mm._replace_history_control_rows(rows, [])
+    assert [
+        (row["type"], row.get("model") or row.get("effort"))
+        for row in normalized[:2]
+    ] == [("model", "gpt-new"), ("effort", "high")]
+    assert [row["type"] for row in normalized[2:]] == ["user_msg"]
+
+
+def test_cached_pagination_strips_legacy_control_rows(monkeypatch, tmp_path):
+    transcript = tmp_path / "legacy-controls.jsonl"
+    transcript.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(mm, "transcript_path", lambda _sid: str(transcript))
+
+    async def go():
+        machine, _ = _mk_machine()
+        machine._history_index = HistoryIndexStore(tmp_path / "state")
+        source = HistorySourceFingerprint.capture(transcript)
+        rows = (
+            {"type": "model", "model": "claude-old", "sid": "legacy"},
+            {"type": "effort", "effort": "low", "sid": "legacy"},
+            {"type": "user_msg", "msg_id": "u-old", "prompt": "old"},
+            {"type": "turn_end", "result": {
+                "subtype": "success", "duration_ms": 0, "is_error": False,
+            }},
+        )
+        machine._history_index.put_page(
+            "legacy", "claude", source,
+            before="u-new", limit=4,
+            page=MaterializedHistoryPage(
+                events=rows,
+                has_more=False,
+                oldest_id="u-old",
+                newest_id="u-old",
+                turns=materialize_history_turns(rows),
+            ),
+        )
+
+        history = await machine._build_history(
+            "legacy", before="u-new", limit=4, detail="full")
+        assert [row["type"] for row in history.events] == [
+            "user_msg", "turn_end"]
+
     asyncio.run(go())
 
 

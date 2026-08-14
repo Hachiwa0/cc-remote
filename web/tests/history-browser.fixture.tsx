@@ -829,6 +829,8 @@ function codexBurstInitialState(): AppState {
 function CodexLiveBurstFixture() {
   const params = useMemo(() => new URLSearchParams(window.location.search), []);
   const composerLive = params.has("composer-live");
+  const composerPaste = params.has("composer-paste");
+  const [lastComposerPrompt, setLastComposerPrompt] = useState<string | null>(null);
   const [state, dispatch] = useReducer(
     reduce,
     undefined,
@@ -1014,7 +1016,11 @@ function CodexLiveBurstFixture() {
             engine="codex"
             editPrompt={null}
             onEditConsumed={() => {}}
-            onSendQuery={() => false}
+            onSendQuery={(prompt) => {
+              if (!composerPaste) return false;
+              setLastComposerPrompt(prompt);
+              return true;
+            }}
             onSteerQuery={() => false}
             onInterrupt={() => {}}
             onEnqueue={() => false}
@@ -1032,6 +1038,9 @@ function CodexLiveBurstFixture() {
             onContext={() => {}}
             contextReport={null}
           />
+          {composerPaste && <output data-testid="composer-paste-output">
+            {lastComposerPrompt ?? ""}
+          </output>}
         </div>
       )}
     </main>
