@@ -4,6 +4,11 @@
 
 ## 未发布
 
+- Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v35。Codex app-server 的
+  精确终态与通过源文件校验的 rollout 终态现在独立于 History 正文投影下发；数百
+  MiB 的 rollout 即使仍在补建内容索引，也不会让已经完成的回合继续转圈。终态事实
+  始终绑定账号、revision 与源文件，不会猜测“最后一个未完成回合”，也不会重复生成
+  完成回执。
 - Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v34。主会话完成回执和精确
   Goal generation 的隐藏回执改由 wrapper 有界持久化；任一浏览器已读或隐藏后会
   同步到所有已连接浏览器，重连后仍保持一致，同时不会误隐藏后来替换的新 Goal。

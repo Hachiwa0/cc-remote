@@ -1513,7 +1513,19 @@ class CodexStreamTranslator:
         self._live_items_truncated = False
         self._turn_closed = False
 
-    def feed(self, msg: dict) -> list:
+    def feed(
+        self,
+        msg: dict,
+        *,
+        authoritative_terminal: bool = True,
+    ) -> list:
+        """Translate one app-server notification.
+
+        ``authoritative_terminal=False`` is reserved for the few callers which
+        feed a locally synthesized ``turn/completed`` only to close translator
+        blocks.  Its TurnEnd remains useful on the live wire, but cannot be
+        persisted as an engine-owned lifecycle fact.
+        """
         method = msg.get("method")
         p = msg.get("params") if isinstance(msg.get("params"), dict) else {}
         out: list = []
@@ -2032,12 +2044,14 @@ class CodexStreamTranslator:
                        else "error_during_execution" if st == "interrupted"
                        else "error")
             completed_turn_id = turn.get("id")
-            out.append(TurnEnd(result=TurnResult(
+            terminal = TurnEnd(result=TurnResult(
                 subtype=subtype,
                 duration_ms=int(turn.get("durationMs") or 0),
                 is_error=(st != "completed"),
             ), turn_id=(completed_turn_id
-                        if isinstance(completed_turn_id, str) else None)))
+                        if isinstance(completed_turn_id, str) else None))
+            terminal._codex_authoritative_terminal = authoritative_terminal
+            out.append(terminal)
             self._clear_all_delta_budgets()
             self._completed_plan = None
             self._turn_closed = True

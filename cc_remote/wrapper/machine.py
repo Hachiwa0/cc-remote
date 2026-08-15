@@ -106,7 +106,7 @@ from cc_remote.protocol import (
     BtwOpened, ContextReport, StatusReport, Notice,
     RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset,
     PreviewAuthorizationRequired, PreviewAuthorizationResult,
-    ConversationTurn, History, TurnDetail, HistoryImage,
+    ConversationTurn, CodexTerminalFence, History, TurnDetail, HistoryImage,
     HistoryInvalidated, ArtifactInvalidated, AskUser, AskUserClosed,
     GoalState, CompletionState, ReplayStart, ReplayEnd, Snapshot, StateEvent,
     State, TakeoverState, SessionControl,
@@ -216,6 +216,7 @@ from cc_remote.wrapper.codex_handle import (
     CodexSteerUserIdentityProof,
 )
 from cc_remote.wrapper.codex_turn_leases import CodexTurnLeaseStore
+from cc_remote.wrapper.codex_lifecycle import CodexTerminalLedger
 from cc_remote.wrapper.codex_client_messages import (
     CodexClientMessageAliases,
     CodexClientMessageStore,
@@ -288,7 +289,8 @@ from cc_remote.wrapper.claude_external import (
     classify_claude_growth,
 )
 from cc_remote.wrapper.codex_external import (
-    CodexTuiLogTracker, HolderScan, codex_app_server_client_socket,
+    CodexTuiLogTracker, HolderScan, RolloutTerminalMarker,
+    codex_app_server_client_socket,
     parse_turn_markers,
     writable_rollout_holders,
 )
@@ -367,11 +369,13 @@ def _codex_success_terminal(message: dict, fallback_turn_id: str) -> TurnEnd:
         duration_ms = max(0, int(duration or 0))
     except (TypeError, ValueError):
         duration_ms = 0
-    return TurnEnd(
+    terminal = TurnEnd(
         result=TurnResult(
             subtype="success", duration_ms=duration_ms, is_error=False),
         turn_id=turn_id,
     )
+    terminal._codex_authoritative_terminal = True
+    return terminal
 
 
 def _codex_user_message_identity(
@@ -1523,6 +1527,15 @@ class WrapperMachine:
         )
         self._codex_turn_leases = CodexTurnLeaseStore(cfg.state_dir)
         try:
+            self._codex_terminal_ledger: CodexTerminalLedger | None = (
+                CodexTerminalLedger(cfg.state_dir)
+            )
+        except Exception:
+            # This store is a rebuildable lifecycle projection.  A damaged
+            # private cache must never prevent access to the native engine.
+            self._codex_terminal_ledger = None
+            log.exception("Codex terminal ledger unavailable")
+        try:
             self._codex_client_messages: CodexClientMessageStore | None = (
                 CodexClientMessageStore(cfg.state_dir)
             )
@@ -1654,6 +1667,7 @@ class WrapperMachine:
         # projection off the managed stream path so config/model catalog reads
         # never delay draining an already-started turn.
         self._codex_effort_publish_tasks: set[asyncio.Task] = set()
+        self._codex_terminal_persist_tasks: set[asyncio.Task] = set()
         # Catalog reads must never hold the serial command lane: a cold Codex
         # app-server startup can take tens of seconds on a very large store.
         self._session_list_command_tasks: set[asyncio.Task] = set()
@@ -1950,6 +1964,16 @@ class WrapperMachine:
                 self._session_presentation = None
                 complete = False
                 log.exception("session presentation profile migration failed")
+        elif transition is not None:
+            complete = False
+        if self._codex_terminal_ledger is not None:
+            try:
+                self._codex_terminal_ledger.migrate_profile_sessions(
+                    transform, profile_revision=revision)
+            except Exception:
+                self._codex_terminal_ledger = None
+                complete = False
+                log.exception("Codex terminal profile migration failed")
         elif transition is not None:
             complete = False
         return complete
@@ -2477,6 +2501,34 @@ class WrapperMachine:
                 )
         return self._history_revision(sid)
 
+    def _bump_codex_projection_revision(self, sid: str) -> str:
+        """Advance a read-side Codex revision without losing source facts.
+
+        This is only for projection-family or exact-alias changes which leave
+        the native rollout untouched.  Rollback and other destructive history
+        invalidations continue to call ``_bump_history_revision`` directly so
+        their revision-scoped volatile terminals fail closed.
+        """
+        previous_revision = self._history_revision(sid)
+        revision = self._bump_history_revision(sid)
+        ledger = getattr(self, "_codex_terminal_ledger", None)
+        if ledger is not None:
+            try:
+                ledger.rebase_revision(
+                    sid,
+                    previous_revision=previous_revision,
+                    revision=revision,
+                )
+            except Exception as exc:
+                # The lifecycle ledger is optional; a display-cache revision
+                # must never fail the underlying turn or History request.
+                log.warning(
+                    "Codex terminal revision could not be rebased",
+                    session_id=sid,
+                    error_type=type(exc).__name__,
+                )
+        return revision
+
     def _invalidate_codex_history(self, sid: str) -> None:
         """Invalidate only Codex-native supplements for one routed thread id."""
         self._codex_rollout_history_revisions.pop(sid, None)
@@ -2521,7 +2573,7 @@ class WrapperMachine:
         still pinning all subsequent cursors to the same reader.
         """
         if advance_revision:
-            self._bump_history_revision(sid)
+            self._bump_codex_projection_revision(sid)
         # Drop official page cursors, locators and detail rows before any
         # rollout page can be requested under the new revision.
         self._invalidate_codex_history(sid)
@@ -2645,7 +2697,7 @@ class WrapperMachine:
             # Source fingerprints do not include metadata learned from the live
             # app-server. Discard an alias-free materialized page and advance
             # the browser revision before it can race this identity update.
-            self._bump_history_revision(session_id)
+            self._bump_codex_projection_revision(session_id)
         return inserted
 
     async def _remember_codex_initial_turn_alias(
@@ -2745,7 +2797,7 @@ class WrapperMachine:
                 )
                 continue
             if inserted:
-                self._bump_history_revision(sid)
+                self._bump_codex_projection_revision(sid)
 
     async def _apply_codex_steer_user_identity(
         self,
@@ -3582,9 +3634,9 @@ class WrapperMachine:
         except OSError:
             source = None
         size = source.size if source is not None else 0
-        active, _partial, last_marker = (
+        active, _partial, last_marker, _last_terminal = (
             await asyncio.to_thread(self._codex_tail_snapshot, path, size)
-            if path and source is not None else (set(), b"", None)
+            if path and source is not None else (set(), b"", None, None)
         )
         persisted_stream_ids = (
             lease.stream_task_ids(
@@ -5490,6 +5542,23 @@ class WrapperMachine:
                 if c.btw and c.engine != "codex" and c.btw_real_id:
                     await self._delete_private_btw(
                         c.btw_real_id, c.cwd, forget=disconnected)
+            terminal_tasks = list(self._codex_terminal_persist_tasks)
+            # Stop every producer first, then give the remaining small fsyncs a
+            # chance to finish. Draining earlier could miss a terminal emitted
+            # by a turn/watch task while shutdown was still unwinding it.
+            if terminal_tasks:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(
+                            *terminal_tasks, return_exceptions=True),
+                        timeout=2.0,
+                    )
+                except asyncio.TimeoutError:
+                    for task in terminal_tasks:
+                        task.cancel()
+                    await asyncio.gather(
+                        *terminal_tasks, return_exceptions=True)
+            self._codex_terminal_persist_tasks.clear()
 
     async def _work_schedule_loop(self) -> None:
         """Claim and launch due Work tasks without stealing the UI focus."""
@@ -6212,6 +6281,187 @@ class WrapperMachine:
         ):
             ctx.active_turn_binding = None
 
+    @staticmethod
+    def _codex_terminal_fence_from_event(
+        msg: TurnEnd,
+    ) -> CodexTerminalFence | None:
+        """Normalize one exact live Codex terminal without inventing timing."""
+        if not msg.turn_id or msg.result.subtype == "steered":
+            return None
+        status = (
+            "completed"
+            if not msg.result.is_error
+            else "interrupted"
+            if msg.result.subtype == "error_during_execution"
+            else "failed"
+        )
+        duration_ms = (
+            msg.result.duration_ms
+            if msg.result.duration_ms > 0 else None
+        )
+        try:
+            return CodexTerminalFence(
+                turn_id=msg.turn_id,
+                status=status,
+                duration_ms=duration_ms,
+                completed_at=msg.ts if msg.ts >= 0 else None,
+            )
+        except (TypeError, ValueError):
+            # Recovery metadata is optional. A malformed/unrepresentable
+            # provider duration must never prevent the authoritative TurnEnd
+            # itself from reaching the browser.
+            return None
+
+    async def _persist_codex_terminal_fence(
+        self,
+        ledger: CodexTerminalLedger,
+        sid: str,
+        fence: CodexTerminalFence,
+        source_identity: tuple[str, int, int, int],
+    ) -> None:
+        try:
+            source_path = await asyncio.to_thread(
+                self._codex_rollout_for_wire, sid)
+            if not source_path:
+                return
+            await asyncio.to_thread(
+                ledger.persist,
+                sid,
+                fence,
+                source_path,
+                expected_source_identity=source_identity,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # The live TurnEnd remains authoritative.  Persistence is only a
+            # reconnect hint and must never hold up or fail the terminal send.
+            log.warning(
+                "Codex terminal fence could not be persisted",
+                session_id=sid,
+                turn_id=fence.turn_id,
+                error_type=type(exc).__name__,
+            )
+
+    def _remember_codex_terminal_fence(
+        self,
+        sid: str,
+        fence: CodexTerminalFence,
+        *,
+        source_identity: tuple[str, int, int, int] | None = None,
+        persist: bool = True,
+    ) -> None:
+        """Publish a fence before an in-flight stale History can win."""
+        ledger = self._codex_terminal_ledger
+        if ledger is None:
+            return
+        try:
+            ledger.remember(
+                sid,
+                fence,
+                revision=self._history_revision(sid),
+                source_identity=source_identity,
+            )
+        except Exception as exc:
+            log.warning(
+                "Codex terminal fence could not be remembered",
+                session_id=sid,
+                turn_id=fence.turn_id,
+                error_type=type(exc).__name__,
+            )
+            return
+        # Persistence must be bound to the exact source observed when the
+        # terminal arrived.  Without that identity, keep only the revision-
+        # scoped process-local fence; resolving a path later could attach an old
+        # terminal to a rollout which rotated in the meantime.
+        if source_identity is not None and persist:
+            task = asyncio.create_task(self._persist_codex_terminal_fence(
+                ledger, sid, fence, source_identity))
+            self._codex_terminal_persist_tasks.add(task)
+            task.add_done_callback(self._codex_terminal_persist_tasks.discard)
+
+    @staticmethod
+    def _codex_watch_source_identity(
+        watch: object,
+    ) -> tuple[str, int, int, int] | None:
+        """Return one validated watched rollout identity or fail unknown."""
+        if not isinstance(watch, dict):
+            return None
+        path = watch.get("path")
+        file_id = watch.get("file_id")
+        size = watch.get("size")
+        if (
+            not isinstance(path, str)
+            or not path
+            or "\x00" in path
+            or not isinstance(file_id, tuple)
+            or len(file_id) != 2
+            or isinstance(size, bool)
+            or not isinstance(size, int)
+            or size < 0
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+                for value in file_id
+            )
+        ):
+            return None
+        return path, file_id[0], file_id[1], size
+
+    def _remember_codex_terminal_event(
+        self,
+        ctx: SessionContext,
+        msg: TurnEnd,
+    ) -> None:
+        """Normalize and retain an authoritative live app-server terminal."""
+        if (
+            ctx.engine != "codex"
+            or ctx.btw
+            or not msg._codex_authoritative_terminal
+        ):
+            return
+        fence = self._codex_terminal_fence_from_event(msg)
+        if fence is None:
+            return
+        if (
+            fence.status == "interrupted"
+            and fence.turn_id in _codex_compaction_continuation_ids(ctx)
+        ):
+            # The app-server uses an interrupted native boundary while compact
+            # immediately continues the same visible logical turn.  Its final
+            # replacement terminal will be recorded normally.
+            return
+        sid = self._ctx_wire_sid(ctx) or ctx.key
+        watch = self._watch.get(sid)
+        source_identity = self._codex_watch_source_identity(watch)
+        self._remember_codex_terminal_fence(
+            sid, fence, source_identity=source_identity)
+
+    async def _codex_terminal_snapshot(
+        self,
+        sid: str,
+        revision: str,
+        *,
+        source_path: str | None = None,
+    ) -> list[CodexTerminalFence]:
+        ledger = self._codex_terminal_ledger
+        if ledger is None:
+            return []
+        try:
+            path = source_path or await asyncio.to_thread(
+                self._codex_rollout_for_wire, sid)
+            snapshot = await asyncio.to_thread(
+                ledger.snapshot, sid, path, revision=revision)
+        except Exception as exc:
+            log.warning(
+                "Codex terminal snapshot unavailable",
+                session_id=sid,
+                error_type=type(exc).__name__,
+            )
+            return []
+        return list(snapshot)
+
     async def _emit_locked(self, ctx: SessionContext, msg) -> None:
         # Stamp routing before buffering so byte accounting includes the final
         # wire shape.  Every live and replayable /btw frame is owner-only; relay
@@ -6301,6 +6551,16 @@ class WrapperMachine:
             # The replayable object is deliberately notification-free. Only a
             # copy sent on this live call receives presentation metadata.
             msg.notification_context = None
+            try:
+                self._remember_codex_terminal_event(ctx, msg)
+            except Exception as exc:
+                # Lifecycle recovery is optional. No cache/ledger failure may
+                # suppress the engine's authoritative live terminal.
+                log.error(
+                    "Codex terminal recovery hook failed",
+                    session_id=msg.sid,
+                    error_type=type(exc).__name__,
+                )
         if is_downstream(msg):
             msg.seq = ctx.next_seq()
             ctx.buffer.append(msg)
@@ -7780,6 +8040,7 @@ class WrapperMachine:
     EXTERNAL_TTL = 60.0
     CODEX_TURN_TRACK_MAX = 512
     CODEX_TURN_ATTRIBUTION_GRACE = 3.0
+    CODEX_TERMINAL_CANDIDATE_GRACE = 3.0
     CLAUDE_OWNED_MESSAGE_MAX = 512
     CLAUDE_SILENCE_NOTICE_SECONDS = 3 * 60.0
     CLAUDE_SILENCE_WARNING_SECONDS = 10 * 60.0
@@ -7981,6 +8242,7 @@ class WrapperMachine:
                 return
             self._watch.pop(victim, None)
             self._codex_sidebar_watches.pop(victim, None)
+        tail_terminal: RolloutTerminalMarker | None = None
         watch = {
             "path": path, "size": st.st_size, "file_id": (st.st_dev, st.st_ino),
             "engine": engine, "external_ts": 0.0,
@@ -7992,7 +8254,12 @@ class WrapperMachine:
                 return
             own_turn_ids = set(
                 getattr(ctx.sdk, "owned_turn_ids", ())) if ctx is not None else set()
-            tail_active, tail_partial = self._codex_tail_state(path, st.st_size)
+            (
+                tail_active,
+                tail_partial,
+                _tail_marker,
+                tail_terminal,
+            ) = self._codex_tail_snapshot(path, st.st_size)
             active_turns = {
                 turn_id: time.time()
                 for turn_id in tail_active
@@ -8020,6 +8287,7 @@ class WrapperMachine:
                 # of being erased by the first empty holder scan.
                 "preserve_seeded_without_holder": bool(sidebar and active_turns),
                 "pending_wrapper_turns": {},
+                "terminal_candidates": OrderedDict(),
                 "takeover_holders": set(),
                 "takeover_interactive_holders": set(),
                 "takeover_pending": None,
@@ -8053,6 +8321,31 @@ class WrapperMachine:
                 "owned_message_ids": OrderedDict(),
             })
         self._watch[sid] = watch
+        if engine == "codex" and tail_terminal is not None:
+            fence = CodexTerminalFence(
+                turn_id=tail_terminal.turn_id,
+                status=tail_terminal.status,
+                duration_ms=tail_terminal.duration_ms,
+                completed_at=tail_terminal.completed_at,
+            )
+            source_identity = (
+                path, int(st.st_dev), int(st.st_ino), int(st.st_size))
+            if fence.status == "interrupted":
+                observed_at = time.time()
+                watch["terminal_candidates"][fence.turn_id] = (
+                    fence, observed_at, source_identity)
+                watch["last_growth_at"] = observed_at
+            else:
+                # Cold startup has no live notification to repopulate a new
+                # ledger. The bounded tail is enough to repair this process's
+                # first History immediately; defer durable persistence until a
+                # later incrementally observed terminal.
+                self._remember_codex_terminal_fence(
+                    sid,
+                    fence,
+                    source_identity=source_identity,
+                    persist=False,
+                )
         if sidebar and engine == "codex":
             self._codex_sidebar_watches[sid] = None
             self._codex_sidebar_watches.move_to_end(sid)
@@ -8481,7 +8774,12 @@ class WrapperMachine:
     @classmethod
     def _codex_tail_snapshot(
         cls, path: str, size: int,
-    ) -> tuple[set[str], bytes, Optional[tuple[str, str]]]:
+    ) -> tuple[
+        set[str],
+        bytes,
+        Optional[tuple[str, str]],
+        RolloutTerminalMarker | None,
+    ]:
         """Return the latest bounded lifecycle state and exact last marker."""
         try:
             start = max(0, size - cls.CODEX_TAIL_READ_MAX)
@@ -8489,11 +8787,11 @@ class WrapperMachine:
                 stream.seek(start)
                 data = stream.read(cls.CODEX_TAIL_READ_MAX)
         except OSError:
-            return set(), b"", None
+            return set(), b"", None, None
         if start:
             _, separator, data = data.partition(b"\n")
             if not separator:
-                return set(), b"", None
+                return set(), b"", None, None
         markers = parse_turn_markers(data)
         # A Codex thread has one current turn. Historical crash/orphan starts can
         # lack a matching terminal record, so set subtraction would resurrect an
@@ -8502,12 +8800,21 @@ class WrapperMachine:
         for kind, turn_id in markers.ordered:
             active = {turn_id} if kind == "task_started" else set()
         last_marker = markers.ordered[-1] if markers.ordered else None
-        return active, markers.partial, last_marker
+        last_terminal = (
+            markers.terminals[-1]
+            if markers.terminals
+            and last_marker is not None
+            and last_marker[0] != "task_started"
+            and markers.terminals[-1].turn_id == last_marker[1]
+            else None
+        )
+        return active, markers.partial, last_marker, last_terminal
 
     @classmethod
     def _codex_tail_state(cls, path: str, size: int) -> tuple[set[str], bytes]:
         """Best-effort seed when a watch begins during an external Codex turn."""
-        active, partial, _last_marker = cls._codex_tail_snapshot(path, size)
+        active, partial, _last_marker, _terminal = cls._codex_tail_snapshot(
+            path, size)
         return active, partial
 
     @classmethod
@@ -8688,6 +8995,7 @@ class WrapperMachine:
             w["active_external_turns"].clear()
             w.setdefault("observed_external_turns", set()).clear()
             w["pending_wrapper_turns"].clear()
+            w.setdefault("terminal_candidates", OrderedDict()).clear()
             if w.get("takeover_pending"):
                 takeover_cleared = True
                 takeover_clear_message = "会话文件已变化，本次自动接管已取消，请重新点击接管"
@@ -8751,9 +9059,59 @@ class WrapperMachine:
                 external_growth = True
 
         if data:
+            w["last_growth_at"] = now
             markers = parse_turn_markers(data, w.get("partial", b""))
             w["partial"] = markers.partial
             visible_user_growth = markers.has_visible_user_message
+            source_identity = self._codex_watch_source_identity(w)
+            candidates: OrderedDict[
+                str,
+                tuple[
+                    CodexTerminalFence,
+                    float,
+                    tuple[str, int, int, int],
+                ],
+            ] = w.setdefault("terminal_candidates", OrderedDict())
+            # Only the newest bounded lifecycle window can repair the moving
+            # History head. Avoid one fsync task per historical marker if a
+            # watcher catches up after an unusually large append burst.
+            for marker in markers.terminals[-16:]:
+                if source_identity is None:
+                    continue
+                fence = CodexTerminalFence(
+                    turn_id=marker.turn_id,
+                    status=marker.status,
+                    duration_ms=marker.duration_ms,
+                    completed_at=marker.completed_at,
+                )
+                if fence.status == "interrupted":
+                    # A rollout interrupt can be an internal compact/account
+                    # handoff boundary. Keep it provisional through a bounded
+                    # quiet window so an idle TUI/daemon FD cannot suppress a
+                    # genuine interrupt forever; app-server TurnEnd above is
+                    # the immediate authoritative path for managed turns.
+                    candidates.pop(fence.turn_id, None)
+                    candidates[fence.turn_id] = (
+                        fence, now, source_identity)
+                    while len(candidates) > self.CODEX_TURN_TRACK_MAX:
+                        candidates.popitem(last=False)
+                else:
+                    candidates.pop(fence.turn_id, None)
+                    self._remember_codex_terminal_fence(
+                        sid, fence, source_identity=source_identity)
+            if markers.ordered:
+                last_kind, last_turn_id = markers.ordered[-1]
+                for candidate_turn_id in list(candidates):
+                    if (
+                        last_kind == "task_started"
+                        or candidate_turn_id != last_turn_id
+                    ):
+                        # A provisional interrupt is only relevant while it is
+                        # the newest lifecycle boundary. A later task/terminal
+                        # makes it either an internal handoff or no longer part
+                        # of the moving History head; failing stale is safer
+                        # than rebinding it past that newer source boundary.
+                        candidates.pop(candidate_turn_id, None)
             for turn_id in markers.started:
                 if turn_id in own_turn_ids:
                     continue
@@ -8800,6 +9158,40 @@ class WrapperMachine:
             if external_growth:
                 for turn_id in active:
                     active[turn_id] = now
+
+        candidates = w.setdefault("terminal_candidates", OrderedDict())
+        continuation_ids = set(_codex_compaction_continuation_ids(ctx))
+        current_source_identity = self._codex_watch_source_identity(w)
+        for turn_id, (
+            fence, seen_at, source_identity,
+        ) in list(candidates.items()):
+            if turn_id in continuation_ids:
+                candidates.pop(turn_id, None)
+                continue
+            if (
+                current_source_identity is None
+                or current_source_identity[:3] != source_identity[:3]
+                or current_source_identity[3] < source_identity[3]
+            ):
+                # Rotation/truncation invalidates a provisional interrupted
+                # marker.  Never rebind it to whatever path exists now.
+                candidates.pop(turn_id, None)
+                continue
+            last_growth_at = float(w.get("last_growth_at", seen_at))
+            if (
+                now - max(seen_at, last_growth_at)
+                < self.CODEX_TERMINAL_CANDIDATE_GRACE
+                or turn_id in active
+                or turn_id in pending
+            ):
+                continue
+            self._remember_codex_terminal_fence(
+                sid,
+                fence,
+                source_identity=source_identity,
+            )
+            candidates.pop(turn_id, None)
+            external_growth = True
 
         if holders or (active and writers):
             w["external_ts"] = now
@@ -10540,9 +10932,29 @@ class WrapperMachine:
             (ctx is not None and ctx.engine == "codex")
             or watch.get("engine") == "codex"
         )
+
+        async def with_terminal_snapshot(history: History) -> History:
+            # Lifecycle is provider-neutral.  Whether content came from the
+            # experimental official pagination API or the bounded rollout
+            # adapter must not change how an exact terminal repairs a stale UI.
+            if not is_codex or before is not None:
+                return history
+            fences = await self._codex_terminal_snapshot(
+                sid, history.revision)
+            continuation_ids = set(
+                history.compaction_continuation_turn_ids)
+            history.terminal_fences = [
+                fence for fence in fences
+                if not (
+                    fence.status == "interrupted"
+                    and fence.turn_id in continuation_ids
+                )
+            ]
+            return history
+
         if is_codex and detail == "summary":
             if self._codex_rollout_history_active(sid):
-                return await self._build_history(
+                history = await self._build_history(
                     sid,
                     before=before,
                     limit=limit,
@@ -10550,6 +10962,7 @@ class WrapperMachine:
                     detail=detail,
                     allow_stale=True,
                 )
+                return await with_terminal_snapshot(history)
             try:
                 history = await self._build_official_codex_history(
                     sid, before=before, limit=limit)
@@ -10560,7 +10973,7 @@ class WrapperMachine:
                 ):
                     self._schedule_official_codex_history_refresh(
                         sid, limit=limit, cwd=cwd)
-                return history
+                return await with_terminal_snapshot(history)
             except _CodexOfficialProjectionIncomplete:
                 revision = self._activate_codex_rollout_history(sid)
                 log.warning(
@@ -10569,7 +10982,7 @@ class WrapperMachine:
                     session_id=sid,
                     revision=revision,
                 )
-                return await self._build_history(
+                history = await self._build_history(
                     sid,
                     before=before,
                     limit=limit,
@@ -10577,6 +10990,7 @@ class WrapperMachine:
                     detail=detail,
                     allow_stale=True,
                 )
+                return await with_terminal_snapshot(history)
             except CodexHistoryUnsupported:
                 # Older app-server builds retain the source-window rollout
                 # parser. This is a capability fallback, never a response/error
@@ -10611,7 +11025,7 @@ class WrapperMachine:
                 # sequence before issuing I/O. Preserve that exact watermark
                 # for its correlated error instead of creating a phantom build.
                 build_seq = self._history_build_sequences.get(sid, 0)
-                return History(
+                history = History(
                     session_id=sid,
                     revision=revision,
                     generation=self.instance_id,
@@ -10639,9 +11053,11 @@ class WrapperMachine:
                         _codex_compaction_continuation_ids(ctx)
                         if before is None else []),
                 )
-        return await self._build_history(
+                return await with_terminal_snapshot(history)
+        history = await self._build_history(
             sid, before=before, limit=limit, cwd_hint=cwd, detail=detail,
             allow_stale=True)
+        return await with_terminal_snapshot(history)
 
     def _schedule_official_codex_history_refresh(
         self,
@@ -14606,7 +15022,9 @@ class WrapperMachine:
                     "status": "interrupted",
                 }},
             }
-            for event in translator.feed(synthetic_old_terminal):
+            for event in translator.feed(
+                synthetic_old_terminal, authoritative_terminal=False,
+            ):
                 if isinstance(event, (Error, TurnEnd)):
                     continue
                 if isinstance(event, StateEvent) and event.detail:
@@ -14933,7 +15351,9 @@ class WrapperMachine:
                         "error": {"message": "Codex app-server connection closed"},
                     }},
                 }
-                for event in translator.feed(synthetic):
+                for event in translator.feed(
+                    synthetic, authoritative_terminal=False,
+                ):
                     if isinstance(event, Error) and event.msg_id is None:
                         event.msg_id = logical_msg_id
                     await self._emit(ctx, event)
@@ -25241,7 +25661,9 @@ class WrapperMachine:
                         "status": "interrupted",
                     }},
                 }
-                for event in ctx.translator.feed(synthetic_old_terminal):
+                for event in ctx.translator.feed(
+                    synthetic_old_terminal, authoritative_terminal=False,
+                ):
                     if isinstance(event, (Error, TurnEnd)):
                         continue
                     await emit_codex_event(event)
