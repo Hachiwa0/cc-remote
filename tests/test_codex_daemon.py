@@ -923,7 +923,8 @@ def test_code_daemon_unavailable_falls_back_and_work_never_probes(monkeypatch):
     asyncio.run(run(True))
 
 
-def test_oversized_resume_newer_core_bypasses_shared_daemon(monkeypatch):
+def test_oversized_resume_prefers_shared_daemon_before_newer_private_core(
+        monkeypatch):
     async def run():
         manager = _Manager(["/managed/codex", "app-server", "proxy"])
         spawned = []
@@ -947,15 +948,18 @@ def test_oversized_resume_newer_core_bypasses_shared_daemon(monkeypatch):
             ).connect(resume_id="oversized-thread", cwd="/tmp")
 
         assert spawned[0][:3] == [
+            "/managed/codex", "app-server", "proxy",
+        ]
+        assert spawned[1][:3] == [
             "/Applications/Codex.app/Resources/codex",
             "app-server", "--stdio",
         ]
-        assert manager.proxy_calls == 0
+        assert manager.proxy_calls == 1
 
     asyncio.run(run())
 
 
-def test_oversized_desktop_openai_resume_uses_private_http_provider(
+def test_oversized_desktop_openai_resume_prefers_shared_daemon_then_http_stdio(
         monkeypatch):
     async def run():
         manager = _Manager(["/managed/codex", "app-server", "proxy"])
@@ -983,13 +987,16 @@ def test_oversized_desktop_openai_resume_uses_private_http_provider(
                 _Cfg(), daemon_mode="auto", daemon_manager=manager,
             ).connect(resume_id="oversized-thread", cwd="/tmp")
 
-        argv = spawned[0]
+        assert spawned[0][:3] == [
+            "/managed/codex", "app-server", "proxy",
+        ]
+        argv = spawned[1]
         assert argv[:3] == [
             "/managed/codex", "app-server", "--stdio",
         ]
         assert any(
             item.endswith("supports_websockets=false") for item in argv)
-        assert manager.proxy_calls == 0
+        assert manager.proxy_calls == 1
 
     asyncio.run(run())
 
@@ -1179,6 +1186,84 @@ def test_proxy_connect_exposes_shared_state_and_disconnect_keeps_manager(
         # Normal session teardown owns only the proxy and keeps daemon liveness
         # cached for the other clients.
         assert manager.invalidations == 0
+
+    asyncio.run(run())
+
+
+def test_oversized_http_resume_keeps_shared_affinity_and_thread_local_provider(
+        monkeypatch):
+    async def run():
+        nonce = b"0123456789abcdef"
+        monkeypatch.setattr(handle_module.os, "urandom", lambda _size: nonce)
+        monkeypatch.setattr(
+            handle_module,
+            "_oversized_desktop_openai_resume_requires_http",
+            lambda _sid: True,
+        )
+        monkeypatch.setattr(
+            handle_module,
+            "_newer_private_core_for_oversized_resume",
+            lambda _bin, _sid: "/Applications/Codex.app/Resources/codex",
+        )
+        manager = _Manager(["/managed/codex", "app-server", "proxy"])
+        spawned = []
+
+        async def spawn(*argv, **_kwargs):
+            spawned.append(list(argv))
+            return _Process(
+                _Reader(_handshake_response(nonce)), 50004 + len(spawned))
+
+        monkeypatch.setattr(
+            handle_module, "_resolve_codex_bin", lambda: "/managed/codex")
+        monkeypatch.setattr(
+            handle_module.asyncio, "create_subprocess_exec", spawn)
+        monkeypatch.setattr(handle_module.os, "killpg", lambda *_args: None)
+        handle = CodexHandle(_Cfg(), daemon_manager=manager)
+        resume_params = []
+
+        async def idle(*_args):
+            await asyncio.Event().wait()
+
+        async def request(method, params=None):
+            if method == "initialize":
+                return {"userAgent": "codex_cli_rs/0.147.0 (test)"}
+            if method == "thread/resume":
+                resume_params.append(params)
+                return {"thread": {"id": "oversized-thread"}}
+            raise AssertionError(method)
+
+        handle._read_loop = idle  # type: ignore[method-assign]
+        handle._request = request  # type: ignore[method-assign]
+        handle._notify = lambda *_args: asyncio.sleep(0)  # type: ignore[method-assign]
+        handle._restore_http_provider_state = (  # type: ignore[method-assign]
+            lambda **_kwargs: asyncio.sleep(0)
+        )
+        await handle.connect(resume_id="oversized-thread", cwd="/tmp")
+
+        assert spawned == [["/managed/codex", "app-server", "proxy"]]
+        assert handle.using_daemon_proxy is True
+        assert handle.shared_daemon_affinity is True
+        expected_resume = {
+            "threadId": "oversized-thread",
+            "cwd": "/tmp",
+            "modelProvider": handle_module._OPENAI_HTTP_RESUME_PROVIDER_ID,
+            "config": handle_module._openai_http_resume_thread_config(),
+            "excludeTurns": True,
+        }
+        assert resume_params == [expected_resume]
+        await handle.disconnect()
+
+        # Reconnecting an already-shared thread must retain its HTTP transport
+        # override while remaining on the shared daemon.  Shared affinity only
+        # disables the private-core fallback, not HTTP-provider detection.
+        await handle.connect(resume_id="oversized-thread", cwd="/tmp")
+        assert spawned == [
+            ["/managed/codex", "app-server", "proxy"],
+            ["/managed/codex", "app-server", "proxy"],
+        ]
+        assert handle.using_daemon_proxy is True
+        assert resume_params == [expected_resume, expected_resume]
+        await handle.disconnect()
 
     asyncio.run(run())
 

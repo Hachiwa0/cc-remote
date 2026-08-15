@@ -3727,6 +3727,7 @@ def test_codex_work_turn_uses_named_profile_without_legacy_sandbox_policy():
     "work_mode,http_only,web_override,preserve_controls,preserve_profile", [
     (False, False, None, False, True),
     (False, True, None, False, True),
+    (False, True, "live", False, True),
     (False, False, "live", False, True),
     (False, False, "live", True, True),
     (False, False, None, True, False),
@@ -3848,14 +3849,19 @@ def test_codex_resume_adopts_native_settings_unless_controls_are_preserved(
                 "config": _expected_work_config(),
                 "permissions": "cc_remote_work",
             })
-        elif web_override:
-            expected_resume["config"] = {"web_search": web_override}
+        else:
+            code_config = codex_handle_module._code_thread_config(
+                http_only_resume=http_only,
+                web_search=web_override,
+            )
+            if code_config is not None:
+                expected_resume["config"] = code_config
         resume_call = next(call for call in calls if call[0] == "thread/resume")
         assert resume_call == ("thread/resume", expected_resume)
         assert not ({
             "sandbox", "sandboxPolicy", "approvalsReviewer",
         } & resume_call[1].keys())
-        if not work_mode and not web_override:
+        if not work_mode and not web_override and not http_only:
             assert not ({"config", "personality"} & resume_call[1].keys())
         assert (handle.model, handle.effort, handle.approval,
                 handle.permission_profile, handle.service_tier) == (
