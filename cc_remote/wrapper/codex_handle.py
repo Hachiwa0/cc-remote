@@ -1119,6 +1119,39 @@ def _append_openai_http_resume_provider(argv: list[str]) -> None:
     ])
 
 
+def _openai_http_resume_thread_config() -> dict[str, Any]:
+    """Register the HTTP compatibility alias in one thread configuration.
+
+    ``thread/resume.config`` is evaluated by the app-server which owns the
+    thread.  Supplying the alias there lets a shared daemon select official
+    Responses HTTP without writing the user's config.toml or starting a second
+    independently writable app-server.
+    """
+    return {
+        "model_providers": {
+            _OPENAI_HTTP_RESUME_PROVIDER_ID: {
+                "name": "cc-remote OpenAI HTTP",
+                "base_url": _OPENAI_HTTP_RESUME_BASE_URL,
+                "wire_api": "responses",
+                "requires_openai_auth": True,
+                "supports_websockets": False,
+            },
+        },
+    }
+
+
+def _code_thread_config(
+    *, http_only_resume: bool, web_search: Optional[str],
+) -> Optional[dict[str, Any]]:
+    """Compose independent Code-time overrides without losing either one."""
+    config: dict[str, Any] = {}
+    if http_only_resume:
+        config.update(_openai_http_resume_thread_config())
+    if web_search:
+        config["web_search"] = web_search
+    return config or None
+
+
 def _semantic_version(value: Optional[str]) -> tuple[int, ...]:
     """Return the numeric release prefix used for app-server feature gates."""
     if not isinstance(value, str):
@@ -1775,11 +1808,7 @@ class CodexHandle:
         codex_bin = await asyncio.to_thread(_resolve_codex_bin)
         private_core = None
         http_only_resume = False
-        if (
-            not self.work_mode
-            and not self._daemon_proxy_established
-            and not control_only
-        ):
+        if not self.work_mode:
             http_only_resume = await asyncio.to_thread(
                 _oversized_desktop_openai_resume_requires_http,
                 resume_id,
@@ -1787,6 +1816,7 @@ class CodexHandle:
                 _oversized_desktop_openai_resume_requires_http,
                 resume_id, self.codex_home,
             )
+        if not self.work_mode and not self._daemon_proxy_established:
             private_core = await asyncio.to_thread(
                 _newer_private_core_for_oversized_resume,
                 codex_bin,
@@ -1796,13 +1826,16 @@ class CodexHandle:
                 codex_bin,
                 resume_id, self.codex_home,
             )
-            if private_core is not None:
-                codex_bin = private_core
+        # The managed binary owns the shared daemon.  A newer desktop core is
+        # only a private-stdio fallback if no shared control plane is available;
+        # choosing it before probing the daemon would split terminal and Web
+        # into two independently writable app-servers for every large thread.
+        stdio_codex_bin = private_core or codex_bin
         self._http_provider_root_id = resume_id if http_only_resume else None
         if http_only_resume:
             self._http_provider_repair_stop.clear()
         child_env = _profile_codex_env(codex_bin, self.codex_home)
-        stdio_argv = [codex_bin, "app-server", "--stdio"]
+        stdio_argv = [stdio_codex_bin, "app-server", "--stdio"]
         if http_only_resume:
             _append_openai_http_resume_provider(stdio_argv)
             log.info(
@@ -1830,8 +1863,7 @@ class CodexHandle:
             ])
         proxy_argv: Optional[list[str]] = None
         strict_shared = False
-        if (private_core is None and not http_only_resume and not self.work_mode
-                and self.daemon_mode == "auto"):
+        if not self.work_mode and self.daemon_mode == "auto":
             try:
                 proxy_argv = await self.daemon_manager.proxy_args(
                     codex_bin, child_env)
@@ -1852,11 +1884,13 @@ class CodexHandle:
                     error_type=type(exc).__name__,
                 )
         attempts = (
-            [(proxy_argv, True), (stdio_argv, False)]
-            if proxy_argv is not None else [(stdio_argv, False)]
+            [(proxy_argv, True, codex_bin),
+             (stdio_argv, False, stdio_codex_bin)]
+            if proxy_argv is not None
+            else [(stdio_argv, False, stdio_codex_bin)]
         )
         if strict_shared and proxy_argv is not None:
-            attempts = [(proxy_argv, True)]
+            attempts = [(proxy_argv, True, codex_bin)]
         if self._daemon_proxy_established:
             if proxy_argv is None:
                 raise RuntimeError(
@@ -1864,15 +1898,15 @@ class CodexHandle:
             # A previously shared thread must never reconnect through private
             # stdio.  Leave the handle disconnected and let Machine retry the
             # shared proxy instead of manufacturing a false external-CLI lock.
-            attempts = [(proxy_argv, True)]
+            attempts = [(proxy_argv, True, codex_bin)]
         if control_only:
             if proxy_argv is None:
                 raise RuntimeError(
                     "shared Codex app-server proxy is unavailable"
                 )
-            attempts = [(proxy_argv, True)]
+            attempts = [(proxy_argv, True, codex_bin)]
         initialized: Any = None
-        for argv, daemon_proxy in attempts:
+        for argv, daemon_proxy, attempt_codex_bin in attempts:
             self._shared_resume_binding_thread_id = (
                 resume_id
                 if daemon_proxy and resume_id and not fork
@@ -1880,7 +1914,7 @@ class CodexHandle:
             )
             try:
                 await self._open_process(
-                    argv, codex_bin, daemon_proxy=daemon_proxy)
+                    argv, attempt_codex_bin, daemon_proxy=daemon_proxy)
                 initialized = await self._request(
                     "initialize", _initialize_params())
                 self.app_server_version = _app_server_version(initialized)
@@ -1948,10 +1982,14 @@ class CodexHandle:
                 }
                 if self.permission_profile:
                     fork_params["permissions"] = self.permission_profile
-                if not self.work_mode and self.web_search_override:
-                    fork_params["config"] = {
-                        "web_search": self.web_search_override,
-                    }
+                code_config = _code_thread_config(
+                    http_only_resume=http_only_resume,
+                    web_search=(
+                        None if self.work_mode else self.web_search_override
+                    ),
+                )
+                if code_config is not None:
+                    fork_params["config"] = code_config
                 if http_only_resume:
                     fork_params["modelProvider"] = (
                         _OPENAI_HTTP_RESUME_PROVIDER_ID)
@@ -2000,10 +2038,13 @@ class CodexHandle:
                         "config": self._work_config,
                         "permissions": "cc_remote_work",
                     })
-                elif self.web_search_override:
-                    resume_params["config"] = {
-                        "web_search": self.web_search_override,
-                    }
+                else:
+                    code_config = _code_thread_config(
+                        http_only_resume=http_only_resume,
+                        web_search=self.web_search_override,
+                    )
+                    if code_config is not None:
+                        resume_params["config"] = code_config
                 if _supports_lightweight_resume(self.app_server_version):
                     # Since Codex 0.144.6, excludeTurns is the official way for
                     # clients with a paged history UI to resume a live thread.
