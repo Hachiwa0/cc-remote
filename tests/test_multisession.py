@@ -321,10 +321,10 @@ def test_lost_rekey_is_replayed_before_cursor_catchup():
             generations={"tmp-lost": machine.instance_id}))
 
         assert [message.type for message in transport.sent] == [
-            "session_rekey", "replay_start", "state", "replay_end",
+            "engine_catalog", "session_rekey", "replay_start", "state", "replay_end",
             "session_control", "query_queue", "completion_state", "perm"]
-        assert transport.sent[0].old_key == "tmp-lost"
-        assert transport.sent[0].session_id == "real-1"
+        assert transport.sent[1].old_key == "tmp-lost"
+        assert transport.sent[1].session_id == "real-1"
         assert all(message.to == "client-1" for message in transport.sent)
         assert all(message.route_id == "route-1" for message in transport.sent)
 

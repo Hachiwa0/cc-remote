@@ -101,7 +101,8 @@ from cc_remote.protocol import (
     MAX_QUERY_QUEUE_BYTES, MAX_QUERY_QUEUE_ITEMS, PREVIEW_ASSET_MAX_BYTES,
     Error, Hello, Query, QueryQueueState, QueuedQueryDetail, QueuedQueryInfo,
     QueuedQueryUpdated,
-    Interrupt, CommandAck, Model, Models, EngineCapabilities, Effort, Fast,
+    Interrupt, CommandAck, Model, Models, EngineCatalog, EngineInfo,
+    EngineCapabilities, Effort, Fast,
     CollaborationMode, Perm, PermissionProfile, PermissionProfiles, WebSearch,
     BtwOpened, ContextReport, StatusReport, Notice,
     RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset,
@@ -115,7 +116,8 @@ from cc_remote.protocol import (
     TurnNotificationContext,
     TurnResult, is_downstream,
     is_reliable_command,
-    SessionInfo, SessionList, SessionListInvalidated, SessionActivity,
+    DshPresetInfo, SessionInfo, SessionList, SessionListInvalidated,
+    SessionActivity,
     SessionFocus,
     SessionRekey, SessionForked, SessionMigrated, DirList,
     WorkDashboard, WorkArtifacts, RollbackResult,
@@ -307,6 +309,31 @@ from cc_remote.wrapper.preview_capabilities import (
     PreviewCapabilityStore,
 )
 from cc_remote.wrapper.transport import WrapperTransport
+from cc_remote.wrapper.dsh_client import (
+    DshClient,
+    DshError,
+    DshPreflight,
+    DshProtocolError,
+    DshRpcError,
+    DshSessionHandle,
+    DshUnavailable,
+    dsh_native_session_id,
+    dsh_wire_session_id,
+)
+from cc_remote.wrapper.dsh_history import DshHistory
+from cc_remote.wrapper.dsh_forks import DshForkJournal, DshForkJournalError
+from cc_remote.wrapper.dsh_state import (
+    DshSessionPinStore,
+    DshSessionPresentationStore,
+)
+from cc_remote.wrapper.dsh_stream import (
+    DshEventError,
+    DshStreamTranslator,
+    decode_dsh_model,
+    dsh_command_item_id,
+    encode_dsh_model,
+    parse_dsh_fork_point,
+)
 
 log = logger("cc_remote.wrapper.machine")
 
@@ -1387,6 +1414,9 @@ class WrapperMachine:
     FORK_RECONCILE_DELAY = 0.1
     FORK_BACKGROUND_ATTEMPTS = 100
     UNCERTAIN_FORK_CAP = 4096
+    DSH_RECEIPT_RECONCILE_DELAYS = (0.0, 0.1, 0.4, 1.0)
+    DSH_INTERACTION_TASK_CAP = 256
+    DSH_COMMAND_ALIAS_CAP = 4096
     MARKDOWN_PREVIEW_SUFFIXES = frozenset({".md", ".markdown"})
     HTML_PREVIEW_SUFFIXES = frozenset({".htm", ".html"})
     OFFICE_PREVIEW_SUFFIXES = frozenset({
@@ -1603,6 +1633,23 @@ class WrapperMachine:
         self.sessions: dict[str, SessionContext] = {}
         self.focused_sid: Optional[str] = None  # pool key of the viewed session
         self.transport.on_connected = self._on_transport_connected
+        self._dsh_client: DshClient | None = (
+            DshClient(cfg.dsh_url, timeout=cfg.dsh_timeout)
+            if getattr(cfg, "dsh_url", "") else None
+        )
+        self._dsh_history: DshHistory | None = (
+            DshHistory(self._dsh_client) if self._dsh_client is not None else None
+        )
+        self._dsh_available = False
+        self._dsh_preflight: DshPreflight | None = None
+        self._dsh_unavailable_reason: str | None = (
+            None if self._dsh_client is not None else "未配置 DSH 本机服务"
+        )
+        # Answerable mux frames must never block the DSH stream reader. Each
+        # batch runs in a bounded task and serializes its cards through ctx.ask_lock.
+        self._dsh_interaction_tasks: set[asyncio.Task] = set()
+        self._dsh_pending_request_asks: dict[tuple[str, str], set[str]] = {}
+        self._dsh_pending_approvals: dict[tuple[str, str], str] = {}
         # Transcript mirror: sessions a client has opened (registered on GetHistory),
         # sid -> {"path", "size", "engine"}. The watcher polls each file's SIZE and,
         # when it grows without us having written it, mirrors the append to clients.
@@ -1739,6 +1786,31 @@ class WrapperMachine:
         self._uncertain_claude_forks: OrderedDict[str, Optional[str]] = OrderedDict()
         self._claude_fork_tasks: dict[str, asyncio.Task] = {}
         self._claude_fork_locks: dict[str, asyncio.Lock] = {}
+        try:
+            self._dsh_forks: DshForkJournal | None = DshForkJournal(
+                self.cfg.state_dir
+            )
+        except DshForkJournalError:
+            # DSH itself remains usable, but an unreadable at-most-once ledger
+            # must fail closed for persistent forks.
+            self._dsh_forks = None
+            log.exception("DSH fork journal unavailable")
+        self._dsh_fork_locks: dict[str, asyncio.Lock] = {}
+        try:
+            self._dsh_session_pins: DshSessionPinStore | None = (
+                DshSessionPinStore(self.cfg.state_dir)
+            )
+        except SessionPinStoreError:
+            self._dsh_session_pins = None
+            log.exception("DSH session pin store unavailable")
+        try:
+            self._dsh_session_presentation: DshSessionPresentationStore | None
+            self._dsh_session_presentation = DshSessionPresentationStore(
+                self.cfg.state_dir
+            )
+        except SessionPresentationStoreError:
+            self._dsh_session_presentation = None
+            log.exception("DSH session presentation store unavailable")
         try:
             self._session_pins: SessionPinStore | None = SessionPinStore(
                 self.cfg.state_dir)
@@ -2261,11 +2333,1054 @@ class WrapperMachine:
         )
         display_name = self._notification_titles.get(route_sid or "")
         return TurnNotificationContext(
-            engine="codex" if ctx.engine == "codex" else "claude",
+            engine=(ctx.engine if ctx.engine in {"claude", "codex", "dsh"}
+                    else "claude"),
             space="work" if ctx.space == "work" else "code",
             display_name=display_name,
             parent_session_id=ctx.parent_sid if ctx.btw else None,
         )
+
+    def _engine_catalog(
+        self,
+        *,
+        to: str | None = None,
+        route_id: str | None = None,
+    ) -> EngineCatalog:
+        return EngineCatalog(
+            engines=[
+                EngineInfo(
+                    id="claude", display_name="Claude Code",
+                    available=True, spaces=["code", "work"],
+                ),
+                EngineInfo(
+                    id="codex", display_name="Codex",
+                    available=True, spaces=["code", "work"],
+                ),
+                EngineInfo(
+                    id="dsh", display_name="DeepSeek Harness",
+                    available=self._dsh_available, spaces=["code"],
+                    reason=(None if self._dsh_available
+                            else self._dsh_unavailable_reason),
+                ),
+            ],
+            to=to,
+            route_id=route_id,
+        )
+
+    @staticmethod
+    def _dsh_preset_rows(
+        preflight: DshPreflight | None,
+    ) -> list[DshPresetInfo]:
+        if preflight is None:
+            return []
+        result: list[DshPresetInfo] = []
+        for row in preflight.presets[:128]:
+            preset_id = row.get("id")
+            trust = row.get("trust")
+            if (
+                not isinstance(preset_id, str)
+                or not preset_id
+                or len(preset_id) > 256
+                or trust not in {"system", "user"}
+            ):
+                continue
+            name = row.get("name")
+            description = row.get("description")
+            broken = row.get("broken")
+            result.append(DshPresetInfo(
+                id=preset_id,
+                name=(name if isinstance(name, str) and name else preset_id)[:256],
+                description=(description[:4096]
+                             if isinstance(description, str) else None),
+                trust=trust,
+                is_default=row.get("isDefault") is True,
+                broken=(broken[:4096] if isinstance(broken, str) else None),
+            ))
+        return result
+
+    def _dsh_ctx_for_native(self, native_sid: str) -> SessionContext | None:
+        try:
+            wire_sid = dsh_wire_session_id(native_sid)
+        except ValueError:
+            return None
+        ctx = self.sessions.get(wire_sid)
+        return ctx if ctx is not None and ctx.engine == "dsh" else None
+
+    def _dsh_client_ready(self) -> tuple[DshClient, DshHistory]:
+        client = self._dsh_client
+        history = self._dsh_history
+        if (
+            client is None
+            or history is None
+            or not self._dsh_available
+        ):
+            raise DshUnavailable(
+                self._dsh_unavailable_reason or "DSH 本机服务未连接"
+            )
+        return client, history
+
+    @staticmethod
+    def _dsh_projection_title(row: dict) -> str | None:
+        projections = row.get("projections")
+        values = (
+            projections.get("values")
+            if isinstance(projections, dict) else None
+        )
+        title = values.get("title") if isinstance(values, dict) else None
+        if not isinstance(title, str):
+            return None
+        normalized = " ".join(title.split())
+        return normalized[:500] or None
+
+    async def _read_dsh_catalog(
+        self,
+    ) -> tuple[list[dict], set[str]]:
+        client, _history = self._dsh_client_ready()
+        sessions_raw, workspace_raw = await asyncio.gather(
+            client.call("session.list"),
+            client.call("workspace.list"),
+        )
+        rows = (
+            sessions_raw.get("items")
+            if isinstance(sessions_raw, dict) else None
+        )
+        archived = (
+            workspace_raw.get("archivedSessionIds")
+            if isinstance(workspace_raw, dict) else None
+        )
+        if (
+            not isinstance(rows, list)
+            or not all(isinstance(row, dict) for row in rows)
+            or not isinstance(archived, list)
+            or not all(isinstance(item, str) for item in archived)
+        ):
+            raise DshProtocolError("DSH session catalog has an invalid shape")
+        archived_ids = set(archived)
+        return [dict(row) for row in rows], archived_ids
+
+    async def _list_dsh_sessions(self, cmd) -> SessionList | Error:
+        client_id = getattr(cmd, "client_id", None)
+        if getattr(cmd, "space", "code") != "code":
+            error = Error(
+                code=ERR_AUTH,
+                message="DeepSeek Harness 首版仅支持 Code 空间",
+                request_id=getattr(cmd, "cmd_id", None),
+                to=client_id,
+            )
+            await self.transport.send(error)
+            return error
+        try:
+            rows, archived_ids = await self._read_dsh_catalog()
+            pinned_ids = (
+                self._dsh_session_pins.ids("dsh")
+                if self._dsh_session_pins is not None else frozenset()
+            )
+            sessions: list[SessionInfo] = []
+            # DSH v1 has no list cursor yet. Keep one sidebar response bounded
+            # like the native Claude/Codex catalogs instead of forwarding an
+            # arbitrarily large local catalog through the relay.
+            for row in rows:
+                if len(sessions) >= 400:
+                    break
+                native_sid = row.get("sessionId")
+                if not isinstance(native_sid, str):
+                    continue
+                try:
+                    wire_sid = dsh_wire_session_id(native_sid)
+                except ValueError:
+                    continue
+                # Subagents are rendered inside their owning DSH turn; exposing
+                # them as top-level cc-remote sessions would grant a second,
+                # misleading navigation/control surface.
+                if row.get("origin") == "subagent":
+                    continue
+                updated_at = row.get("updatedAt")
+                running = row.get("running")
+                blank = row.get("blank")
+                if (
+                    isinstance(updated_at, bool)
+                    or not isinstance(updated_at, (int, float))
+                    or not math.isfinite(float(updated_at))
+                    or updated_at < 0
+                    or not isinstance(running, bool)
+                    or not isinstance(blank, bool)
+                ):
+                    continue
+                resident = self.sessions.get(wire_sid)
+                # DSH persists a freshly-created session before it has any
+                # durable conversation content.  A cold blank row is not yet
+                # useful history and may be an abandoned Web/TUI draft, so do
+                # not turn it into a permanent sidebar entry.  Keep a resident
+                # blank session visible: cc-remote owns that optimistic route
+                # while its first prompt is being admitted.
+                if blank and (
+                    resident is None or resident.engine != "dsh"
+                ):
+                    continue
+                cwd = row.get("cwd")
+                cwd = cwd[:4096] if isinstance(cwd, str) and cwd else None
+                title = self._dsh_projection_title(row)
+                if title is None and cwd:
+                    title = os.path.basename(cwd.rstrip(os.sep))[:500] or None
+                if title is None:
+                    title = "DeepSeek Harness"
+                preset = row.get("agentPreset")
+                preset = (
+                    preset[:256]
+                    if isinstance(preset, str) and preset else None
+                )
+                parent = row.get("parentSessionId")
+                try:
+                    parent_wire = (
+                        dsh_wire_session_id(parent)
+                        if isinstance(parent, str) else None
+                    )
+                except ValueError:
+                    parent_wire = None
+                state = (
+                    resident.state
+                    if resident is not None and resident.engine == "dsh"
+                    else "running" if running else "idle"
+                )
+                sessions.append(SessionInfo(
+                    session_id=wire_sid,
+                    native_session_id=native_sid,
+                    summary=title,
+                    last_modified=str(updated_at),
+                    cwd=cwd,
+                    tag="archived" if native_sid in archived_ids else None,
+                    pinned=wire_sid in pinned_ids,
+                    state=state,
+                    engine="dsh",
+                    space="code",
+                    forked_from_id=parent_wire,
+                    dsh_agent_preset=preset,
+                    **self._session_presentation_fields("dsh", wire_sid),
+                ))
+                self._remember_notification_title(wire_sid, title)
+            event = SessionList(
+                engine="dsh",
+                space="code",
+                request_id=getattr(cmd, "cmd_id", None),
+                sessions=sessions,
+                dsh_presets=self._dsh_preset_rows(self._dsh_preflight),
+                default_dsh_preset_id=(
+                    self._dsh_preflight.default_preset_id
+                    if self._dsh_preflight is not None else None
+                ),
+                to=client_id,
+            )
+            await self.transport.send(event)
+            return event
+        except Exception as exc:
+            log.warning(
+                "DSH session list failed",
+                error_type=type(exc).__name__,
+            )
+            error = Error(
+                code=ERR_INTERNAL,
+                message="DeepSeek Harness 会话列表暂不可用，请稍后重试。",
+                request_id=getattr(cmd, "cmd_id", None),
+                to=client_id,
+            )
+            await self.transport.send(error)
+            return error
+
+    def _track_dsh_task(self, coroutine, *, name: str) -> bool:
+        if len(self._dsh_interaction_tasks) >= self.DSH_INTERACTION_TASK_CAP:
+            close = getattr(coroutine, "close", None)
+            if callable(close):
+                close()
+            log.warning(
+                "DSH background task capacity reached",
+                task=name,
+                cap=self.DSH_INTERACTION_TASK_CAP,
+            )
+            return False
+        task = asyncio.create_task(coroutine, name=name)
+        self._dsh_interaction_tasks.add(task)
+
+        def finished(done: asyncio.Task) -> None:
+            self._dsh_interaction_tasks.discard(done)
+            if done.cancelled():
+                return
+            try:
+                done.result()
+            except Exception as exc:
+                log.warning(
+                    "DSH background event handling failed",
+                    task=name,
+                    error_type=type(exc).__name__,
+                )
+
+        task.add_done_callback(finished)
+        return True
+
+    async def _on_dsh_availability(
+        self,
+        available: bool,
+        preflight: DshPreflight | None,
+        reason: str | None,
+    ) -> None:
+        changed = (
+            available != self._dsh_available
+            or reason != self._dsh_unavailable_reason
+        )
+        self._dsh_available = available
+        self._dsh_preflight = preflight
+        self._dsh_unavailable_reason = reason
+        if not changed:
+            return
+        try:
+            await self.transport.send(self._engine_catalog())
+            await self._invalidate_session_list("dsh", "code")
+        except Exception as exc:
+            # Relay availability must not tear down the healthy loopback streams.
+            log.warning(
+                "DSH availability update could not be published",
+                error_type=type(exc).__name__,
+            )
+        if available:
+            for ctx in tuple(self.sessions.values()):
+                if ctx.engine == "dsh" and ctx.session_id:
+                    reconciliation = (
+                        self._reconcile_dsh_prompt(
+                            ctx, ctx.dsh_uncertain_msg_id,
+                        )
+                        if ctx.dsh_uncertain_msg_id
+                        else self._reconcile_dsh_steer(
+                            ctx,
+                            ctx.dsh_uncertain_steer_id,
+                            notify_rejected=True,
+                        )
+                        if ctx.dsh_uncertain_steer_id
+                        else self._reconcile_dsh_resident(ctx)
+                    )
+                    self._track_dsh_task(
+                        reconciliation,
+                        name=f"cc-remote-dsh-history-{ctx.session_id}",
+                    )
+
+    async def _reconcile_dsh_resident(
+        self,
+        ctx: SessionContext,
+        *,
+        expected_msg_id: str | None = None,
+    ) -> bool | None:
+        """Reconcile one resident from DSH's source log and current catalog.
+
+        ``True`` proves a particular browser message was accepted, ``False``
+        proves it was not accepted while the native session is idle, and
+        ``None`` preserves uncertainty.  The same read also repairs a terminal
+        event missed during a stream reconnect.
+        """
+        sid = self._ctx_wire_sid(ctx)
+        native_sid = ctx.session_id
+        if ctx.engine != "dsh" or not sid or not native_sid:
+            return None
+        if self.sessions.get(ctx.key or sid) is not ctx:
+            return None
+        expected_was_pending = bool(
+            expected_msg_id is not None
+            and expected_msg_id in {
+                ctx.dsh_uncertain_msg_id,
+                ctx.dsh_uncertain_steer_id,
+            }
+        )
+        client, history_store = self._dsh_client_ready()
+        # Reserve ordering before starting I/O. A concurrent GetHistory begun
+        # later must always own a larger sequence even if its DSH read finishes
+        # first; otherwise this reconciliation could overwrite newer content.
+        build_seq = self._history_build_sequences.get(sid, 0) + 1
+        self._history_build_sequences[sid] = build_seq
+        page = await history_store.page(
+            native_sid,
+            wire_session_id=sid,
+            before=None,
+            limit=8,
+        )
+        accepted = (
+            any(turn.clientMsgId == expected_msg_id for turn in page.turns)
+            or any(
+                    (
+                        event.get("type") == "user_msg"
+                        and event.get("client_msg_id") == expected_msg_id
+                    )
+                    or (
+                        event.get("type") == "turn_steered"
+                        and expected_msg_id in {
+                            event.get("msg_id"), event.get("client_msg_id"),
+                        }
+                    )
+                    for event in page.events
+            )
+            if expected_msg_id is not None else None
+        )
+        async with ctx.dsh_event_lock:
+            if page.last_seq >= ctx.dsh_last_source_seq:
+                ctx.dsh_last_source_seq = page.last_seq
+                ctx.dsh_translator = page.translator
+            translator = ctx.dsh_translator
+            active = bool(
+                isinstance(translator, DshStreamTranslator)
+                and translator.active_turn is not None
+            )
+        # DSH history is cut at a bounded message window. A long active turn
+        # can therefore yield a valid tail page whose turn/start is older than
+        # the cut; translator.active_turn alone is not proof that the native
+        # session is idle. Consult the catalog whenever the source tail cannot
+        # prove activity (and when resolving a missing receipt).
+        catalog_running: bool | None = None
+        if not active or (expected_msg_id is not None and not accepted):
+            raw = await client.call("session.list")
+            rows = raw.get("items") if isinstance(raw, dict) else None
+            if not isinstance(rows, list):
+                raise DshProtocolError("session.list omitted items")
+            row = next((
+                item for item in rows
+                if isinstance(item, dict)
+                and item.get("sessionId") == native_sid
+            ), None)
+            if row is None:
+                raise DshProtocolError("DSH resident disappeared from catalog")
+            running = row.get("running")
+            if not isinstance(running, bool):
+                raise DshProtocolError("DSH catalog omitted running state")
+            catalog_running = running
+        # The mux may publish the exact user identity or even a whole new turn
+        # while ``session.list`` is in flight. Re-enter its ordering lane before
+        # applying the older catalog observation: otherwise a live acceptance
+        # can be reported as rejected and a fresh running state overwritten by
+        # idle. A marker can only disappear here through source-bound live or a
+        # concurrent source-bound reconciliation.
+        async with ctx.dsh_event_lock:
+            translator = ctx.dsh_translator
+            active = bool(
+                isinstance(translator, DshStreamTranslator)
+                and translator.active_turn is not None
+            )
+            live_resolved = bool(
+                expected_was_pending
+                and expected_msg_id not in {
+                    ctx.dsh_uncertain_msg_id,
+                    ctx.dsh_uncertain_steer_id,
+                }
+            )
+            if live_resolved:
+                accepted = True
+            source_running = bool(
+                active
+                or catalog_running is True
+                # A direct user/message can precede turn/start on the mux. Keep
+                # the query's admitted running state through that short gap; a
+                # live terminal would already have changed it back to idle.
+                or (live_resolved and ctx.state != "idle")
+            )
+            # Publish the canonical page before changing state so a browser never
+            # sees idle while its exact terminal/content repair is still in flight.
+            projected = History(
+                session_id=sid,
+                revision=self._history_revision(sid),
+                generation=self.instance_id,
+                build_seq=build_seq,
+                live_seq=ctx.seq,
+                events=[],
+                turns=list(page.turns),
+                detail="summary",
+                has_more=page.has_more,
+                oldest_id=page.oldest_id,
+                newest_id=page.newest_id,
+                control=self._session_control(ctx),
+                external=False,
+                # A bounded tail can omit turn/start, while catalog/status can
+                # announce running before mux publishes it. Preserve either source
+                # of positive activity across those independent streams.
+                in_progress=source_running,
+            )
+            projected.sid = sid
+            await self.transport.send(projected)
+
+            if not source_running:
+                ctx.active_msg_id = None
+                ctx.interrupt_deadline = None
+                ctx.interrupt_event.clear()
+                if expected_msg_id == ctx.dsh_uncertain_msg_id:
+                    ctx.dsh_uncertain_msg_id = None
+                if ctx.state != "idle":
+                    await self._set_state(ctx, "idle")
+                await self.transport.send(SessionActivity(
+                    engine="dsh", session_id=sid, state="idle",
+                ))
+            elif ctx.state != "running":
+                ctx.interrupt_deadline = None
+                ctx.interrupt_event.clear()
+                await self._set_state(ctx, "running")
+        if expected_msg_id is None:
+            return None
+        if accepted:
+            if ctx.dsh_uncertain_msg_id == expected_msg_id:
+                ctx.dsh_uncertain_msg_id = None
+            return True
+        if catalog_running is False and not active:
+            return False
+        return None
+
+    async def _reconcile_dsh_terminal(self, ctx: SessionContext) -> None:
+        # Give the independent mux reader one scheduling turn to deliver the
+        # exact terminal before falling back to a source-log read.
+        await asyncio.sleep(0)
+        if ctx.state == "idle":
+            return
+        try:
+            await self._reconcile_dsh_resident(ctx)
+        except Exception as exc:
+            log.debug(
+                "DSH terminal reconciliation deferred",
+                session_id=self._ctx_wire_sid(ctx),
+                error_type=type(exc).__name__,
+            )
+
+    async def _reconcile_dsh_prompt(
+        self, ctx: SessionContext, msg_id: str,
+    ) -> None:
+        """Resolve a prompt whose HTTP receipt was lost without duplicating it."""
+        for delay in self.DSH_RECEIPT_RECONCILE_DELAYS:
+            if delay:
+                await asyncio.sleep(delay)
+            if ctx.dsh_uncertain_msg_id != msg_id:
+                return
+            try:
+                accepted = await self._reconcile_dsh_resident(
+                    ctx, expected_msg_id=msg_id,
+                )
+            except Exception as exc:
+                log.debug(
+                    "DSH prompt reconciliation deferred",
+                    session_id=self._ctx_wire_sid(ctx),
+                    error_type=type(exc).__name__,
+                )
+                continue
+            if accepted is True:
+                return
+            if accepted is False:
+                ctx.dsh_uncertain_msg_id = None
+                ctx.active_msg_id = None
+                if ctx.state != "idle":
+                    await self._set_state(ctx, "idle")
+                await self._emit(ctx, Error(
+                    code=ERR_INTERNAL,
+                    message="DeepSeek Harness 未接收本次消息，请重试。",
+                    msg_id=msg_id,
+                ))
+                return
+        # The host may be temporarily unavailable.  Preserve the uncertain
+        # marker and running state; availability recovery will perform the same
+        # source-bound reconciliation instead of guessing or inviting a resend.
+        log.info(
+            "DSH prompt outcome remains uncertain",
+            session_id=self._ctx_wire_sid(ctx),
+            msg_id=msg_id,
+        )
+
+    async def _reconcile_dsh_steer(
+        self,
+        ctx: SessionContext,
+        msg_id: str,
+        *,
+        notify_rejected: bool,
+    ) -> bool | None:
+        """Resolve one lost DSH steer receipt from its exact source identity.
+
+        Unlike a first prompt, a steer is already inside a running turn, so an
+        unknown outcome must not change the resident state.  ``None`` remains
+        fail-closed: the caller tells the user not to repeat the mutation while
+        the source stream/history continues the reconciliation.
+        """
+        for delay in self.DSH_RECEIPT_RECONCILE_DELAYS:
+            if delay:
+                await asyncio.sleep(delay)
+            if ctx.dsh_uncertain_steer_id != msg_id:
+                return True
+            try:
+                accepted = await self._reconcile_dsh_resident(
+                    ctx, expected_msg_id=msg_id,
+                )
+            except Exception as exc:
+                log.debug(
+                    "DSH steer reconciliation deferred",
+                    session_id=self._ctx_wire_sid(ctx),
+                    error_type=type(exc).__name__,
+                )
+                continue
+            if accepted is True:
+                ctx.dsh_uncertain_steer_id = None
+                return True
+            if accepted is False:
+                ctx.dsh_uncertain_steer_id = None
+                if notify_rejected:
+                    await self._emit(ctx, Error(
+                        code=ERR_NOT_STEERABLE,
+                        message="DeepSeek Harness 未接收本次引导。",
+                        msg_id=msg_id,
+                    ))
+                return False
+        log.info(
+            "DSH steer outcome remains uncertain",
+            session_id=self._ctx_wire_sid(ctx),
+            msg_id=msg_id,
+        )
+        return None
+
+    async def _on_dsh_host(self, frame: dict) -> None:
+        payload = frame["payload"]
+        frame_type = payload.get("type")
+        native_sid = payload.get("sessionId")
+        if frame_type == "host/archived-sessions-changed":
+            archived = payload.get("archivedSessionIds")
+            if not isinstance(archived, list) or not all(
+                isinstance(item, str) for item in archived
+            ):
+                raise DshProtocolError("DSH archived-session state is invalid")
+            await self._invalidate_session_list("dsh", "code")
+            return
+        if not isinstance(native_sid, str):
+            # Workspace and remote Cordis events do not address a conversation.
+            return
+        wire_sid = dsh_wire_session_id(native_sid)
+        ctx = self.sessions.get(wire_sid)
+        if frame_type == "host/session-status":
+            running = payload.get("running")
+            if not isinstance(running, bool):
+                raise DshProtocolError("DSH status frame omitted running")
+            if running:
+                if ctx is not None and ctx.engine == "dsh":
+                    if ctx.state != "running":
+                        await self._set_state(ctx, "running")
+                await self.transport.send(SessionActivity(
+                    engine="dsh",
+                    session_id=wire_sid,
+                    state="running",
+                ))
+            elif ctx is not None and ctx.engine == "dsh":
+                # Host status and session events use independent WebSockets. A
+                # false status may overtake the exact terminal turn/end, so do
+                # not close the browser turn from this advisory signal.
+                self._track_dsh_task(
+                    self._reconcile_dsh_terminal(ctx),
+                    name=f"cc-remote-dsh-terminal-{native_sid}",
+                )
+            else:
+                # Cold sidebar rows have no resident turn projection to race.
+                await self.transport.send(SessionActivity(
+                    engine="dsh",
+                    session_id=wire_sid,
+                    state="idle",
+                ))
+            return
+        if frame_type == "host/agent-error":
+            message = payload.get("message")
+            if ctx is not None and isinstance(message, str):
+                await self._emit(ctx, Error(
+                    code=ERR_CC_CRASH,
+                    message=(message[:4096] or "DSH Agent 运行失败"),
+                    msg_id=ctx.active_msg_id,
+                ))
+            return
+        if frame_type == "host/session-removed" and ctx is not None:
+            self.sessions.pop(wire_sid, None)
+            if self.focused_sid == wire_sid:
+                self.focused_sid = None
+        if frame_type in {"host/session-added", "host/session-removed"}:
+            await self._invalidate_session_list("dsh", "code")
+
+    async def _on_dsh_mux(self, frame: dict) -> None:
+        payload = frame["payload"]
+        frame_type = payload.get("type")
+        native_sid = payload.get("sessionId")
+        if frame_type == "stream/error":
+            return
+        if not isinstance(native_sid, str):
+            raise DshProtocolError("DSH mux frame omitted sessionId")
+        wire_sid = dsh_wire_session_id(native_sid)
+        ctx = self.sessions.get(wire_sid)
+        if frame_type == "session/event":
+            event = payload.get("event")
+            if not isinstance(event, dict):
+                raise DshProtocolError("DSH mux event omitted event")
+            source_seq = event.get("seq")
+            if not isinstance(source_seq, int) or isinstance(source_seq, bool):
+                raise DshProtocolError("DSH mux event omitted seq")
+            if ctx is None or ctx.engine != "dsh":
+                return
+            async with ctx.dsh_event_lock:
+                if source_seq <= ctx.dsh_last_source_seq:
+                    return
+                ctx.dsh_last_source_seq = source_seq
+                if event.get("type") == "turn/start" and ctx.state != "running":
+                    await self._set_state(ctx, "running")
+                translator = ctx.dsh_translator
+                if not isinstance(translator, DshStreamTranslator):
+                    translator = DshStreamTranslator()
+                    ctx.dsh_translator = translator
+                event_type = event.get("type")
+                command_id = None
+                command_alias = None
+                if event_type in {"command/run", "command/done"}:
+                    data = event.get("data")
+                    command_id = (
+                        data.get("commandId")
+                        if isinstance(data, dict) else None
+                    )
+                    if isinstance(command_id, str):
+                        command_alias = ctx.dsh_command_aliases.get(command_id)
+                    if (
+                        event_type == "command/run"
+                        and isinstance(command_id, str)
+                        and ctx.dsh_pending_command_msg_id is not None
+                        and ctx.dsh_pending_command_prompt is not None
+                        and isinstance(data, dict)
+                    ):
+                        name = data.get("name")
+                        args = data.get("args")
+                        native_prompt = (
+                            f"/{name}{args or ''}"
+                            if isinstance(name, str)
+                            and (args is None or isinstance(args, str))
+                            else None
+                        )
+                        if native_prompt == ctx.dsh_pending_command_prompt:
+                            command_alias = ctx.dsh_pending_command_msg_id
+                            self._remember_dsh_command_alias(
+                                ctx, command_id, command_alias,
+                            )
+                try:
+                    translated = translator.feed(
+                        event,
+                        view=payload.get("view"),
+                        command_client_id=command_alias,
+                    )
+                except DshEventError as exc:
+                    raise DshProtocolError(str(exc)) from exc
+                suppress_command_lifecycle = bool(
+                    event_type in {"command/run", "command/done"}
+                    and command_alias is not None
+                )
+                for message in translated:
+                    # commands/execute settles with the exact native commandId.
+                    # Until then, emitting command/run would create a second
+                    # user row beside the browser's optimistic message.  The
+                    # settlement path publishes one aliased canonical page.
+                    if suppress_command_lifecycle:
+                        continue
+                    if isinstance(message, (UserMsg, TurnSteered)):
+                        history_store = self._dsh_history
+                        remember_images = getattr(
+                            history_store, "remember_event_images", None)
+                        if callable(remember_images):
+                            refs = remember_images(
+                                wire_sid,
+                                event,
+                                message.msg_id,
+                                message.client_msg_id,
+                            )
+                            if refs:
+                                message.image_refs = refs
+                    await self._emit(ctx, message)
+                    if (
+                        isinstance(message, UserMsg)
+                        and message.client_msg_id == ctx.dsh_uncertain_msg_id
+                    ):
+                        ctx.dsh_uncertain_msg_id = None
+                    if (
+                        isinstance(message, TurnSteered)
+                        and ctx.dsh_uncertain_steer_id in {
+                            message.msg_id, message.client_msg_id,
+                        }
+                    ):
+                        ctx.dsh_uncertain_steer_id = None
+                    if (
+                        isinstance(message, TurnEnd)
+                        and event_type == "turn/end"
+                    ):
+                        ctx.active_msg_id = None
+                        ctx.interrupt_deadline = None
+                        ctx.interrupt_event.clear()
+                        ctx.dsh_uncertain_msg_id = None
+                        if ctx.state != "idle":
+                            await self._set_state(ctx, "idle")
+                        await self._invalidate_session_list("dsh", "code")
+                if (
+                    event_type == "command/done"
+                    and isinstance(command_id, str)
+                    and command_alias is not None
+                    and ctx.dsh_pending_command_msg_id == command_alias
+                ):
+                    data = event.get("data")
+                    if isinstance(data, dict):
+                        await self._finish_dsh_command(
+                            ctx,
+                            msg_id=command_alias,
+                            prompt=ctx.dsh_pending_command_prompt or "",
+                            name=(
+                                (ctx.dsh_pending_command_prompt or "")
+                                .removeprefix("/").split(maxsplit=1)[0]
+                                or "command"
+                            ),
+                            kind=(
+                                data.get("kind")
+                                if data.get("kind") in {"success", "error"}
+                                else "error"
+                            ),
+                            text=(
+                                data.get("text")
+                                if isinstance(data.get("text"), str) else None
+                            ),
+                            command_id=command_id,
+                        )
+                if event_type == "session/title":
+                    await self._invalidate_session_list("dsh", "code")
+            return
+        if frame_type == "session/subscribed":
+            last_seq = payload.get("lastSeq")
+            if not isinstance(last_seq, int) or isinstance(last_seq, bool):
+                raise DshProtocolError("DSH subscription omitted lastSeq")
+            if ctx is not None and ctx.engine == "dsh":
+                ctx.dsh_last_source_seq = max(ctx.dsh_last_source_seq, last_seq)
+            return
+        if frame_type == "session/projection":
+            if payload.get("key") == "title":
+                await self._invalidate_session_list("dsh", "code")
+            return
+        if frame_type in {"session/queue", "session/jobs"}:
+            # DSH owns these transient plugin surfaces. cc-remote's first
+            # release keeps its own durable send queue and renders job/tool
+            # lifecycle from the ordinary session event stream.
+            return
+        if frame_type == "approval/requested":
+            if ctx is not None and ctx.engine == "dsh":
+                approval_id = payload.get("approvalId")
+                if isinstance(approval_id, str):
+                    self._dsh_pending_approvals[
+                        (wire_sid, approval_id)
+                    ] = frame["rpcId"]
+                tracked = self._track_dsh_task(
+                    self._answer_dsh_approval(ctx, frame),
+                    name=f"cc-remote-dsh-approval-{native_sid}",
+                )
+                if not tracked:
+                    if isinstance(approval_id, str):
+                        self._dsh_pending_approvals.pop(
+                            (wire_sid, approval_id), None
+                        )
+                    client = self._dsh_client
+                    if client is not None:
+                        await client.respond_error(
+                            frame["rpcId"],
+                            message="Remote interaction capacity was reached",
+                        )
+            return
+        if frame_type == "question/requested":
+            if ctx is not None and ctx.engine == "dsh":
+                tracked = self._track_dsh_task(
+                    self._answer_dsh_questions(ctx, frame),
+                    name=f"cc-remote-dsh-question-{native_sid}",
+                )
+                if not tracked:
+                    client = self._dsh_client
+                    if client is not None:
+                        await client.respond_error(
+                            frame["rpcId"],
+                            message="Remote interaction capacity was reached",
+                        )
+            return
+        if frame_type == "approval/resolved":
+            approval_id = payload.get("approvalId")
+            request_id = self._dsh_pending_approvals.pop(
+                (wire_sid, approval_id), None
+            ) if isinstance(approval_id, str) else None
+            if request_id:
+                self._cancel_dsh_request_asks(ctx, wire_sid, request_id)
+            return
+        if frame_type == "question/resolved":
+            request_id = payload.get("questionRpcId")
+            if isinstance(request_id, str):
+                self._cancel_dsh_request_asks(ctx, wire_sid, request_id)
+
+    def _cancel_dsh_request_asks(
+        self,
+        ctx: SessionContext | None,
+        session_id: str,
+        request_id: str,
+    ) -> None:
+        ask_ids = self._dsh_pending_request_asks.pop(
+            (session_id, request_id), set()
+        )
+        if ctx is None:
+            return
+        for ask_id in ask_ids:
+            future = ctx.pending_asks.get(ask_id)
+            if future is not None and not future.done():
+                future.set_exception(AskSuperseded())
+
+    @staticmethod
+    def _dsh_ask_id(
+        session_id: str,
+        request_id: str,
+        suffix: str,
+    ) -> str:
+        digest = hashlib.sha256(
+            f"{session_id}\0{request_id}\0{suffix}".encode(
+                "utf-8", "surrogatepass"
+            )
+        ).hexdigest()[:32]
+        return f"dsh-ask-{digest}"
+
+    async def _answer_dsh_approval(
+        self, ctx: SessionContext, frame: dict,
+    ) -> None:
+        client = self._dsh_client
+        if client is None or not ctx.session_id:
+            return
+        payload = frame["payload"]
+        request_id = frame["rpcId"]
+        wire_sid = self._ctx_wire_sid(ctx)
+        if not wire_sid:
+            raise DshProtocolError("DSH approval session is unavailable")
+        approval_id = payload.get("approvalId")
+        if not isinstance(approval_id, str):
+            raise DshProtocolError("DSH approval omitted approvalId")
+        tool = payload.get("toolName")
+        reason = payload.get("reason")
+        question = f"DeepSeek Harness 请求使用工具：{tool or 'unknown'}"
+        if isinstance(reason, str) and reason:
+            question += f"\n原因：{reason[:4000]}"
+        ask_id = self._dsh_ask_id(wire_sid, request_id, approval_id)
+        request_key = (wire_sid, request_id)
+        self._dsh_pending_request_asks.setdefault(request_key, set()).add(ask_id)
+        try:
+            answer = await self._on_ask_optional(
+                ctx,
+                question,
+                [
+                    {"label": "允许一次", "ds": "仅批准这一次操作"},
+                    {"label": "拒绝", "ds": "拒绝这次操作"},
+                ],
+                header="DSH 权限审批",
+                ask_id=ask_id,
+            )
+            await client.respond(request_id, {
+                "sessionId": ctx.session_id,
+                "approvalId": approval_id,
+                "outcome": (
+                    "allowed-once" if answer == "允许一次" else "rejected"
+                ),
+            })
+        except AskUnavailable:
+            # A disconnected browser, timeout, or superseding native surface
+            # is never implicit consent.  DSH keeps this RPC pending until a
+            # response arrives, so close it explicitly and fail closed.
+            await client.respond(request_id, {
+                "sessionId": ctx.session_id,
+                "approvalId": approval_id,
+                "outcome": "rejected",
+            })
+        finally:
+            self._dsh_pending_approvals.pop(
+                (wire_sid, approval_id), None
+            )
+            self._dsh_pending_request_asks.pop(request_key, None)
+
+    async def _answer_dsh_questions(
+        self, ctx: SessionContext, frame: dict,
+    ) -> None:
+        client = self._dsh_client
+        if client is None or not ctx.session_id:
+            return
+        payload = frame["payload"]
+        request_id = frame["rpcId"]
+        wire_sid = self._ctx_wire_sid(ctx)
+        if not wire_sid:
+            raise DshProtocolError("DSH question session is unavailable")
+        request_key = (wire_sid, request_id)
+        questions = payload.get("questions")
+        if not isinstance(questions, list) or not questions:
+            raise DshProtocolError("DSH question request omitted questions")
+        if len(questions) > 32:
+            await client.respond_error(
+                request_id,
+                message="Remote question batch exceeds the supported bound",
+            )
+            return
+        answers: list[dict] = []
+        try:
+            # Keep a DSH batch contiguous while still allowing AnswerQuestion to
+            # run on the machine's ordinary command lane.
+            async with ctx.ask_lock:
+                for index, question in enumerate(questions):
+                    if not isinstance(question, dict):
+                        raise DshProtocolError("DSH question item is invalid")
+                    question_id = question.get("id")
+                    prompt = question.get("question")
+                    if not isinstance(question_id, str) or not question_id:
+                        raise DshProtocolError("DSH question omitted id")
+                    if not isinstance(prompt, str) or not prompt:
+                        raise DshProtocolError("DSH question omitted text")
+                    detail = question.get("detail")
+                    if isinstance(detail, str) and detail:
+                        prompt = f"{prompt}\n\n{detail}"
+                    raw_options = question.get("options")
+                    option_rows = raw_options if isinstance(raw_options, list) else []
+                    options: list[dict[str, str]] = []
+                    for option in option_rows[:ASK_OPTION_MAX_COUNT]:
+                        if not isinstance(option, dict):
+                            continue
+                        label = option.get("label")
+                        if not isinstance(label, str) or not label:
+                            continue
+                        item = {"label": label[:512]}
+                        description = option.get("description")
+                        if isinstance(description, str) and description:
+                            item["ds"] = description[:2048]
+                        options.append(item)
+                    multi_select = question.get("multiSelect") is True
+                    allow_text = len(option_rows) != len(options) or len(options) < 2
+                    ask_id = self._dsh_ask_id(
+                        wire_sid,
+                        request_id,
+                        f"{index}:{question_id}",
+                    )
+                    self._dsh_pending_request_asks.setdefault(
+                        request_key, set(),
+                    ).add(ask_id)
+                    answer = await self._on_ask_locked(
+                        ctx,
+                        prompt[:16000],
+                        options,
+                        header=(str(question.get("header"))[:512]
+                                if question.get("header") else None),
+                        allow_text=allow_text,
+                        multi_select=multi_select,
+                        ask_id=ask_id,
+                    )
+                    values = answer if isinstance(answer, list) else [answer]
+                    labels = {option["label"] for option in options}
+                    selected = [value for value in values if value in labels]
+                    custom_values = [value for value in values if value not in labels]
+                    answer_row = {"id": question_id, "selected": selected}
+                    if custom_values:
+                        answer_row["custom"] = "\n".join(custom_values)[:16000]
+                    answers.append(answer_row)
+            await client.respond(request_id, {
+                "sessionId": ctx.session_id,
+                "answer": {"answers": answers},
+            })
+        except AskUnavailable:
+            await client.respond_error(
+                request_id,
+                message="Remote question interaction was cancelled",
+            )
+        finally:
+            self._dsh_pending_request_asks.pop(request_key, None)
 
     @staticmethod
     def _goal_identity(goal: object) -> Optional[str]:
@@ -2319,16 +3434,22 @@ class WrapperMachine:
             revision=snapshot.completion_revision,
         )
 
+    def _presentation_store_for_engine(self, engine: str):
+        if engine == "dsh":
+            return self._dsh_session_presentation
+        return self._session_presentation
+
     def _session_presentation_fields(
         self,
         engine: str,
         session_id: str,
     ) -> dict[str, object]:
         """Project a durable completion receipt into one cold catalog row."""
-        if self._session_presentation is None:
+        store = self._presentation_store_for_engine(engine)
+        if store is None:
             return {}
         try:
-            snapshot = self._session_presentation.get(engine, session_id)
+            snapshot = store.get(engine, session_id)
         except SessionPresentationStoreError:
             log.warning(
                 "session completion receipt could not be listed",
@@ -5001,8 +6122,10 @@ class WrapperMachine:
                 if c.session_id != sid:
                     continue
                 if (
-                    c.engine != "codex"
+                    c.engine == "claude"
                     or (
+                        c.engine == "codex"
+                        and
                         not self._codex_profiles.is_multi_profile
                         and (c.codex_profile_id or default_profile_id)
                         == default_profile_id
@@ -5318,6 +6441,25 @@ class WrapperMachine:
         for session_id, entry in list(self._private_btw_sessions.items()):
             await self._delete_private_btw(session_id, entry["cwd"])
 
+    async def _cancel_dsh_commands_for_shutdown(self) -> None:
+        """Cancel command HTTP owners without publishing a user interrupt."""
+        tasks: list[asyncio.Task] = []
+        for ctx in self.sessions.values():
+            task = ctx.turn_task
+            if (
+                ctx.engine == "dsh"
+                and ctx.dsh_pending_command_msg_id is not None
+                and task is not None
+                and not task.done()
+            ):
+                ctx.dsh_pending_command_msg_id = None
+                ctx.dsh_pending_command_prompt = None
+                tasks.append(task)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     # ---- lifecycle ----
 
     async def run(self) -> None:
@@ -5332,6 +6474,12 @@ class WrapperMachine:
         # `new_session(engine="codex")` command.
         await self.transport.start()
         try:
+            if self._dsh_client is not None:
+                await self._dsh_client.start(
+                    self._on_dsh_mux,
+                    self._on_dsh_host,
+                    self._on_dsh_availability,
+                )
             bootstrap_sid = (
                 self.cfg.resume_session_id
                 or load_session_id(self.cfg.state_dir, self.cfg.cc_cwd)
@@ -5412,6 +6560,21 @@ class WrapperMachine:
                         continue
                 await self._process_command_safely(cmd)
         finally:
+            # A DSH slash handler can legitimately outlive an ordinary unary
+            # timeout.  It is owned by the commands/execute HTTP task rather
+            # than DSH's session.cancel RPC, so close that exact request before
+            # stopping the shared client.  Clear the marker first: process
+            # shutdown is not a user interrupt and must not append a synthetic
+            # "Remote 打断" row to an otherwise durable native command.
+            await self._cancel_dsh_commands_for_shutdown()
+            dsh_tasks = list(self._dsh_interaction_tasks)
+            for task in dsh_tasks:
+                task.cancel()
+            if dsh_tasks:
+                await asyncio.gather(*dsh_tasks, return_exceptions=True)
+            self._dsh_interaction_tasks.clear()
+            if self._dsh_client is not None:
+                await self._dsh_client.stop()
             models_tasks = list(self._models_command_tasks.values())
             for task in models_tasks:
                 task.cancel()
@@ -5815,6 +6978,7 @@ class WrapperMachine:
             buffer_head_seq=(ctx.buffer.head_seq if ctx else 0),
             buffer_tail_seq=(ctx.buffer.tail_seq if ctx else 0),
         ))
+        await self.transport.send(self._engine_catalog())
 
     async def _restore_codex_owned_turns(self) -> None:
         """Rehydrate background daemon turns before accepting client commands."""
@@ -6579,17 +7743,20 @@ class WrapperMachine:
         await self._observe_preview_path_event(ctx, msg)
         async with ctx.emit_lock:
             await self._emit_locked(ctx, msg)
+            presentation_store = self._presentation_store_for_engine(
+                ctx.engine
+            )
             if (
                 isinstance(msg, TurnEnd)
                 and not msg.result.is_error
                 and not ctx.btw
-                and self._session_presentation is not None
+                and presentation_store is not None
             ):
                 sid = self._ctx_wire_sid(ctx) or ctx.key
                 if sid:
                     try:
                         snapshot = await asyncio.to_thread(
-                            self._session_presentation.mark_completion,
+                            presentation_store.mark_completion,
                             ctx.engine,
                             sid,
                             msg.turn_id,
@@ -7833,6 +9000,12 @@ class WrapperMachine:
         # sids it already knows and receives only seq > cursor from those rings.
         # This restores live tail loss without reviving the old all-session replay
         # flood. A concurrent turn may re-key sessions across the awaits below.
+        await self.transport.send(
+            self._engine_catalog(
+                to=getattr(cmd, "client_id", None),
+                route_id=getattr(cmd, "route_id", None),
+            )
+        )
         supplied_cursors = getattr(cmd, "cursors", None)
         cursors = dict(supplied_cursors) if isinstance(supplied_cursors, dict) else {}
         supplied_generations = getattr(cmd, "generations", None)
@@ -7939,10 +9112,13 @@ class WrapperMachine:
                         "sid": sid,
                         "route_id": getattr(cmd, "route_id", None),
                     }))
-                if not ctx.btw and self._session_presentation is not None:
+                presentation_store = self._presentation_store_for_engine(
+                    ctx.engine
+                )
+                if not ctx.btw and presentation_store is not None:
                     try:
                         presentation = await asyncio.to_thread(
-                            self._session_presentation.get, ctx.engine, sid
+                            presentation_store.get, ctx.engine, sid
                         )
                     except SessionPresentationStoreError:
                         log.warning(
@@ -8062,8 +9238,10 @@ class WrapperMachine:
         return next((
             ctx for ctx in self.sessions.values()
             if ctx.session_id == sid and (
-                ctx.engine != "codex"
+                ctx.engine == "claude"
                 or (
+                    ctx.engine == "codex"
+                    and
                     not self._codex_profiles.is_multi_profile
                     and (ctx.codex_profile_id or default_profile_id)
                     == default_profile_id
@@ -10911,6 +12089,113 @@ class WrapperMachine:
             history.authoritative = False
         return history
 
+    async def _build_dsh_history(
+        self,
+        sid: str,
+        *,
+        before: str | None,
+        limit: int | None,
+        detail: str,
+        command_aliases: dict[str, str] | None = None,
+    ) -> History:
+        revision = self._history_revision(sid)
+        if before is None:
+            build_seq = self._history_build_sequences.get(sid, 0) + 1
+            self._history_build_sequences[sid] = build_seq
+        else:
+            build_seq = self._history_build_sequences.get(sid, 0)
+        ctx = self._ctx_by_sid(sid)
+        try:
+            native_sid = dsh_native_session_id(sid)
+            _client, history = self._dsh_client_ready()
+            aliases: dict[str, str] = {}
+            if ctx is not None and ctx.engine == "dsh":
+                aliases.update(ctx.dsh_command_aliases)
+            if command_aliases:
+                aliases.update(command_aliases)
+            page = await history.page(
+                native_sid,
+                wire_session_id=sid,
+                before=before,
+                limit=limit or 4,
+                command_aliases=aliases or None,
+            )
+            if (
+                before is None
+                and ctx is not None
+                and ctx.engine == "dsh"
+            ):
+                async with ctx.dsh_event_lock:
+                    if page.last_seq >= ctx.dsh_last_source_seq:
+                        ctx.dsh_last_source_seq = page.last_seq
+                        ctx.dsh_translator = page.translator
+            title = page.projections.get("title")
+            if isinstance(title, str) and title:
+                self._remember_notification_title(sid, title)
+            return History(
+                session_id=sid,
+                revision=revision,
+                generation=self.instance_id,
+                build_seq=build_seq,
+                live_seq=ctx.seq if ctx is not None else None,
+                events=(list(page.events) if detail == "full" else []),
+                turns=(list(page.turns) if detail == "summary" else []),
+                detail=detail,
+                has_more=page.has_more,
+                before=before,
+                control=(
+                    self._session_control(ctx)
+                    if ctx is not None and ctx.engine == "dsh" else None
+                ),
+                oldest_id=page.oldest_id,
+                newest_id=page.newest_id,
+                external=False,
+                in_progress=bool(
+                    ctx is not None and ctx.engine == "dsh"
+                    and ctx.state != "idle"
+                ),
+            )
+        except Exception as exc:
+            log.warning(
+                "DSH history failed",
+                session_id=sid,
+                error_type=type(exc).__name__,
+            )
+            return History(
+                session_id=sid,
+                revision=revision,
+                generation=self.instance_id,
+                build_seq=build_seq,
+                live_seq=ctx.seq if ctx is not None else None,
+                authoritative=False,
+                error="DeepSeek Harness 历史暂时不可用，请稍后重试",
+                events=[],
+                turns=[],
+                detail=detail,
+                has_more=False,
+                before=before,
+                control=(
+                    self._session_control(ctx)
+                    if ctx is not None and ctx.engine == "dsh" else None
+                ),
+                external=False,
+                in_progress=bool(
+                    ctx is not None and ctx.engine == "dsh"
+                    and ctx.state != "idle"
+                ),
+            )
+
+    async def _push_dsh_history(self, ctx: SessionContext) -> History | None:
+        sid = self._ctx_wire_sid(ctx)
+        if ctx.engine != "dsh" or not sid:
+            return None
+        history = await self._build_dsh_history(
+            sid, before=None, limit=4, detail="summary"
+        )
+        history.sid = sid
+        await self.transport.send(history)
+        return history
+
     async def _build_requested_history(
         self,
         sid: str,
@@ -10921,6 +12206,13 @@ class WrapperMachine:
         detail: str,
     ) -> History:
         """Build one requester-neutral page shared by concurrent clients."""
+        if sid.startswith("dsh@"):
+            return await self._build_dsh_history(
+                sid,
+                before=before,
+                limit=limit,
+                detail=detail,
+            )
         self._watch_session(sid)
         # Content and ownership are independent projections.  A bounded ps/lsof
         # scan can take seconds on macOS and must not hold the conversation
@@ -11418,6 +12710,40 @@ class WrapperMachine:
         if requested_revision and requested_revision != revision:
             return await send(error="会话历史已更新，请重新展开该轮")
 
+        if sid.startswith("dsh@"):
+            history = self._dsh_history
+            rows = history.detail(sid, cmd.turn_id) if history else None
+            if rows is None:
+                return await send(
+                    error="详细过程已过期，请刷新会话后重新展开"
+                )
+            try:
+                page, has_more, oldest, has_newer, newer = (
+                    _turn_detail_page(
+                        rows,
+                        before=getattr(cmd, "before", None),
+                        limit=getattr(cmd, "limit", 192),
+                        max_bytes=min(
+                            8 * 1024 * 1024,
+                            max(
+                                512 * 1024,
+                                self.cfg.ws_max_size_bytes // 2,
+                            ),
+                        ),
+                    )
+                )
+            except ValueError:
+                return await send(
+                    error="详细过程分页位置已失效，请重新展开该轮"
+                )
+            return await send(
+                page,
+                has_more=has_more,
+                oldest_cursor=oldest,
+                has_newer=has_newer,
+                newer_cursor=newer,
+            )
+
         self._watch_session(sid)
         watch = self._watch.get(sid) or {}
         ctx = self._ctx_by_sid(sid)
@@ -11725,6 +13051,41 @@ class WrapperMachine:
         if requested_revision and requested_revision != revision:
             return await send(error="会话历史已更新，请重新加载图片")
 
+        if sid.startswith("dsh@"):
+            try:
+                native_sid = dsh_native_session_id(sid)
+                _client, history = self._dsh_client_ready()
+                source = await history.image(
+                    native_sid,
+                    cmd.turn_id,
+                    cmd.image_id,
+                    wire_session_id=sid,
+                )
+                if source is None:
+                    return await send(error="历史图片索引已过期，请刷新会话")
+                media_type, width, height, data = await asyncio.to_thread(
+                    _render_history_image,
+                    {
+                        "media_type": source.media_type,
+                        "data": source.data,
+                    },
+                    cmd.variant,
+                )
+                return await send(
+                    media_type=media_type,
+                    width=width,
+                    height=height,
+                    data=data,
+                )
+            except Exception as exc:
+                log.warning(
+                    "DSH history image failed",
+                    session_id=sid,
+                    image_id=cmd.image_id,
+                    error_type=type(exc).__name__,
+                )
+                return await send(error="历史图片暂时不可用，请稍后重试")
+
         self._watch_session(sid)
         watch = self._watch.get(sid) or {}
         ctx = self._ctx_by_sid(sid)
@@ -11894,6 +13255,13 @@ class WrapperMachine:
         if ctx is None:
             error = Error(code=ERR_NOT_RUNNING, message="该会话未启动，无法接管")
             await self._emit_to_sid(sid, error)
+            return error
+        if ctx.engine == "dsh":
+            error = Error(
+                code=ERR_AUTH,
+                message="DeepSeek Harness 会话由本机 Host 持有，无需 Remote 接管。",
+            )
+            await self._emit(ctx, error)
             return error
         if ctx.state != "idle":
             error = Error(code=ERR_BUSY, message="该会话正在运行，当前无需接管")
@@ -12096,6 +13464,278 @@ class WrapperMachine:
         # can recover a response that was lost with the original WebSocket.
         return None
 
+    async def _refresh_dsh_command_history(
+        self,
+        ctx: SessionContext,
+        command_id: str,
+        msg_id: str,
+    ) -> None:
+        """Publish the native command row once its browser alias is visible."""
+        sid = self._ctx_wire_sid(ctx)
+        if ctx.engine != "dsh" or not sid:
+            return
+        for delay in self.DSH_RECEIPT_RECONCILE_DELAYS:
+            if delay:
+                await asyncio.sleep(delay)
+            if self._ctx_by_sid(sid) is not ctx:
+                return
+            history = await self._build_dsh_history(
+                sid,
+                before=None,
+                limit=8,
+                detail="summary",
+                command_aliases={command_id: msg_id},
+            )
+            if not history.authoritative or not any(
+                turn.clientMsgId == msg_id for turn in history.turns
+            ):
+                continue
+            history.sid = sid
+            await self.transport.send(history)
+            return
+        log.info(
+            "DSH command history alias deferred",
+            session_id=sid,
+            msg_id=msg_id,
+        )
+
+    def _remember_dsh_command_alias(
+        self,
+        ctx: SessionContext,
+        command_id: str,
+        msg_id: str,
+    ) -> None:
+        """Bind one native command lifecycle to its browser presentation.
+
+        ``dict`` preserves insertion order on every supported Python version.
+        Reinsert an existing key to make this a small LRU without adding a
+        second cache type to the already-large resident context.
+        """
+        ctx.dsh_command_aliases.pop(command_id, None)
+        ctx.dsh_command_aliases[command_id] = msg_id
+        while len(ctx.dsh_command_aliases) > self.DSH_COMMAND_ALIAS_CAP:
+            oldest = next(iter(ctx.dsh_command_aliases))
+            ctx.dsh_command_aliases.pop(oldest, None)
+
+    async def _finish_dsh_command(
+        self,
+        ctx: SessionContext,
+        *,
+        msg_id: str,
+        prompt: str,
+        name: str,
+        kind: str,
+        text: str | None,
+        command_id: str | None,
+        interrupted: bool = False,
+    ) -> None:
+        """Close one standalone DSH command without inventing a fork point."""
+        if ctx.dsh_pending_command_msg_id != msg_id:
+            return
+        if command_id is not None:
+            self._remember_dsh_command_alias(ctx, command_id, msg_id)
+        item_id = dsh_command_item_id(command_id or msg_id, msg_id)
+        status = "interrupted" if interrupted else (
+            "succeeded" if kind == "success" else "failed"
+        )
+        terminal = TurnEnd(
+            presentation_id=msg_id,
+            result=TurnResult(
+                subtype=(
+                    "error_during_execution" if interrupted
+                    else "command_success" if kind == "success"
+                    else "command_error"
+                ),
+                duration_ms=0,
+                is_error=interrupted or kind == "error",
+            ),
+        )
+        messages = (
+            UserMsg(
+                msg_id=msg_id,
+                client_msg_id=msg_id,
+                prompt=prompt,
+            ),
+            ProcessEvent(
+                item_id=item_id,
+                kind="task",
+                phase="end",
+                status=status,
+                title=f"/{name}"[:1024],
+                command=prompt,
+                output=text[:2 * 1024 * 1024] if text else None,
+                duration_ms=0,
+            ),
+            terminal,
+        )
+        for message in messages:
+            try:
+                await self._emit(ctx, message)
+            except Exception as exc:
+                # _emit appends to the per-session replay ring before trying
+                # the live transport. Continue so every lifecycle boundary is
+                # recoverable after this socket reconnects.
+                log.debug(
+                    "DSH command live projection delayed",
+                    session_id=self._ctx_wire_sid(ctx),
+                    message_type=message.type,
+                    error_type=type(exc).__name__,
+                )
+        ctx.dsh_pending_command_msg_id = None
+        ctx.dsh_pending_command_prompt = None
+        ctx.active_msg_id = None
+        ctx.interrupt_deadline = None
+        ctx.interrupt_event.clear()
+        if ctx.state != "idle":
+            try:
+                await self._set_state(ctx, "idle")
+            except Exception as exc:
+                log.debug(
+                    "DSH command idle projection delayed",
+                    session_id=self._ctx_wire_sid(ctx),
+                    error_type=type(exc).__name__,
+                )
+        if command_id is not None:
+            self._track_dsh_task(
+                self._refresh_dsh_command_history(ctx, command_id, msg_id),
+                name=f"cc-remote-dsh-command-history-{msg_id}",
+            )
+        try:
+            await self._invalidate_session_list("dsh", "code")
+        except Exception as exc:
+            # The durable command and its per-session ring are already closed.
+            # A sidebar refresh hint is best effort and must not prevent the
+            # canonical aliased history page scheduled above.
+            log.debug(
+                "DSH command list invalidation delayed",
+                session_id=self._ctx_wire_sid(ctx),
+                error_type=type(exc).__name__,
+            )
+
+    async def _fail_dsh_command_unknown(
+        self,
+        ctx: SessionContext,
+        *,
+        msg_id: str,
+        prompt: str,
+        name: str,
+    ) -> None:
+        """Fail closed when commands/execute lost its native commandId."""
+        if ctx.dsh_pending_command_msg_id != msg_id:
+            return
+        messages = (
+            UserMsg(
+                msg_id=msg_id,
+                client_msg_id=msg_id,
+                prompt=prompt,
+            ),
+            ProcessEvent(
+                item_id=dsh_command_item_id(msg_id, msg_id),
+                kind="task",
+                phase="end",
+                status="failed",
+                title=f"/{name}"[:1024],
+                command=prompt,
+                summary="命令回执丢失，执行结果未知",
+            ),
+        )
+        for message in messages:
+            try:
+                await self._emit(ctx, message)
+            except Exception as exc:
+                log.debug(
+                    "DSH unknown command projection delayed",
+                    session_id=self._ctx_wire_sid(ctx),
+                    message_type=message.type,
+                    error_type=type(exc).__name__,
+                )
+        ctx.dsh_pending_command_msg_id = None
+        ctx.dsh_pending_command_prompt = None
+        ctx.active_msg_id = None
+        ctx.interrupt_deadline = None
+        ctx.interrupt_event.clear()
+        error = Error(
+            code=ERR_INTERNAL,
+            message=(
+                "DeepSeek Harness 命令回执丢失，执行结果未知。"
+                "请先刷新历史核对，确认前不要重复执行。"
+            ),
+            msg_id=msg_id,
+        )
+        try:
+            await self._emit(ctx, error)
+        except Exception as exc:
+            log.debug(
+                "DSH unknown command error delivery delayed",
+                session_id=self._ctx_wire_sid(ctx),
+                error_type=type(exc).__name__,
+            )
+        if ctx.state != "idle":
+            try:
+                await self._set_state(ctx, "idle")
+            except Exception as exc:
+                log.debug(
+                    "DSH unknown command idle projection delayed",
+                    session_id=self._ctx_wire_sid(ctx),
+                    error_type=type(exc).__name__,
+                )
+
+    async def _run_dsh_command(
+        self,
+        ctx: SessionContext,
+        prompt: str,
+        msg_id: str,
+        name: str,
+    ) -> None:
+        """Own a cancellable, potentially long-running DSH command request."""
+        task = asyncio.current_task()
+        try:
+            if not isinstance(ctx.sdk, DshSessionHandle):
+                raise DshProtocolError("DSH command handle is unavailable")
+            execution = await ctx.sdk.execute_command(
+                prompt, rpc_id=msg_id,
+            )
+        except asyncio.CancelledError:
+            if ctx.turn_task is task:
+                ctx.turn_task = None
+            await self._finish_dsh_command(
+                ctx,
+                msg_id=msg_id,
+                prompt=prompt,
+                name=name,
+                kind="error",
+                text="命令已由 Remote 打断",
+                command_id=None,
+                interrupted=True,
+            )
+            return
+        except Exception as exc:
+            if ctx.turn_task is task:
+                ctx.turn_task = None
+            log.warning(
+                "DSH command outcome unknown",
+                session_id=self._ctx_wire_sid(ctx),
+                error_type=type(exc).__name__,
+            )
+            await self._fail_dsh_command_unknown(
+                ctx,
+                msg_id=msg_id,
+                prompt=prompt,
+                name=name,
+            )
+            return
+        if ctx.turn_task is task:
+            ctx.turn_task = None
+        await self._finish_dsh_command(
+            ctx,
+            msg_id=msg_id,
+            prompt=prompt,
+            name=name,
+            kind=execution.kind,
+            text=execution.text,
+            command_id=execution.command_id,
+        )
+
     async def _handle_query(self, cmd):
         sid = getattr(cmd, "sid", None)
         ctx = self._ctx_for(sid)
@@ -12114,12 +13754,214 @@ class WrapperMachine:
             return await self._handle_immediate_query(ctx, cmd)
 
     async def _handle_immediate_query(self, ctx: SessionContext, cmd):
+        if (
+            ctx.engine == "dsh"
+            and ctx.dsh_pending_command_msg_id == getattr(cmd, "msg_id", None)
+        ):
+            # A reconnect may replay the same Query before the long-running
+            # command settles. Its wrapper-owned task is already the at-most-once
+            # owner, so acknowledge the duplicate by doing nothing.
+            return None
         if ctx.state != "idle":
             error = Error(
                 code=ERR_BUSY, message="该会话正忙,先 interrupt",
                 msg_id=getattr(cmd, "msg_id", None))
             await self._emit(ctx, error)
             return error
+        if ctx.engine == "dsh":
+            if not cmd.prompt and not cmd.images and not cmd.files:
+                error = Error(
+                    code=ERR_BAD_PROMPT,
+                    message="消息内容为空，请输入内容或添加图片。",
+                    msg_id=getattr(cmd, "msg_id", None),
+                )
+                await self._emit(ctx, error)
+                return error
+            if cmd.files:
+                error = Error(
+                    code=ERR_BAD_PROMPT,
+                    message="DeepSeek Harness 当前不支持通用文件附件。",
+                    msg_id=getattr(cmd, "msg_id", None),
+                )
+                await self._emit(ctx, error)
+                return error
+            attachment_error = validate_attachments(cmd.images, None)
+            if attachment_error:
+                error = Error(
+                    code=ERR_BAD_PROMPT,
+                    message="图片附件不符合要求，请调整后重试。",
+                    msg_id=getattr(cmd, "msg_id", None),
+                )
+                await self._emit(ctx, error)
+                return error
+            if not isinstance(ctx.sdk, DshSessionHandle):
+                error = Error(
+                    code=ERR_INTERNAL,
+                    message="DeepSeek Harness 会话控制器不可用。",
+                    msg_id=getattr(cmd, "msg_id", None),
+                )
+                await self._emit(ctx, error)
+                return error
+            if ctx.dsh_uncertain_steer_id is not None:
+                error = Error(
+                    code=ERR_STEER_UNKNOWN,
+                    message=(
+                        "上一条 DeepSeek Harness 引导结果仍在核对；"
+                        "确认前请勿重复发送。"
+                    ),
+                    msg_id=cmd.msg_id,
+                    request_id=getattr(cmd, "cmd_id", None),
+                    to=getattr(cmd, "client_id", None),
+                    sid=self._ctx_wire_sid(ctx),
+                )
+                await self.transport.send(error)
+                return error
+            try:
+                self._dsh_client_ready()
+            except DshError:
+                error = Error(
+                    code=ERR_NOT_RUNNING,
+                    message="DeepSeek Harness 本机服务未连接，本次未发送。",
+                    msg_id=getattr(cmd, "msg_id", None),
+                )
+                await self._emit(ctx, error)
+                return error
+            command_descriptor = None
+            if cmd.prompt.startswith("/") and not cmd.images:
+                try:
+                    command_descriptor = await ctx.sdk.resolve_command(
+                        cmd.prompt
+                    )
+                except DshUnavailable:
+                    error = Error(
+                        code=ERR_NOT_RUNNING,
+                        message=(
+                            "DeepSeek Harness 命令目录暂不可用，"
+                            "本次未发送。"
+                        ),
+                        msg_id=cmd.msg_id,
+                    )
+                    await self._emit(ctx, error)
+                    return error
+                except (DshRpcError, DshProtocolError) as exc:
+                    log.warning(
+                        "DSH command discovery failed",
+                        session_id=self._ctx_wire_sid(ctx),
+                        error_type=type(exc).__name__,
+                    )
+                    error = Error(
+                        code=ERR_INTERNAL,
+                        message=(
+                            "DeepSeek Harness 命令目录不兼容或暂不可用，"
+                            "本次未发送。"
+                        ),
+                        msg_id=cmd.msg_id,
+                    )
+                    await self._emit(ctx, error)
+                    return error
+            ctx.interrupt_event.clear()
+            ctx.interrupt_deadline = None
+            ctx.active_msg_id = cmd.msg_id
+            await self._set_state(ctx, "running")
+            if command_descriptor is not None:
+                ctx.dsh_pending_command_msg_id = cmd.msg_id
+                ctx.dsh_pending_command_prompt = cmd.prompt
+                try:
+                    await self._emit(ctx, ProcessEvent(
+                        item_id=dsh_command_item_id(cmd.msg_id, cmd.msg_id),
+                        kind="task",
+                        phase="start",
+                        status="running",
+                        title=f"/{command_descriptor.name}"[:1024],
+                        command=cmd.prompt,
+                    ))
+                except Exception as exc:
+                    log.debug(
+                        "DSH command start projection delayed",
+                        session_id=self._ctx_wire_sid(ctx),
+                        error_type=type(exc).__name__,
+                    )
+                ctx.turn_task = asyncio.create_task(
+                    self._run_dsh_command(
+                        ctx,
+                        cmd.prompt,
+                        cmd.msg_id,
+                        command_descriptor.name,
+                    ),
+                    name=f"cc-remote-dsh-command-{cmd.msg_id}",
+                )
+                return None
+            try:
+                result = await ctx.sdk.prompt(
+                    cmd.prompt,
+                    images=getattr(cmd, "images", None),
+                    rpc_id=cmd.msg_id,
+                    mode="queue",
+                )
+            except DshRpcError as exc:
+                ctx.active_msg_id = None
+                await self._set_state(ctx, "idle")
+                error = Error(
+                    code=ERR_BAD_PROMPT,
+                    message=(exc.message[:4096] or
+                             "DeepSeek Harness 拒绝了本次消息。"),
+                    msg_id=cmd.msg_id,
+                )
+                await self._emit(ctx, error)
+                return error
+            except (DshUnavailable, DshProtocolError) as exc:
+                # The carrier may fail after DSH appended the user message. Do
+                # not mark the optimistic turn failed or accept a duplicate
+                # retry until the source log proves which side committed.
+                ctx.dsh_uncertain_msg_id = cmd.msg_id
+                log.warning(
+                    "DSH prompt receipt lost; reconciling source history",
+                    session_id=self._ctx_wire_sid(ctx),
+                    error_type=type(exc).__name__,
+                )
+                tracked = self._track_dsh_task(
+                    self._reconcile_dsh_prompt(ctx, cmd.msg_id),
+                    name=f"cc-remote-dsh-prompt-{cmd.msg_id}",
+                )
+                if not tracked:
+                    await self._reconcile_dsh_prompt(ctx, cmd.msg_id)
+                return None
+            except Exception as exc:
+                ctx.active_msg_id = None
+                await self._set_state(ctx, "idle")
+                log.warning(
+                    "DSH prompt failed",
+                    session_id=self._ctx_wire_sid(ctx),
+                    error_type=type(exc).__name__,
+                )
+                error = Error(
+                    code=ERR_INTERNAL,
+                    message="DeepSeek Harness 消息未确认，请刷新历史后再重试。",
+                    msg_id=cmd.msg_id,
+                )
+                await self._emit(ctx, error)
+                return error
+            if isinstance(result, dict) and isinstance(
+                result.get("command"), dict
+            ):
+                # A registry change can race the preceding commands/list read.
+                # session.prompt still reports the settled command but omits
+                # commandId, so close the optimistic row honestly and let the
+                # next canonical history read adopt the durable native id.
+                command = result["command"]
+                name = cmd.prompt[1:].split(maxsplit=1)[0] or "command"
+                ctx.dsh_pending_command_msg_id = cmd.msg_id
+                ctx.dsh_pending_command_prompt = cmd.prompt
+                await self._finish_dsh_command(
+                    ctx,
+                    msg_id=cmd.msg_id,
+                    prompt=cmd.prompt,
+                    name=name,
+                    kind="success",
+                    text=command.get("text"),
+                    command_id=None,
+                )
+            return None
         if ctx.engine == "claude" and ctx.space == "code":
             await self._adopt_claude_broker_handle(ctx)
             if ctx.state != "idle":
@@ -12293,6 +14135,91 @@ class WrapperMachine:
         if ctx is None:
             return await reject(
                 ERR_NOT_STEERABLE, "该会话未启动，无法引导当前任务")
+        if ctx.engine == "dsh":
+            if ctx.state != "running":
+                return await reject(
+                    ERR_NOT_STEERABLE,
+                    "当前没有可引导的 DeepSeek Harness 任务",
+                )
+            if cmd.files:
+                return await reject(
+                    ERR_NOT_STEERABLE,
+                    "DeepSeek Harness 当前不支持通用文件附件。",
+                )
+            attachment_error = validate_attachments(
+                getattr(cmd, "images", None), None
+            )
+            if attachment_error or (not cmd.prompt and not cmd.images):
+                return await reject(
+                    ERR_NOT_STEERABLE,
+                    "消息内容或图片附件不符合要求。",
+                )
+            if not isinstance(ctx.sdk, DshSessionHandle):
+                return await reject(
+                    ERR_NOT_STEERABLE,
+                    "DeepSeek Harness 会话控制器不可用。",
+                )
+            if ctx.dsh_uncertain_steer_id is not None:
+                return await reject(
+                    ERR_STEER_UNKNOWN,
+                    "上一条 DeepSeek Harness 引导结果仍在核对；确认前请勿重复发送。",
+                )
+            try:
+                async with ctx.steer_lock:
+                    if ctx.state != "running":
+                        return await reject(
+                            ERR_NOT_STEERABLE,
+                            "DeepSeek Harness 任务已结束，本次引导未发送。",
+                        )
+                    await ctx.sdk.prompt(
+                        cmd.prompt,
+                        images=getattr(cmd, "images", None),
+                        rpc_id=cmd.msg_id,
+                        mode="steer",
+                    )
+                ctx.active_msg_id = cmd.msg_id
+                return None
+            except DshRpcError as exc:
+                return await reject(
+                    ERR_NOT_STEERABLE,
+                    exc.message[:4096]
+                    or "DeepSeek Harness 拒绝了本次引导。",
+                )
+            except (DshUnavailable, DshProtocolError) as exc:
+                # The HTTP response can disappear after DSH appended the steer.
+                # Correlate its rpcId against durable history before reporting
+                # anything that might invite the user to duplicate it.
+                ctx.dsh_uncertain_steer_id = cmd.msg_id
+                log.warning(
+                    "DSH steer receipt lost; reconciling source history",
+                    session_id=self._ctx_wire_sid(ctx),
+                    error_type=type(exc).__name__,
+                )
+                outcome = await self._reconcile_dsh_steer(
+                    ctx, cmd.msg_id, notify_rejected=False,
+                )
+                if outcome is True:
+                    return None
+                if outcome is False:
+                    return await reject(
+                        ERR_NOT_STEERABLE,
+                        "DeepSeek Harness 未接收本次引导。",
+                    )
+                return await reject(
+                    ERR_STEER_UNKNOWN,
+                    "DeepSeek Harness 尚未确认本次引导是否生效；"
+                    "请先观察后续输出，确认前不要重复发送。",
+                )
+            except Exception as exc:
+                log.warning(
+                    "DSH steer failed",
+                    session_id=self._ctx_wire_sid(ctx),
+                    error_type=type(exc).__name__,
+                )
+                return await reject(
+                    ERR_NOT_STEERABLE,
+                    "DeepSeek Harness 引导未确认，请刷新历史后重试。",
+                )
         if ctx.engine != "codex":
             return await reject(
                 ERR_NOT_STEERABLE,
@@ -12721,6 +14648,35 @@ class WrapperMachine:
             cmd_id=getattr(cmd, "cmd_id", None),
         )
         await self._emit(ctx, StateEvent(state="interrupting"))
+        if (
+            ctx.engine == "dsh"
+            and ctx.dsh_pending_command_msg_id is not None
+        ):
+            # commands/execute forwards HTTP cancellation to the command
+            # handler's AbortSignal; session.cancel only addresses model turns.
+            # Cancel the exact owning request instead of sending the wrong RPC.
+            command_task = ctx.turn_task
+            if command_task is not None and command_task is not asyncio.current_task():
+                if not command_task.done():
+                    command_task.cancel()
+                await asyncio.gather(command_task, return_exceptions=True)
+            elif ctx.dsh_pending_command_msg_id is not None:
+                msg_id = ctx.dsh_pending_command_msg_id
+                prompt = ctx.dsh_pending_command_prompt or ""
+                await self._finish_dsh_command(
+                    ctx,
+                    msg_id=msg_id,
+                    prompt=prompt,
+                    name=(
+                        prompt.removeprefix("/").split(maxsplit=1)[0]
+                        or "command"
+                    ),
+                    kind="error",
+                    text="命令已由 Remote 打断",
+                    command_id=None,
+                    interrupted=True,
+                )
+            return
         # A turn can still be reconnecting to apply effort/tier changes and may
         # not have submitted its query yet.  Serialize against that final launch
         # window: if the turn observes our event and aborts, it changes state to
@@ -12742,6 +14698,17 @@ class WrapperMachine:
                 )
             except Exception as e:
                 log.exception("interrupt call failed", error=str(e))
+                if ctx.engine == "dsh":
+                    tracked = self._track_dsh_task(
+                        self._reconcile_dsh_terminal(ctx),
+                        name=(
+                            "cc-remote-dsh-interrupt-"
+                            f"{ctx.session_id or ctx.key}"
+                        ),
+                    )
+                    if not tracked:
+                        await self._reconcile_dsh_terminal(ctx)
+                    return
                 # The stream is still authoritative: a very fast turn may have
                 # completed just before this RPC, with its terminal frame already
                 # queued. Do not surface raw app-server text or force idle here.
@@ -12904,6 +14871,184 @@ class WrapperMachine:
             CLAUDE_DEFAULT_EFFORT,
         )
 
+    @staticmethod
+    def _dsh_models_payload(
+        value: dict,
+    ) -> tuple[list[dict], str | None, str | None]:
+        groups = value.get("groups")
+        current = value.get("current")
+        if not isinstance(groups, list):
+            raise DshProtocolError("DSH model catalog omitted groups")
+        default_model = None
+        default_effort = None
+        current_provider = None
+        current_model = None
+        if isinstance(current, dict):
+            provider = current.get("provider")
+            model = current.get("model")
+            if isinstance(provider, str) and isinstance(model, str):
+                try:
+                    default_model = encode_dsh_model(provider, model)
+                except ValueError:
+                    default_model = None
+                current_provider = provider
+                current_model = model
+            selected_effort = current.get("reasoningEffort")
+            if isinstance(selected_effort, str) and selected_effort:
+                default_effort = selected_effort[:64]
+        result: list[dict] = []
+        for group in groups[:128]:
+            if not isinstance(group, dict):
+                continue
+            provider = group.get("id")
+            provider_name = group.get("name")
+            models = group.get("models")
+            if not isinstance(provider, str) or not isinstance(models, list):
+                continue
+            for model_row in models[:512]:
+                if not isinstance(model_row, dict):
+                    continue
+                native_model = model_row.get("id")
+                if not isinstance(native_model, str):
+                    continue
+                try:
+                    wire_model = encode_dsh_model(provider, native_model)
+                except ValueError:
+                    continue
+                reasoning = model_row.get("reasoning")
+                raw_efforts = (
+                    reasoning.get("efforts")
+                    if isinstance(reasoning, dict) else []
+                )
+                efforts: list[str] = []
+                if isinstance(raw_efforts, list):
+                    for effort_row in raw_efforts[:64]:
+                        effort_id = (
+                            effort_row.get("id")
+                            if isinstance(effort_row, dict) else None
+                        )
+                        if (
+                            isinstance(effort_id, str)
+                            and effort_id
+                            and len(effort_id) <= 64
+                        ):
+                            efforts.append(effort_id)
+                configured_effort = (
+                    reasoning.get("defaultEffort")
+                    if isinstance(reasoning, dict) else None
+                )
+                row: dict[str, object] = {
+                    "id": wire_model,
+                    "display_name": (
+                        str(model_row.get("name") or native_model)[:256]
+                    ),
+                    "description": (
+                        str(model_row.get("description"))[:4096]
+                        if isinstance(model_row.get("description"), str)
+                        else str(provider_name or provider)[:256]
+                    ),
+                    "efforts": efforts,
+                    "is_default": (
+                        provider == current_provider
+                        and native_model == current_model
+                    ),
+                    "provider": provider[:256],
+                    "provider_name": str(provider_name or provider)[:256],
+                }
+                if (
+                    isinstance(configured_effort, str)
+                    and configured_effort in efforts
+                ):
+                    row["default_effort"] = configured_effort
+                result.append(row)
+        return result, default_model, default_effort
+
+    async def _handle_get_dsh_models(self, cmd) -> Models | Error:
+        client_id = getattr(cmd, "client_id", None)
+        try:
+            client, _history = self._dsh_client_ready()
+            requested_sid = getattr(cmd, "session_id", None)
+            native_sid = None
+            if requested_sid:
+                native_sid = dsh_native_session_id(requested_sid)
+                value = await client.call(
+                    "session.models", {"sessionId": native_sid}
+                )
+            else:
+                catalog = await client.call("llm.models")
+                if not isinstance(catalog, dict):
+                    raise DshProtocolError(
+                        "llm.models returned an invalid value"
+                    )
+                host = (
+                    self._dsh_preflight.host
+                    if self._dsh_preflight is not None else {}
+                )
+                provider = host.get("provider")
+                model = host.get("model")
+                value = dict(catalog)
+                if isinstance(provider, str) and isinstance(model, str):
+                    value["current"] = {
+                        "provider": provider,
+                        "model": model,
+                    }
+            if not isinstance(value, dict):
+                raise DshProtocolError(
+                    "DSH model catalog returned an invalid value"
+                )
+            models, default_model, default_effort = (
+                self._dsh_models_payload(value)
+            )
+            ctx = self._ctx_by_sid(requested_sid) if requested_sid else None
+            if (
+                native_sid is not None
+                and ctx is not None
+                and ctx.engine == "dsh"
+                and isinstance(ctx.sdk, DshSessionHandle)
+            ):
+                ctx.sdk.model = default_model
+                ctx.sdk.effort = default_effort
+            response = Models(
+                engine="dsh",
+                models=models,
+                default_model=default_model,
+                default_effort=default_effort,
+                cwd=getattr(cmd, "cwd", None),
+                session_id=requested_sid,
+                to=client_id,
+            )
+            await self.transport.send(response)
+            if requested_sid is not None and ctx is not None:
+                route_id = getattr(cmd, "route_id", None)
+                if default_model:
+                    await self.transport.send(Model(
+                        model=default_model,
+                        sid=requested_sid,
+                        to=client_id,
+                        route_id=route_id,
+                    ))
+                if default_effort:
+                    await self.transport.send(Effort(
+                        effort=default_effort,
+                        sid=requested_sid,
+                        to=client_id,
+                        route_id=route_id,
+                    ))
+            return response
+        except Exception as exc:
+            log.warning(
+                "DSH model catalog failed",
+                error_type=type(exc).__name__,
+            )
+            error = Error(
+                code=ERR_INTERNAL,
+                message="DeepSeek Harness 模型目录暂不可用，请稍后重试。",
+                request_id=getattr(cmd, "cmd_id", None),
+                to=client_id,
+            )
+            await self.transport.send(error)
+            return error
+
     async def _handle_get_models(self, cmd) -> None:
         """Answer with the engine's catalog and effective new-session defaults.
 
@@ -12913,6 +15058,8 @@ class WrapperMachine:
         the client keeps its static presentation table.
         """
         engine = getattr(cmd, "engine", None) or "cc"
+        if engine == "dsh":
+            return await self._handle_get_dsh_models(cmd)
         codex_profile = None
         codex_home = None
         if engine == "codex":
@@ -13000,6 +15147,105 @@ class WrapperMachine:
     async def _handle_get_engine_capabilities(self, cmd):
         engine = cmd.engine
         space = getattr(cmd, "space", "code")
+        if engine == "dsh":
+            client_id = getattr(cmd, "client_id", None)
+            target_cwd = getattr(cmd, "cwd", None)
+            requested_sid = getattr(cmd, "session_id", None)
+            ctx = (
+                self.sessions.get(requested_sid)
+                if isinstance(requested_sid, str) else None
+            )
+            if ctx is not None and (
+                ctx.engine != "dsh"
+                or ctx.space != "code"
+                or self._ctx_wire_sid(ctx) != requested_sid
+            ):
+                ctx = None
+            items = []
+            errors = []
+            cwd_value = target_cwd or (ctx.cwd if ctx else self.cfg.cc_cwd)
+            if requested_sid is None:
+                errors.append(
+                    "请先打开一个 DeepSeek Harness 会话再读取 Skills"
+                )
+            elif ctx is None or not ctx.session_id:
+                errors.append(
+                    "DeepSeek Harness 会话未连接，请重新打开后读取 Skills"
+                )
+            elif target_cwd and os.path.realpath(target_cwd) != os.path.realpath(
+                ctx.cwd
+            ):
+                errors.append(
+                    "DeepSeek Harness 会话目录已变化，请刷新后重试"
+                )
+            else:
+                try:
+                    client, _history = self._dsh_client_ready()
+                    value = await client.call(
+                        "skill.list", {"sessionId": ctx.session_id}
+                    )
+                    rows = (
+                        value.get("skills")
+                        if isinstance(value, dict) else None
+                    )
+                    if not isinstance(rows, list):
+                        raise DshProtocolError(
+                            "skill.list returned an invalid value"
+                        )
+                    for row in rows[:2000]:
+                        if not isinstance(row, dict):
+                            continue
+                        name = row.get("name")
+                        description = row.get("description")
+                        if not isinstance(name, str) or not name:
+                            continue
+                        detail = row.get("whenToUse")
+                        items.append({
+                            "kind": "skill",
+                            "id": name[:512],
+                            "name": name[:512],
+                            "description": (
+                                description[:16 * 1024]
+                                if isinstance(description, str) else None
+                            ),
+                            "enabled": True,
+                            "installed": True,
+                            "status": (
+                                "可由模型调用"
+                                if row.get("modelInvocable") is True
+                                else "仅用户调用"
+                            ),
+                            "scope": "project",
+                            "source": "DeepSeek Harness",
+                            "detail": (
+                                detail[:4096]
+                                if isinstance(detail, str) else None
+                            ),
+                            "actions": [],
+                        })
+                except Exception as exc:
+                    log.warning(
+                        "DSH skill catalog failed",
+                        error_type=type(exc).__name__,
+                    )
+                    errors.append("DeepSeek Harness Skills 暂时不可用")
+            result = EngineCapabilities(
+                engine="dsh",
+                space="code",
+                request_id=getattr(cmd, "cmd_id", None),
+                cwd=os.path.realpath(cwd_value),
+                items=items,
+                errors=errors,
+                notes=[
+                    "插件组合由 DSH Agent Preset 管理；"
+                    "cc-remote 首版只读展示已组合的 Skills。"
+                ],
+                skills_only=getattr(cmd, "skills_only", False),
+                session_id=requested_sid,
+                to=client_id,
+            )
+            await self.transport.send(result)
+            return result
         try:
             codex_profile = self._engine_capability_profile(cmd)
         except ValueError:
@@ -13107,6 +15353,18 @@ class WrapperMachine:
         return error
 
     async def _handle_manage_engine_plugin(self, cmd):
+        if cmd.engine == "dsh":
+            error = Error(
+                code=ERR_AUTH,
+                message=(
+                    "DeepSeek Harness 插件由本机 Agent Preset 管理；"
+                    "Remote 不开放安装或卸载。"
+                ),
+                request_id=getattr(cmd, "cmd_id", None),
+                to=getattr(cmd, "client_id", None),
+            )
+            await self.transport.send(error)
+            return error
         try:
             codex_profile = self._engine_capability_profile(cmd)
             target_cwd = self._engine_capability_cwd(cmd, codex_profile)
@@ -13138,6 +15396,15 @@ class WrapperMachine:
         return await self._handle_get_engine_capabilities(cmd)
 
     async def _handle_manage_engine_skill(self, cmd):
+        if cmd.engine == "dsh":
+            error = Error(
+                code=ERR_AUTH,
+                message="DeepSeek Harness Skills 在 Remote 中仅供查看。",
+                request_id=getattr(cmd, "cmd_id", None),
+                to=getattr(cmd, "client_id", None),
+            )
+            await self.transport.send(error)
+            return error
         try:
             codex_profile = self._engine_capability_profile(cmd)
             codex_home = (
@@ -13170,6 +15437,15 @@ class WrapperMachine:
         return await self._handle_get_engine_capabilities(cmd)
 
     async def _handle_manage_engine_hook(self, cmd):
+        if cmd.engine == "dsh":
+            error = Error(
+                code=ERR_AUTH,
+                message="DeepSeek Harness Hooks 在 Remote 中不开放远程管理。",
+                request_id=getattr(cmd, "cmd_id", None),
+                to=getattr(cmd, "client_id", None),
+            )
+            await self.transport.send(error)
+            return error
         try:
             codex_profile = self._engine_capability_profile(cmd)
             await manage_engine_hook(
@@ -13254,6 +15530,19 @@ class WrapperMachine:
             return error
 
         if not ctx.session_id or is_claude_broker:
+            return None
+        if ctx.engine == "dsh":
+            try:
+                self._dsh_client_ready()
+            except DshError:
+                error = Error(
+                    code=ERR_NOT_RUNNING,
+                    message=f"DeepSeek Harness 本机服务未连接，无法{action}。",
+                    request_id=request_id,
+                    to=client_id,
+                )
+                await self._emit(ctx, error)
+                return error
             return None
         if ctx.engine == "claude" and ctx.space != "code":
             return None
@@ -13363,6 +15652,38 @@ class WrapperMachine:
             ctx, action="切换模型")
         if control_error is not None:
             return control_error
+        if ctx.engine == "dsh":
+            if not isinstance(ctx.sdk, DshSessionHandle):
+                error = Error(
+                    code=ERR_INTERNAL,
+                    message="DeepSeek Harness 会话控制器不可用。",
+                )
+                await self._emit(ctx, error)
+                return error
+            try:
+                applied_model = await ctx.sdk.set_model(cmd.model)
+                ctx.announced_model = applied_model
+                events: list[object] = [Model(model=applied_model)]
+                await self._emit(ctx, events[0])
+                selected_effort = ctx.sdk.effort
+                if isinstance(selected_effort, str) and selected_effort:
+                    ctx.announced_effort = selected_effort
+                    effort_event = Effort(effort=selected_effort)
+                    await self._emit(ctx, effort_event)
+                    events.append(effort_event)
+                return tuple(events)
+            except (DshError, ValueError) as exc:
+                log.warning(
+                    "DSH model switch failed",
+                    session_id=self._ctx_wire_sid(ctx),
+                    error_type=type(exc).__name__,
+                )
+                error = Error(
+                    code=ERR_BAD_PROMPT,
+                    message="DeepSeek Harness 模型切换未完成，请刷新目录后重试。",
+                )
+                await self._emit(ctx, error)
+                return error
         try:
             if getattr(ctx.sdk, "is_claude_broker", False):
                 confirmed = await self._confirm_claude_broker_model_switch(
@@ -13619,10 +15940,49 @@ class WrapperMachine:
         ctx = self._ctx_for(getattr(cmd, "sid", None))
         if ctx is None:
             return await self._missing_session_error(cmd, "切换思考强度")
+        requested_engine = getattr(cmd, "engine", None)
+        if (
+            (requested_engine is not None and requested_engine != ctx.engine)
+            or (ctx.engine == "dsh" and requested_engine != "dsh")
+        ):
+            error = Error(
+                code=ERR_PROTOCOL,
+                message="思考强度请求与当前会话引擎不匹配。",
+                request_id=getattr(cmd, "cmd_id", None),
+                to=getattr(cmd, "client_id", None),
+            )
+            await self._emit(ctx, error)
+            return error
         control_error = await self._runtime_control_preflight(
             ctx, action="切换思考强度")
         if control_error is not None:
             return control_error
+        if ctx.engine == "dsh":
+            if not isinstance(ctx.sdk, DshSessionHandle):
+                error = Error(
+                    code=ERR_INTERNAL,
+                    message="DeepSeek Harness 会话控制器不可用。",
+                )
+                await self._emit(ctx, error)
+                return error
+            try:
+                applied = await ctx.sdk.set_effort(cmd.effort)
+            except (DshError, ValueError) as exc:
+                log.warning(
+                    "DSH effort switch failed",
+                    session_id=self._ctx_wire_sid(ctx),
+                    error_type=type(exc).__name__,
+                )
+                error = Error(
+                    code=ERR_BAD_PROMPT,
+                    message="DeepSeek Harness 思考强度切换未完成，请重试。",
+                )
+                await self._emit(ctx, error)
+                return error
+            ctx.announced_effort = applied
+            event = Effort(effort=applied)
+            await self._emit(ctx, event)
+            return event
         if ctx.engine == "codex":
             applied = await self._apply_codex_effort(ctx, cmd.effort) or cmd.effort
             ctx.announced_effort = applied
@@ -13840,6 +16200,12 @@ class WrapperMachine:
         if parent is None:
             return await self._send_btw_error(
                 cmd, ERR_NOT_RUNNING, "没有可 fork 的会话")
+        if parent.engine == "dsh":
+            return await self._send_btw_error(
+                cmd,
+                ERR_AUTH,
+                "DeepSeek Harness 首版不支持 btw 侧边会话。",
+            )
         if parent.btw:  # never fork a fork — fork its parent instead
             parent = self._ctx_by_sid(parent.parent_sid or "") or parent
         try:
@@ -13944,6 +16310,16 @@ class WrapperMachine:
         ctx = self._ctx_for(getattr(cmd, "sid", None))
         if ctx is None:
             return await self._missing_session_error(cmd, "切换权限模式")
+        if ctx.engine == "dsh":
+            error = Error(
+                code=ERR_AUTH,
+                message=(
+                    "DeepSeek Harness 权限由本机 Agent Preset 与插件配置管理，"
+                    "Remote 不修改该权限。"
+                ),
+            )
+            await self._emit(ctx, error)
+            return error
         control_error = await self._runtime_control_preflight(
             ctx, action="切换权限模式")
         if control_error is not None:
@@ -14439,6 +16815,22 @@ class WrapperMachine:
         ctx = self._ctx_for(getattr(cmd, "sid", None))
         if ctx is None:
             return await self._missing_session_error(cmd, "读取上下文")
+        if ctx.engine == "dsh":
+            # DSH does not expose one authoritative context-usage RPC yet.  An
+            # older same-protocol Web/PWA bundle may still prime this read when
+            # focus moves to DSH, so treat it as an unavailable capability
+            # instead of a business/auth rejection.  This also lets the normal
+            # ContextReport response retire that client's pending read without
+            # showing a cross-surface command-error banner.
+            event = ContextReport(
+                total_tokens=0,
+                max_tokens=0,
+                percentage=0.0,
+                available=False,
+                categories=[],
+            )
+            await self._emit(ctx, event)
+            return event
         try:
             usage = await ctx.sdk.get_context_usage()
             work_fields: dict[str, int | float] = {}
@@ -16076,6 +18468,10 @@ class WrapperMachine:
         ctx = await self._goal_ctx(cmd)
         if ctx is None:
             return await self._missing_session_error(cmd, "读取 Goal")
+        if ctx.engine == "dsh":
+            return await self._emit_goal_error(
+                ctx, cmd, "DeepSeek Harness 首版不开放 Goal 控制。"
+            )
         try:
             ctx.goal_visible = True
             goal = (await ctx.sdk.get_goal() if ctx.engine == "codex"
@@ -16095,6 +18491,10 @@ class WrapperMachine:
         ctx = await self._goal_ctx(cmd)
         if ctx is None:
             return await self._missing_session_error(cmd, "隐藏 Goal")
+        if ctx.engine == "dsh":
+            return await self._emit_goal_error(
+                ctx, cmd, "DeepSeek Harness 首版不开放 Goal 控制。"
+            )
         if self._session_presentation is None:
             return await self._emit_goal_error(ctx, cmd, "Goal 隐藏状态暂不可用")
         try:
@@ -16144,7 +18544,17 @@ class WrapperMachine:
             )
             await self._emit(ctx, error)
             return error
-        if self._session_presentation is None:
+        known_engine = (
+            ctx.engine
+            if ctx is not None
+            else "dsh" if sid.startswith("dsh@") else None
+        )
+        presentation_store = (
+            self._presentation_store_for_engine(known_engine)
+            if known_engine is not None
+            else self._session_presentation
+        )
+        if presentation_store is None:
             error = Error(
                 code=ERR_INTERNAL,
                 message="任务完成状态暂不可用",
@@ -16163,8 +18573,9 @@ class WrapperMachine:
                 else sid
             )
             engine = ctx.engine if ctx is not None else (
-                await asyncio.to_thread(
-                    self._session_presentation.completion_engine,
+                known_engine
+                or await asyncio.to_thread(
+                    presentation_store.completion_engine,
                     session_id,
                     cmd.completion_id,
                 )
@@ -16178,8 +18589,13 @@ class WrapperMachine:
                 )
                 await self._emit_to_sid(sid, error)
                 return error
+            presentation_store = self._presentation_store_for_engine(engine)
+            if presentation_store is None:
+                raise SessionPresentationStoreError(
+                    "session presentation store is unavailable"
+                )
             snapshot = await asyncio.to_thread(
-                self._session_presentation.acknowledge_completion,
+                presentation_store.acknowledge_completion,
                 engine,
                 session_id,
                 cmd.completion_id,
@@ -16215,6 +18631,10 @@ class WrapperMachine:
         ctx = await self._goal_ctx(cmd)
         if ctx is None:
             return await self._missing_session_error(cmd, "设置 Goal")
+        if ctx.engine == "dsh":
+            return await self._emit_goal_error(
+                ctx, cmd, "DeepSeek Harness 首版不开放 Goal 控制。"
+            )
         if ctx.engine != "codex":
             if getattr(cmd, "token_budget", None) is not None:
                 error = Error(
@@ -16356,6 +18776,10 @@ class WrapperMachine:
         ctx = await self._goal_ctx(cmd)
         if ctx is None:
             return await self._missing_session_error(cmd, "清除 Goal")
+        if ctx.engine == "dsh":
+            return await self._emit_goal_error(
+                ctx, cmd, "DeepSeek Harness 首版不开放 Goal 控制。"
+            )
         if ctx.engine != "codex":
             if ctx.state != "idle":
                 error = Error(
@@ -18061,6 +20485,8 @@ class WrapperMachine:
     async def _handle_list_sessions(self, cmd) -> None:
         engine = getattr(cmd, "engine", "claude")
         space = getattr(cmd, "space", "code")
+        if engine == "dsh":
+            return await self._list_dsh_sessions(cmd)
         if engine == "codex":
             return await self._list_codex_sessions(cmd)
         # Claude may create the fork transcript before its init/session id reaches
@@ -19035,7 +21461,20 @@ class WrapperMachine:
         requested_space = getattr(cmd, "space", "code")
         codex_profile = None
         native_sid = sid
-        if engine == "codex":
+        if engine == "dsh":
+            try:
+                native_sid = dsh_native_session_id(sid)
+            except ValueError:
+                error = Error(
+                    code=ERR_AUTH,
+                    message="DeepSeek Harness 会话标识无效",
+                    request_id=getattr(cmd, "cmd_id", None),
+                    sid=sid,
+                    to=getattr(cmd, "client_id", None),
+                )
+                await self.transport.send(error)
+                return error
+        elif engine == "codex":
             try:
                 codex_profile, native_sid = self._codex_target(sid)
             except ValueError:
@@ -19049,11 +21488,13 @@ class WrapperMachine:
                 await self.transport.send(error)
                 return error
         work_profile_id = codex_profile.id if codex_profile is not None else None
-        work_record = await asyncio.to_thread(
-            self._work.for_engine(engine).get_by_session,
-            native_sid,
-            codex_profile_id=work_profile_id,
-        )
+        work_record = None
+        if engine != "dsh":
+            work_record = await asyncio.to_thread(
+                self._work.for_engine(engine).get_by_session,
+                native_sid,
+                codex_profile_id=work_profile_id,
+            )
         actual_space = "work" if work_record is not None else "code"
         if requested_space != actual_space:
             error = Error(
@@ -19065,7 +21506,7 @@ class WrapperMachine:
             await self.transport.send(error)
             return error
         ctx = self.sessions.get(sid)
-        if ctx is None and engine != "codex":
+        if ctx is None and engine == "claude":
             ctx = next((c for c in self.sessions.values()
                         if c.session_id == sid), None)
         if ctx is None and engine == "claude" and actual_space == "code":
@@ -19112,7 +21553,10 @@ class WrapperMachine:
                 # Surface it on the session the user switched INTO (not the stale
                 # focused one). _spawn has already emitted the specific cause;
                 # this durable session-scoped row only closes the loading state.
-                engine_name = "Codex" if engine == "codex" else "Claude"
+                engine_name = {
+                    "codex": "Codex",
+                    "dsh": "DeepSeek Harness",
+                }.get(engine, "Claude")
                 error = Error(
                     code=ERR_CC_CRASH,
                     message=f"{engine_name} 会话暂时无法打开，请稍后重试。",
@@ -19143,10 +21587,11 @@ class WrapperMachine:
         control_event = self._session_control(ctx)
         await self._emit(ctx, control_event)
         cached_responses.append(control_event)
-        if not ctx.btw and self._session_presentation is not None:
+        presentation_store = self._presentation_store_for_engine(ctx.engine)
+        if not ctx.btw and presentation_store is not None:
             try:
                 presentation = await asyncio.to_thread(
-                    self._session_presentation.get,
+                    presentation_store.get,
                     ctx.engine,
                     self._ctx_wire_sid(ctx) or ctx.key,
                 )
@@ -19465,6 +21910,9 @@ class WrapperMachine:
                     cmd, "permission_profile", None),
                 "web_search": getattr(cmd, "web_search", None),
                 "service_tier": getattr(cmd, "service_tier", None),
+                "dsh_agent_preset": getattr(
+                    cmd, "dsh_agent_preset", None
+                ),
                 "space": space,
                 "work_id": work_record.work_id if work_record else None,
                 "raise_on_failure": True,
@@ -19501,7 +21949,7 @@ class WrapperMachine:
         # sequenced frame. Otherwise its cursor has no paired generation and a
         # normal transport reconnect is mistaken for a wrapper restart.
         snap = Snapshot(
-            cc_session_id=None,
+            cc_session_id=(ctx.key if ctx.engine == "dsh" else None),
             state=ctx.state,
             tail_text=ctx.buffer.latest_tail_text(),
             cwd=ctx.cwd,
@@ -19588,10 +22036,48 @@ class WrapperMachine:
             # must reject. Visible Work surfaces answer this unbuffered hint
             # with their own generation- and surface-bound list request.
             await self._invalidate_session_list(engine, "work")
+        elif ctx.engine == "dsh":
+            await self._invalidate_session_list("dsh", "code")
         return tuple(cached_responses)
 
     async def _handle_rename_session(self, cmd) -> None:
         sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
+        if sid.startswith("dsh@") or getattr(cmd, "engine", None) == "dsh":
+            if not sid.startswith("dsh@") or getattr(
+                cmd, "space", "code"
+            ) != "code":
+                error = Error(
+                    code=ERR_AUTH,
+                    message="会话不属于请求的 DeepSeek Harness Code 空间",
+                    request_id=getattr(cmd, "cmd_id", None),
+                    to=getattr(cmd, "client_id", None),
+                )
+                await self.transport.send(error)
+                return error
+            try:
+                native_sid = dsh_native_session_id(sid)
+                client, _history = self._dsh_client_ready()
+                await client.call("session.rename", {
+                    "sessionId": native_sid,
+                    "title": cmd.title,
+                })
+                self._remember_notification_title(sid, cmd.title)
+                await self._invalidate_session_list("dsh", "code")
+                return await self._list_dsh_sessions(cmd)
+            except Exception as exc:
+                log.warning(
+                    "DSH rename failed",
+                    session_id=sid,
+                    error_type=type(exc).__name__,
+                )
+                error = Error(
+                    code=ERR_INTERNAL,
+                    message="DeepSeek Harness 会话重命名未完成，请重试。",
+                    request_id=getattr(cmd, "cmd_id", None),
+                    to=getattr(cmd, "client_id", None),
+                )
+                await self.transport.send(error)
+                return error
         is_codex = await self._is_codex_session(sid)
         engine = "codex" if is_codex else "claude"
         native_sid = sid
@@ -19670,6 +22156,59 @@ class WrapperMachine:
 
     async def _handle_archive_session(self, cmd) -> None:
         sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
+        if sid.startswith("dsh@") or getattr(cmd, "engine", None) == "dsh":
+            if not sid.startswith("dsh@") or getattr(
+                cmd, "space", "code"
+            ) != "code":
+                error = Error(
+                    code=ERR_AUTH,
+                    message="会话不属于请求的 DeepSeek Harness Code 空间",
+                    request_id=getattr(cmd, "cmd_id", None),
+                    to=getattr(cmd, "client_id", None),
+                )
+                await self.transport.send(error)
+                return error
+            if not cmd.archived:
+                error = Error(
+                    code=ERR_PROTOCOL,
+                    message="当前 DeepSeek Harness API 尚未提供取消归档。",
+                    request_id=getattr(cmd, "cmd_id", None),
+                    to=getattr(cmd, "client_id", None),
+                )
+                await self.transport.send(error)
+                return error
+            try:
+                native_sid = dsh_native_session_id(sid)
+                client, _history = self._dsh_client_ready()
+                value = await client.call("workspace.archiveSession", {
+                    "sessionId": native_sid,
+                })
+                archived = (
+                    value.get("archivedSessionIds")
+                    if isinstance(value, dict) else None
+                )
+                if not isinstance(archived, list) or not all(
+                    isinstance(item, str) for item in archived
+                ):
+                    raise DshProtocolError(
+                        "workspace.archiveSession returned invalid state"
+                    )
+                await self._invalidate_session_list("dsh", "code")
+                return await self._list_dsh_sessions(cmd)
+            except Exception as exc:
+                log.warning(
+                    "DSH archive failed",
+                    session_id=sid,
+                    error_type=type(exc).__name__,
+                )
+                error = Error(
+                    code=ERR_INTERNAL,
+                    message="DeepSeek Harness 会话归档未完成，请重试。",
+                    request_id=getattr(cmd, "cmd_id", None),
+                    to=getattr(cmd, "client_id", None),
+                )
+                await self.transport.send(error)
+                return error
         is_codex = await self._is_codex_session(sid)
         engine = "codex" if is_codex else "claude"
         native_sid = sid
@@ -19749,6 +22288,55 @@ class WrapperMachine:
 
     async def _handle_pin_session(self, cmd) -> None:
         sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
+        if sid.startswith("dsh@") or getattr(cmd, "engine", None) == "dsh":
+            pin_store = self._dsh_session_pins
+            if (
+                not sid.startswith("dsh@")
+                or getattr(cmd, "space", "code") != "code"
+                or pin_store is None
+            ):
+                error = Error(
+                    code=ERR_AUTH if pin_store is not None else ERR_INTERNAL,
+                    message=(
+                        "会话不属于请求的 DeepSeek Harness Code 空间"
+                        if pin_store is not None
+                        else "置顶状态存储暂不可用"
+                    ),
+                    request_id=getattr(cmd, "cmd_id", None),
+                    to=getattr(cmd, "client_id", None),
+                )
+                await self.transport.send(error)
+                return error
+            try:
+                native_sid = dsh_native_session_id(sid)
+                rows, _archived = await self._read_dsh_catalog()
+                if not any(
+                    row.get("sessionId") == native_sid
+                    and row.get("origin") != "subagent"
+                    for row in rows
+                ):
+                    raise LookupError("DSH session does not exist")
+                await asyncio.to_thread(
+                    pin_store.set_pinned,
+                    "dsh",
+                    sid,
+                    bool(cmd.pinned),
+                )
+                return await self._list_dsh_sessions(cmd)
+            except Exception as exc:
+                log.warning(
+                    "DSH pin update failed",
+                    session_id=sid,
+                    error_type=type(exc).__name__,
+                )
+                error = Error(
+                    code=ERR_INTERNAL,
+                    message="DeepSeek Harness 置顶状态保存失败。",
+                    request_id=getattr(cmd, "cmd_id", None),
+                    to=getattr(cmd, "client_id", None),
+                )
+                await self.transport.send(error)
+                return error
         is_codex = await self._is_codex_session(sid)
         engine = "codex" if is_codex else "claude"
         requested_engine = getattr(cmd, "engine", None)
@@ -19928,6 +22516,20 @@ class WrapperMachine:
             return await self._handle_delete_work_session(cmd)
         sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
         requested_engine = getattr(cmd, "engine", "claude")
+        if sid.startswith("dsh@") or requested_engine == "dsh":
+            message = (
+                "DeepSeek Harness 当前未提供永久删除接口；可以先归档该会话。"
+                if sid.startswith("dsh@") and requested_engine == "dsh"
+                else "会话不属于请求的引擎"
+            )
+            error = Error(
+                code=ERR_AUTH,
+                message=message,
+                sid=sid,
+                to=getattr(cmd, "client_id", None),
+            )
+            await self.transport.send(error)
+            return error
         is_codex = await self._is_codex_session(sid)
         engine = "codex" if is_codex else "claude"
         if engine != requested_engine:
@@ -21798,6 +24400,8 @@ class WrapperMachine:
     async def _handle_fork_session(self, cmd):
         """Dispatch a message-level persistent fork to the owning engine."""
         sid = self._resolve_session_alias(cmd.session_id) or cmd.session_id
+        if sid.startswith("dsh@"):
+            return await self._handle_dsh_fork_session(cmd, sid)
         is_codex = await self._is_codex_session(sid)
         engine = "codex" if is_codex else "claude"
         # Resident contexts already carry the authoritative surface.  Avoid an
@@ -21824,6 +24428,331 @@ class WrapperMachine:
         if is_codex:
             return await self._handle_codex_fork_session(cmd)
         return await self._handle_claude_fork_session(cmd, sid)
+
+    async def _dsh_fork_candidate(
+        self,
+        entry: dict,
+        *,
+        attempts: int = 1,
+    ) -> str | None:
+        """Find the unique child created beyond one durable catalog cut."""
+        baseline = set(entry.get("baseline_session_ids") or ())
+        native_parent = entry.get("native_parent_session_id")
+        at_seq = entry.get("at_seq")
+        if not isinstance(native_parent, str) or not isinstance(at_seq, int):
+            raise DshForkJournalError("DSH fork journal identity is invalid")
+        client, _history = self._dsh_client_ready()
+        for attempt in range(max(1, attempts)):
+            if attempt:
+                await asyncio.sleep(self.FORK_RECONCILE_DELAY)
+            rows, _archived = await self._read_dsh_catalog()
+            candidates = [
+                row for row in rows
+                if isinstance(row.get("sessionId"), str)
+                and row["sessionId"] not in baseline
+                and row.get("parentSessionId") == native_parent
+                and row.get("origin") != "subagent"
+            ]
+            exact: list[str] = []
+            for row in candidates[:32]:
+                native_child = row["sessionId"]
+                try:
+                    page = await client.call("session.history", {
+                        "sessionId": native_child,
+                        # Slice at the durable fork cut instead of inspecting
+                        # the child's moving tail. A child may have run many
+                        # turns before a wrapper restart retries reconciliation;
+                        # its inherited anchor must remain discoverable then.
+                        "beforeSeq": at_seq + 1,
+                        "maxMessages": 1,
+                    })
+                except DshError:
+                    continue
+                events = page.get("events") if isinstance(page, dict) else None
+                if not isinstance(events, list):
+                    continue
+                if any(
+                    isinstance(item, dict)
+                    and isinstance(item.get("event"), dict)
+                    and item["event"].get("type") == "turn/end"
+                    and item["event"].get("seq") == at_seq
+                    for item in events
+                ):
+                    exact.append(native_child)
+            if len(exact) == 1:
+                return exact[0]
+            if len(exact) > 1:
+                raise DshForkJournalError(
+                    "multiple DSH children match one uncertain fork"
+                )
+        return None
+
+    async def _finish_dsh_fork(
+        self,
+        cmd,
+        entry: dict,
+        native_child: str,
+    ) -> SessionForked:
+        journal = self._dsh_forks
+        if journal is None:
+            raise DshForkJournalError("DSH fork journal is unavailable")
+        child_sid = dsh_wire_session_id(native_child)
+        await asyncio.to_thread(
+            journal.complete, cmd.request_id, child_sid,
+        )
+        event = SessionForked(
+            parent_session_id=entry["parent_session_id"],
+            session_id=child_sid,
+            cwd=entry["cwd"],
+            target="same_cwd",
+            last_turn_id=entry["last_turn_id"],
+            request_id=cmd.request_id,
+            to=getattr(cmd, "client_id", None),
+        )
+        # The read hint precedes navigation just like Claude/Codex forks.
+        await self._invalidate_session_list("dsh", "code")
+        await self.transport.send(event)
+        try:
+            await self._list_dsh_sessions(cmd)
+        except Exception as exc:
+            log.debug(
+                "DSH fork sidebar refresh deferred",
+                session_id=child_sid,
+                error_type=type(exc).__name__,
+            )
+        return event
+
+    async def _dsh_fork_candidate_or_defer(
+        self,
+        cmd,
+        entry: dict,
+        *,
+        attempts: int,
+    ) -> str:
+        """Reconcile one submitted fork without acknowledging uncertainty."""
+        try:
+            child = await self._dsh_fork_candidate(
+                entry,
+                attempts=attempts,
+            )
+        except DshError as exc:
+            log.info(
+                "DSH fork reconciliation source unavailable",
+                request_id=cmd.request_id,
+                error_type=type(exc).__name__,
+            )
+            child = None
+        if child is not None:
+            return child
+        await self._send_session_fork_error(
+            cmd,
+            ERR_FORK_RECONCILING,
+            "DSH 派生结果仍在核对，请勿重复创建。",
+        )
+        raise _ForkOutcomeUncertain(
+            "DSH fork outcome is not yet visible"
+        )
+
+    async def _handle_dsh_fork_session(self, cmd, sid: str):
+        """Persistently fork one completed DSH turn exactly once."""
+        if not getattr(cmd, "client_id", None):
+            return await self._send_session_fork_error(
+                cmd, ERR_AUTH, "派生会话需要已绑定的客户端"
+            )
+        journal = self._dsh_forks
+        if journal is None:
+            return await self._send_session_fork_error(
+                cmd, ERR_INTERNAL, "DSH 派生安全日志不可用，未执行派生"
+            )
+        request_id = cmd.request_id
+        lock = self._dsh_fork_locks.get(request_id)
+        if lock is None:
+            if len(self._dsh_fork_locks) >= self.UNCERTAIN_FORK_CAP:
+                return await self._send_session_fork_error(
+                    cmd, ERR_BUSY, "DSH 派生请求过多，请稍后重试"
+                )
+            lock = asyncio.Lock()
+            self._dsh_fork_locks[request_id] = lock
+        terminal = False
+        try:
+            async with lock:
+                try:
+                    native_parent = dsh_native_session_id(sid)
+                    at_seq = parse_dsh_fork_point(cmd.last_turn_id)
+                except ValueError:
+                    return await self._send_session_fork_error(
+                        cmd, ERR_AUTH, "DeepSeek Harness 派生位置无效"
+                    )
+                try:
+                    existing = await asyncio.to_thread(journal.get, request_id)
+                    if existing is None:
+                        rows, _archived = await self._read_dsh_catalog()
+                        if len(rows) > 1000:
+                            return await self._send_session_fork_error(
+                                cmd,
+                                ERR_INTERNAL,
+                                "DSH 会话目录过大，当前版本无法安全派生",
+                            )
+                        parent = next((
+                            row for row in rows
+                            if row.get("sessionId") == native_parent
+                            and row.get("origin") != "subagent"
+                        ), None)
+                        if parent is None:
+                            return await self._send_session_fork_error(
+                                cmd, ERR_NOT_RUNNING, "DeepSeek Harness 源会话不存在"
+                            )
+                        cwd = parent.get("cwd")
+                        if not isinstance(cwd, str) or not cwd:
+                            cwd = str(
+                                (self._dsh_preflight.host
+                                 if self._dsh_preflight else {}).get("cwd")
+                                or self.cfg.cc_cwd
+                            )
+                        cwd = os.path.realpath(cwd)
+                        if not os.path.isdir(cwd):
+                            return await self._send_session_fork_error(
+                                cmd, ERR_INVALID_CWD, "源会话工作目录已不存在"
+                            )
+                        baseline = {
+                            row["sessionId"] for row in rows
+                            if isinstance(row.get("sessionId"), str)
+                        }
+                        existing = await asyncio.to_thread(
+                            journal.begin,
+                            request_id,
+                            sid,
+                            native_parent,
+                            cmd.last_turn_id,
+                            at_seq,
+                            cwd,
+                            baseline,
+                        )
+                    status_value = existing.get("status")
+                    if status_value == "complete":
+                        terminal = True
+                        child_sid = existing.get("session_id")
+                        if not isinstance(child_sid, str):
+                            raise DshForkJournalError(
+                                "completed DSH fork omitted child"
+                            )
+                        return await self._finish_dsh_fork(
+                            cmd, existing, dsh_native_session_id(child_sid)
+                        )
+                    if status_value == "rejected":
+                        terminal = True
+                        return await self._send_session_fork_error(
+                            cmd,
+                            ERR_INTERNAL,
+                            existing.get("error_message")
+                            or "DeepSeek Harness 会话派生已被拒绝",
+                        )
+                    if status_value in {"submitted", "uncertain"}:
+                        child = await self._dsh_fork_candidate_or_defer(
+                            cmd,
+                            existing,
+                            attempts=4,
+                        )
+                        terminal = True
+                        return await self._finish_dsh_fork(
+                            cmd, existing, child,
+                        )
+
+                    claimed = await asyncio.to_thread(
+                        journal.claim_submission, request_id,
+                    )
+                    if not claimed:
+                        raise _ForkOutcomeUncertain(
+                            "DSH fork submission ownership was lost"
+                        )
+                    try:
+                        client, _history = self._dsh_client_ready()
+                        result = await client.call("session.fork", {
+                            "sessionId": native_parent,
+                            "atSeq": at_seq,
+                        })
+                        if not isinstance(result, dict) or not isinstance(
+                            result.get("sessionId"), str
+                        ):
+                            raise DshProtocolError(
+                                "session.fork omitted child session id"
+                            )
+                        child = result["sessionId"]
+                    except DshRpcError as exc:
+                        partial_child = (
+                            exc.details.get("sessionId")
+                            if exc.code == "workspace-attach-failed" else None
+                        )
+                        if isinstance(partial_child, str):
+                            child = partial_child
+                        else:
+                            message = (
+                                exc.message[:512]
+                                or "DeepSeek Harness 拒绝了会话派生"
+                            )
+                            await asyncio.to_thread(
+                                journal.reject, request_id, message,
+                            )
+                            terminal = True
+                            return await self._send_session_fork_error(
+                                cmd, ERR_INTERNAL, message,
+                            )
+                    except (DshUnavailable, DshProtocolError):
+                        await asyncio.to_thread(
+                            journal.mark_uncertain, request_id,
+                        )
+                        child = await self._dsh_fork_candidate_or_defer(
+                            cmd,
+                            existing,
+                            attempts=4,
+                        )
+                    terminal = True
+                    return await self._finish_dsh_fork(cmd, existing, child)
+                except DshForkJournalError as exc:
+                    log.warning(
+                        "DSH fork safety check failed",
+                        request_id=request_id,
+                        error_type=type(exc).__name__,
+                    )
+                    # A journal write can fail after ``submitted`` was durably
+                    # recorded and after DSH created the child.  Returning a
+                    # normal Error here would ACK the reliable command even
+                    # though the at-most-once outcome still needs recovery.
+                    # Keep it retryable/reconciling whenever the last readable
+                    # state has crossed the native mutation boundary.
+                    try:
+                        pending = await asyncio.to_thread(
+                            journal.get, request_id,
+                        )
+                    except DshForkJournalError:
+                        pending = None
+                    if pending is not None and pending.get("status") in {
+                        "submitted", "uncertain",
+                    }:
+                        await self._send_session_fork_error(
+                            cmd,
+                            ERR_FORK_RECONCILING,
+                            "DSH 派生结果仍在核对，请勿重复创建。",
+                        )
+                        raise _ForkOutcomeUncertain(
+                            "DSH fork journal failed after submission"
+                        ) from exc
+                    return await self._send_session_fork_error(
+                        cmd, ERR_INTERNAL, "DSH 派生状态无法安全确认，未重复执行"
+                    )
+        finally:
+            keep_lock = False
+            if not terminal:
+                try:
+                    pending = await asyncio.to_thread(journal.get, request_id)
+                except DshForkJournalError:
+                    pending = None
+                keep_lock = bool(
+                    pending is not None
+                    and pending.get("status") in {"submitted", "uncertain"}
+                )
+            if not keep_lock and self._dsh_fork_locks.get(request_id) is lock:
+                self._dsh_fork_locks.pop(request_id, None)
 
     @staticmethod
     def _claude_fork_title(info) -> str:
@@ -23583,6 +26512,269 @@ class WrapperMachine:
 
     # ---- spawn (build a ctx: SdkHandle + connect + history) ----
 
+    async def _spawn_dsh(
+        self,
+        resume_id: Optional[str],
+        *,
+        cwd: Optional[str],
+        model: Optional[str],
+        effort: Optional[str],
+        agent_preset: Optional[str],
+        space: str,
+        raise_on_failure: bool,
+    ) -> Optional[SessionContext]:
+        """Attach one DSH-owned session to the shared resident router.
+
+        DSH keeps the Agent and log alive independently of cc-remote.  A
+        resident context is therefore only a bounded control/event projection;
+        eviction drops that projection without cancelling native work.
+        """
+
+        async def reject(code: str, message: str) -> None:
+            if raise_on_failure:
+                raise _SpawnFailure(code, message)
+            target = None
+            if resume_id:
+                try:
+                    target = dsh_wire_session_id(resume_id)
+                except ValueError:
+                    target = resume_id
+            error = Error(code=code, message=message)
+            if target:
+                await self._emit_to_sid(target, error)
+            else:
+                await self._emit_focused(error)
+
+        if space != "code":
+            await reject(ERR_AUTH, "DeepSeek Harness 首版仅支持 Code 空间")
+            return None
+        try:
+            client, history = self._dsh_client_ready()
+        except DshError:
+            await reject(
+                ERR_NOT_RUNNING,
+                "DeepSeek Harness 本机服务未连接，请先启动 dsh web。",
+            )
+            return None
+
+        victim: str | None = None
+        if len(self.sessions) >= self.cfg.max_concurrent_sessions:
+            victim = next((
+                key for key, candidate in self.sessions.items()
+                if key != self.focused_sid
+                and candidate.state == "idle"
+                and not candidate.btw
+                and not candidate.queued_queries
+                and not self._query_queue_task_active(candidate)
+            ), None)
+            if victim is None:
+                await reject(ERR_BUSY, "所有会话都在运行,先中断一个再切换")
+                return None
+
+        try:
+            rows, _archived = await self._read_dsh_catalog()
+            row = None
+            native_sid = resume_id
+            if native_sid is not None:
+                if native_sid.startswith("dsh@"):
+                    native_sid = dsh_native_session_id(native_sid)
+                # Validate the native id even before trusting a catalog row.
+                dsh_wire_session_id(native_sid)
+                row = next((
+                    candidate for candidate in rows
+                    if candidate.get("sessionId") == native_sid
+                    and candidate.get("origin") != "subagent"
+                ), None)
+                if row is None:
+                    await reject(
+                        ERR_NOT_RUNNING,
+                        "DeepSeek Harness 会话不存在或不是可控制的主会话。",
+                    )
+                    return None
+
+            if row is not None:
+                recorded_cwd = row.get("cwd")
+                target_cwd = (
+                    os.path.realpath(recorded_cwd)
+                    if isinstance(recorded_cwd, str) and recorded_cwd
+                    else os.path.realpath(
+                        str((self._dsh_preflight.host if self._dsh_preflight
+                             else {}).get("cwd") or self.cfg.cc_cwd)
+                    )
+                )
+                if not os.path.isdir(target_cwd):
+                    await reject(
+                        ERR_INVALID_CWD,
+                        "DeepSeek Harness 会话的工作目录已不存在。",
+                    )
+                    return None
+                resolved_preset = row.get("agentPreset")
+                resolved_preset = (
+                    resolved_preset
+                    if isinstance(resolved_preset, str) else None
+                )
+            else:
+                target_cwd = os.path.realpath(os.path.expanduser(
+                    cwd or self.cfg.cc_cwd
+                ))
+                if not os.path.isdir(target_cwd):
+                    await reject(ERR_INVALID_CWD, f"目录不存在: {cwd}")
+                    return None
+                create_payload: dict[str, object] = {
+                    "cwd": target_cwd,
+                    # A known candidate makes create retries idempotent and lets
+                    # us reconcile a response lost after native publication.
+                    "sessionId": str(uuid4()),
+                }
+                if agent_preset:
+                    create_payload["agentPreset"] = agent_preset
+                candidate_sid = str(create_payload["sessionId"])
+                try:
+                    created = await client.call(
+                        "session.create", create_payload
+                    )
+                except DshUnavailable:
+                    # session.create documents retry-by-preallocated-id.  A
+                    # post-commit carrier failure is resolved by an exact list
+                    # witness instead of blindly creating a second session.
+                    refreshed, _archived = await self._read_dsh_catalog()
+                    row = next((
+                        candidate for candidate in refreshed
+                        if candidate.get("sessionId") == candidate_sid
+                    ), None)
+                    if row is None:
+                        raise
+                    created = {
+                        "sessionId": candidate_sid,
+                        "agentPreset": row.get("agentPreset"),
+                    }
+                if not isinstance(created, dict):
+                    raise DshProtocolError(
+                        "session.create returned an invalid value"
+                    )
+                native_sid = created.get("sessionId")
+                if not isinstance(native_sid, str):
+                    raise DshProtocolError("session.create omitted sessionId")
+                dsh_wire_session_id(native_sid)
+                resolved_preset = created.get("agentPreset")
+                resolved_preset = (
+                    resolved_preset
+                    if isinstance(resolved_preset, str) else agent_preset
+                )
+                row = {"running": False}
+
+            assert native_sid is not None
+            handle = DshSessionHandle(
+                client,
+                native_sid,
+                target_cwd,
+                agent_preset=resolved_preset,
+            )
+            await handle.refresh_models()
+            if model is not None:
+                provider, native_model = decode_dsh_model(model)
+                await handle.select_model(
+                    provider, native_model, effort
+                )
+            elif effort is not None:
+                await handle.set_effort(effort)
+            wire_sid = dsh_wire_session_id(native_sid)
+            ctx = SessionContext(
+                session_id=native_sid,
+                sdk=handle,
+                buffer=RingBuffer(
+                    self.cfg.ring_max_events,
+                    self.cfg.ring_max_bytes,
+                ),
+                cwd=target_cwd,
+                engine="dsh",
+                space="code",
+                state=(
+                    "running"
+                    if isinstance(row, dict) and row.get("running") is True
+                    else "idle"
+                ),
+                dsh_agent_preset=resolved_preset,
+            )
+            ctx.key = wire_sid
+            ctx.announced_model = handle.model
+            ctx.announced_effort = handle.effort
+            if victim is not None:
+                def eligible(key: str, candidate: SessionContext) -> bool:
+                    return bool(
+                        key != self.focused_sid
+                        and candidate.state == "idle"
+                        and not candidate.btw
+                        and not candidate.queued_queries
+                        and not self._query_queue_task_active(candidate)
+                    )
+
+                current = self.sessions.get(victim)
+                if current is None or not eligible(victim, current):
+                    victim = next((
+                        key for key, candidate in self.sessions.items()
+                        if eligible(key, candidate)
+                    ), None)
+                if victim is not None:
+                    previous = self.sessions.pop(victim)
+                    self._purge_preview_image_snapshots(
+                        previous.preview_snapshot_token
+                    )
+                    try:
+                        await previous.sdk.disconnect()
+                    except Exception:
+                        pass
+                    log.info("evicted idle session for DSH cap", key=victim)
+                else:
+                    # A previously-idle victim may start natively while DSH RPCs
+                    # are in flight.  Never evict that now-running owner or lose
+                    # the successfully-created DSH session; one lightweight DSH
+                    # projection may temporarily exceed the residency target.
+                    log.warning(
+                        "DSH resident cap temporarily exceeded",
+                        resident=len(self.sessions),
+                        cap=self.cfg.max_concurrent_sessions,
+                    )
+            self.sessions[wire_sid] = ctx
+            # Install an exact tail fold while live delivery waits on the same
+            # lock. This closes the catalog→resident race for active sessions.
+            async with ctx.dsh_event_lock:
+                try:
+                    page = await history.page(
+                        native_sid,
+                        wire_session_id=wire_sid,
+                        before=None,
+                        limit=4,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "DSH tail seed failed",
+                        session_id=wire_sid,
+                        error_type=type(exc).__name__,
+                    )
+                else:
+                    ctx.dsh_translator = page.translator
+                    ctx.dsh_last_source_seq = page.last_seq
+            log.info(
+                "DSH session attached",
+                session_id=wire_sid,
+                cwd=target_cwd,
+                resident=len(self.sessions),
+            )
+            return ctx
+        except _SpawnFailure:
+            raise
+        except (DshError, ValueError) as exc:
+            log.warning(
+                "DSH session attach failed",
+                error_type=type(exc).__name__,
+            )
+            await reject(
+                ERR_CC_CRASH,
+                "DeepSeek Harness 会话连接未完成，请稍后重试。",
+            )
+            return None
+
     async def _spawn(self, resume_id: Optional[str], cwd: Optional[str] = None,
                      bootstrap: bool = False, engine: str = "claude",
                      codex_profile_id: Optional[str] = None,
@@ -23592,6 +26784,7 @@ class WrapperMachine:
                      permission_profile: Optional[str] = None,
                      web_search: Optional[str] = None,
                      service_tier: Optional[str] = None,
+                     dsh_agent_preset: Optional[str] = None,
                      space: str = "code",
                      work_id: Optional[str] = None,
                      raise_on_failure: bool = False) -> Optional[SessionContext]:
@@ -23606,6 +26799,16 @@ class WrapperMachine:
         after connect; codex model as a per-turn field. An omitted Claude model
         resolves from current settings, then falls back to the curated default;
         omitted Codex controls retain native defaults."""
+        if engine == "dsh":
+            return await self._spawn_dsh(
+                resume_id,
+                cwd=cwd,
+                model=model,
+                effort=effort,
+                agent_preset=dsh_agent_preset,
+                space=space,
+                raise_on_failure=raise_on_failure,
+            )
         explicit_claude_model = engine == "claude" and model is not None
         explicit_codex_model = engine == "codex" and model is not None
         explicit_codex_effort = engine == "codex" and effort is not None

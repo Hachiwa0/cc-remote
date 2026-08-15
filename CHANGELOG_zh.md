@@ -4,6 +4,13 @@
 
 ## 未发布
 
+- Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v36，并新增可选的第三个
+  Code 后端 DeepSeek Harness。仅 loopback 的适配器提供会话、流式过程、历史分页、
+  图片、模型/思考强度、Agent Preset、有效 Skills、引导/打断、派生、重命名、置顶和
+  归档，同时不把模型凭据放进 cc-remote。插件安装、组合、权限、配置和凭据仍由本机
+  DSH/Cordis 管理；插件工具、Hook、子 Agent 与可安全忽略的未知事件进入通用过程
+  时间线，不加载具有 loopback 特权的插件前端；未知必需事件仍遵循 DSH 的失败关闭
+  日志契约。
 - Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v35。Codex app-server 的
   精确终态与通过源文件校验的 rollout 终态现在独立于 History 正文投影下发；数百
   MiB 的 rollout 即使仍在补建内容索引，也不会让已经完成的回合继续转圈。终态事实

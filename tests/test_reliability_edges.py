@@ -113,7 +113,8 @@ def test_client_hello_reseeds_binding_before_tail_after_cursor_passed_owner():
             generations={"s-replay": machine.instance_id},
         ))
 
-        replay = transport.sent[:6]
+        assert transport.sent[0].type == "engine_catalog"
+        replay = transport.sent[1:7]
         assert [event.type for event in replay] == [
             "replay_start", "turn_binding", "assistant_msg_start", "delta",
             "replay_end", "session_control",
@@ -219,13 +220,14 @@ def test_client_hello_preseeds_proven_current_suffix_after_binding_eviction():
 
         reseed = next(index for index, event in enumerate(transport.sent)
                       if isinstance(event, TurnBinding))
-        assert isinstance(transport.sent[0], ReplayStart)
-        assert transport.sent[0].truncated is True
+        assert transport.sent[0].type == "engine_catalog"
+        assert isinstance(transport.sent[1], ReplayStart)
+        assert transport.sent[1].truncated is True
         # The retained head is strictly newer than the evicted binding. Every
         # replayed narrative frame is therefore a proven suffix of that exact
         # logical turn and must see the owner seed before it is reduced.
-        assert transport.sent[0].from_seq > ctx.active_turn_binding.seq
-        assert reseed == 1
+        assert transport.sent[1].from_seq > ctx.active_turn_binding.seq
+        assert reseed == 2
         assert transport.sent[reseed].seq is None
 
     asyncio.run(run())
@@ -284,10 +286,10 @@ def test_fresh_hello_reseeds_owner_when_current_boundary_left_ring():
         await machine._handle_client_hello(Hello(
             role="client", client_id="client-1"))
 
-        assert [event.type for event in transport.sent[:2]] == [
-            "snapshot", "turn_binding",
+        assert [event.type for event in transport.sent[:3]] == [
+            "engine_catalog", "snapshot", "turn_binding",
         ]
-        assert transport.sent[1].seq is None
+        assert transport.sent[2].seq is None
 
         await machine._emit_locked(ctx, TurnEnd(
             turn_id="native-turn",

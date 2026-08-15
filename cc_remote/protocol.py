@@ -28,7 +28,7 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 35
+PROTOCOL_VERSION = 36
 
 # Codex Desktop renders a 53-week daily token-activity calendar. Keep the wire
 # payload to that same bounded window so an account response can never turn a
@@ -38,7 +38,8 @@ MAX_SAFE_WIRE_INTEGER = 9_007_199_254_740_991
 MAX_SAFE_WIRE_TIMESTAMP_SECONDS = MAX_SAFE_WIRE_INTEGER // 1000
 
 State = Literal["idle", "running", "interrupting", "draining"]
-Engine = Literal["claude", "codex"]
+Engine = Literal["claude", "codex", "dsh"]
+WorkEngine = Literal["claude", "codex"]
 Space = Literal["code", "work"]
 RestoreMode = Literal["conversation", "files", "both"]
 RestoreOutcome = Literal["succeeded", "failed", "skipped"]
@@ -61,6 +62,10 @@ CodexThreadStatus = Literal["notLoaded", "idle", "systemError", "active"]
 EffortLevel = Literal[
     "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
 ]
+STANDARD_EFFORT_LEVELS = frozenset({
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+})
+EffortName = Annotated[str, StringConstraints(min_length=1, max_length=64)]
 PermissionMode = Literal[
     "default", "acceptEdits", "plan", "auto", "bypassPermissions",
     "never", "on-request", "untrusted",
@@ -513,7 +518,17 @@ class SetEffort(_Command):
     Unlike set_model, effort is a spawn-time CLI flag (--effort), so applying it
     respawns the cc subprocess with resume — done lazily at the next turn."""
     type: Literal["set_effort"] = "set_effort"
-    effort: EffortLevel
+    # DSH deliberately treats reasoning effort ids as provider-defined opaque
+    # strings (for example ``off``).  The engine discriminator is required to
+    # open that namespace; legacy/standard engines retain the closed enum.
+    engine: Optional[Engine] = None
+    effort: EffortName
+
+    @model_validator(mode="after")
+    def effort_matches_engine(self):
+        if self.engine != "dsh" and self.effort not in STANDARD_EFFORT_LEVELS:
+            raise ValueError("unsupported reasoning effort")
+        return self
 
 
 class SetServiceTier(_Command):
@@ -675,6 +690,10 @@ class UserMsg(_Base):
     client_msg_id: Optional[WireId] = None
     prompt: str
     images: Optional[list[QueryImage]] = Field(default=None, max_length=MAX_ATTACHMENT_COUNT)
+    # Payload-free historical locators let non-originating browsers paint DSH
+    # attachments immediately without putting base64 bodies in the replay ring.
+    image_refs: Optional[list[ConversationImageRef]] = Field(
+        default=None, max_length=MAX_ATTACHMENT_COUNT)
     # Metadata only: file bodies stay out of replay/cache, while names remain
     # visible across devices and after transcript history reload.
     files: Optional[list[UserFileMeta]] = Field(default=None, max_length=MAX_ATTACHMENT_COUNT)
@@ -684,9 +703,14 @@ class TurnSteered(_Base):
     """A user message appended to the active Codex turn."""
     type: Literal["turn_steered"] = "turn_steered"
     msg_id: WireId
+    # DSH persists a source-sequence id while a Remote submission owns a client
+    # rpc id. Carry both so live and materialized steer segments deduplicate.
+    client_msg_id: Optional[WireId] = None
     turn_id: WireId
     prompt: str
     images: Optional[list[QueryImage]] = Field(
+        default=None, max_length=MAX_ATTACHMENT_COUNT)
+    image_refs: Optional[list[ConversationImageRef]] = Field(
         default=None, max_length=MAX_ATTACHMENT_COUNT)
     files: Optional[list[UserFileMeta]] = Field(
         default=None, max_length=MAX_ATTACHMENT_COUNT)
@@ -840,6 +864,11 @@ class TurnEnd(_Base):
     # Synthetic/legacy boundaries without a real engine id leave it unset.
     # The legacy wire name stays stable for protocol-v5 browser compatibility.
     turn_id: Optional[WireId] = None
+    # Presentation-only owner for a lifecycle whose visible row identity differs
+    # from its engine fork/checkpoint boundary. DSH model turns use the human
+    # message here and the native turn/end sequence in ``turn_id``; DSH slash
+    # commands have only this field because they are not legal fork points.
+    presentation_id: Optional[WireId] = None
     # Claude's file-checkpoint API targets the top-level user transcript UUID,
     # not the assistant UUID above or the browser's optimistic message id.
     checkpoint_id: Optional[WireId] = None
@@ -885,6 +914,33 @@ class CodexProfileInfo(BaseModel):
     error: Optional[str] = Field(default=None, min_length=1, max_length=384)
 
 
+class DshPresetInfo(BaseModel):
+    """Display-safe DSH agent composition metadata."""
+    model_config = ConfigDict(extra="forbid")
+    id: str = Field(min_length=1, max_length=256)
+    name: str = Field(min_length=1, max_length=256)
+    description: Optional[str] = Field(default=None, max_length=4096)
+    trust: Literal["system", "user"]
+    is_default: bool = False
+    broken: Optional[str] = Field(default=None, max_length=4096)
+
+
+class EngineInfo(BaseModel):
+    """One wrapper-local engine and the product spaces it can serve."""
+    model_config = ConfigDict(extra="forbid")
+    id: Engine
+    display_name: str = Field(min_length=1, max_length=64)
+    available: bool
+    spaces: list[Space] = Field(min_length=1, max_length=2)
+    reason: Optional[str] = Field(default=None, max_length=384)
+
+
+class EngineCatalog(_Base):
+    """Dynamic wrapper capability catalog, emitted on hello and changes."""
+    type: Literal["engine_catalog"] = "engine_catalog"
+    engines: list[EngineInfo] = Field(min_length=2, max_length=3)
+
+
 class SessionInfo(BaseModel):
     """A row in the sessions sidebar (subset of SDK SDKSessionInfo)."""
     model_config = ConfigDict(extra="forbid")
@@ -897,7 +953,7 @@ class SessionInfo(BaseModel):
     tag: Optional[str] = None  # SDK session tag; "archived" hides the card in the sidebar
     pinned: bool = False  # cc-remote sidebar preference; engine transcripts stay untouched
     state: Optional[State] = None  # if resident: this session's idle/running/... (sidebar status dot)
-    engine: Optional[str] = None  # "claude" | "codex"; None = claude (legacy sidebar badge)
+    engine: Optional[Engine] = None  # None = claude (legacy sidebar badge)
     forked_from_id: Optional[WireId] = None  # Codex thread/fork parent, when present
     codex_status: Optional[CodexThreadStatus] = None  # authoritative app-server status
     space: Space = "code"
@@ -908,6 +964,7 @@ class SessionInfo(BaseModel):
     native_session_id: Optional[WireId] = None
     codex_profile_id: Optional[WireId] = None
     codex_profile_label: Optional[str] = Field(default=None, max_length=48)
+    dsh_agent_preset: Optional[str] = Field(default=None, max_length=256)
     # A catalog read also repairs completion receipts for cold/evicted sessions
     # which have no resident Snapshot on reconnect.
     completion_id: Optional[WireId] = None
@@ -920,14 +977,14 @@ class ListSessions(_Command):
     session store (Claude ~/.claude/projects vs Codex ~/.codex/sessions);
     optional, default claude."""
     type: Literal["list_sessions"] = "list_sessions"
-    engine: Literal["claude", "codex"] = "claude"
+    engine: Engine = "claude"
     space: Space = "code"
 
 
 class SessionList(_Base):
     """wrapper -> client: the sessions (downstream so a reconnect restores it)."""
     type: Literal["session_list"] = "session_list"
-    engine: Literal["claude", "codex"]
+    engine: Engine
     space: Space = "code"
     # Exact ListSessions.cmd_id. A single Codex read may paint a cached list and
     # then a refreshed list, so both responses intentionally carry the same id.
@@ -935,6 +992,8 @@ class SessionList(_Base):
     sessions: list[SessionInfo]
     codex_profiles: list[CodexProfileInfo] = Field(default_factory=list, max_length=32)
     default_codex_profile_id: Optional[WireId] = None
+    dsh_presets: list[DshPresetInfo] = Field(default_factory=list, max_length=128)
+    default_dsh_preset_id: Optional[str] = Field(default=None, max_length=256)
 
 
 class SessionListInvalidated(_Base):
@@ -945,7 +1004,7 @@ class SessionListInvalidated(_Base):
     ListSessions; the wrapper never broadcasts an uncorrelated SessionList.
     """
     type: Literal["session_list_invalidated"] = "session_list_invalidated"
-    engine: Literal["claude", "codex"]
+    engine: Engine
     space: Space = "code"
 
 
@@ -959,7 +1018,7 @@ class SessionActivity(_Base):
     presentation.
     """
     type: Literal["session_activity"] = "session_activity"
-    engine: Literal["claude", "codex"]
+    engine: Engine
     session_id: WireId
     state: State
 
@@ -971,6 +1030,15 @@ class SwitchSession(_Command):
     session_id: WireId
     engine: Optional[Engine] = None
     space: Space = "code"
+
+    @model_validator(mode="after")
+    def dsh_target_matches_engine(self):
+        is_dsh = self.session_id.startswith("dsh@")
+        if is_dsh != (self.engine == "dsh"):
+            raise ValueError("DSH session ids require the DSH engine")
+        if is_dsh and self.space != "code":
+            raise ValueError("DSH is only supported in Code")
+        return self
 
 
 class NewSession(_Command):
@@ -989,10 +1057,11 @@ class NewSession(_Command):
     cwd: Optional[str] = Field(default=None, max_length=4096)
     engine: Engine = "claude"
     codex_profile_id: Optional[WireId] = None
+    dsh_agent_preset: Optional[str] = Field(default=None, max_length=256)
     space: Space = "code"
     project_id: Optional[WireId] = None
     model: Optional[ModelName] = None    # None -> engine default (settings.json / codex config)
-    effort: Optional[EffortLevel] = None  # None -> engine default
+    effort: Optional[EffortName] = None  # None -> engine default
     collaboration_mode: Optional[CollaborationModeName] = None  # Codex only; first turn included
     permission_mode: Optional[
         Literal["never", "on-request", "untrusted"]
@@ -1025,6 +1094,18 @@ class NewSession(_Command):
         if invalid:
             raise ValueError(
                 f"{', '.join(invalid)} only supported for Codex sessions")
+        if self.dsh_agent_preset is not None and self.engine != "dsh":
+            raise ValueError("dsh_agent_preset only supported for DSH sessions")
+        if (
+            self.effort is not None
+            and self.engine != "dsh"
+            and self.effort not in STANDARD_EFFORT_LEVELS
+        ):
+            raise ValueError("unsupported reasoning effort")
+        if self.engine == "dsh" and self.space != "code":
+            raise ValueError("DSH is only supported in Code")
+        if self.engine == "dsh" and self.files:
+            raise ValueError("DSH does not accept generic file attachments")
         if self.space == "work" and self.cwd is not None:
             raise ValueError("Work session cwd is assigned by the wrapper")
         if self.space == "work" and self.web_search is not None:
@@ -1038,7 +1119,7 @@ class DeleteWorkSession(_Command):
     """Permanently delete one registered Work chat and its owned files."""
     type: Literal["delete_work_session"] = "delete_work_session"
     session_id: WireId
-    engine: Engine
+    engine: WorkEngine
     space: Literal["work"] = "work"
 
 
@@ -1048,6 +1129,15 @@ class DeleteSession(_Command):
     session_id: WireId
     engine: Engine
     space: Space = "code"
+
+    @model_validator(mode="after")
+    def dsh_target_matches_engine(self):
+        is_dsh = self.session_id.startswith("dsh@")
+        if is_dsh != (self.engine == "dsh"):
+            raise ValueError("DSH session ids require the DSH engine")
+        if is_dsh and self.space != "code":
+            raise ValueError("DSH is only supported in Code")
+        return self
 
 
 class RollbackSession(_Command):
@@ -1060,7 +1150,7 @@ class RollbackSession(_Command):
     """
     type: Literal["rollback_session"] = "rollback_session"
     session_id: WireId
-    engine: Engine
+    engine: WorkEngine
     space: Literal["code"] = "code"
     restore: RestoreMode = "conversation"
     num_turns: int = Field(default=1, ge=1, le=1000)
@@ -1079,7 +1169,7 @@ class RollbackResult(_Base):
     """Structured, non-atomic restore result for the confirmation UI."""
     type: Literal["rollback_result"] = "rollback_result"
     session_id: WireId
-    engine: Engine
+    engine: WorkEngine
     restore: RestoreMode
     conversation: RestoreOutcome
     files: RestoreOutcome
@@ -1172,7 +1262,7 @@ class WorkScheduleInfo(BaseModel):
 
 class WorkDashboard(_Base):
     type: Literal["work_dashboard"] = "work_dashboard"
-    engine: Engine
+    engine: WorkEngine
     projects: list[WorkProjectInfo] = Field(max_length=500)
     sources: list[WorkSourceInfo] = Field(max_length=5000)
     plugins: list[WorkPluginInfo] = Field(max_length=500)
@@ -1181,25 +1271,25 @@ class WorkDashboard(_Base):
 
 class GetWorkDashboard(_Command):
     type: Literal["get_work_dashboard"] = "get_work_dashboard"
-    engine: Engine = "claude"
+    engine: WorkEngine = "claude"
 
 
 class CreateWorkProject(_Command):
     type: Literal["create_work_project"] = "create_work_project"
-    engine: Engine = "claude"
+    engine: WorkEngine = "claude"
     name: str = Field(min_length=1, max_length=200)
     description: str = Field(default="", max_length=16 * 1024)
 
 
 class DeleteWorkProject(_Command):
     type: Literal["delete_work_project"] = "delete_work_project"
-    engine: Engine = "claude"
+    engine: WorkEngine = "claude"
     project_id: WireId
 
 
 class AddWorkSource(_Command):
     type: Literal["add_work_source"] = "add_work_source"
-    engine: Engine = "claude"
+    engine: WorkEngine = "claude"
     project_id: WireId
     kind: Literal["file", "link", "note"]
     title: str = Field(min_length=1, max_length=500)
@@ -1219,13 +1309,13 @@ class AddWorkSource(_Command):
 
 class DeleteWorkSource(_Command):
     type: Literal["delete_work_source"] = "delete_work_source"
-    engine: Engine = "claude"
+    engine: WorkEngine = "claude"
     source_id: WireId
 
 
 class CreateWorkPlugin(_Command):
     type: Literal["create_work_plugin"] = "create_work_plugin"
-    engine: Engine = "claude"
+    engine: WorkEngine = "claude"
     project_id: Optional[WireId] = None
     name: str = Field(min_length=1, max_length=200)
     instructions: str = Field(min_length=1, max_length=64 * 1024)
@@ -1233,13 +1323,13 @@ class CreateWorkPlugin(_Command):
 
 class DeleteWorkPlugin(_Command):
     type: Literal["delete_work_plugin"] = "delete_work_plugin"
-    engine: Engine = "claude"
+    engine: WorkEngine = "claude"
     plugin_id: WireId
 
 
 class CreateWorkSchedule(_Command):
     type: Literal["create_work_schedule"] = "create_work_schedule"
-    engine: Engine = "claude"
+    engine: WorkEngine = "claude"
     project_id: Optional[WireId] = None
     codex_profile_id: Optional[WireId] = None
     title: str = Field(min_length=1, max_length=200)
@@ -1256,13 +1346,13 @@ class CreateWorkSchedule(_Command):
 
 class DeleteWorkSchedule(_Command):
     type: Literal["delete_work_schedule"] = "delete_work_schedule"
-    engine: Engine = "claude"
+    engine: WorkEngine = "claude"
     schedule_id: WireId
 
 
 class GetWorkArtifacts(_Command):
     type: Literal["get_work_artifacts"] = "get_work_artifacts"
-    engine: Engine = "claude"
+    engine: WorkEngine = "claude"
     session_id: WireId
 
 
@@ -1277,7 +1367,7 @@ class WorkArtifactInfo(BaseModel):
 
 class WorkArtifacts(_Base):
     type: Literal["work_artifacts"] = "work_artifacts"
-    engine: Engine
+    engine: WorkEngine
     session_id: WireId
     artifacts: list[WorkArtifactInfo] = Field(max_length=200)
 
@@ -1322,6 +1412,15 @@ class RenameSession(_Command):
     engine: Optional[Engine] = None
     space: Space = "code"
 
+    @model_validator(mode="after")
+    def dsh_target_matches_engine(self):
+        is_dsh = self.session_id.startswith("dsh@")
+        if is_dsh != (self.engine == "dsh"):
+            raise ValueError("DSH session ids require the DSH engine")
+        if is_dsh and self.space != "code":
+            raise ValueError("DSH is only supported in Code")
+        return self
+
 
 class ArchiveSession(_Command):
     """client -> wrapper: toggle the "archived" tag on a session."""
@@ -1331,6 +1430,15 @@ class ArchiveSession(_Command):
     engine: Optional[Engine] = None
     space: Space = "code"
 
+    @model_validator(mode="after")
+    def dsh_target_matches_engine(self):
+        is_dsh = self.session_id.startswith("dsh@")
+        if is_dsh != (self.engine == "dsh"):
+            raise ValueError("DSH session ids require the DSH engine")
+        if is_dsh and self.space != "code":
+            raise ValueError("DSH is only supported in Code")
+        return self
+
 
 class PinSession(_Command):
     """client -> wrapper: persist a cross-client sidebar pin preference."""
@@ -1339,6 +1447,15 @@ class PinSession(_Command):
     pinned: bool
     engine: Optional[Engine] = None
     space: Space = "code"
+
+    @model_validator(mode="after")
+    def dsh_target_matches_engine(self):
+        is_dsh = self.session_id.startswith("dsh@")
+        if is_dsh != (self.engine == "dsh"):
+            raise ValueError("DSH session ids require the DSH engine")
+        if is_dsh and self.space != "code":
+            raise ValueError("DSH is only supported in Code")
+        return self
 
 
 class ForkSession(_Command):
@@ -1431,12 +1548,27 @@ class GetModels(_Command):
     its model list therefore remains empty and the client keeps the static table.
     """
     type: Literal["get_models"] = "get_models"
-    engine: Optional[Literal["cc", "claude", "codex"]] = None
+    engine: Optional[Literal["cc", "claude", "codex", "dsh"]] = None
     client_id: Optional[WireId] = None  # requester, so the wrapper routes Models back to=<client_id>
     # Claude defaults can depend on project/local settings, so resolve them in
     # the same directory the prospective new session will use.
     cwd: Optional[str] = Field(default=None, max_length=4096)
     codex_profile_id: Optional[WireId] = None
+    # DSH's exact current selection is session-owned. Omission requests the
+    # host-wide catalog/defaults used by a prospective new session.
+    session_id: Optional[WireId] = None
+
+    @model_validator(mode="after")
+    def engine_scoped_fields(self):
+        if self.session_id is not None and self.engine != "dsh":
+            raise ValueError("session_id is only supported for DSH models")
+        if self.session_id is not None and not self.session_id.startswith("dsh@"):
+            raise ValueError("DSH models require a DSH session id")
+        if self.codex_profile_id is not None and self.engine != "codex":
+            raise ValueError(
+                "codex_profile_id is only supported for Codex models"
+            )
+        return self
 
 
 class Models(_Base):
@@ -1458,6 +1590,9 @@ class Models(_Base):
     # can never be rendered against a different directory in the new-chat form.
     cwd: Optional[str] = Field(default=None, max_length=4096)
     codex_profile_id: Optional[WireId] = None
+    # Present only when this is the current selection/catalog of one existing
+    # DSH session.  Host-wide new-session defaults leave it absent.
+    session_id: Optional[WireId] = None
 
 
 class GetEngineCapabilities(_Command):
@@ -1469,6 +1604,23 @@ class GetEngineCapabilities(_Command):
     cwd: Optional[str] = Field(default=None, max_length=4096)
     skills_only: bool = False
     codex_profile_id: Optional[WireId] = None
+    # DSH Skills are the effective catalog of one composed Agent/Preset, not a
+    # cwd-global installation list.
+    session_id: Optional[WireId] = None
+
+    @model_validator(mode="after")
+    def engine_scoped_fields(self):
+        if self.engine == "dsh" and self.space != "code":
+            raise ValueError("DSH capabilities are only supported in Code")
+        if self.codex_profile_id is not None and self.engine != "codex":
+            raise ValueError(
+                "codex_profile_id is only supported for Codex capabilities"
+            )
+        if self.session_id is not None and self.engine != "dsh":
+            raise ValueError("session_id is only supported for DSH capabilities")
+        if self.session_id is not None and not self.session_id.startswith("dsh@"):
+            raise ValueError("DSH capabilities require a DSH session id")
+        return self
 
 
 class ManageEnginePlugin(_Command):
@@ -1549,6 +1701,7 @@ class EngineCapabilities(_Base):
     notes: list[str] = Field(default_factory=list, max_length=32)
     skills_only: bool = False
     codex_profile_id: Optional[WireId] = None
+    session_id: Optional[WireId] = None
 
 
 class SetPerm(_Command):
@@ -2280,7 +2433,7 @@ class CompletionState(_Base):
 
 AnyMessage = Union[
     Hello, Query, CancelQueuedQuery, GetQueuedQuery, QueuedQueryDetail, UpdateQueuedQuery, QueuedQueryUpdated, QueryQueueState, Steer, Interrupt, Takeover, TakeoverState, SessionControl, SetModel, SetEffort, SetServiceTier, SetCollaborationMode, SetPerm, GetPermissionProfiles, SetPermissionProfile, SetWebSearch, Fast, CollaborationMode, OpenBtw, CloseBtw, BtwOpened, GetContext, GetStatus, GetDiff, GetFilePreview, SaveMarkdown, GetPreviewAsset, AuthorizePreview, GetHistory, GetTurnDetail, GetHistoryImage, GetModels, GetEngineCapabilities, ManageEnginePlugin, ManageEngineSkill, ManageEngineHook, ListSessions, SwitchSession, NewSession, DeleteWorkSession, DeleteSession, RollbackSession, RollbackResult, CompactSession, StartReview, GetWorkDashboard, CreateWorkProject, DeleteWorkProject, AddWorkSource, DeleteWorkSource, CreateWorkPlugin, DeleteWorkPlugin, CreateWorkSchedule, DeleteWorkSchedule, GetWorkArtifacts, ListDir, Ping, Pong, CommandAck,
-    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, PermissionProfiles, PermissionProfile, WebSearch, ContextReport, StatusReport, Notice, RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, PreviewAuthorizationRequired, PreviewAuthorizationResult, History, TurnDetail, HistoryImage, HistoryInvalidated, ArtifactInvalidated, Models, EngineCapabilities, AskUser, AskUserClosed, AnswerQuestion,
+    ReplayStart, ReplayEnd, Snapshot, StateEvent, Model, Effort, Perm, PermissionProfiles, PermissionProfile, WebSearch, ContextReport, StatusReport, Notice, RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset, PreviewAuthorizationRequired, PreviewAuthorizationResult, History, TurnDetail, HistoryImage, HistoryInvalidated, ArtifactInvalidated, Models, EngineCatalog, EngineCapabilities, AskUser, AskUserClosed, AnswerQuestion,
     SessionList, SessionListInvalidated, SessionActivity, SessionFocus, SessionRekey, RenameSession, ArchiveSession, PinSession, WorkDashboard, WorkArtifacts,
     ForkSession, ForkSessionWorktree, SessionForked, MigrateSession, SessionMigrated, DirList,
     GetGoal, SetGoal, ClearGoal, DismissGoal, GoalState,
@@ -2343,6 +2496,7 @@ _TYPE_MAP: dict[str, type[BaseModel]] = {
     "get_history_image": GetHistoryImage,
     "get_models": GetModels,
     "models": Models,
+    "engine_catalog": EngineCatalog,
     "get_engine_capabilities": GetEngineCapabilities,
     "engine_capabilities": EngineCapabilities,
     "manage_engine_plugin": ManageEnginePlugin,

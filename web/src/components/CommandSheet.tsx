@@ -4,12 +4,12 @@ import {
   type Cmd, type CmdGroup, type Catalog,
 } from "../data";
 import { Icon } from "../icons";
-import type { PermissionProfileInfo } from "../protocol";
+import type { Engine, PermissionProfileInfo } from "../protocol";
 
 interface Props {
   open: boolean;
   kind: "commands" | "models" | "efforts" | "perms";
-  engine?: "claude" | "codex";
+  engine?: Engine;
   catalog?: Catalog;   // engine-reported models/efforts; falls back to data.ts
   // command mode: the token typed after "/" in the composer (prefix filter).
   // There is NO input box in this sheet anymore — the composer textarea is the

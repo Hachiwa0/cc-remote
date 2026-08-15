@@ -20,6 +20,7 @@ export interface SkillCatalogRequest {
   cwd: string;
   skillsOnly: boolean;
   codexProfileId?: string | null;
+  dshSessionId?: string | null;
 }
 
 export interface SkillCatalogReadIdentity extends SkillCatalogRequest {
@@ -46,11 +47,13 @@ export const skillCatalogKey = (
   space: Space,
   cwd: string,
   codexProfileId?: string | null,
+  dshSessionId?: string | null,
 ): string => [
   machineId,
   engine,
   space,
   engine === "codex" ? (codexProfileId || "__default__") : "",
+  engine === "dsh" ? (dshSessionId || "__no_session__") : "",
   cwd || ".",
 ].join("\u0000");
 
@@ -74,6 +77,8 @@ export const skillCatalogResponseMatches = (
   && (read.engine !== "codex"
     || (response.codex_profile_id ?? null)
       === (read.codexProfileId ?? null))
+  && (read.engine !== "dsh"
+    || (response.session_id ?? null) === (read.dshSessionId ?? null))
 );
 
 export const skillCatalogMutationResponseMatches = (

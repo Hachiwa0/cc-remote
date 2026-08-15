@@ -121,6 +121,20 @@ export const CODEX_MODELS: Model[] = [
   { id: "gpt-5.5", name: "GPT-5.5", ds: "上一代 · 旧会话兼容", ic: "cpu" },
   { id: "gpt-5.4", name: "GPT-5.4", ds: "更早 · 旧会话兼容", ic: "cpu" },
 ];
+
+// DSH owns slash commands, plugins and Agent composition. cc-remote only
+// intercepts controls it can faithfully represent; every other slash is sent
+// verbatim to DSH (for example its native /compact command).
+export const DSH_COMMANDS: Command[] = [
+  { g: "设置" },
+  { slash: "model", name: "切换模型", ds: "选择 DSH Provider、模型与思考强度", ic: "cpu" },
+  { g: "扩展" },
+  { slash: "extensions", name: "Agent 能力", ds: "只读查看当前 Agent Preset 组合的 Skills", ic: "spark" },
+  { slash: "skills", name: "Skills", ds: "只读查看当前 DSH Skills", ic: "read" },
+  { g: "会话" },
+  { slash: "preview", name: "预览文件", ds: "/preview <路径> 打开 Markdown 或 UTF-8 源文件", ic: "read" },
+  { slash: "clear", name: "新会话", ds: "开始新的 DeepSeek Harness 会话", ic: "close" },
+];
 export const CODEX_PERMS: Perm[] = [
   { id: "never", name: "Never", short: "Never", ds: "不询问 · 需要审批时拒绝", ic: "shield" },
   { id: "on-request", name: "On Request", short: "On Request", ds: "需要时才询问", ic: "shield" },
@@ -229,6 +243,7 @@ const fromCatalog = (entries: CatalogModel[]): Model[] =>
   });
 
 export const modelsFor = (engine?: string, catalog?: Catalog): Model[] => {
+  if (engine === "dsh") return fromCatalog(catalog?.dsh ?? []);
   if (engine !== "codex") return MODELS;
   const live = catalog?.codex;
   return live?.length ? fromCatalog(live) : CODEX_MODELS;
@@ -245,7 +260,7 @@ export const defaultModelFor = (engine?: string, catalog?: Catalog,
   // them. Claude may legitimately use a custom/provider alias absent from the
   // common suggestions above, so preserve its wrapper-resolved id.
   return want && (engine !== "codex" || list.some((m) => m.id === want))
-    ? want : list[0].id;
+    ? want : list[0]?.id ?? "";
 };
 
 /** Effort levels the SELECTED model actually accepts. Unknown/unset model falls back
@@ -253,7 +268,7 @@ export const defaultModelFor = (engine?: string, catalog?: Catalog,
 export const effortsFor = (engine?: string, model?: string | null, catalog?: Catalog): Effort[] => {
   const m = model ? modelsFor(engine, catalog).find((x) => x.id === model) : undefined;
   if (m?.efforts) return m.efforts;
-  return engine === "codex" ? CODEX_EFFORTS : EFFORTS;
+  return engine === "dsh" ? [] : engine === "codex" ? CODEX_EFFORTS : EFFORTS;
 };
 
 /** A null app-server thread effort is a real model-default state, not loading.
@@ -280,9 +295,15 @@ export function effortIsSelectable(
  *  switches to a model that lacks the current level (sol `ultra` -> luna `max`). */
 export const defaultEffortFor = (engine?: string, model?: string | null, catalog?: Catalog): string => {
   const list = effortsFor(engine, model, catalog);
-  return list.reduce((a, b) => (rank(b.id) > rank(a.id) ? b : a)).id;
+  return list.reduce<Effort | null>(
+    (current, candidate) => !current || rank(candidate.id) > rank(current.id)
+      ? candidate : current,
+    null,
+  )?.id ?? "";
 };
-export const permsFor = (engine?: string): Perm[] => (engine === "codex" ? CODEX_PERMS : PERMS);
+export const permsFor = (engine?: string): Perm[] => (
+  engine === "dsh" ? [] : engine === "codex" ? CODEX_PERMS : PERMS
+);
 
 // Map a cc-reported model id (e.g. "claude-mythos-5[1m]") to a MODELS entry id.
 // An id we don't know (any codex model) passes through verbatim — the codex chips
@@ -360,21 +381,31 @@ export const CODEX_COMMANDS: Command[] = [
   { slash: "clear", name: "新会话", ds: "开新 codex 会话", ic: "close" },
 ];
 const CODEX_CMD_LIST: Cmd[] = CODEX_COMMANDS.filter(isCmd) as Cmd[];
+const DSH_CMD_LIST: Cmd[] = DSH_COMMANDS.filter(isCmd) as Cmd[];
 const WORK_CMD_LIST: Cmd[] = WORK_COMMANDS.filter(isCmd) as Cmd[];
 export const CODEX_CLIENT_SLASHES = new Set(["model", "plan", "normal", "clear", "context", "status", "permissions", "fast", "goal", "btw", "diff", "preview", "review", "compact", "rollback", ...EXTENSION_SLASHES]);
+export const DSH_CLIENT_SLASHES = new Set([
+  "model", "extensions", "skills", "preview", "clear",
+]);
 const HIDDEN_CODE_ONLY_SLASHES = new Set(["rollback"]);
 export type CommandSurface = "code" | "work";
 export const commandsFor = (engine?: string, surface: CommandSurface = "code"): Command[] => (
-  surface === "work" ? WORK_COMMANDS : engine === "codex" ? CODEX_COMMANDS : COMMANDS
+  engine === "dsh" ? DSH_COMMANDS
+    : surface === "work" ? WORK_COMMANDS
+      : engine === "codex" ? CODEX_COMMANDS : COMMANDS
 );
-export const clientSlashesFor = (engine?: string): Set<string> => (engine === "codex" ? CODEX_CLIENT_SLASHES : CLIENT_SLASHES);
+export const clientSlashesFor = (engine?: string): Set<string> => (
+  engine === "codex" ? CODEX_CLIENT_SLASHES
+    : engine === "dsh" ? DSH_CLIENT_SLASHES : CLIENT_SLASHES
+);
 
 /** A built-in command intentionally available on Code but absent from Work.
  * Unknown slashes return false so user-installed Claude skills remain usable. */
 export function isKnownCodeOnlySlash(slash: string, engine?: string): boolean {
   const normalized = slash.toLowerCase();
   return (engine === "codex" && HIDDEN_CODE_ONLY_SLASHES.has(normalized)) || ((
-    engine === "codex" ? CODEX_CMD_LIST : CMD_LIST).some(
+    engine === "codex" ? CODEX_CMD_LIST
+      : engine === "dsh" ? DSH_CMD_LIST : CMD_LIST).some(
     (command) => command.slash === normalized,
   ) && !WORK_CMD_LIST.some((command) => command.slash === normalized));
 }
@@ -425,8 +456,9 @@ export function matchSkills(
 export function matchCommands(token: string, engine?: string,
                               surface: CommandSurface = "code"): Cmd[] {
   const t = token.toLowerCase();
-  const list = surface === "work"
-    ? WORK_CMD_LIST : engine === "codex" ? CODEX_CMD_LIST : CMD_LIST;
+  const list = engine === "dsh"
+    ? DSH_CMD_LIST : surface === "work"
+      ? WORK_CMD_LIST : engine === "codex" ? CODEX_CMD_LIST : CMD_LIST;
   return list.filter((c) => c.slash.toLowerCase().startsWith(t));
 }
 

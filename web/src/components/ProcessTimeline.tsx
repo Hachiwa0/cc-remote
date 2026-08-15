@@ -34,6 +34,7 @@ import {
   PointerTapGuard,
   releaseDraggedPointer,
 } from "../pointer-tap";
+import type { Engine } from "../protocol";
 
 const PlanProgressPopover = lazy(() => import("./PlanProgressPopover").then(
   ({ PlanProgressPopover: Popover }) => ({ default: Popover }),
@@ -629,7 +630,7 @@ export function ProcessTimeline({ blocks, done, active, durationMs, startTs, don
     variant: HistoryImageVariant,
   ) => boolean;
   onPreviewHistoryImage?: (turnId: string, imageId: string) => void;
-  engine?: "claude" | "codex";
+  engine?: Engine;
   /** The session-level progress strip owns this plan instead of this row. */
   externalPlanItemId?: string | null;
   openOverride?: boolean;

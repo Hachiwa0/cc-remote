@@ -3,9 +3,10 @@ import { createPortal } from "react-dom";
 import { Icon } from "../icons";
 import type { NotificationMode } from "../notification-mode";
 import type { PushBindingState } from "../push";
+import type { Engine } from "../protocol";
 
 interface Props {
-  engine: "claude" | "codex";
+  engine: Engine;
   theme: "light" | "dark";
   notificationMode: NotificationMode;
   notificationBinding: PushBindingState;

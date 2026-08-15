@@ -197,6 +197,12 @@ def test_client_command_scalars_are_bounded_or_enumerated(factory):
 
 def test_known_dynamic_control_values_remain_supported():
     assert SetEffort(effort="ultra").effort == "ultra"
+    assert SetEffort(engine="dsh", effort="off").effort == "off"
+    assert NewSession(engine="dsh", effort="provider-auto").effort == (
+        "provider-auto"
+    )
+    with pytest.raises(ValidationError, match="unsupported reasoning effort"):
+        NewSession(engine="codex", effort="provider-auto")
     assert SetServiceTier(service_tier="toggle").service_tier == "toggle"
     assert SetCollaborationMode(mode="plan").mode == "plan"
     assert SetCollaborationMode(mode="default").mode == "default"

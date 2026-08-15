@@ -28,6 +28,10 @@ import {
 const codex: SessionInfo = { session_id: "codex-parent", engine: "codex" };
 const claude: SessionInfo = { session_id: "claude-parent", engine: "claude" };
 const archivedCodex: SessionInfo = { session_id: "codex-archived", engine: "codex", tag: "archived" };
+const dsh: SessionInfo = { session_id: "dsh@native", engine: "dsh" };
+const archivedDsh: SessionInfo = {
+  session_id: "dsh@archived", engine: "dsh", tag: "archived",
+};
 
 assert.deepEqual(sessionMenuCapabilities(codex), {
   rename: true,
@@ -45,6 +49,15 @@ assert.deepEqual(sessionMenuCapabilities(claude), {
 });
 assert.equal(sessionMenuCapabilities(archivedCodex).forkWorktree, false);
 assert.equal(sessionMenuCapabilities(archivedCodex).migrate, false);
+assert.deepEqual(sessionMenuCapabilities(dsh), {
+  rename: true,
+  archive: true,
+  forkWorktree: false,
+  migrate: false,
+  delete: false,
+});
+assert.equal(sessionMenuCapabilities(archivedDsh).archive, false,
+  "DSH has no unarchive RPC and must not render a misleading action");
 assert.equal(sessionMenuCapabilities({
   ...codex, space: "work",
 }).migrate, false);
@@ -231,6 +244,8 @@ assert.equal(canForkTurn(
   "claude", { done: true, forkPointId: "assistant-uuid" }), true);
 assert.equal(canForkTurn(
   "claude", { done: true }), false);
+assert.equal(canForkTurn(
+  "dsh", { done: true, forkPointId: "dsh-seq-20" }), true);
 assert.equal(isTerminalWorktreeForkError("wrapper_offline"), false);
 assert.equal(isTerminalWorktreeForkError("fork_reconciling"), false);
 assert.equal(isTerminalWorktreeForkError("internal"), true);

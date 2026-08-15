@@ -1,10 +1,10 @@
 # cc-remote
 
-**把你机器上的 Claude Code / Codex，带到手机和任意浏览器。**
+**把你机器上的 Claude Code / Codex / DeepSeek Harness，带到手机和任意浏览器。**
 
-自托管 · 双引擎 · 多会话 · 实时过程 · 响应式 Web
+自托管 · 三后端 · 多会话 · 实时过程 · 响应式 Web
 
-**当前版本：v3.0.0** · Wire protocol v35
+**当前版本：v3.0.0** · Wire protocol v36
 
 [English](README_en.md) ·
 [5 分钟上手](#本地快速开始一台机器5-分钟) ·
@@ -13,7 +13,8 @@
 [更新记录](CHANGELOG_zh.md)
 
 cc-remote 是一个开源的远程控制面：本机 `wrapper` 驱动已经安装并登录的
-`claude` / `codex`，浏览器通过你自托管的 WebSocket 中继查看和控制会话。
+`claude` / `codex`，并可连接本机 DeepSeek Harness（DSH）；浏览器通过你自托管的
+WebSocket 中继查看和控制会话。
 模型、认证与工具执行仍由本地 CLI 决定；cc-remote 不代理模型 API，也不会把
 API key 烤进网页。
 
@@ -58,7 +59,7 @@ v3 把 cc-remote 从“能在网页控制 CLI”推进为一个本地优先、�
 | **原生 App / CLI 协同** | Claude CLI/Desktop/Agent View 与 Codex shared daemon/App/CLI 使用各自的所有权模型。v3 对齐 running、只读、打断、steer、compact、turn binding 和终止状态，避免兄弟会话误锁、历史回合串到尾部或留下“假思考中”。 |
 | **多设备隔离** | Device Center 提供一次性配对、独立可撤销的机器凭据和在线状态；relay 按用户允许的 `machine_id` 路由。设备、Code / Work、引擎、连接 generation 和会话归属分别隔离，延迟帧不能污染当前视图。 |
 | **移动端与文件体验** | 历史到顶继续拉取时保留滚动锚点；图片按需加载，支持灯箱、再次点击收起和双指缩放；Markdown、源码、HTML、PDF 与 Office 预览仍在本机安全边界内完成。工作目录外的精确文件会先在请求它的会话中确认，只授权当前文件身份；用户确认的 Markdown 保持只读，只有本会话成功写入的文件才可保存。PWA 图标、窄屏弹层、错误提示和过程时间线也统一收敛。 |
-| **可回滚发布** | 产品版本统一为 v3.0.0，wire protocol 为 v33。构建和部署同时校验产品版本与协议版本；VPS 使用不可变 release、独立 venv、原子 `current` 切换和失败回滚，避免直接覆盖正在运行的目录。 |
+| **可回滚发布** | 产品版本统一为 v3.0.0，wire protocol 为 v36。构建和部署同时校验产品版本与协议版本；VPS 使用不可变 release、独立 venv、原子 `current` 切换和失败回滚，避免直接覆盖正在运行的目录。 |
 
 > **信任边界没有改变：**模型账号、API key、会话源文件和工具执行仍留在
 > wrapper 所在机器；VPS relay 不保存对话或 Artifact。浏览历史只读取本地
@@ -71,7 +72,7 @@ v3 把 cc-remote 从“能在网页控制 CLI”推进为一个本地优先、�
 
 | 场景 | 可以做什么 |
 |---|---|
-| **双引擎** | 在同一个 Web UI 中使用 Claude Code 和 Codex；每个会话保持自己的模型、思考强度、权限与运行状态。 |
+| **三个 Code 后端** | 在同一个 Web UI 中使用 Claude Code、Codex 和可选的 DeepSeek Harness；每个会话保持自己的模型、思考强度与运行状态。DSH 仅在本机服务健康时出现，首版只进入 Code。 |
 | **Code / Work 双空间** | Code 继续面向代码仓库；Work 是完全独立的 Cowork 工作区，用于文档、表格、演示、资料整理和临时协作，不混入代码会话列表。 |
 | **Work 项目与资料库** | 为 Claude/Codex 分别建立私有项目、文件/链接/笔记资料库和可复用工作模板；创建工作时会把选定上下文物化到专属目录。 |
 | **Work 定时任务与隔离** | 支持一次、每日、每周任务；执行记录、租约、失败重试和防重叠状态均持久化。每个工作默认只能访问自己的私有目录，需要的资料通过会话附件或项目资料库显式加入。 |
@@ -93,14 +94,14 @@ v3 把 cc-remote 从“能在网页控制 CLI”推进为一个本地优先、�
 两条**互相独立**的链路：
 
 ```
-模型链路（cc-remote 不碰）:  claude / codex ──(各自本地配置)──▶ 模型服务
+模型链路（cc-remote 不碰）:  claude / codex / dsh ──(各自本地配置)──▶ 模型服务
 
 控制链路（本仓库）:          浏览器 ⇄ 中继(WebSocket) ⇄ wrapper ⇄ SDK / app-server ⇄ 本地 CLI
 ```
 
 | 组件 | 跑在哪 | 干什么 |
 |---|---|---|
-| **wrapper** | `claude` / `codex` 所在的机器 | 持有会话池、把 SDK/app-server 事件翻成线协议、管打断/排空、按需从 transcript/rollout 读历史，并在本机临时转换 Office 预览。**只出站连中继，机器不需要开入站端口。** |
+| **wrapper** | `claude` / `codex` / `dsh web` 所在的机器 | 持有会话池、把 SDK/app-server/DSH 事件翻成线协议、管打断/排空、按需读取原生历史，并在本机临时转换 Office 预览。**只出站连中继，机器不需要开入站端口。** |
 | **relay（中继）** | 公网 VPS（或本地） | 纯 WebSocket 转发器（FastAPI）。每个 `machine_id` 一个 wrapper 槽，浏览器使用 HttpOnly 会话 cookie，并只接收所选机器的事件。**不持久化会话或 Artifact，从不 import `claude-agent-sdk`、从不碰模型 API**。 |
 | **web** | 浏览器 | React 客户端；中继同源托管它的静态文件（`web/dist`）。 |
 
@@ -160,6 +161,19 @@ Code 会话按两家 CLI 的真实控制面协同，不替换官方命令：
   Profile；会话与定时任务会冻结该账号归属，重试或默认账号变化都不会换号。若账号
   被移除，既有 Work 会保持原归属并明确失败；需恢复该 Profile，或在其他账号下新建
   Work / 定时任务，不会把既有数据静默改绑到默认账号。
+
+- **DeepSeek Harness：**先在 wrapper 同一台机器启动
+  `npx @deepseek-ai/dsh@0.1.0-rc.6 web`。首版适配固定于这个 RC；升级 DSH 前需重新
+  验证 RPC、事件日志和打断契约。
+  wrapper 默认只探测 `http://127.0.0.1:3080`，健康时才在 Code 引擎选择器中显示
+  DSH。Remote 支持会话、新建/恢复、历史、图片、模型与思考强度、引导、打断、派生、
+  重命名、置顶和归档；新建时还可选择 DSH 的 Agent Preset。
+- **DSH 插件边界：**插件仍由 DSH/Cordis 在本机负责安装、启停、组合、权限、配置和
+  凭据。cc-remote 不加载插件前端，也不复制插件管理器；它只读展示当前 Agent 的有效
+  Skills，并把插件工具、Hook、子 Agent 与标记为可忽略的未知事件降级渲染为通用
+  过程卡；未知事件的任意 payload 不会穿过 relay。未标记为可忽略的必需事件会按 DSH
+  的日志版本契约拒绝猜测，需升级适配后再读取。这样插件运行能力可以进入会话，但
+  loopback 特权配置面和密钥不会穿过 relay。
 
 多账号配置示例（每个目录都必须是绝对路径、互不重复，并且已经分别登录 Codex）：
 
@@ -466,12 +480,12 @@ npm --prefix web run build   # 产出 web/dist/
 
 > 现在网页**不再把 token 烤进 JS**：登录改为向中继 POST 口令换取短期会话 token。所以构建不需要任何 `VITE_*` 变量。
 
-> **升级到协议 v35**：线协议会严格拒绝版本不一致。请在同一次维护窗口部署
+> **升级到协议 v36**：线协议会严格拒绝版本不一致。请在同一次维护窗口部署
 > `cc_remote/` 和新的 `web/dist/`，然后依次重启 relay、wrapper；不要新旧版本滚动混跑。
 > 升级期间已有 WebSocket 会短暂重连，relay 重启也会要求浏览器重新登录。已打开的
 > 旧版页面必须做一次**硬刷新**（重新加载新的带 hash 静态资源），仅重新登录不够。
-> 手工发布时先停本机 wrapper，再停服更新 relay + web，最后启动 v35 relay 和
-> v35 wrapper；这样旧 wrapper 不会占住同一 `machine_id` 的连接槽。若从 v34 以前的
+> 手工发布时先停本机 wrapper，再停服更新 relay + web，最后启动 v36 relay 和
+> v36 wrapper；这样旧 wrapper 不会占住同一 `machine_id` 的连接槽。若从 v34 以前的
 > 版本跨级升级，仍须执行 v34 引入的 Work SQLite 迁移保护：启动新 wrapper 前用
 > `deploy/work_registry_snapshot.py snapshot` 保存两个注册表。回滚时先停新版本、恢复
 > 该快照，再切回旧代码；不要在 wrapper 运行时只复制主 `.sqlite3` 文件而漏掉 WAL。
@@ -528,7 +542,7 @@ sudo bash ~/cc-remote-upload/deploy/setup-vps.sh \
 脚本会：装 `python3-venv` + Caddy、建 `ccremote` 系统用户、创建不可变 release
 和 release-local venv、合并 Caddy 配置、原子切换 `current`，再重启 relay。若新
 relay 重启或健康检查失败，`current`、Caddyfile、systemd unit 会作为一个事务全部
-恢复，并验证旧 release 的 `/healthz`。成功后再启动 v35 wrapper。
+恢复，并验证旧 release 的 `/healthz`。成功后再启动 v36 wrapper。
 
 验证：
 
@@ -656,6 +670,8 @@ HTTPS_PROXY=http://your-proxy:port      # SOCKS 用 ALL_PROXY=socks5://...
 | `CC_REMOTE_CODEX_DAEMON` | `auto` | Code 默认连接 Codex 官方共享 daemon；`off` 强制使用私有 stdio app-server，并失去与原生 Codex CLI/App 的实时双向协同。Work 始终私有，不受此项影响。 |
 | `CC_REMOTE_CODEX_PROFILES_JSON` | 空 | 可选 Codex 多账号注册表；格式为 `{profile_id:{"label":"…","home":"/绝对/CODEX_HOME","default":true}}`。最多 32 项、home 必须唯一，且必须且只能有一个默认项。每项使用独立 daemon；Code 合并展示并按标签区分，Codex Work 新会话和定时任务可选择任一项。空值保持单账号兼容。显式 JSON 优先于文件。 |
 | `CC_REMOTE_CODEX_PROFILES_FILE` | 空（macOS LaunchAgent 为 `~/.cc-remote/codex-profiles.json`） | 可选注册表 JSON 文件；必须是有上限的普通文件。文件不存在等同单账号，便于先安装再配置。 |
+| `CC_REMOTE_DSH_URL` | `http://127.0.0.1:3080` | 可选 DSH Web loopback 地址；只接受无凭据的 `http://127.0.0.1`、`http://[::1]` 或 `http://localhost` origin。设为空可完全关闭发现。DSH 不健康时 Web 不提供该引擎。 |
+| `CC_REMOTE_DSH_TIMEOUT` | `10` | DSH 本机 HTTP/WebSocket 建连与请求超时，允许 0.1–60 秒。 |
 | `CC_REMOTE_STATE_DIR` | `~/.cc-remote` | 本机 wrapper 状态目录。账号切换 hook 与 wrapper 必须使用同一个值，daemon 代际屏障保存在其中；不包含 Codex 凭据。 |
 | `CC_CWD` | 当前目录 | 新会话默认工作目录。Claude `--resume` 靠它定位 `~/.claude/projects/` 下的会话文件，**必须对**；Codex 恢复时会优先从 rollout 取原 cwd。 |
 | `CC_RESUME_SESSION_ID` | 空 | 恢复指定会话 UUID；留空开新会话。首次启动后 id 会持久化到 `~/.cc-remote/`。 |

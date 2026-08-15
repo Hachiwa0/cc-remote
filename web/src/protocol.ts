@@ -1,7 +1,8 @@
 // Mirror of cc_remote/protocol.py. Kept in sync manually (generate later).
 
 export type State = "idle" | "running" | "interrupting" | "draining";
-export type Engine = "claude" | "codex";
+export type Engine = "claude" | "codex" | "dsh";
+export type WorkEngine = Exclude<Engine, "dsh">;
 export type Space = "code" | "work";
 export type RestoreMode = "conversation" | "files" | "both";
 export type RestoreOutcome = "succeeded" | "failed" | "skipped";
@@ -101,7 +102,7 @@ export interface SessionControl extends Base {
   can_takeover?: boolean | null;
 }
 export interface SetModel extends Base { type: "set_model"; model: string }
-export interface SetEffort extends Base { type: "set_effort"; effort: EffortLevel }
+export interface SetEffort extends Base { type: "set_effort"; effort: string; engine?: Engine | null }
 export interface SetServiceTier extends Base { type: "set_service_tier"; service_tier: ServiceTier }
 export interface SetCollaborationMode extends Base { type: "set_collaboration_mode"; mode: CollaborationModeName }
 export interface Ping extends Base { type: "ping"; n: number }
@@ -160,8 +161,8 @@ export interface SessionMigrated extends Base {
   cwd: string;
   request_id: string;
 }
-export interface UserMsg extends Base { type: "user_msg"; msg_id: string; client_msg_id?: string | null; prompt: string; images?: QueryImg[] | null; files?: { filename: string }[] | null }
-export interface TurnSteered extends Base { type: "turn_steered"; msg_id: string; turn_id: string; prompt: string; images?: QueryImg[] | null; files?: { filename: string }[] | null }
+export interface UserMsg extends Base { type: "user_msg"; msg_id: string; client_msg_id?: string | null; prompt: string; images?: QueryImg[] | null; image_refs?: ConversationImageRef[] | null; files?: { filename: string }[] | null }
+export interface TurnSteered extends Base { type: "turn_steered"; msg_id: string; client_msg_id?: string | null; turn_id: string; prompt: string; images?: QueryImg[] | null; image_refs?: ConversationImageRef[] | null; files?: { filename: string }[] | null }
 export interface AssistantMsgStart extends Base { type: "assistant_msg_start"; message_id: string; channel?: AssistantChannel }
 export interface Delta extends Base { type: "delta"; message_id: string; text: string; channel?: AssistantChannel }
 export interface ToolUse extends Base {
@@ -225,7 +226,7 @@ export interface TurnDiff extends Base { type: "turn_diff"; item_id: string; tur
 export interface TurnBinding extends Base { type: "turn_binding"; msg_id: string; turn_id: string }
 export interface TurnResult { subtype: string; duration_ms: number; is_error: boolean; total_cost_usd?: number | null; num_turns?: number | null }
 export interface TurnNotificationContext { engine: Engine; space: Space; display_name?: string | null; parent_session_id?: string | null }
-export interface TurnEnd extends Base { type: "turn_end"; result: TurnResult; turn_id?: string | null; checkpoint_id?: string | null; notification_context?: TurnNotificationContext | null }
+export interface TurnEnd extends Base { type: "turn_end"; result: TurnResult; turn_id?: string | null; presentation_id?: string | null; checkpoint_id?: string | null; notification_context?: TurnNotificationContext | null }
 export interface ErrorMsg extends Base {
   type: "error";
   code: string;
@@ -241,6 +242,25 @@ export interface CodexProfileInfo {
   id: string;
   label: string;
   error?: string | null;
+}
+export interface DshPresetInfo {
+  id: string;
+  name: string;
+  description?: string | null;
+  trust: "system" | "user";
+  is_default?: boolean;
+  broken?: string | null;
+}
+export interface EngineInfo {
+  id: Engine;
+  display_name: string;
+  available: boolean;
+  spaces: Space[];
+  reason?: string | null;
+}
+export interface EngineCatalog extends Base {
+  type: "engine_catalog";
+  engines: EngineInfo[];
 }
 export interface SessionInfo {
   session_id: string;
@@ -260,6 +280,7 @@ export interface SessionInfo {
   native_session_id?: string | null;
   codex_profile_id?: string | null;
   codex_profile_label?: string | null;
+  dsh_agent_preset?: string | null;
   completion_id?: string | null;
   completion_unread?: boolean | null;
   completion_revision?: number | null;
@@ -272,8 +293,9 @@ export interface NewSession extends Base {
   type: "new_session";
   request_id?: string | null;
   cwd?: string | null;
-  engine?: "claude" | "codex";
+  engine?: Engine;
   codex_profile_id?: string | null;
+  dsh_agent_preset?: string | null;
   space?: Space;
   project_id?: string | null;
   model?: string | null;
@@ -288,7 +310,7 @@ export interface NewSession extends Base {
   images?: QueryImg[] | null;
   files?: QueryFile[] | null;
 }
-export interface SessionList extends Base { type: "session_list"; engine: Engine; space?: Space; request_id?: string | null; sessions: SessionInfo[]; codex_profiles?: CodexProfileInfo[]; default_codex_profile_id?: string | null }
+export interface SessionList extends Base { type: "session_list"; engine: Engine; space?: Space; request_id?: string | null; sessions: SessionInfo[]; codex_profiles?: CodexProfileInfo[]; default_codex_profile_id?: string | null; dsh_presets?: DshPresetInfo[]; default_dsh_preset_id?: string | null }
 export interface SessionListInvalidated extends Base { type: "session_list_invalidated"; engine: Engine; space?: Space }
 export interface SessionActivity extends Base { type: "session_activity"; engine: Engine; session_id: string; state: State }
 export interface SessionFocus extends Base { type: "session_focus"; session_id: string; cwd?: string | null; request_id?: string | null }
@@ -299,12 +321,12 @@ export interface SessionRekey extends Base { type: "session_rekey"; old_key: str
 export interface RenameSession extends Base { type: "rename_session"; session_id: string; title: string; engine?: Engine; space?: Space }
 export interface ArchiveSession extends Base { type: "archive_session"; session_id: string; archived: boolean; engine?: Engine; space?: Space }
 export interface PinSession extends Base { type: "pin_session"; session_id: string; pinned: boolean; engine?: Engine; space?: Space }
-export interface DeleteWorkSession extends Base { type: "delete_work_session"; session_id: string; engine: Engine; space?: "work" }
+export interface DeleteWorkSession extends Base { type: "delete_work_session"; session_id: string; engine: WorkEngine; space?: "work" }
 export interface DeleteSession extends Base { type: "delete_session"; session_id: string; engine: Engine; space?: Space }
 export interface RollbackSession extends Base {
   type: "rollback_session";
   session_id: string;
-  engine: Engine;
+  engine: WorkEngine;
   space?: "code";
   restore?: RestoreMode;
   num_turns?: number;
@@ -313,7 +335,7 @@ export interface RollbackSession extends Base {
 export interface RollbackResult extends Base {
   type: "rollback_result";
   session_id: string;
-  engine: Engine;
+  engine: WorkEngine;
   restore: RestoreMode;
   conversation: RestoreOutcome;
   files: RestoreOutcome;
@@ -324,23 +346,23 @@ export interface RollbackResult extends Base {
 }
 export interface CompactSession extends Base { type: "compact_session"; session_id: string; engine?: "codex"; space?: "code" }
 export interface StartReview extends Base { type: "start_review"; session_id: string; engine?: "codex"; space?: "code"; target: "uncommittedChanges" | "baseBranch" | "commit" | "custom"; value?: string | null }
-export interface GetWorkDashboard extends Base { type: "get_work_dashboard"; engine?: Engine }
-export interface CreateWorkProject extends Base { type: "create_work_project"; engine?: Engine; name: string; description?: string }
-export interface DeleteWorkProject extends Base { type: "delete_work_project"; engine?: Engine; project_id: string }
-export interface AddWorkSource extends Base { type: "add_work_source"; engine?: Engine; project_id: string; kind: "file" | "link" | "note"; title: string; uri?: string | null; file?: QueryFile | null }
-export interface DeleteWorkSource extends Base { type: "delete_work_source"; engine?: Engine; source_id: string }
-export interface CreateWorkPlugin extends Base { type: "create_work_plugin"; engine?: Engine; project_id?: string | null; name: string; instructions: string }
-export interface DeleteWorkPlugin extends Base { type: "delete_work_plugin"; engine?: Engine; plugin_id: string }
-export interface CreateWorkSchedule extends Base { type: "create_work_schedule"; engine?: Engine; project_id?: string | null; codex_profile_id?: string | null; title: string; prompt: string; next_run_at: number; repeat_seconds?: number | null }
-export interface DeleteWorkSchedule extends Base { type: "delete_work_schedule"; engine?: Engine; schedule_id: string }
-export interface GetWorkArtifacts extends Base { type: "get_work_artifacts"; engine?: Engine; session_id: string }
+export interface GetWorkDashboard extends Base { type: "get_work_dashboard"; engine?: WorkEngine }
+export interface CreateWorkProject extends Base { type: "create_work_project"; engine?: WorkEngine; name: string; description?: string }
+export interface DeleteWorkProject extends Base { type: "delete_work_project"; engine?: WorkEngine; project_id: string }
+export interface AddWorkSource extends Base { type: "add_work_source"; engine?: WorkEngine; project_id: string; kind: "file" | "link" | "note"; title: string; uri?: string | null; file?: QueryFile | null }
+export interface DeleteWorkSource extends Base { type: "delete_work_source"; engine?: WorkEngine; source_id: string }
+export interface CreateWorkPlugin extends Base { type: "create_work_plugin"; engine?: WorkEngine; project_id?: string | null; name: string; instructions: string }
+export interface DeleteWorkPlugin extends Base { type: "delete_work_plugin"; engine?: WorkEngine; plugin_id: string }
+export interface CreateWorkSchedule extends Base { type: "create_work_schedule"; engine?: WorkEngine; project_id?: string | null; codex_profile_id?: string | null; title: string; prompt: string; next_run_at: number; repeat_seconds?: number | null }
+export interface DeleteWorkSchedule extends Base { type: "delete_work_schedule"; engine?: WorkEngine; schedule_id: string }
+export interface GetWorkArtifacts extends Base { type: "get_work_artifacts"; engine?: WorkEngine; session_id: string }
 export interface WorkArtifactInfo { path: string; size: number; modified_at: number; kind: "document" | "spreadsheet" | "presentation" | "image" | "pdf" | "file"; previewable: boolean }
-export interface WorkArtifacts extends Base { type: "work_artifacts"; engine: Engine; session_id: string; artifacts: WorkArtifactInfo[] }
+export interface WorkArtifacts extends Base { type: "work_artifacts"; engine: WorkEngine; session_id: string; artifacts: WorkArtifactInfo[] }
 export interface WorkProjectInfo { project_id: string; name: string; description: string; created_at: number; updated_at: number }
 export interface WorkSourceInfo { source_id: string; project_id: string; kind: "file" | "link" | "note"; title: string; uri?: string | null; created_at: number }
 export interface WorkPluginInfo { plugin_id: string; project_id?: string | null; name: string; instructions: string; enabled: boolean; created_at: number; updated_at: number }
 export interface WorkScheduleInfo { schedule_id: string; project_id?: string | null; codex_profile_id?: string | null; title: string; prompt: string; next_run_at: number; repeat_seconds?: number | null; enabled: boolean; last_run_at?: number | null; last_session_id?: string | null; last_error?: string | null; last_run_id?: string | null; last_run_status?: "queued" | "claimed" | "running" | "succeeded" | "failed" | null; last_run_attempt?: number | null; created_at: number; updated_at: number }
-export interface WorkDashboard extends Base { type: "work_dashboard"; engine: Engine; projects: WorkProjectInfo[]; sources: WorkSourceInfo[]; plugins: WorkPluginInfo[]; schedules: WorkScheduleInfo[] }
+export interface WorkDashboard extends Base { type: "work_dashboard"; engine: WorkEngine; projects: WorkProjectInfo[]; sources: WorkSourceInfo[]; plugins: WorkPluginInfo[]; schedules: WorkScheduleInfo[] }
 export interface DirEntry { name: string; path: string }
 export interface ListDir extends Base { type: "list_dir"; path?: string | null }
 export interface DirList extends Base { type: "dir_list"; path: string; parent?: string | null; dirs: DirEntry[]; request_id?: string | null }
@@ -418,7 +440,7 @@ export interface ArtifactInvalidated extends Base { type: "artifact_invalidated"
 // which reasoning levels it accepts — and `turn/start` does NOT validate the level
 // (it accepts `bogus-zzz`), so one we invent client-side only fails later inside the
 // model API. The server is authoritative; data.ts's table is a fallback.
-export interface GetModels extends Base { type: "get_models"; engine?: string | null; client_id?: string | null; cwd?: string | null; codex_profile_id?: string | null }
+export interface GetModels extends Base { type: "get_models"; engine?: "cc" | Engine | null; client_id?: string | null; cwd?: string | null; codex_profile_id?: string | null; session_id?: string | null }
 export interface CatalogModel {
   id: string;
   display_name: string;
@@ -429,15 +451,15 @@ export interface CatalogModel {
 }
 // Effective controls for a NEW no-override session. These are display metadata,
 // not the focused session's controls and not implicit overrides on NewSession.
-export interface Models extends Base { type: "models"; engine: string; models: CatalogModel[]; default_model?: string | null; default_effort?: string | null; cwd?: string | null; codex_profile_id?: string | null }
-export interface GetEngineCapabilities extends Base { type: "get_engine_capabilities"; engine: Engine; space?: Space; client_id?: string | null; cwd?: string | null; skills_only?: boolean; codex_profile_id?: string | null }
+export interface Models extends Base { type: "models"; engine: string; models: CatalogModel[]; default_model?: string | null; default_effort?: string | null; cwd?: string | null; codex_profile_id?: string | null; session_id?: string | null }
+export interface GetEngineCapabilities extends Base { type: "get_engine_capabilities"; engine: Engine; space?: Space; client_id?: string | null; cwd?: string | null; skills_only?: boolean; codex_profile_id?: string | null; session_id?: string | null }
 export interface ManageEnginePlugin extends Base { type: "manage_engine_plugin"; engine: Engine; action: "install" | "uninstall"; plugin_id: string; space?: Space; client_id?: string | null; cwd?: string | null; codex_profile_id?: string | null }
 export interface ManageEngineSkill extends Base { type: "manage_engine_skill"; engine: Engine; action: "create" | "remove" | "enable" | "disable"; skill_id?: string | null; name?: string | null; description?: string | null; instructions?: string | null; scope?: "user" | "project"; space?: Space; client_id?: string | null; cwd?: string | null; codex_profile_id?: string | null }
 export interface ManageEngineHook extends Base { type: "manage_engine_hook"; engine: Engine; action: "create" | "remove"; hook_id?: string | null; event?: string | null; matcher?: string | null; command?: string | null; timeout?: number | null; scope?: "user" | "project"; space?: Space; client_id?: string | null; cwd?: string | null; codex_profile_id?: string | null }
 export type EngineCapabilityKind = "skill" | "plugin" | "app" | "mcp" | "hook";
 export type EngineCapabilityAction = "install" | "uninstall" | "enable" | "disable" | "remove";
 export interface EngineCapabilityItem { kind: EngineCapabilityKind; id: string; name: string; description?: string | null; enabled?: boolean | null; installed?: boolean | null; status?: string | null; scope?: string | null; source?: string | null; tool_count?: number | null; resource_count?: number | null; install_url?: string | null; actions?: EngineCapabilityAction[]; event?: string | null; matcher?: string | null; handler_type?: string | null; detail?: string | null }
-export interface EngineCapabilities extends Base { type: "engine_capabilities"; engine: Engine; space: Space; request_id?: string | null; cwd: string; items: EngineCapabilityItem[]; errors?: string[]; notes?: string[]; skills_only: boolean; codex_profile_id?: string | null }
+export interface EngineCapabilities extends Base { type: "engine_capabilities"; engine: Engine; space: Space; request_id?: string | null; cwd: string; items: EngineCapabilityItem[]; errors?: string[]; notes?: string[]; skills_only: boolean; codex_profile_id?: string | null; session_id?: string | null }
 export interface AskOption { label: string; ds?: string }
 export interface AskUser extends Base { type: "ask_user"; ask_id: string; header?: string | null; question: string; options: AskOption[]; allow_text?: boolean; secret?: boolean; multi_select?: boolean }
 export interface AskUserClosed extends Base { type: "ask_user_closed"; ask_id: string; reason: "answered" | "cancelled" | "timeout" | "superseded" }
@@ -570,7 +592,7 @@ export interface ContextReport extends Base {
 }
 
 export type ServerEvent =
-  | Pong | CommandAck | ReplayStart | ReplayEnd | Snapshot | StateEvent | QueryQueueState | QueuedQueryDetail | QueuedQueryUpdated | Model | Effort | Fast | CollaborationMode | BtwOpened | Perm | PermissionProfiles | PermissionProfile | WebSearch | ContextReport | DiffReport | FilePreview | FileSaveResult | PreviewAsset | PreviewAuthorizationRequired | PreviewAuthorizationResult | History | TurnDetail | HistoryImage | HistoryInvalidated | ArtifactInvalidated | Models | EngineCapabilities | TakeoverState | SessionControl
+  | Pong | CommandAck | ReplayStart | ReplayEnd | Snapshot | StateEvent | QueryQueueState | QueuedQueryDetail | QueuedQueryUpdated | Model | Effort | Fast | CollaborationMode | BtwOpened | Perm | PermissionProfiles | PermissionProfile | WebSearch | ContextReport | DiffReport | FilePreview | FileSaveResult | PreviewAsset | PreviewAuthorizationRequired | PreviewAuthorizationResult | History | TurnDetail | HistoryImage | HistoryInvalidated | ArtifactInvalidated | Models | EngineCatalog | EngineCapabilities | TakeoverState | SessionControl
   | AskUser | AskUserClosed | GoalState | CompletionState | StatusReport | Notice | RateLimitUpdate | RollbackResult
   | SessionList | SessionListInvalidated | SessionActivity | SessionFocus | SessionRekey | SessionForked | SessionMigrated | WorkDashboard | WorkArtifacts
   | DirList
@@ -578,7 +600,7 @@ export type ServerEvent =
   | ProcessEvent | TurnPlan | TurnDiff | TurnBinding
   | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
 
-export const PROTOCOL_VERSION = 35;
+export const PROTOCOL_VERSION = 36;
 
 const CONTROL_MODES = new Set<ControlMode>([
   "remote", "codex_shared", "claude_broker", "external_cli", "agent_view", "desktop",
@@ -644,7 +666,11 @@ export function sessionControlLocksInput(control: SessionControl): boolean {
 /** Local storage is user-controlled and may contain stale values from older
  * builds. Normalize before a value reaches a strict Pydantic command frame. */
 export function normalizeEngine(value: string | null): Engine {
-  return value === "codex" ? "codex" : "claude";
+  return value === "codex" || value === "dsh" ? value : "claude";
+}
+
+export function isWorkEngine(engine: Engine): engine is WorkEngine {
+  return engine !== "dsh";
 }
 
 export function normalizeDiffTheme(value: string | null): DiffTheme {

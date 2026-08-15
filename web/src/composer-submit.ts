@@ -1,4 +1,4 @@
-import type { State } from "./protocol";
+import type { Engine, State } from "./protocol";
 
 export type SendMode = "steer" | "queue";
 
@@ -19,14 +19,14 @@ export type BusySubmitAction =
 export function classifyBusySubmit(
   state: State,
   mode: SendMode,
-  engine: "claude" | "codex",
+  engine: Engine,
   hasPayload: boolean,
 ): BusySubmitAction {
   if (state === "idle") return "noop";
   if (!hasPayload) return "noop";
   if (mode === "queue") return "enqueue";
   if (state !== "running") return "replace";
-  return engine === "codex" ? "steer" : "interrupt-and-replace";
+  return engine === "claude" ? "interrupt-and-replace" : "steer";
 }
 
 export function isComposerBusy(state: State): boolean {

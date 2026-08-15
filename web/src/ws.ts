@@ -8,7 +8,8 @@
 // no cursor reset, no re-hello (background turns keep streaming). All outbound
 // commands that target a session stamp `sid: focusedSid`.
 import type {
-  DiffTheme, GoalStatus, QueryFile, QueryImg, ServerEvent, SessionControl, Space,
+  DiffTheme, Engine, GoalStatus, QueryFile, QueryImg, ServerEvent,
+  SessionControl, Space, WorkEngine,
 } from "./protocol.ts";
 import {
   compareSessionControl,
@@ -35,7 +36,7 @@ export type ConnState = "connecting" | "connected" | "reconnecting" | "disconnec
 export interface EventOwnership {
   scopeKey: string;
   machineId: string;
-  engine: "claude" | "codex";
+  engine: Engine;
   space: Space;
   codexProfileId?: string | null;
   surfaceEpoch: number;
@@ -49,13 +50,13 @@ interface ListRequestOwnership {
 
 interface InvalidatedListRefresh {
   requestId: string;
-  engine: "claude" | "codex";
+  engine: Engine;
   space: Space;
   dirty: boolean;
 }
 
 export function sessionScopeKey(
-  machineId: string, engine: "claude" | "codex", space: Space,
+  machineId: string, engine: Engine, space: Space,
 ): string {
   return `${machineId}:${space}:${engine}`;
 }
@@ -155,17 +156,17 @@ export class RelayWs {
   private controlBySession: Record<string, SessionControl> = {};
   private rebuildingSessions = new Set<string>();
   private replayOrder: string[] = [];
-  private engineBySession: Record<string, "claude" | "codex"> = {};
+  private engineBySession: Record<string, Engine> = {};
   private spaceBySession: Record<string, Space> = {};
   private codexProfileBySession: Record<string, string> = {};
   private focusedSid: string | null = null;
-  private activeEngine: "claude" | "codex" = "claude";
+  private activeEngine: Engine = "claude";
   private activeSpace: Space = "code";
   // Correlates a create response without using SessionFocus as a trigger for the
   // first query. A later explicit switch clears it, so late create focus cannot
   // override the user's newer navigation intent.
   private newSessionFocusRequestId: string | null = null;
-  private newSessionEngine: "claude" | "codex" = "claude";
+  private newSessionEngine: Engine = "claude";
   private newSessionSpace: Space = "code";
   private connectionGeneration = 0;
   private surfaceEpoch = 1;
@@ -436,7 +437,7 @@ export class RelayWs {
     }
   }
 
-  setFocusedSid(sid: string | null, engine?: "claude" | "codex", space?: Space): void {
+  setFocusedSid(sid: string | null, engine?: Engine, space?: Space): void {
     this.focusedSid = sid;
     if (sid) {
       if (engine) this.engineBySession[sid] = engine;
@@ -450,7 +451,7 @@ export class RelayWs {
   }
 
   /** Set the visible product surface and drop a focus owned by another one. */
-  setSurface(engine: "claude" | "codex", space: Space): void {
+  setSurface(engine: Engine, space: Space): void {
     const changed = engine !== this.activeEngine || space !== this.activeSpace;
     this.activeEngine = engine;
     this.activeSpace = space;
@@ -483,7 +484,8 @@ export class RelayWs {
     codex_profile_id?: string | null;
   }>): void {
     for (const session of sessions) {
-      if (session.engine === "codex" || session.engine === "claude") {
+      if (session.engine === "codex" || session.engine === "claude"
+          || session.engine === "dsh") {
         this.engineBySession[session.session_id] = session.engine;
       }
       if (session.space === "work" || session.space === "code") {
@@ -734,11 +736,22 @@ export class RelayWs {
   }
 
   sendSetEffort(effort: string): void {
-    this.send({ v: PROTOCOL_VERSION, type: "set_effort", effort, ts: nowTs(), ...this.sidObj() });
+    const frame: Record<string, unknown> = {
+      v: PROTOCOL_VERSION, type: "set_effort", effort,
+      ts: nowTs(), ...this.sidObj(),
+    };
+    if (this.activeEngine === "dsh") frame.engine = "dsh";
+    this.send(frame);
   }
 
   sendSetEffortTo(sid: string, effort: string): void {
-    this.send({ v: PROTOCOL_VERSION, type: "set_effort", sid, effort, ts: nowTs() });
+    const frame: Record<string, unknown> = {
+      v: PROTOCOL_VERSION, type: "set_effort", sid, effort, ts: nowTs(),
+    };
+    const engine = this.engineBySession[sid]
+      ?? (sid === this.focusedSid ? this.activeEngine : undefined);
+    if (engine === "dsh") frame.engine = "dsh";
+    this.send(frame);
   }
 
   sendSetServiceTier(service_tier: string): void {
@@ -914,9 +927,10 @@ export class RelayWs {
   /** Ask the engine for its catalog and explicit new-session defaults. Claude
    *  needs cwd because project/local settings can change the selected model. */
   sendGetModels(
-    engine: "cc" | "claude" | "codex",
+    engine: "cc" | Engine,
     cwd?: string | null,
     codexProfileId?: string | null,
+    sessionId?: string | null,
   ): void {
     const frame: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "get_models", engine,
@@ -926,13 +940,15 @@ export class RelayWs {
     if (engine === "codex" && codexProfileId) {
       frame.codex_profile_id = codexProfileId;
     }
+    if (engine === "dsh" && sessionId) frame.session_id = sessionId;
     this.send(frame);
   }
 
-  sendGetEngineCapabilities(engine: "claude" | "codex", space: Space,
+  sendGetEngineCapabilities(engine: Engine, space: Space,
                             cwd?: string | null,
                             skillsOnly = false,
-                            codexProfileId?: string | null): string | null {
+                            codexProfileId?: string | null,
+                            dshSessionId?: string | null): string | null {
     const frame: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "get_engine_capabilities", engine, space,
       client_id: this.clientId, skills_only: skillsOnly, ts: nowTs(),
@@ -941,10 +957,13 @@ export class RelayWs {
     if (engine === "codex" && codexProfileId) {
       frame.codex_profile_id = codexProfileId;
     }
+    if (engine === "dsh" && dshSessionId) {
+      frame.session_id = dshSessionId;
+    }
     return this.sendTracked(frame);
   }
 
-  sendManageEnginePlugin(engine: "claude" | "codex", space: Space,
+  sendManageEnginePlugin(engine: Engine, space: Space,
                          action: "install" | "uninstall", pluginId: string,
                          cwd?: string | null,
                          codexProfileId?: string | null): string | null {
@@ -960,7 +979,7 @@ export class RelayWs {
   }
 
   sendManageEngineSkill(
-    engine: "claude" | "codex", space: Space,
+    engine: Engine, space: Space,
     action: "create" | "remove" | "enable" | "disable",
     options: {
       skillId?: string; name?: string; description?: string;
@@ -986,7 +1005,7 @@ export class RelayWs {
   }
 
   sendManageEngineHook(
-    engine: "claude" | "codex", space: Space,
+    engine: Engine, space: Space,
     action: "create" | "remove",
     options: {
       hookId?: string; event?: string; matcher?: string; command?: string;
@@ -1101,7 +1120,7 @@ export class RelayWs {
     });
   }
 
-  sendListSessions(engine?: "claude" | "codex", space: Space = "code"): boolean {
+  sendListSessions(engine?: Engine, space: Space = "code"): boolean {
     const targetEngine = engine ?? "claude";
     const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "list_sessions", ts: nowTs() };
     if (engine && engine !== "claude") obj.engine = engine;
@@ -1114,7 +1133,7 @@ export class RelayWs {
    * those authoritative refreshes cannot borrow the surface active at receive
    * time or be dropped as unowned. */
   private sendListRefreshingCommand(
-    obj: Record<string, unknown>, engine: "claude" | "codex", space: Space,
+    obj: Record<string, unknown>, engine: Engine, space: Space,
     commandId = uuid(),
   ): string | null {
     const ownership = this.ownershipSnapshot(engine, space);
@@ -1133,7 +1152,7 @@ export class RelayWs {
   }
 
   private refreshInvalidatedSessionList(
-    engine: "claude" | "codex",
+    engine: Engine,
     space: Space,
     socketGeneration: number,
   ): void {
@@ -1176,7 +1195,7 @@ export class RelayWs {
     }
   }
 
-  sendSwitchSession(sessionId: string, engine?: "claude" | "codex", space: Space = "code"): void {
+  sendSwitchSession(sessionId: string, engine?: Engine, space: Space = "code"): void {
     const targetEngine = engine ?? this.activeEngine;
     if (engine) this.engineBySession[sessionId] = engine;
     this.spaceBySession[sessionId] = space;
@@ -1196,7 +1215,7 @@ export class RelayWs {
     }
   }
 
-  sendNewSession(cwd?: string | null, engine?: "claude" | "codex",
+  sendNewSession(cwd?: string | null, engine?: Engine,
                  model?: string | null, effort?: string | null,
                  initial?: { prompt: string; msg_id: string; images?: QueryImg[]; files?: QueryFile[] },
                  collaborationMode?: "default" | "plan",
@@ -1205,7 +1224,8 @@ export class RelayWs {
                  webSearch?: "cached" | "live",
                  serviceTier?: "default" | "fast",
                  space: Space = "code", projectId?: string | null,
-                 codexProfileId?: string | null): boolean {
+                 codexProfileId?: string | null,
+                 dshAgentPreset?: string | null): boolean {
     const requestId = initial?.msg_id ?? uuid();
     this.newSessionFocusRequestId = requestId;
     this.newSessionEngine = engine ?? "claude";
@@ -1223,6 +1243,9 @@ export class RelayWs {
     if (engine && engine !== "claude") obj.engine = engine;
     if (engine === "codex" && codexProfileId) {
       obj.codex_profile_id = codexProfileId;
+    }
+    if (engine === "dsh" && dshAgentPreset) {
+      obj.dsh_agent_preset = dshAgentPreset;
     }
     if (space !== "code") obj.space = space;
     if (space === "work" && projectId) obj.project_id = projectId;
@@ -1258,7 +1281,7 @@ export class RelayWs {
   }
 
   sendRenameSession(sessionId: string, title: string,
-                    engine?: "claude" | "codex", space: Space = "code"): void {
+                    engine?: Engine, space: Space = "code"): void {
     const targetEngine = engine
       ?? this.engineBySession[sessionId] ?? this.activeEngine;
     const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "rename_session", session_id: sessionId, title, ts: nowTs() };
@@ -1268,7 +1291,7 @@ export class RelayWs {
   }
 
   sendArchiveSession(sessionId: string, archived: boolean,
-                     engine?: "claude" | "codex", space: Space = "code"): void {
+                     engine?: Engine, space: Space = "code"): void {
     const targetEngine = engine
       ?? this.engineBySession[sessionId] ?? this.activeEngine;
     const obj: Record<string, unknown> = { v: PROTOCOL_VERSION, type: "archive_session", session_id: sessionId, archived, ts: nowTs() };
@@ -1278,7 +1301,7 @@ export class RelayWs {
   }
 
   sendPinSession(sessionId: string, pinned: boolean,
-                 engine?: "claude" | "codex", space: Space = "code"): void {
+                 engine?: Engine, space: Space = "code"): void {
     const targetEngine = engine
       ?? this.engineBySession[sessionId] ?? this.activeEngine;
     const obj: Record<string, unknown> = {
@@ -1290,14 +1313,14 @@ export class RelayWs {
     this.sendListRefreshingCommand(obj, targetEngine, space);
   }
 
-  sendDeleteWorkSession(sessionId: string, engine: "claude" | "codex"): boolean {
+  sendDeleteWorkSession(sessionId: string, engine: WorkEngine): boolean {
     return this.sendListRefreshingCommand({
       v: PROTOCOL_VERSION, type: "delete_work_session", session_id: sessionId,
       engine, space: "work", ts: nowTs(),
     }, engine, "work") !== null;
   }
 
-  sendDeleteSession(sessionId: string, engine: "claude" | "codex",
+  sendDeleteSession(sessionId: string, engine: Engine,
                     space: Space = "code"): boolean {
     return this.sendListRefreshingCommand({
       v: PROTOCOL_VERSION, type: "delete_session", session_id: sessionId,
@@ -1305,7 +1328,7 @@ export class RelayWs {
     }, engine, space) !== null;
   }
 
-  sendRollbackSession(sessionId: string, engine: "claude" | "codex",
+  sendRollbackSession(sessionId: string, engine: WorkEngine,
                       restore: "conversation" | "files" | "both",
                       numTurns = 1, checkpointId?: string): boolean {
     const command: Record<string, unknown> = {
@@ -1334,31 +1357,31 @@ export class RelayWs {
     return this.send(command);
   }
 
-  sendGetWorkDashboard(engine: "claude" | "codex"): void {
+  sendGetWorkDashboard(engine: WorkEngine): void {
     this.send({
       v: PROTOCOL_VERSION, type: "get_work_dashboard", engine, ts: nowTs(),
     });
   }
 
-  sendGetWorkArtifacts(engine: "claude" | "codex", sessionId: string): void {
+  sendGetWorkArtifacts(engine: WorkEngine, sessionId: string): void {
     this.send({
       v: PROTOCOL_VERSION, type: "get_work_artifacts", engine,
       session_id: sessionId, client_id: this.clientId, ts: nowTs(),
     });
   }
 
-  sendCreateWorkProject(engine: "claude" | "codex", name: string,
+  sendCreateWorkProject(engine: WorkEngine, name: string,
                         description: string): boolean {
     return this.send({ v: PROTOCOL_VERSION, type: "create_work_project", engine,
       name, description, ts: nowTs() });
   }
 
-  sendDeleteWorkProject(engine: "claude" | "codex", projectId: string): boolean {
+  sendDeleteWorkProject(engine: WorkEngine, projectId: string): boolean {
     return this.send({ v: PROTOCOL_VERSION, type: "delete_work_project", engine,
       project_id: projectId, ts: nowTs() });
   }
 
-  sendAddWorkSource(engine: "claude" | "codex", projectId: string,
+  sendAddWorkSource(engine: WorkEngine, projectId: string,
                     kind: "file" | "link" | "note", title: string,
                     uri?: string, file?: QueryFile): boolean {
     const command: Record<string, unknown> = {
@@ -1370,12 +1393,12 @@ export class RelayWs {
     return this.send(command);
   }
 
-  sendDeleteWorkSource(engine: "claude" | "codex", sourceId: string): boolean {
+  sendDeleteWorkSource(engine: WorkEngine, sourceId: string): boolean {
     return this.send({ v: PROTOCOL_VERSION, type: "delete_work_source", engine,
       source_id: sourceId, ts: nowTs() });
   }
 
-  sendCreateWorkPlugin(engine: "claude" | "codex", name: string,
+  sendCreateWorkPlugin(engine: WorkEngine, name: string,
                        instructions: string, projectId?: string): boolean {
     const command: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "create_work_plugin", engine,
@@ -1385,12 +1408,12 @@ export class RelayWs {
     return this.send(command);
   }
 
-  sendDeleteWorkPlugin(engine: "claude" | "codex", pluginId: string): boolean {
+  sendDeleteWorkPlugin(engine: WorkEngine, pluginId: string): boolean {
     return this.send({ v: PROTOCOL_VERSION, type: "delete_work_plugin", engine,
       plugin_id: pluginId, ts: nowTs() });
   }
 
-  sendCreateWorkSchedule(engine: "claude" | "codex", title: string,
+  sendCreateWorkSchedule(engine: WorkEngine, title: string,
                          prompt: string, nextRunAt: number,
                          repeatSeconds?: number, projectId?: string,
                          codexProfileId?: string): boolean {
@@ -1406,7 +1429,7 @@ export class RelayWs {
     return this.send(command);
   }
 
-  sendDeleteWorkSchedule(engine: "claude" | "codex", scheduleId: string): boolean {
+  sendDeleteWorkSchedule(engine: WorkEngine, scheduleId: string): boolean {
     return this.send({ v: PROTOCOL_VERSION, type: "delete_work_schedule", engine,
       schedule_id: scheduleId, ts: nowTs() });
   }
@@ -1448,7 +1471,8 @@ export class RelayWs {
     const frame: Record<string, unknown> = {
       v: PROTOCOL_VERSION, type: "switch_session", session_id: sid, ts: nowTs(),
     };
-    if (this.engineBySession[sid] === "codex") frame.engine = "codex";
+    const engine = this.engineBySession[sid];
+    if (engine && engine !== "claude") frame.engine = engine;
     if (this.spaceBySession[sid] === "work") frame.space = "work";
     this.sendUntracked(frame);
   }

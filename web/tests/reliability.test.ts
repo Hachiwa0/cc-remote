@@ -274,21 +274,27 @@ const preferenceStorage = {
   getItem: (key: string) => preferenceValues.get(key) ?? null,
 };
 assert.deepEqual(readEngineSpaces(preferenceStorage, "codex"), {
-  claude: "code", codex: "work",
+  claude: "code", codex: "work", dsh: "code",
 }, "legacy space migrates only to the previously active engine");
 preferenceValues.set(ENGINE_SPACES_KEY, JSON.stringify({
   claude: "work", codex: "code",
 }));
 assert.deepEqual(readEngineSpaces(preferenceStorage, "codex"), {
-  claude: "work", codex: "code",
+  claude: "work", codex: "code", dsh: "code",
 }, "persisted engine spaces survive reload independently");
 assert.deepEqual(
-  rememberEngineSpace({ claude: "work", codex: "code" }, "codex", "work"),
-  { claude: "work", codex: "work" },
+  rememberEngineSpace(
+    { claude: "work", codex: "code", dsh: "code" }, "codex", "work",
+  ),
+  { claude: "work", codex: "work", dsh: "code" },
   "changing one engine's space must preserve the other engine's memory",
 );
-let switchingSpaces: { claude: "code" | "work"; codex: "code" | "work" } = {
-  claude: "code", codex: "code",
+let switchingSpaces: {
+  claude: "code" | "work";
+  codex: "code" | "work";
+  dsh: "code";
+} = {
+  claude: "code", codex: "code", dsh: "code",
 };
 switchingSpaces = rememberEngineSpace(switchingSpaces, "claude", "work");
 assert.equal(switchingSpaces.codex, "code",
@@ -721,6 +727,8 @@ assert.deepEqual(
   ],
   "Codex permission labels should match the official approval-policy names",
 );
+assert.deepEqual(permsFor("dsh"), [],
+  "DSH permissions remain owned by its local Agent Preset");
 for (const engine of ["claude", "codex"] as const) {
   for (const slash of ["extensions", "skills", "plugins", "apps", "mcp", "hooks"]) {
     assert.equal(clientSlashesFor(engine).has(slash), true,
@@ -764,6 +772,12 @@ assert.notEqual(repoSkillKey, skillCatalogKey(
   "Skill catalogs must remain inside the machine authorization boundary");
 assert.notEqual(repoSkillKey, stackSkillKey,
   "Skill catalogs from different CODEX_HOME profiles must never share a cache entry");
+const dshSkillKeyA = skillCatalogKey(
+  "machine-a", "dsh", "code", "/repo/a", null, "dsh@session-a");
+const dshSkillKeyB = skillCatalogKey(
+  "machine-a", "dsh", "code", "/repo/a", null, "dsh@session-b");
+assert.notEqual(dshSkillKeyA, dshSkillKeyB,
+  "effective DSH Skills must be isolated by composed session/Preset");
 assert.notEqual(
   skillCatalogReadKey(repoSkillKey, true),
   skillCatalogReadKey(repoSkillKey, false),
@@ -17483,7 +17497,9 @@ assert.match(appSource, /draftKey=\{focusedComposerDraftKey\}/);
 assert.match(appSource, /composerDraftsRef\.current\.rekey/,
   "temp session id capture must retain the focused composer draft");
 assert.match(appSource, /\{space === "work" \? "Work" : "Code"\}/);
-assert.match(appSource, /<button className="engine-toggle" onClick=\{toggleEngine\}/);
+assert.match(appSource, /<EnginePicker engine=\{engine\} engines=\{state\.engineCatalog\}/);
+assert.match(appSource, /onSelect=\{switchEngine\}/,
+  "the explicit engine picker must use the remembered-surface switch path");
 assert.match(appSource, /setNewChatAutoFocus\(false\)/,
   "switching engines must not summon the new-chat keyboard");
 assert.match(appSource, /prepareSurfaceSwitch\(nextEngine, nextSpace\)/,
@@ -17585,10 +17601,10 @@ assert.doesNotMatch(appSource,
   /<button className=\{`work-profile-owner/,
   "an existing Work owner is informational and must not become switchable");
 assert.match(appSource,
-  /workDashboardMachineId === machineId[\s\S]{0,180}workDashboards\[engine\]/,
+  /workDashboardMachineId === machineId[\s\S]{0,220}activeWorkEngine !== null[\s\S]{0,100}workDashboards\[activeWorkEngine\]/,
   "Work dashboard data must not cross a device boundary");
 assert.match(appSource,
-  /<WorkDashboardSheet[\s\S]{0,180}key=\{sessionScopeKey\(machineId, engine, "work"\)\}/,
+  /<WorkDashboardSheet[\s\S]{0,180}key=\{sessionScopeKey\(machineId, activeWorkEngine, "work"\)\}/,
   "the Work manager must remount across device and engine scopes");
 assert.match(appSource,
   /setWorkManagerOpen\(false\);[\s\S]{0,180}setWorkDashboards\(\{\}\);/,
@@ -17672,8 +17688,8 @@ assert.match(appSource,
 assert.match(appSource,
   /skillCatalogRefreshSucceeded\(msg\)[\s\S]{0,200}storeSkillCatalog/,
   "a failed Skill refresh must not replace a usable cached catalog");
-assert.match(appSource, /Warm the cwd-scoped Codex Skill catalog[\s\S]*requestSkillCatalog/,
-  "focused Codex sessions must prefetch Skills before the user types $");
+assert.match(appSource, /Warm the effective Codex\/DSH Skill catalog[\s\S]*requestSkillCatalog/,
+  "focused Codex and DSH sessions must prefetch Skills before the user types $");
 assert.match(appSource,
   /msg\.type === "wrapper_reconnected"[\s\S]*skillCatalogsRef\.current = \{\}[\s\S]*requestSkillCatalog\(focusedSkills, true\)/,
   "a wrapper generation change must invalidate and rewarm native Skill catalogs");

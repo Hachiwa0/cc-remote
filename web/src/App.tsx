@@ -66,6 +66,7 @@ import {
   rekeyGoalUiPreference,
   rememberGoalUi,
   writeGoalUiPreferences,
+  type GoalEventOwnership,
   type GoalUiPreferences,
 } from "./scoped-goal-ui";
 import { shouldOpenCodexStatus } from "./status-capabilities";
@@ -103,7 +104,8 @@ import { classifyBtwOpened, consumeDiscardedBtwSnapshot, matchesBtwRequest,
   type QueryFile, type SessionInfo, type CodexPermissionMode,
   type CodexWebSearchMode, type PermissionProfileInfo,
   type CodexServiceTier, type CollaborationModeName,
-  type DiffTheme, type Engine, type Space,
+  type DiffTheme, type Engine, type Space, type WorkEngine,
+  isWorkEngine,
   type SessionControl, type History, sessionControlLocksInput } from "./protocol";
 import type { EngineCapabilities, EngineCapabilityItem, EngineCapabilityKind, WorkArtifactInfo, WorkDashboard } from "./protocol";
 import { isMarkdownPath } from "./preview-path";
@@ -222,6 +224,8 @@ import {
   LEGACY_SPACE_KEY,
   readEngineSpaces,
   rememberEngineSpace,
+  siblingSpaceForPrefetch,
+  type EngineSpaces,
 } from "./surface-preferences";
 
 const THEME_KEY = "cc_remote_theme";
@@ -235,6 +239,9 @@ const BtwPanel = lazy(() => import("./components/BtwPanel").then(
 ));
 const ArtifactPanel = lazy(() => import("./components/ArtifactPanel").then(
   ({ ArtifactPanel: Panel }) => ({ default: Panel }),
+));
+const EnginePicker = lazy(() => import("./components/EnginePicker").then(
+  ({ EnginePicker: Picker }) => ({ default: Picker }),
 ));
 
 interface QueuedQueryEditorState extends QueuedQueryEditor {
@@ -271,7 +278,7 @@ export default function App() {
   const initialSpacesRef = useRef(readEngineSpaces(localStorage, initialEngineRef.current));
   const [engine, setEngine] = useState<Engine>(initialEngineRef.current);
   const [space, setSpace] = useState<Space>(initialSpacesRef.current[initialEngineRef.current]);
-  const spacesByEngineRef = useRef<Record<Engine, Space>>(initialSpacesRef.current);
+  const spacesByEngineRef = useRef<EngineSpaces>(initialSpacesRef.current);
   const [authed, setAuthed] = useState(false);
   const [authReady, setAuthReady] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -345,7 +352,7 @@ export default function App() {
     enabled: false, expires_at: null,
   });
   const [workProjectId, setWorkProjectId] = useState<string | null>(null);
-  const [workDashboards, setWorkDashboards] = useState<Partial<Record<Engine, WorkDashboard>>>({});
+  const [workDashboards, setWorkDashboards] = useState<Partial<Record<WorkEngine, WorkDashboard>>>({});
   const [workDashboardMachineId, setWorkDashboardMachineId] =
     useState(machineId);
   const [workArtifactsBySid, setWorkArtifactsBySid] = useState<Record<string, WorkArtifactInfo[]>>({});
@@ -410,6 +417,7 @@ export default function App() {
         request.cwd,
         request.skillsOnly,
         request.codexProfileId,
+        request.dshSessionId,
       ) ?? null,
     );
   }
@@ -420,6 +428,7 @@ export default function App() {
     cwd: string;
     skillsOnly: boolean;
     codexProfileId?: string | null;
+    dshSessionId?: string | null;
   } | null>(null);
   const historyRequestsRef = useRef(new HistoryRequestCoordinator());
   const historyDetailRequestsRef = useRef(new HistoryDetailRequestCoordinator(
@@ -732,8 +741,11 @@ export default function App() {
     }),
   ) as Record<string, CompletionBadgeKind>;
   const activeScopeKey = sessionScopeKey(machineId, engine, space);
+  const activeWorkEngine: WorkEngine | null = isWorkEngine(engine)
+    ? engine : null;
   const activeWorkDashboard = workDashboardMachineId === machineId
-    ? workDashboards[engine] ?? null
+      && activeWorkEngine !== null
+    ? workDashboards[activeWorkEngine] ?? null
     : null;
   const activeWorkProjectId = workDashboardMachineId === machineId
     ? workProjectId
@@ -783,7 +795,7 @@ export default function App() {
   );
   const focusedSession = state.sessions.find(
     (session) => session.session_id === focusedSid);
-  const focusedEngine = (focusedSession?.engine ?? engine) as "claude" | "codex";
+  const focusedEngine: Engine = focusedSession?.engine ?? engine;
   const focusedCodexProfileId = focusedEngine === "codex"
     ? focusedSession?.codex_profile_id
       ?? codexProfileIdForSession(focusedSid, state.defaultCodexProfileId)
@@ -802,19 +814,21 @@ export default function App() {
       : rt.ccSessionId);
   const focusedCatalog = catalogForEngineProfile(
     state.catalog, focusedEngine, focusedCodexProfileId);
-  const completedGoalRetired = completedGoalHasNewerUserTurn(
-    rt.goal, rt.turns,
-  ) || completedGoalHasNewerUserTurn(rt.goal, historyView.turns);
+  const goalEngine = focusedEngine === "dsh" ? null : focusedEngine;
+  const completedGoalRetired = goalEngine !== null && (
+    completedGoalHasNewerUserTurn(rt.goal, rt.turns)
+    || completedGoalHasNewerUserTurn(rt.goal, historyView.turns)
+  );
   // A live plan always wins over plans found while browsing older history.
   // When the runtime's small newest-turn window has no plan, the displayed
   // history may still reveal the plan which owns this session's long task.
   const runtimePlanProgress = latestPlanProgress(rt.turns);
   const historyPlanProgress = historyView.browsing || historyView.recovering
     ? latestPlanProgress(historyView.turns) : null;
-  let planProgress = focusedSid
+  let planProgress = focusedSid && goalEngine
       ? planProgressCacheRef.current.resolve({
         machineId,
-        engine: focusedEngine,
+        engine: goalEngine,
         space,
         sid: focusedSid,
         runtime: runtimePlanProgress,
@@ -831,7 +845,7 @@ export default function App() {
   if (completedGoalRetired && planProgress
       && !planFollowsCompletedGoal(rt.goal, planProgress)) {
     planProgressCacheRef.current.clear({
-      machineId, engine: focusedEngine, space, sid: focusedSid!,
+      machineId, engine: goalEngine!, space, sid: focusedSid!,
     });
     planProgress = null;
   }
@@ -842,7 +856,8 @@ export default function App() {
   );
   const focusedSkillCatalogKey = skillCatalogKey(
     machineId, focusedEngine, space, capabilityCwd,
-    focusedCodexProfileId);
+    focusedCodexProfileId,
+    focusedEngine === "dsh" ? focusedSid : null);
   focusedSkillScopeRef.current = {
     key: focusedSkillCatalogKey,
     engine: focusedEngine,
@@ -850,6 +865,7 @@ export default function App() {
     cwd: capabilityCwd,
     skillsOnly: true,
     codexProfileId: focusedCodexProfileId,
+    dshSessionId: focusedEngine === "dsh" ? focusedSid : null,
   };
   const activeBtwDraftKey = composerDraftKey(
     machineId, space,
@@ -874,8 +890,8 @@ export default function App() {
     state, activeBtwSid);
   const activeBtwSendMode = activeBtwSid
     ? btwSendModeBySid[activeBtwSid] ?? "steer" : "steer";
-  const focusedGoalScopeKey = focusedSid
-    ? goalUiScopeKey(machineId, space, focusedEngine, focusedSid) : null;
+  const focusedGoalScopeKey = focusedSid && goalEngine
+    ? goalUiScopeKey(machineId, space, goalEngine, focusedSid) : null;
   const storedGoalPreference = focusedGoalScopeKey
     ? goalUiPreferencesRef.current[focusedGoalScopeKey] : undefined;
   const storedGoalIdentity = goalStableIdentity(rt.goal);
@@ -1268,6 +1284,7 @@ export default function App() {
     const scope: HistoryPageCacheScope = {
       machineId,
       engine: listed?.engine === "codex" || listed?.engine === "claude"
+        || listed?.engine === "dsh"
         ? listed.engine : fallbackEngine,
       space: listed?.space === "work" || listed?.space === "code"
         ? listed.space : fallbackSpace,
@@ -1293,8 +1310,10 @@ export default function App() {
       historySessionListsRef.current)) {
       if (!sessions.some((session) => session.session_id === sid)) continue;
       const [listedSpace, listedEngine] = surfaceKey.split(":");
-      if ((listedEngine !== "claude" && listedEngine !== "codex")
+      if ((listedEngine !== "claude" && listedEngine !== "codex"
+            && listedEngine !== "dsh")
           || (listedSpace !== "code" && listedSpace !== "work")) continue;
+      if (listedEngine === "dsh" && listedSpace !== "code") continue;
       const sessionScope: HistoryPageCacheSessionScope = {
         machineId,
         engine: listedEngine,
@@ -1401,7 +1420,9 @@ export default function App() {
     localStorage.setItem(ENGINE_KEY, engine);
     wsRef.current?.setSurface(engine, space);
     wsRef.current?.sendListSessions(engine, space);
-    if (space === "work") wsRef.current?.sendGetWorkDashboard(engine);
+    if (space === "work" && isWorkEngine(engine)) {
+      wsRef.current?.sendGetWorkDashboard(engine);
+    }
   }, [engine, space]);
   useEffect(() => {
     document.documentElement.setAttribute("data-space", space);
@@ -1446,14 +1467,19 @@ export default function App() {
     state.newChat,
   ]);
   useEffect(() => {
-    if (state.newChat || focusedEngine !== "codex"
-        || !focusedCodexProfileId
-        || state.connState !== "connected" || !state.wrapperOnline) return;
-    wsRef.current?.sendGetModels(
-      "codex", undefined, focusedCodexProfileId);
+    if (state.newChat || state.connState !== "connected"
+        || !state.wrapperOnline) return;
+    if (focusedEngine === "codex" && focusedCodexProfileId) {
+      wsRef.current?.sendGetModels(
+        "codex", undefined, focusedCodexProfileId);
+    } else if (focusedEngine === "dsh" && focusedSid) {
+      wsRef.current?.sendGetModels(
+        "dsh", undefined, undefined, focusedSid);
+    }
   }, [
     focusedCodexProfileId,
     focusedEngine,
+    focusedSid,
     state.connState,
     state.newChat,
     state.wrapperOnline,
@@ -1513,13 +1539,16 @@ export default function App() {
         ? current.codexProfileByScope[focusScopeKey]
           ?? current.defaultCodexProfileId
         : null,
+      dshAgentPreset: nextEngine === "dsh"
+        ? current.defaultDshPresetId
+        : null,
     });
     setNewChatAutoFocus(false);
   }, [clearForkFocusLease, engine, machineId, rememberSurfaceFocus, space]);
 
   const focusListedSession = useCallback((selected: SessionInfo) => {
     const selectedEngine: Engine = selected.engine === "codex"
-      || selected.engine === "claude"
+      || selected.engine === "claude" || selected.engine === "dsh"
       ? selected.engine : engineRef.current;
     const selectedSpace: Space = selected.space === "work"
       || selected.space === "code"
@@ -1538,7 +1567,7 @@ export default function App() {
     wsRef.current?.setFocusedSid(id, selectedEngine, selectedSpace);
     requestHistory(id, undefined, HISTORY_INITIAL_PAGE);
     wsRef.current?.sendSwitchSession(id, selectedEngine, selectedSpace);
-    if (selectedSpace === "work") {
+    if (selectedSpace === "work" && isWorkEngine(selectedEngine)) {
       wsRef.current?.sendGetWorkArtifacts(selectedEngine, id);
     }
     if (isMobile()) setSidebarOpen(false);
@@ -1648,10 +1677,15 @@ export default function App() {
 
   // Engine and Work/Code switches are navigation. Each surface restores the
   // session that was last open there instead of silently starting a new one.
-  const toggleEngine = () => {
+  const switchEngine = useCallback((nextEngine: Engine) => {
+    if (nextEngine === engine) return;
     cancelPendingNotificationTarget();
-    const nextEngine: Engine = engine === "codex" ? "claude" : "codex";
-    const nextSpace = spacesByEngineRef.current[nextEngine];
+    const entry = stateRef.current.engineCatalog.find(
+      (candidate) => candidate.id === nextEngine && candidate.available);
+    if (!entry) return;
+    const rememberedSpace = spacesByEngineRef.current[nextEngine];
+    const nextSpace: Space = nextEngine === "dsh"
+      || !entry.spaces.includes(rememberedSpace) ? "code" : rememberedSpace;
     pendingCreateRef.current = null;
     setCreateError(null);
     setStatusOpenSid(null);
@@ -1664,9 +1698,10 @@ export default function App() {
     setEngine(nextEngine);
     setSpace(nextSpace);
     if (isMobile()) setSidebarOpen(false);
-  };
+  }, [cancelPendingNotificationTarget, engine, prepareSurfaceSwitch]);
 
   const switchSpace = (next: Space) => {
+    if (engine === "dsh" && next !== "code") return;
     if (next === space || !confirmArtifactDiscard()) return;
     cancelPendingNotificationTarget();
     pendingCreateRef.current = null;
@@ -1723,12 +1758,14 @@ export default function App() {
               engine: session?.engine ?? engineRef.current,
               space: session?.space ?? spaceRef.current,
             };
-            planProgressCacheRef.current.clear({
-              machineId: scoped.machineId,
-              engine: scoped.engine,
-              space: scoped.space,
-              sid: msg.session_id,
-            });
+            if (scoped.engine !== "dsh") {
+              planProgressCacheRef.current.clear({
+                machineId: scoped.machineId,
+                engine: scoped.engine,
+                space: scoped.space,
+                sid: msg.session_id,
+              });
+            }
           } else if (msg.type === "session_rekey") {
             const session = stateRef.current.sessions.find(
               (candidate) => candidate.session_id === msg.old_key
@@ -1738,11 +1775,13 @@ export default function App() {
               engine: session?.engine ?? engineRef.current,
               space: session?.space ?? spaceRef.current,
             };
-            planProgressCacheRef.current.rekey({
-              machineId: scoped.machineId,
-              engine: scoped.engine,
-              space: scoped.space,
-            }, msg.old_key, msg.session_id);
+            if (scoped.engine !== "dsh") {
+              planProgressCacheRef.current.rekey({
+                machineId: scoped.machineId,
+                engine: scoped.engine,
+                space: scoped.space,
+              }, msg.old_key, msg.session_id);
+            }
           }
           // SessionList is a scoped response, not a broadcast catalog. Without
           // the exact request ownership it may belong to an older surface or
@@ -1759,7 +1798,15 @@ export default function App() {
               goalRecoveryRequestsRef.current.delete(
                 `${lifecycleEpoch}\0${completedGoalRequest.scopeKey}`);
             }
-            const key = goalUiScopeForEvent(msg.sid, ownership);
+            const goalOwnership: GoalEventOwnership | undefined = ownership?.engine === "claude"
+                || ownership?.engine === "codex"
+              ? {
+                  machineId: ownership.machineId,
+                  engine: ownership.engine,
+                  space: ownership.space,
+                }
+              : undefined;
+            const key = goalUiScopeForEvent(msg.sid, goalOwnership);
             if (key) {
               const localGoalIdentity = goalStableIdentity(msg.goal);
               const localPreference = goalUiPreferencesRef.current[key];
@@ -2098,10 +2145,10 @@ export default function App() {
             if (session?.space === "work"
                 || (spaceRef.current === "work"
                   && stateRef.current.focusedSid === sid)) {
-              ws.sendGetWorkArtifacts(
-                (session?.engine as Engine | undefined) ?? engineRef.current,
-                sid,
-              );
+              const targetEngine = session?.engine ?? engineRef.current;
+              if (isWorkEngine(targetEngine)) {
+                ws.sendGetWorkArtifacts(targetEngine, sid);
+              }
             }
           } else if (msg.type === "replay_start" && msg.sid
               && (msg.truncated || msg.rebuild)) {
@@ -2656,11 +2703,12 @@ export default function App() {
               // the active surface so its title/status comes from the native
               // catalog without making the user toggle or reload the page.
               ws.sendListSessions(engineRef.current, spaceRef.current);
-              if (spaceRef.current === "work") {
+              if (spaceRef.current === "work"
+                  && isWorkEngine(engineRef.current)) {
                 ws.sendGetWorkArtifacts(engineRef.current, msg.session_id);
               }
             }
-            if (ownership) {
+            if (ownership && ownership.engine !== "dsh") {
               const oldGoalKey = goalUiScopeKey(
                 ownership.machineId, ownership.space, ownership.engine,
                 msg.old_key);
@@ -2725,11 +2773,14 @@ export default function App() {
             // Warm the sibling Work/Code surface once per page lifetime. Codex
             // reuses the just-read native catalog in the wrapper, so this does
             // not start a second app-server and the user's first toggle is fast.
-            const siblingSpace: Space = listedSpace === "work" ? "code" : "work";
-            const siblingKey = `${siblingSpace}:${msg.engine}`;
-            if (!prefetchedSurfacesRef.current.has(siblingKey)) {
-              prefetchedSurfacesRef.current.add(siblingKey);
-              ws.sendListSessions(msg.engine, siblingSpace);
+            const siblingSpace = siblingSpaceForPrefetch(
+              msg.engine, listedSpace);
+            if (siblingSpace !== null) {
+              const siblingKey = `${siblingSpace}:${msg.engine}`;
+              if (!prefetchedSurfacesRef.current.has(siblingKey)) {
+                prefetchedSurfacesRef.current.add(siblingKey);
+                ws.sendListSessions(msg.engine, siblingSpace);
+              }
             }
           }
           if (msg.type === "session_activity") {
@@ -2798,6 +2849,7 @@ export default function App() {
             }
           }
           if (msg.type === "session_focus" && spaceRef.current === "work"
+              && isWorkEngine(engineRef.current)
               && !msg.session_id.startsWith("tmp-")) {
             ws.sendGetWorkArtifacts(engineRef.current, msg.session_id);
           }
@@ -2868,11 +2920,13 @@ export default function App() {
             setSkillCatalogs({});
             skillCatalogRequestsRef.current?.resetReads();
             const focusedSkills = focusedSkillScopeRef.current;
-            if (focusedSkills?.engine === "codex" && focusedSkills.cwd) {
+            if ((focusedSkills?.engine === "codex"
+                || focusedSkills?.engine === "dsh") && focusedSkills.cwd) {
               requestSkillCatalog(focusedSkills, true);
             }
             ws.sendListSessions(engineRef.current, spaceRef.current);
-            if (spaceRef.current === "work") {
+            if (spaceRef.current === "work"
+                && isWorkEngine(engineRef.current)) {
               ws.sendGetWorkDashboard(engineRef.current);
             }
             ws.sendGetModels("codex");
@@ -2882,7 +2936,13 @@ export default function App() {
           }
           // refresh the context ring after each turn (local SDK query, no model tokens)
           if (msg.type === "turn_end" && msg.sid) {
-            ws.sendGetContextTo(msg.sid);
+            const listedSession = Object.values(
+              sessionListsBySurfaceRef.current,
+            ).flat().find((session) => session.session_id === msg.sid);
+            const eventEngine = listedSession?.engine
+              ?? (stateRef.current.focusedSid === msg.sid
+                ? engineRef.current : undefined);
+            if (eventEngine !== "dsh") ws.sendGetContextTo(msg.sid);
             if (sessionActivityPendingRef.current.delete(msg.sid)) {
               const listed = Object.values(sessionListsBySurfaceRef.current)
                 .flat().find((session) => session.session_id === msg.sid);
@@ -2895,8 +2955,10 @@ export default function App() {
               (candidate) => candidate.session_id === msg.sid);
             if (session?.space === "work"
                 || (spaceRef.current === "work" && stateRef.current.focusedSid === msg.sid)) {
-              ws.sendGetWorkArtifacts(
-                (session?.engine as Engine | undefined) ?? engineRef.current, msg.sid);
+              const targetEngine = session?.engine ?? engineRef.current;
+              if (isWorkEngine(targetEngine)) {
+                ws.sendGetWorkArtifacts(targetEngine, msg.sid);
+              }
             }
           }
         },
@@ -2921,7 +2983,8 @@ export default function App() {
             notificationListRequestRef.current = null;
             bumpNotificationListRevision();
             ws.sendListSessions(engineRef.current, spaceRef.current);
-            if (spaceRef.current === "work") {
+            if (spaceRef.current === "work"
+                && isWorkEngine(engineRef.current)) {
               ws.sendGetWorkDashboard(engineRef.current);
               const currentSid = stateRef.current.focusedSid;
               if (currentSid) ws.sendGetWorkArtifacts(engineRef.current, currentSid);
@@ -3092,7 +3155,7 @@ export default function App() {
     if (latest && latest.session_id !== state.focusedSid) {
       dispatch({ type: "exit_new_chat" });
       dispatch({ type: "focus_session", sid: latest.session_id });
-      const latestEngine = (latest.engine as "claude" | "codex") || engineRef.current;
+      const latestEngine = latest.engine ?? engineRef.current;
       wsRef.current.setFocusedSid(latest.session_id, latestEngine, spaceRef.current);
       requestHistory(
         latest.session_id, undefined, HISTORY_INITIAL_PAGE);
@@ -3121,11 +3184,13 @@ export default function App() {
     ] = focusedSid;
   }, [focusedSid, state.newChat, state.sessions, engine, machineId]);
 
-  // Warm the cwd-scoped Codex Skill catalog when a session becomes usable.
+  // Warm the effective Codex/DSH Skill catalog when a session becomes usable.
   // Composer completion then reads memory synchronously; an expired entry stays
   // visible while this refresh runs in the background.
   useEffect(() => {
-    if (!authed || !focusedSid || focusedEngine !== "codex" || state.newChat
+    if (!authed || !focusedSid
+        || (focusedEngine !== "codex" && focusedEngine !== "dsh")
+        || state.newChat
         || !capabilityCwd || state.connState !== "connected"
         || !state.wrapperOnline) return;
     requestSkillCatalog({
@@ -3135,6 +3200,7 @@ export default function App() {
       cwd: capabilityCwd,
       skillsOnly: true,
       codexProfileId: focusedCodexProfileId,
+      dshSessionId: focusedEngine === "dsh" ? focusedSid : null,
     });
   }, [
     authed,
@@ -3164,6 +3230,7 @@ export default function App() {
       cwd: capabilityCwd,
       skillsOnly: false,
       codexProfileId: focusedCodexProfileId,
+      dshSessionId: focusedEngine === "dsh" ? focusedSid : null,
     }, true);
   }, [
     authed,
@@ -3171,6 +3238,7 @@ export default function App() {
     capabilityCwd,
     focusedEngine,
     focusedCodexProfileId,
+    focusedSid,
     focusedSkillCatalogKey,
     requestSkillCatalog,
     space,
@@ -3416,6 +3484,7 @@ export default function App() {
   // that the replacement wrapper has finished restoring resident sessions.
   useEffect(() => {
     if (!authed || !focusedSid || state.newChat
+        || focusedEngine === "dsh"
         || state.connState !== "connected" || !state.wrapperOnline) return;
     if (stateRef.current.runtimes[focusedSid]?.contextRequestId) return;
     const requestId = wsRef.current?.sendGetContext();
@@ -3424,6 +3493,7 @@ export default function App() {
     }
   }, [
     authed,
+    focusedEngine,
     focusedSid,
     state.connState,
     state.newChat,
@@ -3908,7 +3978,8 @@ export default function App() {
                             permissionProfile?: string,
                             webSearch?: CodexWebSearchMode,
                             serviceTier?: CodexServiceTier): boolean => {
-    if (!wsRef.current || !state.newChat || newChatCodexProfileMissing) {
+    if (!wsRef.current || !state.newChat || newChatCodexProfileMissing
+        || (engine === "dsh" && (space !== "code" || !!files?.length))) {
       return false;
     }
     const { cwd, cwdSource, model, effort } = state.newChat;
@@ -3931,7 +4002,8 @@ export default function App() {
         : undefined,
       engine === "codex" ? serviceTier : undefined,
       space, space === "work" ? activeWorkProjectId : undefined,
-      engine === "codex" ? newChatCodexProfileId : undefined);
+      engine === "codex" ? newChatCodexProfileId : undefined,
+      engine === "dsh" ? state.newChat.dshAgentPreset : undefined);
     if (queued) {
       pendingCreateRef.current = msg_id;
       createRequestsRef.current.set(msg_id, {
@@ -3977,6 +4049,10 @@ export default function App() {
       scopeKey: activeScopeKey,
       profileId,
     });
+  };
+  const pickNewChatDshPreset = (presetId: string | null) => {
+    if (engine !== "dsh") return;
+    dispatch({ type: "set_new_chat_dsh_preset", presetId });
   };
   const interrupt = () => wsRef.current?.sendInterrupt();
   const setModel = (model: string) => {
@@ -4042,8 +4118,8 @@ export default function App() {
     return requestId;
   };
   const runGoal = (args: string) => {
-    if (!focusedSid || !focusedGoalScopeKey) return;
-    const command = parseGoalCommand(args, focusedEngine);
+    if (!focusedSid || !focusedGoalScopeKey || !goalEngine) return;
+    const command = parseGoalCommand(args, goalEngine);
     rememberFocusedGoalUi();
     if (command.kind === "clear") {
       wsRef.current?.sendClearGoal();
@@ -4063,7 +4139,7 @@ export default function App() {
     }
   };
   const openStatus = () => {
-    if (!focusedSid) return;
+    if (!focusedSid || focusedEngine !== "codex") return;
     setStatusOpenSid(focusedSid);
     refreshStatus();
   };
@@ -4073,7 +4149,7 @@ export default function App() {
     refreshStatus();
   };
   const requestContext = () => {
-    if (!focusedSid) return;
+    if (!focusedSid || focusedEngine === "dsh") return;
     const requestId = wsRef.current?.sendGetContext();
     if (requestId) {
       dispatch({ type: "begin_context_request", sid: focusedSid, requestId });
@@ -4255,7 +4331,7 @@ export default function App() {
   // destroying the fork; returning to that parent restores it. Other sessions
   // can open their own independent side conversations.
   const openBtw = () => {
-    if (!confirmArtifactDiscard()) return;
+    if (focusedEngine === "dsh" || !confirmArtifactDiscard()) return;
     setRightView("btw");
     const parentSid = visibleParentSid;
     if (!parentSid || activeBtw
@@ -4568,7 +4644,8 @@ export default function App() {
           </div>
           <span className={`hstat ${effectiveState}`}><span className="sd" />
             <span className="hstat-label">{effectiveState}</span></span>
-          {space === "code" && focusedSid && !state.newChat && (
+          {space === "code" && focusedEngine !== "dsh"
+              && focusedSid && !state.newChat && (
             <TerminalControl control={rt.control} engine={focusedEngine}
               availability={state.connState !== "connected" || !state.wrapperOnline
                 ? "offline" : rt.replaying || !rt.syncReady ? "syncing" : "online"}
@@ -4583,8 +4660,16 @@ export default function App() {
             <Icon name="devices" size={18} />
             <span>{activeDevice?.label ?? machineId}</span><i />
           </button>
-          <button className="engine-toggle" onClick={toggleEngine} aria-label="切换新会话引擎"
-            title="新建会话使用的引擎">{engine === "codex" ? "◇ Codex" : "✳ Claude"}</button>
+          <Suspense fallback={(
+            <span className={`engine-toggle engine-${engine}`} aria-hidden="true">
+              <span>{engine === "claude" ? "✳" : engine === "codex" ? "◇" : "◆"}</span>
+              <span>{engine === "claude" ? "Claude" : engine === "codex" ? "Codex" : "DSH"}</span>
+              <Icon name="chev" size={13} />
+            </span>
+          )}>
+            <EnginePicker engine={engine} engines={state.engineCatalog}
+              onSelect={switchEngine} />
+          </Suspense>
           <HeaderMenu
             engine={engine}
             theme={theme}
@@ -4626,6 +4711,9 @@ export default function App() {
             codexProfiles={state.codexProfiles}
             defaultCodexProfileId={state.defaultCodexProfileId}
             codexProfileId={newChatCodexProfileId}
+            dshPresets={state.dshPresets}
+            defaultDshPresetId={state.defaultDshPresetId}
+            dshAgentPreset={state.newChat.dshAgentPreset}
             workDashboard={activeWorkDashboard}
             selectedProjectId={activeWorkProjectId}
             onSelectProject={setWorkProjectId}
@@ -4634,6 +4722,7 @@ export default function App() {
             onPickModel={pickNewChatModel}
             onPickEffort={pickNewChatEffort}
             onPickCodexProfile={pickNewChatCodexProfile}
+            onPickDshPreset={pickNewChatDshPreset}
             permissionProfiles={
               newChatPermissionCatalog?.machineId === machineId
                 && newChatPermissionCatalog.cwd === state.newChat.cwd
@@ -4678,7 +4767,8 @@ export default function App() {
               onPreviewMarkdown={historyView.recovering
                 ? undefined : previewMarkdown}
               onOpenFile={historyView.recovering ? undefined : previewFile}
-              onOpenArtifacts={historyView.recovering ? undefined : () => {
+              onOpenArtifacts={historyView.recovering || space !== "work"
+                  || !isWorkEngine(focusedEngine) ? undefined : () => {
                 if (focusedSid) {
                   wsRef.current?.sendGetWorkArtifacts(focusedEngine, focusedSid);
                 }
@@ -4700,12 +4790,12 @@ export default function App() {
               onFork={!historyView.recovering && space === "code"
                 ? forkFromTurn : undefined} />
 
-            <Suspense fallback={((goalUi?.revealed && !completedGoalRetired)
+            {goalEngine && <Suspense fallback={((goalUi?.revealed && !completedGoalRetired)
                 || goalUi?.open || planProgress)
               ? <span className="goal-suspense" role="status"
                   aria-label={planProgress ? "正在加载计划进度" : "正在加载 Goal"} />
               : null}>
-              <GoalPanel engine={focusedEngine} goal={rt.goal}
+              <GoalPanel engine={goalEngine} goal={rt.goal}
                 revealed={!!goalUi?.revealed} open={!!goalUi?.open}
                 loading={!!goalUi?.loading}
                 completedGoalRetired={completedGoalRetired}
@@ -4752,7 +4842,7 @@ export default function App() {
                   wsRef.current?.sendClearGoal();
                   setGoalUi({ revealed: false, open: false, loading: false });
                 }} />
-            </Suspense>
+            </Suspense>}
 
             <Composer
           draftKey={focusedComposerDraftKey}
@@ -4818,18 +4908,18 @@ export default function App() {
             codexProfileId: focusedCodexProfileId ?? newChatCodexProfileId,
           })}
           onContext={requestContext}
-          onOpenBtw={openBtw}
+          onOpenBtw={focusedEngine === "dsh" ? undefined : openBtw}
           onDiff={() => getDiff("")}
           onPreview={previewMarkdown}
-          onGoal={runGoal}
-          onStatus={openStatus}
-          onRefreshUsage={refreshStatus}
-          onReview={(target, value) => {
+          onGoal={focusedEngine === "dsh" ? undefined : runGoal}
+          onStatus={focusedEngine === "codex" ? openStatus : undefined}
+          onRefreshUsage={focusedEngine === "codex" ? refreshStatus : undefined}
+          onReview={focusedEngine === "codex" ? (target, value) => {
             if (focusedSid) wsRef.current?.sendStartReview(focusedSid, target, value);
-          }}
-          onCompact={() => {
+          } : undefined}
+          onCompact={focusedEngine === "codex" ? () => {
             if (focusedSid) wsRef.current?.sendCompactSession(focusedSid);
-          }}
+          } : undefined}
           onOpenExtensions={(kind) => {
             setCapabilitiesKind(kind);
             setCapabilitiesOpen(true);
@@ -4841,6 +4931,7 @@ export default function App() {
               cwd: capabilityCwd,
               skillsOnly: false,
               codexProfileId: focusedCodexProfileId,
+              dshSessionId: focusedEngine === "dsh" ? focusedSid : null,
             }, true);
           }}
           skills={skillCatalogs[focusedSkillCatalogKey]?.items}
@@ -4852,15 +4943,16 @@ export default function App() {
               cwd: capabilityCwd,
               skillsOnly: true,
               codexProfileId: focusedCodexProfileId,
+              dshSessionId: focusedEngine === "dsh" ? focusedSid : null,
             });
           }}
           workArtifactCount={space === "work" ? currentWorkArtifacts.length : 0}
-          onOpenArtifacts={() => {
+          onOpenArtifacts={space === "work" && isWorkEngine(focusedEngine) ? () => {
             if (focusedSid) {
               wsRef.current?.sendGetWorkArtifacts(focusedEngine, focusedSid);
             }
             setWorkArtifactsOpen(true);
-          }}
+          } : undefined}
           contextReport={rt.contextReport}
           contextError={rt.contextError}
           statusReport={rt.statusReport}
@@ -4992,10 +5084,10 @@ export default function App() {
       <ForkWorktreeSheet open={forkWorktreeSession !== null} session={forkWorktreeSession}
         creating={forkWorktreeCreating} error={forkWorktreeError}
         onConfirm={submitForkWorktree} onClose={closeForkWorktree} />
-      <WorkDashboardSheet
-        key={sessionScopeKey(machineId, engine, "work")}
+      {activeWorkEngine && <WorkDashboardSheet
+        key={sessionScopeKey(machineId, activeWorkEngine, "work")}
         open={workManagerOpen && space === "work"}
-        scopeKey={sessionScopeKey(machineId, engine, "work")}
+        scopeKey={sessionScopeKey(machineId, activeWorkEngine, "work")}
         dashboard={activeWorkDashboard}
         codexProfiles={state.codexProfiles}
         defaultCodexProfileId={state.defaultCodexProfileId}
@@ -5004,17 +5096,17 @@ export default function App() {
         selectedProjectId={activeWorkProjectId}
         onSelectProject={setWorkProjectId}
         onClose={() => setWorkManagerOpen(false)}
-        onCreateProject={(name, description) => !!wsRef.current?.sendCreateWorkProject(engine, name, description)}
-        onDeleteProject={(projectId) => !!wsRef.current?.sendDeleteWorkProject(engine, projectId)}
-        onAddSource={(projectId, kind, title, uri, file) => !!wsRef.current?.sendAddWorkSource(engine, projectId, kind, title, uri, file)}
-        onDeleteSource={(sourceId) => !!wsRef.current?.sendDeleteWorkSource(engine, sourceId)}
+        onCreateProject={(name, description) => !!wsRef.current?.sendCreateWorkProject(activeWorkEngine, name, description)}
+        onDeleteProject={(projectId) => !!wsRef.current?.sendDeleteWorkProject(activeWorkEngine, projectId)}
+        onAddSource={(projectId, kind, title, uri, file) => !!wsRef.current?.sendAddWorkSource(activeWorkEngine, projectId, kind, title, uri, file)}
+        onDeleteSource={(sourceId) => !!wsRef.current?.sendDeleteWorkSource(activeWorkEngine, sourceId)}
         onCreateSchedule={(title, prompt, nextRunAt, repeatSeconds, projectId,
           codexProfileId) => !!wsRef.current?.sendCreateWorkSchedule(
-          engine, title, prompt, nextRunAt, repeatSeconds, projectId,
+          activeWorkEngine, title, prompt, nextRunAt, repeatSeconds, projectId,
           codexProfileId)}
-        onDeleteSchedule={(scheduleId) => !!wsRef.current?.sendDeleteWorkSchedule(engine, scheduleId)}
-        onCreatePlugin={(name, instructions, projectId) => !!wsRef.current?.sendCreateWorkPlugin(engine, name, instructions, projectId)}
-        onDeletePlugin={(pluginId) => !!wsRef.current?.sendDeleteWorkPlugin(engine, pluginId)} />
+        onDeleteSchedule={(scheduleId) => !!wsRef.current?.sendDeleteWorkSchedule(activeWorkEngine, scheduleId)}
+        onCreatePlugin={(name, instructions, projectId) => !!wsRef.current?.sendCreateWorkPlugin(activeWorkEngine, name, instructions, projectId)}
+        onDeletePlugin={(pluginId) => !!wsRef.current?.sendDeleteWorkPlugin(activeWorkEngine, pluginId)} />}
       <WorkArtifactsSheet open={workArtifactsOpen && space === "work"
           && !state.newChat && currentWorkArtifacts.length > 0}
         artifacts={currentWorkArtifacts}
@@ -5023,7 +5115,7 @@ export default function App() {
       <CapabilitiesSheet open={capabilitiesOpen}
         engine={focusedEngine}
         activeKind={capabilitiesKind}
-        readOnly={space === "work"}
+        readOnly={space === "work" || focusedEngine === "dsh"}
         report={capabilitiesByScope[focusedSkillCatalogKey] ?? null}
         loading={capabilitiesLoading}
         onKindChange={setCapabilitiesKind}
@@ -5036,6 +5128,7 @@ export default function App() {
             cwd: capabilityCwd,
             skillsOnly: false,
             codexProfileId: focusedCodexProfileId,
+            dshSessionId: focusedEngine === "dsh" ? focusedSid : null,
           }, true);
         }}
         onManagePlugin={(item, action) => {

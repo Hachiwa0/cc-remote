@@ -1,7 +1,7 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { Icon } from "../icons";
 import type {
-  EngineCapabilities, EngineCapabilityItem, EngineCapabilityKind,
+  Engine, EngineCapabilities, EngineCapabilityItem, EngineCapabilityKind,
 } from "../protocol";
 
 export interface SkillDraft {
@@ -21,7 +21,7 @@ export interface HookDraft {
 
 interface Props {
   open: boolean;
-  engine: "claude" | "codex";
+  engine: Engine;
   activeKind: EngineCapabilityKind | "all";
   report: EngineCapabilities | null;
   loading: boolean;
@@ -114,7 +114,9 @@ export function CapabilitiesSheet({
           onClick={() => onKindChange(kind)}>{LABELS[kind]}</button>)}
       </nav>
       <div className="capabilities-body">
-        {readOnly && <div className="capabilities-note">Work 仅展示有效目录，不允许修改 Code 扩展。</div>}
+        {readOnly && <div className="capabilities-note">{engine === "dsh"
+          ? "DSH 插件、凭据与 Agent 组合由本机 Harness 管理；Remote 仅展示当前 Agent 的有效 Skills。"
+          : "Work 仅展示有效目录，不允许修改 Code 扩展。"}</div>}
         {loading && !report && <div className="capabilities-empty">正在读取扩展目录…</div>}
         {report?.notes?.map((note) => <div className="capabilities-note" key={note}>{note}</div>)}
         {report?.errors?.length ? <div className="capabilities-errors">

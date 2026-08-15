@@ -54,12 +54,22 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   transport, never the caller's Origin. Uvicorn trusts forwarded transport
   metadata only from loopback Caddy. Never put tokens in URLs or protocol
   message bodies; logging redacts token/password fields.
-- **Protocol version gate**: current wire protocol v35 is declared by
+- **Protocol version gate**: current wire protocol v36 is declared by
   `PROTOCOL_VERSION` in both `protocol.py` and `web/src/protocol.ts`.
   `deserialize` hard-rejects a version mismatch, and
   `_Base` is `extra="forbid"`, so ANY protocol change must be deployed to all
   three tiers together (wrapper + relay + web) and the relay restarted — the
   relay imports `protocol.py` and drops frames it can't parse.
+- **DSH is a loopback capability carrier, not a second plugin manager**: the
+  wrapper may connect only to a credential-free loopback HTTP origin. DSH/Cordis
+  owns plugin installation, composition, permissions, settings, and credentials;
+  cc-remote selects Agent Presets, reads effective Skills, and renders resulting
+  tool/Hook/subagent events. Never proxy DSH settings or credentials, load its
+  plugin frontends, or expose its authoring/mutation RPCs through the relay.
+- **DSH is pinned to `@deepseek-ai/dsh@0.1.0-rc.6`**: its Typert RPC and event-log
+  contracts are still release-candidate APIs. Keep the README launch command
+  exact and re-run the DSH contract, history, interrupt, command, and fork tests
+  before changing this version.
 - **Device scope is an authorization boundary**: one relay can serve multiple
   wrappers. Every browser command, event, push subscription, and pairing token
   is scoped by `machine_id`; a credential for one enrolled device must never be
@@ -68,8 +78,10 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
 - **Multi-session routing key**: the wrapper runs a POOL of resident sessions
   (`WrapperMachine.sessions: dict[key, SessionContext]`, cap
   `MAX_CONCURRENT_SESSIONS`). `ctx.key` is the routing identity = the real cc sid
-  once known, else `tmp-<uuid>`. Every emit stamps `sid = ctx.session_id or
-  ctx.key`, so a brand-new session's pre-capture frames route deterministically
+  once known, else `tmp-<uuid>`. DSH is the exception: `ctx.session_id` remains
+  the native id while `ctx.key` is the namespaced `dsh@<native-id>` wire id.
+  Every emit must use `_ctx_wire_sid(ctx)`, so a brand-new session's pre-capture
+  frames route deterministically
   (never leak into the focused runtime). Keep `ctx.key` in sync with the pool
   dict key on every re-key.
 - **Focus vs re-key (don't conflate)**: switching the viewed session is
@@ -101,8 +113,10 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   takes over. Codex Code sessions use the official app-server; shared-daemon
   CLI activity and private Codex App activity are different ownership sources
   and must not be collapsed into one "external process" heuristic. Ordinary
-  shared sessions stay on the daemon; only the guarded oversized-resume path may
-  select a newer official private app-server for compatibility.
+  shared sessions, including guarded oversized HTTP resumes, stay on the daemon.
+  A newer official private app-server is only a compatibility fallback before
+  shared affinity has ever been established; it must never outrank a usable
+  shared control plane.
 - **History = local projection + materialized summary pages; reconnect = live-tail replay**
   (protocol v24): IndexedDB paints the browser's last projection before network
   validation. `GetHistory(detail="summary")` returns a small canonical turn page
@@ -139,7 +153,9 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   `codex_handle.py` / `codex_stream.py` / `codex_daemon.py` / `codex_external.py`
   implement the official Codex app-server paths; `codex_lifecycle.py` owns the
   source-bound exact-terminal ledger; `history_store.py` owns the rebuildable
-  SQLite projection; `machine.py`, `command_router.py`,
+  SQLite projection; `dsh_client.py` / `dsh_stream.py` / `dsh_history.py` /
+  `dsh_forks.py` implement the loopback DeepSeek Harness Code backend;
+  `machine.py`, `command_router.py`,
   `session_ctx.py`, `ringbuffer.py`, `transport.py`, and `session.py` provide
   the shared session pool, command dispatch, live replay, relay transport, and
   persistence.

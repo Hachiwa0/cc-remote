@@ -14,7 +14,7 @@ import {
   useVirtualizer,
 } from "@tanstack/react-virtual";
 import type { Turn } from "../domain/conversation";
-import type { Space } from "../protocol";
+import type { Engine, Space } from "../protocol";
 import { MessageBlock } from "./MessageBlock";
 import { Icon, ClaudeMark, ClaudeWorking, ClaudeSpark } from "../icons";
 import { canForkTurn } from "../session-worktree";
@@ -294,7 +294,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   sid: string | null;
   turns: Turn[];
   surface?: Space;
-  engine?: "claude" | "codex";
+  engine?: Engine;
   loading?: boolean;
   hasMore?: boolean;
   historyPagingReady?: boolean;

@@ -227,6 +227,12 @@ class WrapperConfig:
     # behavior using CODEX_HOME (or ~/.codex).
     codex_profiles_json: str = field(
         default_factory=_codex_profiles_json)
+    # Optional DeepSeek Harness Web carrier. DSH exposes no authentication, so
+    # only a loopback HTTP origin is accepted. Empty disables auto-discovery.
+    dsh_url: str = field(default_factory=lambda: _env(
+        "CC_REMOTE_DSH_URL", "http://127.0.0.1:3080").strip())
+    dsh_timeout: float = field(
+        default_factory=lambda: _float("CC_REMOTE_DSH_TIMEOUT", 10.0))
     # Optional local PTY broker used only by the explicit `claude-remote`
     # experiment. It is intentionally disabled in the supported product path:
     # direct native Claude owners are mirrored read-only and explicitly taken
@@ -556,6 +562,29 @@ def validate_wrapper_config(cfg: WrapperConfig) -> None:
             errors.append(
                 "CC_REMOTE_CODEX_PROXY must be an http(s) or socks5 URL "
                 "without credentials, path, query, or fragment")
+    if cfg.dsh_url:
+        try:
+            dsh = urlsplit(cfg.dsh_url)
+            dsh_port = dsh.port
+        except ValueError:
+            dsh = urlsplit("")
+            dsh_port = None
+        if (
+            dsh.scheme != "http"
+            or not dsh.netloc
+            or dsh.hostname not in {"127.0.0.1", "::1", "localhost"}
+            or dsh.username is not None
+            or dsh.password is not None
+            or dsh.path not in {"", "/"}
+            or dsh.query
+            or dsh.fragment
+            or (dsh_port is not None and not 1 <= dsh_port <= 65535)
+        ):
+            errors.append(
+                "CC_REMOTE_DSH_URL must be a credential-free loopback http origin"
+            )
+    if not (0.1 <= cfg.dsh_timeout <= 60.0) or not math.isfinite(cfg.dsh_timeout):
+        errors.append("CC_REMOTE_DSH_TIMEOUT must be between 0.1 and 60 seconds")
     if cfg.experimental_claude_broker:
         if (not cfg.claude_broker_socket
                 or "\x00" in cfg.claude_broker_socket

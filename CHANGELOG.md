@@ -4,6 +4,15 @@
 
 ## Unreleased
 
+- Upgrade the coordinated Wrapper/Relay/Web gate to protocol v36 and add
+  DeepSeek Harness as an optional third Code backend. A loopback-only adapter
+  provides sessions, streaming, paged history, images, model/effort controls,
+  Agent Presets, effective Skills, steer/interrupt, fork, rename, pin, and
+  archive without moving model credentials into cc-remote. DSH/Cordis remains
+  the authority for plugin installation, composition, permissions, settings,
+  and credentials; plugin tools, Hooks, subagents, and safely ignorable unknown
+  events use the common process timeline instead of loading privileged plugin
+  frontends. Required unknown events retain DSH's fail-closed log semantics.
 - Upgrade the coordinated Wrapper/Relay/Web gate to protocol v35. Exact Codex
   app-server and source-validated rollout terminals now travel independently of
   the narrative History projection, so a multi-hundred-MiB rollout cannot keep

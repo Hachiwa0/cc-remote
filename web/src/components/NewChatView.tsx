@@ -8,7 +8,7 @@ import {
   effortsFor, modelsFor, type Catalog, type Effort, type Model,
 } from "../data";
 import { attachmentBytes, pickFiles } from "../img";
-import type { CodexPermissionMode, CodexProfileInfo, CodexServiceTier, CodexWebSearchMode, CollaborationModeName, PermissionProfileInfo, QueryImg, QueryFile, Space, WorkDashboard } from "../protocol";
+import type { CodexPermissionMode, CodexProfileInfo, CodexServiceTier, CodexWebSearchMode, CollaborationModeName, DshPresetInfo, Engine, PermissionProfileInfo, QueryImg, QueryFile, Space, WorkDashboard } from "../protocol";
 import { ImeSubmitGuard } from "../ime-submit";
 import { PendingImageAttachments } from "./PendingImageAttachments";
 import { CommandSheet } from "./CommandSheet";
@@ -21,8 +21,6 @@ import {
   type ComposerPaste,
 } from "../composer-pastes";
 import { PasteCards } from "./PasteCards";
-
-type Engine = "claude" | "codex";
 
 export interface NewChatCatalogRequest {
   engine: Engine;
@@ -42,6 +40,7 @@ export function newChatCatalogRequest(
       ...(codexProfileId ? { codexProfileId } : {}),
     };
   }
+  if (engine === "dsh") return { engine };
   return space === "code" ? { engine, cwd } : null;
 }
 
@@ -140,6 +139,9 @@ interface Props {
   codexProfiles?: CodexProfileInfo[];
   defaultCodexProfileId?: string | null;
   codexProfileId?: string | null;
+  dshPresets?: DshPresetInfo[];
+  defaultDshPresetId?: string | null;
+  dshAgentPreset?: string | null;
   autoFocus?: boolean;
   createError?: string | null;
   workDashboard?: WorkDashboard | null;
@@ -150,6 +152,7 @@ interface Props {
   onPickModel?: (model: string | null) => void;
   onPickEffort?: (effort: string | null) => void;
   onPickCodexProfile?: (profileId: string) => void;
+  onPickDshPreset?: (presetId: string | null) => void;
   permissionProfiles?: PermissionProfileInfo[] | null;
   onGetPermissionProfiles?: (cwd: string) => void;
   onSend: (prompt: string, images?: QueryImg[], files?: QueryFile[],
@@ -241,8 +244,9 @@ export function NewChatView({ cwd, controlScopeKey,
   catalog = {}, model = null, effort = null,
   defaultModel = null, defaultEffort = null, autoFocus = true, createError,
   codexProfiles = [], defaultCodexProfileId = null, codexProfileId = null,
+  dshPresets = [], defaultDshPresetId = null, dshAgentPreset = null,
   workDashboard, selectedProjectId, onSelectProject, onManageWork, onPickCwd,
-  onPickModel, onPickEffort, onPickCodexProfile,
+  onPickModel, onPickEffort, onPickCodexProfile, onPickDshPreset,
   permissionProfiles, onGetPermissionProfiles,
   onSend }: Props) {
   const [text, setText] = useState("");
@@ -266,6 +270,10 @@ export function NewChatView({ cwd, controlScopeKey,
   useEffect(() => {
     if (createError) setCreating(false);
   }, [createError]);
+
+  useEffect(() => {
+    if (engine === "dsh") setFiles([]);
+  }, [engine]);
 
   useEffect(() => {
     setExecutionControls((current) => (
@@ -326,8 +334,18 @@ export function NewChatView({ cwd, controlScopeKey,
   const selectedProfileWarning = selectedProfileMissing
     ? "所选 Codex 账号已移除，请重新选择。"
     : selectedCodexProfile?.error ?? null;
+  const effectiveDshPresetId = dshAgentPreset ?? defaultDshPresetId;
+  const selectedDshPreset = engine === "dsh" && effectiveDshPresetId
+    ? dshPresets.find((preset) => preset.id === effectiveDshPresetId) ?? null
+    : null;
+  const selectedDshPresetMissing = engine === "dsh"
+    && !!dshAgentPreset && selectedDshPreset === null;
+  const selectedDshPresetWarning = selectedDshPresetMissing
+    ? "所选 DSH Agent Preset 已不可用，请重新选择。"
+    : selectedDshPreset?.broken ?? null;
   const canSend = (text.trim().length > 0 || hasAttachments || pastes.length > 0)
-    && !creating && !importing && !selectedProfileMissing;
+    && !creating && !importing && !selectedProfileMissing
+    && !selectedDshPresetMissing && !selectedDshPreset?.broken;
   const modelList = modelsFor(engine, catalog);
   const effectiveModel = model ?? defaultModel;
   const effortList = newChatEfforts(engine, effectiveModel, catalog);
@@ -372,10 +390,14 @@ export function NewChatView({ cwd, controlScopeKey,
     setImporting(true);
     try {
       const batch = await pickFiles(
-        fl, images.length + files.length, attachmentBytes(images, files));
+        fl, images.length + files.length, attachmentBytes(images, files),
+        { imagesOnly: engine === "dsh" });
       if (batch.images.length) setImages((previous) => [...previous, ...batch.images]);
-      if (batch.files.length) setFiles((previous) => [...previous, ...batch.files]);
-      if (batch.errors.length) window.alert(batch.errors.join("；"));
+      if (batch.files.length && engine !== "dsh") {
+        setFiles((previous) => [...previous, ...batch.files]);
+      }
+      const errors = [...batch.errors];
+      if (errors.length) window.alert(errors.join("；"));
     } finally {
       setImporting(false);
     }
@@ -407,7 +429,8 @@ export function NewChatView({ cwd, controlScopeKey,
     }
     const prompt = composed.prompt;
     if ((!prompt && !hasAttachments) || creating || importing
-        || selectedProfileMissing) return;
+        || selectedProfileMissing || selectedDshPresetMissing
+        || !!selectedDshPreset?.broken) return;
     setCreating(true);
     const queued = onSend(
       prompt, images.length ? images : undefined, files.length ? files : undefined,
@@ -474,14 +497,45 @@ export function NewChatView({ cwd, controlScopeKey,
       <span>{selectedProfileWarning}</span>
     </div>
   ) : null;
+  const dshPresetSelector = engine === "dsh" ? (
+    <label className="newchat-profile">
+      <span>Agent</span>
+      <select value={dshAgentPreset ?? ""}
+        onChange={(event) => onPickDshPreset?.(event.target.value || null)}
+        disabled={creating || importing || !onPickDshPreset}
+        aria-label="选择 DSH Agent Preset">
+        <option value="">
+          {selectedDshPreset && dshAgentPreset === null
+            ? `默认 · ${selectedDshPreset.name}` : "默认 Agent"}
+        </option>
+        {selectedDshPresetMissing && dshAgentPreset && (
+          <option value={dshAgentPreset} disabled>已移除 Agent</option>
+        )}
+        {dshPresets.map((preset) => (
+          <option key={preset.id} value={preset.id} disabled={!!preset.broken}>
+            {preset.name}{preset.trust === "user" ? " · 用户" : ""}
+            {preset.broken ? " · 不可用" : ""}
+          </option>
+        ))}
+      </select>
+    </label>
+  ) : null;
+  const dshPresetWarning = selectedDshPresetWarning ? (
+    <div className="newchat-profile-error" role="status">
+      <Icon name="warning" size={14} />
+      <span>{selectedDshPresetWarning}</span>
+    </div>
+  ) : null;
 
   return (
     <div className={"newchat " + (space === "work" ? "work-newchat" : "code-newchat")}>
       <div className="newchat-card">
         <div className="newchat-greet">{space === "work"
           ? "开始一项工作"
-          : engine === "codex" ? "开始 Codex 新对话" : "开始新对话"}
-          <span className={`newchat-engine ${engine}`}>{engine === "codex" ? "◇ Codex" : "✳ Claude"}</span>
+          : engine === "codex" ? "开始 Codex 新对话"
+            : engine === "dsh" ? "开始 DSH 新对话" : "开始新对话"}
+          <span className={`newchat-engine ${engine}`}>{engine === "codex"
+            ? "◇ Codex" : engine === "dsh" ? "◆ DSH" : "✳ Claude"}</span>
         </div>
         {space === "work" ? (
           <>
@@ -510,16 +564,19 @@ export function NewChatView({ cwd, controlScopeKey,
               <span>{workDashboard.plugins.length} 个工作模板</span>
             </div>}
           </>
-        ) : profileSelector ? (
+        ) : profileSelector || dshPresetSelector ? (
           <div className="newchat-context">
             {profileSelector}
+            {dshPresetSelector}
             {cwdButton}
             {profileWarning}
+            {dshPresetWarning}
           </div>
         ) : (
           <>
             {cwdButton}
             {profileWarning}
+            {dshPresetWarning}
           </>
         )}
 
@@ -645,7 +702,7 @@ export function NewChatView({ cwd, controlScopeKey,
       <CommandSheet
         open={permissionsOpen}
         kind="perms"
-        engine={engine}
+        engine="codex"
         onClose={() => setPermissionsOpen(false)}
         currentPerm={permissionMode}
         onPickPerm={(mode) => updateExecutionControls({

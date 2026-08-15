@@ -10,7 +10,7 @@ import {
 import type {
   State, QueryImg, QueryFile, ContextReport, StatusReport,
   CollaborationModeName, SessionControl, EngineCapabilityKind,
-  EngineCapabilityItem, PermissionProfileInfo,
+  Engine, EngineCapabilityItem, PermissionProfileInfo,
 } from "../protocol";
 import { presentLegacyExternalControl, presentSessionControl } from "../session-control-ui";
 import type { ConnState } from "../ws";
@@ -76,7 +76,7 @@ interface Props {
   external?: boolean;
   takeoverPending?: boolean;
   takeoverMessage?: string | null;
-  engine?: "claude" | "codex";
+  engine?: Engine;
   catalog?: Catalog;   // engine-reported models/efforts; falls back to data.ts
   editPrompt: string | null;
   onEditConsumed: () => void;
@@ -159,6 +159,7 @@ export function Composer(p: Props) {
   // popover DERIVED from the composer text (no second input box).
   const [sheetKind, setSheetKind] = useState<"models" | "efforts" | "perms" | null>(null);
   const openPermissions = () => {
+    if (p.engine === "dsh") return;
     setSheetKind("perms");
     if (p.engine === "codex") p.onGetPermissionProfiles();
   };
@@ -243,7 +244,7 @@ export function Composer(p: Props) {
   const offline = !p.wrapperOnline || p.connState !== "connected";
   const legacyControl = !p.control && p.external
     ? presentLegacyExternalControl(
-        p.engine === "codex" ? "codex" : "claude",
+        p.engine ?? "claude",
         !!p.takeoverPending,
         p.takeoverMessage,
       ) : null;
@@ -271,6 +272,14 @@ export function Composer(p: Props) {
     setUsageOpen(false);
     if (workSettingsRef.current?.open) workSettingsRef.current.open = false;
   }, [locked]);
+
+  useEffect(() => {
+    if (p.engine !== "dsh") return;
+    setFiles([]);
+    setCtxOpen(false);
+    setUsageOpen(false);
+    setSheetKind((kind) => kind === "perms" ? null : kind);
+  }, [p.engine, setFiles]);
 
   // edit: refill the input box with a past prompt (user-bubble edit button)
   useEffect(() => {
@@ -351,7 +360,8 @@ export function Composer(p: Props) {
     setImporting(true);
     try {
       const batch = await pickFiles(
-        fl, images.length + files.length, attachmentBytes(images, files));
+        fl, images.length + files.length, attachmentBytes(images, files),
+        { imagesOnly: p.engine === "dsh" });
       if (draftKeyRef.current === targetDraftKey) {
         if (batch.images.length) {
           setImages((previous) => [...previous, ...batch.images]);
@@ -632,7 +642,7 @@ export function Composer(p: Props) {
 
   const stopping = busy && !hasText && !hasAttachments;
   const interruptSettling = isInterruptSettling(p.state);
-  const primaryIsInterrupt = (p.engine ?? "claude") !== "codex";
+  const primaryIsInterrupt = (p.engine ?? "claude") === "claude";
   const sendIcon = !busy ? "send" : stopping ? "stop"
     : p.sendMode === "steer" ? (primaryIsInterrupt ? "bolt" : "send")
       : "queue";
@@ -896,26 +906,26 @@ export function Composer(p: Props) {
               disabled={locked || importing}><Icon name="plus" size={19} /></button>
             {inputControl(p.engine === "codex"
               ? "输入 / 命令，$ Skill"
-              : "输入 / 命令")}
+              : p.engine === "dsh" ? "输入消息或 DSH 原生命令" : "输入 / 命令")}
             {sendControl}
           </div>
           <div className="hint">
-          <button
-            type="button"
-            className={"hint-mode" + modeCls}
-            onClick={openPermissions}
-            disabled={locked}
-            title={deferredClaudeControls
-              ? `${externalClaudeOwner} 当前权限模式未公开`
-              : (p.engine === "codex"
-                ? `执行环境：${permissionProfileName ?? "默认"}；审批：${perm?.name ?? "读取中"}`
-                : "点击切换权限模式")}
-          >
-            {deferredClaudeControls
-              ? externalClaudeOwner
-              : modeLabel}
-            {!deferredClaudeControls && <span className="hint-mode-ch">▾</span>}
-          </button>
+          {p.engine !== "dsh" && <button
+              type="button"
+              className={"hint-mode" + modeCls}
+              onClick={openPermissions}
+              disabled={locked}
+              title={deferredClaudeControls
+                ? `${externalClaudeOwner} 当前权限模式未公开`
+                : (p.engine === "codex"
+                  ? `执行环境：${permissionProfileName ?? "默认"}；审批：${perm?.name ?? "读取中"}`
+                  : "点击切换权限模式")}
+            >
+              {deferredClaudeControls
+                ? externalClaudeOwner
+                : modeLabel}
+              {!deferredClaudeControls && <span className="hint-mode-ch">▾</span>}
+            </button>}
           <span className="hint-kbds"><kbd>Enter</kbd> 发送 · <kbd>Shift+Tab</kbd> 切模式 · <kbd>/</kbd> 命令{
             p.engine === "codex" && <> · <kbd>$</kbd> Skills</>
           }</span>
@@ -936,6 +946,12 @@ export function Composer(p: Props) {
               title={deferredClaudeControls
                 ? `Remote 接管后思考强度：${effortName ?? "读取中"}；不是${externalClaudeOwner}当前强度`
                 : "思考强度"}>{effortName ?? "强度读取中"}</button>
+            {p.engine === "dsh" && (
+              <button className="hint-ctl" onClick={() => p.onOpenExtensions?.("skill")}
+                disabled={locked} title="只读查看当前 Agent Preset 的 Skills">
+                Skills
+              </button>
+            )}
             {p.engine === "codex" && p.collaborationMode === "plan" && (
               <button
                 className="hint-ctl collaboration-chip plan"
@@ -972,7 +988,7 @@ export function Composer(p: Props) {
                 } : undefined}
               />
             )}
-            <button
+            {p.engine !== "dsh" && <button
               className={"hint-ring" + (contextAvailable ? "" : " unavailable")}
               aria-label="上下文占用"
               title="上下文占用"
@@ -993,8 +1009,8 @@ export function Composer(p: Props) {
                   transform="rotate(-90 18 18)"
                 />
               </svg>
-            </button>
-            {ctxOpen && (
+            </button>}
+            {p.engine !== "dsh" && ctxOpen && (
               <div className="ctx-pop" role="dialog" aria-label="上下文占用">
                 {p.contextError ? (
                   <div className="ctx-pop-loading" role="alert">{p.contextError}</div>
@@ -1059,8 +1075,10 @@ export function Composer(p: Props) {
         <div className="drop-overlay" aria-hidden="true">
           <div className="drop-card">
             <span className="dc-ic"><Icon name="plus" size={36} /></span>
-            <div className="dc-tx">拖拽文件到此处发送</div>
-            <div className="dc-sub">图片直接进对话 · 其他文件写到 /tmp 用 @ 引用</div>
+            <div className="dc-tx">{p.engine === "dsh" ? "拖拽图片到此处发送" : "拖拽文件到此处发送"}</div>
+            <div className="dc-sub">{p.engine === "dsh"
+              ? "DeepSeek Harness 当前仅接收图片附件"
+              : "图片直接进对话 · 其他文件写到 /tmp 用 @ 引用"}</div>
           </div>
         </div>
       )}

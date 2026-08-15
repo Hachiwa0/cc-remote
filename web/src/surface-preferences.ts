@@ -3,7 +3,11 @@ import type { Engine, Space } from "./protocol";
 export const LEGACY_SPACE_KEY = "cc_remote_space";
 export const ENGINE_SPACES_KEY = "cc_remote_spaces_by_engine_v1";
 
-export type EngineSpaces = Record<Engine, Space>;
+export type EngineSpaces = {
+  claude: Space;
+  codex: Space;
+  dsh: "code";
+};
 
 interface ReadableStorage {
   getItem(key: string): string | null;
@@ -23,11 +27,15 @@ export function readEngineSpaces(
     if (saved) return {
       claude: normalizeSpace(saved.claude),
       codex: normalizeSpace(saved.codex),
+      // DSH is a Code-only backend. Ignore a poisoned/future Work value even
+      // if an older client wrote it before learning the engine catalog.
+      dsh: "code",
     };
   } catch { /* migrate malformed/legacy storage below */ }
   return {
     claude: currentEngine === "claude" ? legacySpace : "code",
     codex: currentEngine === "codex" ? legacySpace : "code",
+    dsh: "code",
   };
 }
 
@@ -36,5 +44,16 @@ export function rememberEngineSpace(
   engine: Engine,
   space: Space,
 ): EngineSpaces {
-  return { ...spaces, [engine]: space };
+  return { ...spaces, [engine]: engine === "dsh" ? "code" : space };
+}
+
+/** Return the opposite surface which may be warmed in the background.
+ * Code-only engines must never synthesize a Work request: the wrapper treats
+ * that as a real cross-surface authorization error. */
+export function siblingSpaceForPrefetch(
+  engine: Engine,
+  listedSpace: Space,
+): Space | null {
+  if (engine === "dsh") return null;
+  return listedSpace === "work" ? "code" : "work";
 }

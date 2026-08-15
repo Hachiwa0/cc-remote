@@ -16,7 +16,7 @@ import type {
   CollaborationModeName, Notice, RateLimitUpdate,
   StatusRateLimit, StatusRateWindow, SessionControl, PermissionProfileInfo,
   PreviewAuthorizationOperation, CodexProfileInfo,
-  CodexTerminalFence,
+  CodexTerminalFence, DshPresetInfo, EngineInfo,
 } from "./protocol";
 import type { SendMode } from "./composer-submit";
 import {
@@ -348,6 +348,9 @@ export interface AppState {
   connState: ConnState;
   wrapperOnline: boolean;
   banner?: string;
+  // Connectivity belongs to the machine; transient command failures belong to
+  // the view which issued them and must not follow navigation.
+  bannerKind?: "connection" | "command";
   artifact: Artifact | null;
   dirPicker: {
     path: string;
@@ -364,12 +367,19 @@ export interface AppState {
     model: string | null;
     effort: string | null;
     codexProfileId: string | null;
+    dshAgentPreset: string | null;
   } | null;
   // Public labels/errors only; CODEX_HOME never crosses the wire. Selection is
   // scoped like cwd so Code accounts cannot leak across devices or surfaces.
   codexProfiles: CodexProfileInfo[];
   defaultCodexProfileId: string | null;
   codexProfileByScope: Record<string, string>;
+  // DSH composes plugins/skills inside an Agent Preset. cc-remote stores only
+  // display metadata and the new-session selection; installation, credentials
+  // and permissions remain owned by the local DSH host.
+  dshPresets: DshPresetInfo[];
+  defaultDshPresetId: string | null;
+  engineCatalog: EngineInfo[];
   // sessions + multi-session runtimes
   sessions: SessionInfo[];
   focusedSid: string | null;
@@ -498,9 +508,10 @@ export type Action =
   | { type: "prune_runtimes"; protectedSids: string[] }
   | { type: "answer_question"; sid: string; ask_id: string }
   | { type: "dismiss_notice"; sid: string; noticeId: string }
-  | { type: "enter_new_chat"; cwd: string; cwdSource?: "default" | "inherited" | "explicit"; model?: string | null; effort?: string | null; codexProfileId?: string | null }
+  | { type: "enter_new_chat"; cwd: string; cwdSource?: "default" | "inherited" | "explicit"; model?: string | null; effort?: string | null; codexProfileId?: string | null; dshAgentPreset?: string | null }
   | { type: "set_new_chat_cwd"; cwd: string; cwdSource?: "default" | "inherited" | "explicit" }
   | { type: "set_new_chat_codex_profile"; scopeKey: string; profileId: string }
+  | { type: "set_new_chat_dsh_preset"; presetId: string | null }
   | { type: "clear_scope_cwd"; scopeKey: string }
   | { type: "set_new_chat_model"; model: string | null }
   | { type: "set_new_chat_effort"; effort: string | null }
@@ -519,6 +530,14 @@ export const initialState: AppState = {
   codexProfiles: [],
   defaultCodexProfileId: null,
   codexProfileByScope: {},
+  dshPresets: [],
+  defaultDshPresetId: null,
+  engineCatalog: [
+    { id: "claude", display_name: "Claude Code", available: true,
+      spaces: ["code", "work"] },
+    { id: "codex", display_name: "Codex", available: true,
+      spaces: ["code", "work"] },
+  ],
   sessions: [],
   focusedSid: null,
   runtimes: {},
@@ -1652,6 +1671,7 @@ function decodeTurnDetailEvents(
   let scratch: AppState = {
     ...state,
     banner: undefined,
+    bannerKind: undefined,
     historyBrowse: null,
     retainedHistoryBrowse: null,
     runtimes: { [sid]: createRuntime() },
@@ -1965,15 +1985,24 @@ export function reduce(state: AppState, action: Action): AppState {
         newChat: null, btwByParentSid: {}, catalog: {}, catalogDefault: {},
         catalogDefaultEffort: {}, catalogDefaultCwd: {}, codexProfiles: [],
         defaultCodexProfileId: null, codexProfileByScope: {},
+        dshPresets: [], defaultDshPresetId: null,
         retainedHistoryBrowse: null,
       };
     case "conn": {
       let banner = state.banner;
-      if (action.connState === "connected") banner = undefined;
-      else if (action.connState === "reconnecting") banner = action.detail || "正在重新连接…";
-      else if (action.connState === "connecting") banner = "正在连接…";
-      else if (action.connState === "disconnected" && action.detail) {
+      let bannerKind = state.bannerKind;
+      if (action.connState === "connected") {
+        banner = undefined;
+        bannerKind = undefined;
+      } else if (action.connState === "reconnecting") {
+        banner = action.detail || "正在重新连接…";
+        bannerKind = "connection";
+      } else if (action.connState === "connecting") {
+        banner = "正在连接…";
+        bannerKind = "connection";
+      } else if (action.connState === "disconnected" && action.detail) {
         banner = action.detail;
+        bannerKind = "connection";
       }
       const runtimes = action.connState === "connected"
         ? state.runtimes
@@ -1997,13 +2026,14 @@ export function reduce(state: AppState, action: Action): AppState {
           ? state.retainedHistoryBrowse
           : state.historyBrowse ?? state.retainedHistoryBrowse,
         banner,
+        bannerKind,
       };
     }
     case "command_error":
-      return { ...state, banner: action.detail };
+      return { ...state, banner: action.detail, bannerKind: "command" };
     case "dismiss_banner":
       return state.banner === action.banner
-        ? { ...state, banner: undefined }
+        ? { ...state, banner: undefined, bannerKind: undefined }
         : state;
     case "query_sent":
     case "steer_sent": {
@@ -2312,6 +2342,8 @@ export function reduce(state: AppState, action: Action): AppState {
       return {
         ...state, sessions: [], focusedSid: null, historyRecovery: null,
         historyBrowse: null, retainedHistoryBrowse: null,
+        ...(state.bannerKind === "command"
+          ? { banner: undefined, bannerKind: undefined } : {}),
       };
     case "restore_session_list":
       // Surface switches are view changes. Paint that surface's last accepted
@@ -2322,6 +2354,8 @@ export function reduce(state: AppState, action: Action): AppState {
         ...state, sessions: action.sessions, focusedSid: null,
         historyRecovery: null, historyBrowse: null,
         retainedHistoryBrowse: null,
+        ...(state.bannerKind === "command"
+          ? { banner: undefined, bannerKind: undefined } : {}),
       };
     case "drop_fork_placeholder": {
       const sessions = state.sessions.filter((session) => !(
@@ -2355,6 +2389,8 @@ export function reduce(state: AppState, action: Action): AppState {
       const runtimes = { ...state.runtimes, [sid]: { ...rt, loading: rt.turns.length === 0 } };
       return {
         ...state, focusedSid: sid, runtimes, artifact: null,
+        ...(state.bannerKind === "command"
+          ? { banner: undefined, bannerKind: undefined } : {}),
         historyRecovery: state.historyRecovery?.sid === sid
           ? state.historyRecovery : null,
         // Switching away and back always opens the authoritative latest
@@ -2752,6 +2788,8 @@ export function reduce(state: AppState, action: Action): AppState {
     case "enter_new_chat":
       return {
         ...state,
+        ...(state.bannerKind === "command"
+          ? { banner: undefined, bannerKind: undefined } : {}),
         historyRecovery: null,
         historyBrowse: null,
         retainedHistoryBrowse: null,
@@ -2761,6 +2799,7 @@ export function reduce(state: AppState, action: Action): AppState {
           model: action.model ?? null,
           effort: action.effort ?? null,
           codexProfileId: action.codexProfileId ?? null,
+          dshAgentPreset: action.dshAgentPreset ?? null,
         },
       };
     case "set_new_chat_cwd":
@@ -2790,6 +2829,16 @@ export function reduce(state: AppState, action: Action): AppState {
         },
       };
     }
+    case "set_new_chat_dsh_preset":
+      return state.newChat ? {
+        ...state,
+        newChat: {
+          ...state.newChat,
+          dshAgentPreset: action.presetId,
+          model: null,
+          effort: null,
+        },
+      } : state;
     case "clear_scope_cwd": {
       if (!(action.scopeKey in state.cwdByScope)) return state;
       const cwdByScope = { ...state.cwdByScope };
@@ -2841,6 +2890,8 @@ function reduceEvent(
     };
   }
   switch (e.type) {
+    case "engine_catalog":
+      return { ...state, engineCatalog: [...e.engines] };
     case "snapshot": {
       // Per-session: the frame's sid is the runtime key; cc_session_id is the
       // real cc id (may still be null while a brand-new session's id is captured).
@@ -3213,6 +3264,10 @@ function reduceEvent(
         codexProfiles,
         defaultCodexProfileId,
       } = normalized;
+      const dshPresets = e.engine === "dsh"
+        ? [...(e.dsh_presets ?? [])] : state.dshPresets;
+      const defaultDshPresetId = e.engine === "dsh"
+        ? e.default_dsh_preset_id ?? null : state.defaultDshPresetId;
       let codexProfileByScope = state.codexProfileByScope;
       let selectedCodexProfileId: string | null = null;
       if (e.engine === "codex" && ownership && codexProfiles.length > 0) {
@@ -3260,6 +3315,7 @@ function reduceEvent(
           model: null,
           effort: null,
           codexProfileId: selectedCodexProfileId,
+          dshAgentPreset: state.newChat?.dshAgentPreset ?? null,
         }
         : state.newChat && e.engine === "codex" && selectedCodexProfileId
           && state.newChat.codexProfileId !== selectedCodexProfileId
@@ -3299,6 +3355,8 @@ function reduceEvent(
         codexProfiles,
         defaultCodexProfileId,
         codexProfileByScope,
+        dshPresets,
+        defaultDshPresetId,
         focusedSid: focusedMissing ? null : state.focusedSid,
         historyRecovery: focusedMissing ? null : state.historyRecovery,
         historyBrowse: focusedMissing ? null : state.historyBrowse,
@@ -3483,7 +3541,10 @@ function reduceEvent(
       // targeted newest-page read can advance the wrapper's build sequence
       // without ever being routed to this browser.
       let scratch: AppState = {
-        ...state, banner: undefined, runtimes: { [sid]: createRuntime() },
+        ...state,
+        banner: undefined,
+        bannerKind: undefined,
+        runtimes: { [sid]: createRuntime() },
       };
       for (const ev of e.events) {
         scratch = reduceEvent(scratch, ev as ServerEvent, false);
@@ -4169,10 +4230,14 @@ function reduceEvent(
         // directory the user has left replace the still-current result.
         return catalog === state.catalog ? state : { ...state, catalog };
       }
+      const existingDshSession = e.engine === "dsh" && !!e.session_id;
       let catalogDefault = state.catalogDefault;
       let catalogDefaultEffort = state.catalogDefaultEffort;
       let catalogDefaultCwd = state.catalogDefaultCwd;
-      if (e.cwd) {
+      if (existingDshSession) {
+        // session.models describes one existing DSH Agent. Its current route
+        // must not replace the host-wide defaults used by New Chat.
+      } else if (e.cwd) {
         // A Claude response is authoritative even when probing failed and the
         // value is null: clear an older cwd's value instead of showing stale data.
         catalogDefault = { ...catalogDefault };
@@ -4219,6 +4284,7 @@ function reduceEvent(
           }])),
         wrapperOnline: false,
         banner: "machine offline — waiting for reconnect",
+        bannerKind: "connection",
         historyBrowse: null,
         retainedHistoryBrowse:
           state.historyBrowse ?? state.retainedHistoryBrowse,
@@ -4226,7 +4292,12 @@ function reduceEvent(
     case "wrapper_reconnected":
       // The event only proves a process connected to the relay. Wait for this
       // client's Hello replay/snapshot before draining any queued turns.
-      return { ...state, wrapperOnline: false, banner: "machine reconnected — syncing…" };
+      return {
+        ...state,
+        wrapperOnline: false,
+        banner: "machine reconnected — syncing…",
+        bannerKind: "connection",
+      };
     case "diff_report":
       if (!state.artifact || state.artifact.file !== e.file
           || state.artifact.requestId !== e.request_id
@@ -4732,6 +4803,7 @@ function reduceEvent(
             }])),
           wrapperOnline: false,
           banner: "设备离线，正在等待重新连接…",
+          bannerKind: "connection",
           historyBrowse: null,
           retainedHistoryBrowse:
             state.historyBrowse ?? state.retainedHistoryBrowse,
@@ -4781,7 +4853,13 @@ function reduceEvent(
           ));
           clearAcceptance(rt);
         });
-        return { ...next, banner: presentCommandProblem(e) };
+        return e.sid === state.focusedSid
+          ? {
+              ...next,
+              banner: presentCommandProblem(e),
+              bannerKind: "command",
+            }
+          : next;
       }
       if (e.msg_id) {
         const key = e.sid ?? state.focusedSid;
@@ -4809,7 +4887,9 @@ function reduceEvent(
                 };
               }
             });
-            return { ...next, banner: problem };
+            return key === state.focusedSid
+              ? { ...next, banner: problem, bannerKind: "command" }
+              : next;
           }
           const next = patch(state, key, (rt) => {
             rt.queue = rt.queue.filter(
@@ -4831,15 +4911,25 @@ function reduceEvent(
               },
             ];
           });
-          return {
+          const bounded = {
             ...next,
             runtimes: boundFailedDeferred(next.runtimes),
-            banner: problem,
           };
+          return key === state.focusedSid
+            ? { ...bounded, banner: problem, bannerKind: "command" }
+            : bounded;
         }
       }
       if (!e.msg_id) {
-        return { ...state, banner: presentCommandProblem(e) };
+        // A delayed response can arrive after navigation. Reconcile any
+        // request-local state above, but do not let the previous session's
+        // warning become a global banner on the newly focused surface.
+        if (e.sid && e.sid !== state.focusedSid) return state;
+        return {
+          ...state,
+          banner: presentCommandProblem(e),
+          bannerKind: "command",
+        };
       }
       return patch(state, e.sid, (rt) => {
         rt.loading = false; // never leave a spinner spinning behind an error
@@ -4893,6 +4983,8 @@ function reduceEvent(
           turnHasIdentityAlias(turn, e.msg_id)
           || turnHasIdentityAlias(turn, e.client_msg_id));
         const imgs = (e.images && e.images.length) ? e.images : undefined;
+        const imageRefs = (e.image_refs && e.image_refs.length)
+          ? e.image_refs : undefined;
         const fileMeta = (e.files && e.files.length)
           ? e.files.map((file) => ({ filename: file.filename, data: "" }))
           : undefined;
@@ -4902,6 +4994,7 @@ function reduceEvent(
         if (existing) {
           if (!existing.prompt && e.prompt) existing.prompt = e.prompt;
           if (!existing.images && imgs) existing.images = imgs;
+          if (!existing.imageRefs && imageRefs) existing.imageRefs = imageRefs;
           if (fileMeta) existing.files = fileMeta;
           else if (existing.files) existing.files = existing.files.map(
             (file) => ({ filename: file.filename, data: "" }));
@@ -4916,6 +5009,7 @@ function reduceEvent(
             clientMsgId: e.client_msg_id ?? undefined,
             prompt: e.prompt,
             images: imgs,
+            imageRefs,
             files: fileMeta,
             blocks: [],
             done: false,
@@ -4947,17 +5041,24 @@ function reduceEvent(
         }
         const turns = cloneTurns(rt.turns);
         const imgs = (e.images && e.images.length) ? e.images : undefined;
+        const imageRefs = (e.image_refs && e.image_refs.length)
+          ? e.image_refs : undefined;
         const fileMeta = (e.files && e.files.length)
           ? e.files.map((file) => ({ filename: file.filename, data: "" }))
           : undefined;
         const stamp = eventTimestampMs(e.ts);
         const doneTs = stamp ?? Date.now();
-        const localAcceptance = rt.acceptancePending === e.msg_id
+        const acceptedIds = new Set(
+          [e.msg_id, e.client_msg_id].filter(
+            (id): id is string => !!id));
+        const localAcceptance = !!rt.acceptancePending
+          && acceptedIds.has(rt.acceptancePending)
           && (rt.acceptanceKind === "steer"
             || rt.acceptanceKind === "steer_unknown");
         const optimisticIndex = pendingOptimisticSteerIndex(rt, turns);
         let existing = turns.find((turn) =>
-          turnHasIdentityAlias(turn, e.msg_id));
+          turnHasIdentityAlias(turn, e.msg_id)
+          || turnHasIdentityAlias(turn, e.client_msg_id));
         if (existing) {
           if (localAcceptance) {
             // An external steer can be accepted while this browser's own
@@ -4982,9 +5083,13 @@ function reduceEvent(
           // again after reconnect. Other duplicates only refresh metadata.
           existing.prompt ||= e.prompt;
           existing.images ??= imgs;
+          existing.imageRefs ??= imageRefs;
           if (fileMeta) existing.files = fileMeta;
           existing.ts ??= stamp;
-          existing.clientMsgId ??= e.msg_id;
+          existing.clientMsgId ??= e.client_msg_id ?? e.msg_id;
+          if (e.client_msg_id === existing.id && e.msg_id !== existing.id) {
+            existing.historyTurnId ??= e.msg_id;
+          }
           existing.liveTaskId ??= e.turn_id;
           if (boundCompletedTurns && typeof e.seq === "number") {
             rt.liveOwner = {
@@ -5014,10 +5119,11 @@ function reduceEvent(
         }
         existing = {
           id: e.msg_id,
-          clientMsgId: e.msg_id,
+          clientMsgId: e.client_msg_id ?? e.msg_id,
           liveTaskId: e.turn_id,
           prompt: e.prompt,
           images: imgs,
+          imageRefs,
           files: fileMeta,
           blocks: [],
           done: false,
@@ -5402,6 +5508,13 @@ function reduceEvent(
         let t = findBoundLiveTaskOwner(
           rt, turns, e.turn_id, e.seq, false)
           ?? findTurnByEngineId(turns, e.turn_id);
+        if (!t && e.presentation_id) {
+          // Some durable engine nodes are complete conversation rows without
+          // being legal fork/checkpoint anchors.  Keep ownership separate from
+          // turn_id so rendering their terminal never enables a bogus fork.
+          t = turns.find((turn) =>
+            turnHasIdentityAlias(turn, e.presentation_id));
+        }
         if (!t && e.checkpoint_id) {
           // Claude binds the optimistic row to its native user/checkpoint UUID,
           // while ResultMessage identifies the terminal with the final assistant

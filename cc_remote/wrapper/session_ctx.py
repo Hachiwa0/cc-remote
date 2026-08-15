@@ -85,7 +85,43 @@ class SessionContext:
     key: Optional[str] = None
     seq: int = 0                       # per-session monotonic counter
     state: State = "idle"
-    engine: str = "claude"             # "claude" (SdkHandle) | "codex" (CodexHandle)
+    engine: str = "claude"             # claude | codex | dsh
+    # DSH owns one durable Agent in its local host. Its native UUID is kept in
+    # ``session_id`` while ``key`` is always the namespaced ``dsh@<uuid>`` route.
+    # The translator and source watermark belong to this resident subscription,
+    # not to the browser's downstream sequence namespace.
+    dsh_agent_preset: Optional[str] = None
+    dsh_translator: Any = None
+    dsh_last_source_seq: int = -1
+    # A carrier failure after ``session.prompt`` may happen after DSH durably
+    # accepted the message.  Keep the exact browser id until history/catalog
+    # reconciliation proves acceptance or rejection; never invite a duplicate
+    # retry by immediately pretending the session is idle.
+    dsh_uncertain_msg_id: Optional[str] = None
+    # ``mode=steer`` crosses the same non-idempotent HTTP boundary as an
+    # ordinary DSH prompt, but it must not reuse ``dsh_uncertain_msg_id``:
+    # that field deliberately keeps a newly-started turn busy while this one
+    # belongs to an already-running turn. Only a source-matched user/message or
+    # an explicit history/catalog reconciliation may clear this marker; a
+    # terminal alone cannot distinguish acceptance from a lost request.
+    dsh_uncertain_steer_id: Optional[str] = None
+    # DSH registered slash commands are standalone durable log nodes, not
+    # model turns.  While commands/execute is in flight, its raw command/run
+    # and command/done rows are withheld from live delivery; the exact native
+    # commandId in the settlement receipt then aliases the canonical history
+    # row back to this optimistic browser message.
+    dsh_pending_command_msg_id: Optional[str] = None
+    dsh_pending_command_prompt: Optional[str] = None
+    # The HTTP settlement and mux log stream are independent.  Retain a
+    # bounded generation-local commandId -> browser message alias so a late
+    # command/run or any later history page cannot duplicate the optimistic
+    # row after commands/execute has already returned.
+    dsh_command_aliases: dict[str, str] = field(default_factory=dict)
+    # Tail-history seeding and the live mux share one source sequence.  Hold
+    # this lock while installing a tail snapshot so an event that arrives in
+    # the read/add window is either represented by that page or delivered once
+    # afterwards, never lost or duplicated.
+    dsh_event_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     # Codex's complete local account boundary. ``session_id`` remains the
     # native app-server UUID while ``key`` is the browser-facing routing id
     # (namespaced for every profile when multiple profiles are configured).

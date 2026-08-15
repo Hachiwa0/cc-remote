@@ -142,6 +142,7 @@ def test_new_session_starts_initial_query_on_the_new_ctx():
             "permission_profile": None,
             "web_search": None,
             "service_tier": None,
+            "dsh_agent_preset": None,
             "space": "code",
             "work_id": None,
             "raise_on_failure": True,

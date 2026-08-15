@@ -434,16 +434,31 @@ export function SessionsSidebar({ open, engine, space,
             <button className="iconbtn" onClick={onClose} aria-label="收起"><Icon name="chevrons-left" /></button>
           </div>
           <div className="space-switch" role="tablist" aria-label="切换工作空间">
-            <button role="tab" aria-selected={space === "work"}
-              className={space === "work" ? "active" : ""}
-              onClick={() => onSpaceChange("work")}>
-              <Icon name="work" size={17} />Work
-            </button>
-            <button role="tab" aria-selected={space === "code"}
-              className={space === "code" ? "active" : ""}
-              onClick={() => onSpaceChange("code")}>
-              <Icon name="code" size={18} />Code
-            </button>
+            {engine === "dsh" ? <>
+              <button role="tab" aria-selected={false} disabled
+                className="space-switch-locked"
+                aria-label="Work（DSH 暂不支持）"
+                title="DSH 暂不支持 Work">
+                <Icon name="work" size={17} />Work
+                <Icon name="lock" size={12} />
+              </button>
+              <button role="tab" aria-selected={space === "code"}
+                className={space === "code" ? "active" : ""}
+                onClick={() => onSpaceChange("code")}>
+                <Icon name="code" size={18} />Code
+              </button>
+            </> : <>
+              <button role="tab" aria-selected={space === "work"}
+                className={space === "work" ? "active" : ""}
+                onClick={() => onSpaceChange("work")}>
+                <Icon name="work" size={17} />Work
+              </button>
+              <button role="tab" aria-selected={space === "code"}
+                className={space === "code" ? "active" : ""}
+                onClick={() => onSpaceChange("code")}>
+                <Icon name="code" size={18} />Code
+              </button>
+            </>}
           </div>
           {showCodexProfileManagement && (
             <div className="codex-profile-filter" role="group"

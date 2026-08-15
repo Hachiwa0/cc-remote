@@ -205,6 +205,7 @@ export async function pickFiles(
   list: FileList | File[] | null,
   existingCount = 0,
   existingBytes = 0,
+  options: { imagesOnly?: boolean } = {},
 ): Promise<AttachmentBatch> {
   const result: AttachmentBatch = { images: [], files: [], errors: [] };
   if (!list) return result;
@@ -226,6 +227,9 @@ export async function pickFiles(
         item = await downscaleImage(file);
         image = true;
       } else {
+        if (options.imagesOnly) {
+          throw new Error(`${file.name || "附件"}：当前引擎只支持图片附件`);
+        }
         if (file.size > MAX_SINGLE_ATTACHMENT_BYTES) throw new Error(`${file.name} 超过 6 MiB`);
         if (!file.name || new TextEncoder().encode(file.name).byteLength > MAX_FILENAME_BYTES) {
           throw new Error("附件文件名为空或过长");
