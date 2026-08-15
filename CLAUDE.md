@@ -66,7 +66,7 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   `useLayoutEffect` is deliberately dependency-free — late virtualizer/image
   measurements settle without a React render, and constraining it to its read
   set reintroduces a full-viewport jump on touch release.
-- **Protocol version gate**: current wire protocol v34 is declared by
+- **Protocol version gate**: current wire protocol v35 is declared by
   `PROTOCOL_VERSION` in both `protocol.py` and `web/src/protocol.ts`.
   `deserialize` hard-rejects a version mismatch, and
   `_Base` is `extra="forbid"`, so ANY protocol change must be deployed to all
@@ -125,7 +125,12 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   hello sends lightweight resident `Snapshot`s; reconnect cursors replay only
   the bounded missing live tail. Source fingerprints invalidate appended pages,
   and rollback explicitly invalidates both server and browser projections. These
-  reads never spawn/resume an engine or create a model turn.
+  reads never spawn/resume an engine or create a model turn. Codex
+  `History.terminal_fences` is a separate bounded lifecycle projection: only a
+  real app-server terminal or a source-validated rollout marker may enter it;
+  local synthetic failures may not. The browser applies a fence only to its
+  exact native turn identity and never changes completion receipts or guesses
+  from the last open row.
 - **Token-aware residency**: resuming an evicted Claude SDK session may rebuild
   a cold prompt cache, so it only happens on first spawn / re-focus after
   eviction; raising the cap trades RAM for fewer cold re-sends. Codex context is

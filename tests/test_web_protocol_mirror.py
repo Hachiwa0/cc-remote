@@ -123,7 +123,7 @@ def test_every_python_wire_type_has_a_typescript_interface():
     for wire_type, model in _TYPE_MAP.items():
         body_name = mirrored[wire_type]
         for field in model.__annotations__:
-            if field == "type":
+            if field == "type" or field in model.__private_attributes__:
                 continue
             assert _field_optional(body_name, field) is not None, (
                 f"{body_name} is missing Python field {field!r}"

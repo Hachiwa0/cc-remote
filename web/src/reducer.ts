@@ -16,6 +16,7 @@ import type {
   CollaborationModeName, Notice, RateLimitUpdate,
   StatusRateLimit, StatusRateWindow, SessionControl, PermissionProfileInfo,
   PreviewAuthorizationOperation, CodexProfileInfo,
+  CodexTerminalFence,
 } from "./protocol";
 import type { SendMode } from "./composer-submit";
 import {
@@ -248,6 +249,14 @@ export interface SessionRuntime {
     seq: number;
     generation: string | null;
   } | null;
+  // Source/revision-bound Codex terminals which arrived before their exact
+  // native turn identity was present in the current narrative projection.
+  // These never use array position or the generic "last open turn" fallback.
+  pendingTerminalFences: {
+    revision: string;
+    generation: string | null;
+    fences: CodexTerminalFence[];
+  } | null;
   // A wrapper restart invalidated every unscoped liveTaskId fallback still
   // present in the visible projection. New-generation events establish an
   // ordered owner; old legacy identities remain ineligible for this generation.
@@ -415,6 +424,7 @@ export function createRuntime(): SessionRuntime {
     pendingHistoryCandidateBuildSeq: null,
     historyBuildSeq: 0, historyLiveSeq: 0,
     historyFence: null, liveOwner: null, pendingLiveBinding: null,
+    pendingTerminalFences: null,
     legacyLiveFallbackBlocked: false,
     lastLiveSeq: 0, lastLifecycleSeq: 0,
     hasLoadedOlderHistory: false,
@@ -747,6 +757,180 @@ function findTurnByEngineId(turns: Turn[], id: string | null | undefined): Turn 
     || turn.forkPointId === id || turn.codexTurnId === id
     || mutableTurnBlocks(turn).some((block) => block.kind === "process"
       && block.turn_id === id));
+}
+
+function boundedTerminalFences(
+  values: readonly CodexTerminalFence[],
+): CodexTerminalFence[] {
+  const byTurn = new Map<string, CodexTerminalFence>();
+  for (const fence of values) {
+    byTurn.delete(fence.turn_id);
+    byTurn.set(fence.turn_id, fence);
+    if (byTurn.size > 16) {
+      const oldest = byTurn.keys().next().value;
+      if (oldest !== undefined) byTurn.delete(oldest);
+    }
+  }
+  return [...byTurn.values()];
+}
+
+function turnHasExactNativeTerminalId(turn: Turn, turnId: string): boolean {
+  return turn.id === turnId
+    || turn.forkPointId === turnId
+    || turn.liveTaskId === turnId
+    || turn.codexTurnId === turnId
+    || mutableTurnBlocks(turn).some((block) =>
+      block.kind === "process" && block.turn_id === turnId);
+}
+
+function applyTerminalFence(turn: Turn, fence: CodexTerminalFence): Turn {
+  const next: Turn = {
+    ...turn,
+    blocks: turn.blocks.map((block) => ({ ...block })),
+    liveSpillBlocks: turn.liveSpillBlocks?.map((block) => ({ ...block })),
+    detailProjection: turn.detailProjection
+      ? {
+          ...turn.detailProjection,
+          blocks: turn.detailProjection.blocks.map((block) => ({ ...block })),
+        }
+      : undefined,
+    done: true,
+    progress: undefined,
+  };
+  if (typeof fence.duration_ms === "number" && fence.duration_ms > 0) {
+    next.durationMs = fence.duration_ms;
+  }
+  if (typeof fence.completed_at === "number"
+      && Number.isFinite(fence.completed_at)
+      && fence.completed_at >= 0
+      && fence.completed_at <= Math.floor(Number.MAX_SAFE_INTEGER / 1000)) {
+    next.doneTs = Math.round(fence.completed_at * 1000);
+  }
+  if (fence.status === "completed") {
+    next.interrupted = undefined;
+    next.error = undefined;
+    delete next.terminalSource;
+    finishOpenBlocks(next, "succeeded", false);
+  } else if (fence.status === "interrupted") {
+    next.interrupted = true;
+    next.error = undefined;
+    next.terminalSource = "unexpected_interrupt";
+    finishOpenBlocks(next, "interrupted", true);
+  } else {
+    next.interrupted = undefined;
+    next.error ??= "本次回复未完成，请重试。";
+    next.terminalSource = "failed";
+    finishOpenBlocks(next, "failed", true);
+  }
+  return next;
+}
+
+function installCodexTerminalFences(
+  runtime: SessionRuntime,
+  incoming: readonly CodexTerminalFence[] | undefined,
+  options: {
+    revision: string;
+    generation: string | null;
+    continuationTurnIds?: readonly string[];
+    // A current newest-page History carries a complete bounded snapshot. A
+    // stale build may add an exact terminal which the browser has not seen, but
+    // must not erase a newer pending fence merely because its older snapshot
+    // omitted it.
+    replaceSnapshot?: boolean;
+    // A complete current History can prove that a completed matching row is
+    // the final narrative segment for this native turn. Live/stale paths cannot:
+    // Codex steer segments may share the same native turn id and arrive later.
+    consumeSettledMatches?: boolean;
+  },
+): void {
+  const { revision, generation } = options;
+  const continuationTurnIds = options.continuationTurnIds ?? [];
+  const previous = runtime.pendingTerminalFences;
+  const sameScope = !!previous
+    && previous.revision === revision
+    && previous.generation === generation;
+  if (incoming === undefined && !sameScope) return;
+  const candidates = boundedTerminalFences(
+    incoming === undefined
+      ? (sameScope ? previous!.fences : [])
+      : options.replaceSnapshot === false && sameScope
+        ? [...previous!.fences, ...incoming]
+        : incoming,
+  );
+  const continuations = new Set(continuationTurnIds);
+  const unresolved: CodexTerminalFence[] = [];
+  let turns = runtime.turns;
+  let copied = false;
+  for (const fence of candidates) {
+    if (fence.status === "interrupted"
+        && continuations.has(fence.turn_id)) {
+      continue;
+    }
+    const matches = turns.flatMap((turn, index) =>
+      turnHasExactNativeTerminalId(turn, fence.turn_id) ? [index] : []);
+    const openMatches = matches.filter((index) => !turns[index].done);
+    const targetIndex = openMatches.length === 1 ? openMatches[0] : -1;
+    if (targetIndex < 0) {
+      if (matches.length === 0 || !options.consumeSettledMatches) {
+        unresolved.push(fence);
+      }
+      continue;
+    }
+    // A fence only repairs an unfinished narrative row. If the exact turn is
+    // already terminal, its richer live/history outcome wins; never let an
+    // older recovery hint rewrite a completed error or interruption.
+    if (!copied) {
+      turns = [...turns];
+      copied = true;
+    }
+    turns[targetIndex] = applyTerminalFence(turns[targetIndex], fence);
+    if (!options.consumeSettledMatches) {
+      // A stale/running page can arrive before an ordered TurnSteered frame.
+      // Close the only exact row we can currently see, but retain the fence so
+      // a later segment sharing this native turn id cannot reopen forever.
+      unresolved.push(fence);
+    }
+  }
+  if (copied) runtime.turns = turns;
+  runtime.pendingTerminalFences = unresolved.length > 0
+    ? { revision, generation, fences: unresolved }
+    : null;
+}
+
+function mergePendingTerminalFences(
+  source: SessionRuntime["pendingTerminalFences"],
+  target: SessionRuntime["pendingTerminalFences"],
+): SessionRuntime["pendingTerminalFences"] {
+  if (!source) return target;
+  if (!target) return source;
+  if (source.revision !== target.revision
+      || source.generation !== target.generation) return source;
+  return {
+    revision: source.revision,
+    generation: source.generation,
+    fences: boundedTerminalFences([...target.fences, ...source.fences]),
+  };
+}
+
+function applyPendingCodexTerminalFences(runtime: SessionRuntime): void {
+  const pending = runtime.pendingTerminalFences;
+  if (!pending) return;
+  installCodexTerminalFences(runtime, undefined, {
+    revision: pending.revision,
+    generation: pending.generation,
+  });
+}
+
+function discardPendingCodexTerminalFence(
+  runtime: SessionRuntime,
+  turnId: string | null | undefined,
+): void {
+  const pending = runtime.pendingTerminalFences;
+  if (!pending || !turnId) return;
+  const fences = pending.fences.filter((fence) => fence.turn_id !== turnId);
+  runtime.pendingTerminalFences = fences.length > 0
+    ? { ...pending, fences }
+    : null;
 }
 
 function findExplicitLiveTaskOwner(
@@ -1647,6 +1831,7 @@ function switchControlGeneration(
     runtime.historyFence = null;
     runtime.liveOwner = null;
     runtime.pendingLiveBinding = null;
+    runtime.pendingTerminalFences = null;
     runtime.legacyLiveFallbackBlocked = true;
   }
   if (runtime.historyGeneration !== null
@@ -2540,6 +2725,7 @@ export function reduce(state: AppState, action: Action): AppState {
           }
           rt.turns = restoreCachedTurnDetails(rt.turns, action.turns);
         }
+        applyPendingCodexTerminalFences(rt);
         rt.loading = false;
       }, true);
     case "prune_runtimes": {
@@ -2853,6 +3039,12 @@ function reduceEvent(
                 : source.historyFence,
             liveOwner: mergedLiveTaskOwner,
             pendingLiveBinding: mergedPendingBinding,
+            pendingTerminalFences: orderingGenerationConflict
+              ? source.pendingTerminalFences
+              : mergePendingTerminalFences(
+                  source.pendingTerminalFences,
+                  mergeTarget.pendingTerminalFences,
+                ),
             historyGeneration: source.historyRevision == null
               ? mergeTarget.historyGeneration : source.historyGeneration,
             pendingHistoryGeneration:
@@ -2905,6 +3097,17 @@ function reduceEvent(
           // bounded merge.
           mergedRuntime.liveOwner = remapExplicitLiveTaskOwner(
             mergedLiveTaskOwner, mergedRuntime.turns);
+          if (mergedRuntime.pendingTerminalFences) {
+            const pending = mergedRuntime.pendingTerminalFences;
+            installCodexTerminalFences(
+              mergedRuntime,
+              undefined,
+              {
+                revision: pending.revision,
+                generation: pending.generation,
+              },
+            );
+          }
           runtimes[session_id] = mergedRuntime;
         } else {
           runtimes[session_id] = { ...source, ccSessionId: session_id };
@@ -3142,6 +3345,7 @@ function reduceEvent(
         rt.historyFence = null;
         rt.liveOwner = null;
         rt.pendingLiveBinding = null;
+        rt.pendingTerminalFences = null;
         rt.hasLoadedOlderHistory = false;
         rt.hydratedCacheTurnIds = [];
         rt.liveDetailTurnIds = [];
@@ -3248,6 +3452,29 @@ function reduceEvent(
           switchControlGeneration(rt, e.generation);
         }, true);
       }
+      if (!e.before && e.terminal_fences !== undefined
+          && (!preControlBase.pendingHistoryRevision
+            || e.revision === preControlBase.pendingHistoryRevision)
+          && (!staleHistoryBuild
+            || preControlBase.historyRevision === e.revision)) {
+        // Terminal authority is independent from narrative freshness. Even a
+        // sampled/stale content page may close an exact already-painted native
+        // turn; unmatched fences remain revision-scoped until that identity
+        // arrives. No lifecycle/state or notification receipt is changed here.
+        state = patch(state, sid, (rt) => {
+          installCodexTerminalFences(
+            rt,
+            e.terminal_fences,
+            {
+              revision: e.revision,
+              generation: e.generation ?? rt.historyGeneration,
+              continuationTurnIds:
+                e.compaction_continuation_turn_ids ?? [],
+              replaceSnapshot: !staleHistoryBuild,
+            },
+          );
+        }, true);
+      }
       if (staleHistoryBuild) return state;
       const base = state.runtimes[sid] ?? createRuntime();
       // build_seq orders newest-page reads only within the same boot-scoped
@@ -3307,6 +3534,7 @@ function reduceEvent(
             oldestId: e.oldest_id ?? null,
             historyRevision: e.revision,
           };
+          applyPendingCodexTerminalFences(previewRuntime);
           next = {
             ...next,
             historyRecovery: pendingRecovery
@@ -3597,6 +3825,27 @@ function reduceEvent(
         }
         return settled;
       });
+      const terminalRuntime: SessionRuntime = {
+        ...base,
+        turns,
+        pendingTerminalFences: base.pendingTerminalFences,
+      };
+      installCodexTerminalFences(
+        terminalRuntime,
+        e.terminal_fences,
+        {
+          revision: e.revision,
+          generation: e.generation ?? base.historyGeneration,
+          continuationTurnIds:
+            e.compaction_continuation_turn_ids ?? [],
+          // Only an idle, unraced newest page proves that an already-completed
+          // row is the final narrative segment for this native turn. A running
+          // or live-raced page can still be followed by a steer segment which
+          // shares the same native turn id, so keep its fence pending.
+          consumeSettledMatches: settledHistory,
+        },
+      );
+      turns = terminalRuntime.turns;
       turns = turns.map(withLimitedTurnBlocks);
       const boundedTurns = boundRuntimeTurns(turns);
       const historyTrimmed = boundedTurns.length < turns.length;
@@ -3727,6 +3976,8 @@ function reduceEvent(
               : base.historyFence,
             liveOwner,
             pendingLiveBinding,
+            pendingTerminalFences:
+              terminalRuntime.pendingTerminalFences,
             historyNewestId: acceptsControlState
               ? (Object.prototype.hasOwnProperty.call(e, "newest_id")
                   ? (e.newest_id ?? null)
@@ -4436,6 +4687,7 @@ function reduceEvent(
             rt.historyFence = null;
             rt.liveOwner = null;
             rt.pendingLiveBinding = null;
+            rt.pendingTerminalFences = null;
             rt.historyGeneration = null;
             rt.historyNewestId = null;
             rt.lastLiveSeq = 0;
@@ -4679,6 +4931,7 @@ function reduceEvent(
           [e.msg_id, e.client_msg_id],
           boundNativeTurnId,
         );
+        applyPendingCodexTerminalFences(rt);
       });
       const sessions = e.sid
         ? bumpSessionActivity(next.sessions, e.sid, Math.round(e.ts * 1000))
@@ -4745,6 +4998,7 @@ function reduceEvent(
           }
           markTurnAsLive(rt, existing.id, boundCompletedTurns, e.seq);
           rt.turns = turns;
+          applyPendingCodexTerminalFences(rt);
           return;
         }
 
@@ -4781,6 +5035,7 @@ function reduceEvent(
         markTurnAsLive(rt, existing.id, boundCompletedTurns, e.seq);
         if (boundCompletedTurns) replaceWithBoundedTurns(rt, turns);
         else rt.turns = turns;
+        applyPendingCodexTerminalFences(rt);
       }, true);
       const sessions = e.sid
         ? bumpSessionActivity(next.sessions, e.sid, Math.round(e.ts * 1000))
@@ -5001,6 +5256,7 @@ function reduceEvent(
         owner.progress = undefined;
         if (boundCompletedTurns) limitTurnBlocks(owner);
         rt.turns = turns;
+        applyPendingCodexTerminalFences(rt);
       });
     case "turn_plan":
       return patch(state, e.sid, (rt) => {
@@ -5137,6 +5393,7 @@ function reduceEvent(
         }
         if (boundCompletedTurns) replaceWithBoundedTurns(rt, turns);
         else rt.turns = turns;
+        applyPendingCodexTerminalFences(rt);
       });
     case "turn_end":
       return patch(state, e.sid, (rt) => {
@@ -5169,6 +5426,7 @@ function reduceEvent(
             t = openTurns[0];
           }
         }
+        const terminalClosedOpenTurn = !!t && !t.done;
         if (t) {
           markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
           if (rt.acceptancePending === t.id) {
@@ -5226,6 +5484,10 @@ function reduceEvent(
         }
         if (boundCompletedTurns) replaceWithBoundedTurns(rt, turns);
         else rt.turns = turns;
+        applyPendingCodexTerminalFences(rt);
+        if (terminalClosedOpenTurn) {
+          discardPendingCodexTerminalFence(rt, e.turn_id);
+        }
         // TurnEnd closes the visible turn, but the wrapper may still be
         // draining an interrupt, finishing a checkpoint, or releasing its
         // app-server consumer. Only the following authoritative State(idle)

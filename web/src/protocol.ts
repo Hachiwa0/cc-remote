@@ -401,7 +401,8 @@ export interface GetHistory extends Base { type: "get_history"; session_id: stri
 // a fresh History; we render the session read-only (a cc session has one owner).
 export interface ConversationImageRef { image_id: string; media_type: QueryImg["media_type"]; width: number; height: number; byte_size: number }
 export interface ConversationTurn { id: string; clientMsgId?: string | null; prompt: string; blocks: unknown[]; done: boolean; forkPointId?: string | null; checkpointId?: string | null; interrupted?: boolean | null; error?: string | null; images?: QueryImg[] | null; imageRefs?: ConversationImageRef[] | null; files?: QueryFile[] | null; ts?: number | null; doneTs?: number | null; durationMs?: number | null; detailEventCount: number; detailLoaded: boolean }
-export interface History extends Base { type: "history"; session_id: string; revision: string; generation?: string | null; build_seq?: number; live_seq?: number | null; authoritative?: boolean; error?: string | null; events: ServerEvent[]; turns?: ConversationTurn[]; detail?: "summary" | "full"; has_more: boolean; oldest_id?: string | null; newest_id?: string | null; before?: string | null; control?: SessionControl | null; external?: boolean; takeover_pending?: boolean; in_progress?: boolean; compaction_continuation_turn_ids?: string[]; reset?: boolean }
+export interface CodexTerminalFence { turn_id: string; status: "completed" | "interrupted" | "failed"; duration_ms?: number | null; completed_at?: number | null }
+export interface History extends Base { type: "history"; session_id: string; revision: string; generation?: string | null; build_seq?: number; live_seq?: number | null; authoritative?: boolean; error?: string | null; events: ServerEvent[]; turns?: ConversationTurn[]; detail?: "summary" | "full"; has_more: boolean; oldest_id?: string | null; newest_id?: string | null; before?: string | null; control?: SessionControl | null; external?: boolean; takeover_pending?: boolean; in_progress?: boolean; compaction_continuation_turn_ids?: string[]; terminal_fences?: CodexTerminalFence[]; reset?: boolean }
 export interface GetTurnDetail extends Base { type: "get_turn_detail"; session_id: string; turn_id: string; client_id?: string | null; revision?: string | null; before?: string | null; limit?: number | null }
 export interface TurnDetail extends Base { type: "turn_detail"; session_id: string; turn_id: string; revision: string; authoritative?: boolean; error?: string | null; events: ServerEvent[]; has_more?: boolean; oldest_cursor?: string | null; has_newer?: boolean; newer_cursor?: string | null; before?: string | null }
 export interface GetHistoryImage extends Base { type: "get_history_image"; session_id: string; turn_id: string; image_id: string; variant: "thumbnail" | "full"; request_id: string; client_id?: string | null; revision?: string | null }
@@ -577,7 +578,7 @@ export type ServerEvent =
   | ProcessEvent | TurnPlan | TurnDiff | TurnBinding
   | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
 
-export const PROTOCOL_VERSION = 34;
+export const PROTOCOL_VERSION = 35;
 
 const CONTROL_MODES = new Set<ControlMode>([
   "remote", "codex_shared", "claude_broker", "external_cli", "agent_view", "desktop",

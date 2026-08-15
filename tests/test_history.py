@@ -27,8 +27,10 @@ from claude_agent_sdk.types import (
 )
 
 from cc_remote.protocol import (
+    MAX_SAFE_WIRE_INTEGER,
     serialize, deserialize,
-    GetHistory, GetHistoryImage, GetTurnDetail, History, HistoryImage,
+    CodexTerminalFence, GetHistory, GetHistoryImage, GetTurnDetail, History,
+    HistoryImage,
     TurnDetail, HistoryInvalidated,
     UserMsg, TurnSteered, AssistantMsgStart, AssistantMsgEnd, Delta,
     ProcessEvent, TurnPlan, TurnBinding, TurnEnd, TurnResult, Error,
@@ -65,6 +67,220 @@ from cc_remote.wrapper.stream import (
     translate_history,
 )
 from tests.test_multisession import _mk_machine, _mk_ctx
+
+
+def test_live_codex_terminal_is_available_to_stale_history_immediately(
+    tmp_path,
+):
+    rollout = tmp_path / "terminal-rollout.jsonl"
+    rollout.write_text(
+        '{"type":"session_meta","payload":{"id":"terminal-session"}}\n')
+
+    async def run():
+        machine, transport = _mk_machine()
+        sid = "terminal-session"
+        ctx = _mk_ctx(sid, sid)
+        ctx.engine = "codex"
+        ctx.sdk = SimpleNamespace(
+            compaction_continuation_turn_ids=frozenset())
+        machine.sessions[sid] = ctx
+        source_stat = rollout.stat()
+        machine._watch[sid] = {
+            "path": str(rollout),
+            "file_id": (source_stat.st_dev, source_stat.st_ino),
+            "size": source_stat.st_size,
+            "engine": "codex",
+        }
+        machine._codex_rollout_for_wire = lambda _sid: str(rollout)
+
+        terminal = TurnEnd(
+            result=TurnResult(
+                subtype="success", duration_ms=1200, is_error=False),
+            turn_id="native-terminal-turn",
+        )
+        terminal._codex_authoritative_terminal = True
+        await machine._emit_locked(ctx, terminal)
+        immediate = machine._codex_terminal_ledger.snapshot(
+            sid,
+            rollout,
+            revision=machine._history_revision(sid),
+        )
+        assert immediate == (CodexTerminalFence(
+            turn_id="native-terminal-turn",
+            status="completed",
+            duration_ms=1200,
+            completed_at=transport.sent[-1].ts,
+        ),)
+
+        async def stale_official_history(_sid, *, before, limit):
+            assert before is None and limit == 4
+            return History(
+                session_id=sid,
+                revision=machine._history_revision(sid),
+                generation=machine.instance_id,
+                build_seq=1,
+                live_seq=0,
+                authoritative=False,
+                error="stale projection",
+                events=[],
+                turns=[],
+                detail="summary",
+                has_more=False,
+                in_progress=True,
+            )
+
+        machine._build_official_codex_history = stale_official_history
+        history = await machine._build_requested_history(
+            sid,
+            before=None,
+            limit=4,
+            cwd=ctx.cwd,
+            detail="summary",
+        )
+        assert history.authoritative is False
+        assert history.terminal_fences == list(immediate)
+
+        # A local transport/drain failure still closes the live UI, but is not
+        # an engine-owned fact and must not poison a later History response.
+        await machine._emit_locked(ctx, TurnEnd(
+            result=TurnResult(
+                subtype="error", duration_ms=0, is_error=True),
+            turn_id="synthetic-local-failure",
+        ))
+        assert machine._codex_terminal_ledger.snapshot(
+            sid,
+            rollout,
+            revision=machine._history_revision(sid),
+        ) == immediate
+
+        unsafe_terminal = TurnEnd(
+            result=TurnResult(
+                subtype="success",
+                duration_ms=MAX_SAFE_WIRE_INTEGER + 1,
+                is_error=False,
+            ),
+            turn_id="unsafe-duration-terminal",
+        )
+        unsafe_terminal._codex_authoritative_terminal = True
+        await machine._emit_locked(ctx, unsafe_terminal)
+        assert transport.sent[-1].turn_id == "unsafe-duration-terminal"
+        assert machine._codex_terminal_ledger.snapshot(
+            sid,
+            rollout,
+            revision=machine._history_revision(sid),
+        ) == immediate
+
+        def fail_recovery(*_args):
+            raise RuntimeError("optional ledger failure")
+
+        machine._remember_codex_terminal_event = fail_recovery
+        fallback_terminal = TurnEnd(
+            result=TurnResult(
+                subtype="success", duration_ms=1, is_error=False),
+            turn_id="live-terminal-survives-ledger-failure",
+        )
+        fallback_terminal._codex_authoritative_terminal = True
+        await machine._emit_locked(ctx, fallback_terminal)
+        assert transport.sent[-1].turn_id == fallback_terminal.turn_id
+
+        tasks = list(machine._codex_terminal_persist_tasks)
+        if tasks:
+            await asyncio.gather(*tasks)
+
+    asyncio.run(run())
+
+
+def test_codex_terminal_provenance_never_crosses_the_wire():
+    terminal = TurnEnd(
+        result=TurnResult(
+            subtype="success", duration_ms=1, is_error=False),
+        turn_id="native-turn",
+    )
+    terminal._codex_authoritative_terminal = True
+
+    encoded = serialize(terminal)
+    restored = deserialize(encoded)
+
+    assert "_codex_authoritative_terminal" not in encoded
+    assert isinstance(restored, TurnEnd)
+    assert restored._codex_authoritative_terminal is False
+
+
+def test_unbound_live_codex_terminal_is_visible_in_same_revision():
+    async def run():
+        machine, _transport = _mk_machine()
+        sid = "unbound-terminal-session"
+        ctx = _mk_ctx(sid, sid)
+        ctx.engine = "codex"
+        ctx.sdk = SimpleNamespace(
+            compaction_continuation_turn_ids=frozenset())
+        machine.sessions[sid] = ctx
+        machine._codex_rollout_for_wire = lambda _sid: None
+
+        terminal = TurnEnd(
+            result=TurnResult(
+                subtype="success", duration_ms=15, is_error=False),
+            turn_id="unbound-native-turn",
+        )
+        terminal._codex_authoritative_terminal = True
+        await machine._emit_locked(ctx, terminal)
+
+        assert await machine._codex_terminal_snapshot(
+            sid, machine._history_revision(sid),
+        ) == [CodexTerminalFence(
+            turn_id="unbound-native-turn",
+            status="completed",
+            duration_ms=15,
+            completed_at=terminal.ts,
+        )]
+        assert not machine._codex_terminal_persist_tasks
+
+    asyncio.run(run())
+
+
+def test_compaction_interrupted_terminal_is_not_persisted_as_completion(
+    tmp_path,
+):
+    rollout = tmp_path / "compact-rollout.jsonl"
+    rollout.write_text(
+        '{"type":"session_meta","payload":{"id":"compact-session"}}\n')
+
+    async def run():
+        machine, _transport = _mk_machine()
+        sid = "compact-session"
+        ctx = _mk_ctx(sid, sid)
+        ctx.engine = "codex"
+        ctx.sdk = SimpleNamespace(
+            compaction_continuation_turn_ids=frozenset({"compact-turn"}))
+        machine.sessions[sid] = ctx
+        source_stat = rollout.stat()
+        machine._watch[sid] = {
+            "path": str(rollout),
+            "file_id": (source_stat.st_dev, source_stat.st_ino),
+            "size": source_stat.st_size,
+            "engine": "codex",
+        }
+        machine._codex_rollout_for_wire = lambda _sid: str(rollout)
+
+        terminal = TurnEnd(
+            result=TurnResult(
+                subtype="error_during_execution",
+                duration_ms=0,
+                is_error=True,
+            ),
+            turn_id="compact-turn",
+        )
+        terminal._codex_authoritative_terminal = True
+        await machine._emit_locked(ctx, terminal)
+
+        assert machine._codex_terminal_ledger.snapshot(
+            sid,
+            rollout,
+            revision=machine._history_revision(sid),
+        ) == ()
+        assert not machine._codex_terminal_persist_tasks
+
+    asyncio.run(run())
 
 
 def _write_projection_rollout(path, native_turn_ids: list[str]) -> None:

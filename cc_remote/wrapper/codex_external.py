@@ -8,17 +8,22 @@ wrapper when an externally-produced transcript must be reloaded.
 """
 from __future__ import annotations
 
+import glob
 import json
+import math
 import os
 import re
 import sqlite3
 import subprocess
 import sys
-import glob
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Mapping
 
+from cc_remote.protocol import (
+    MAX_SAFE_WIRE_INTEGER,
+    MAX_SAFE_WIRE_TIMESTAMP_SECONDS,
+)
 from cc_remote.wrapper.process_scan import (
     DarwinProcessInfo,
     MAX_PROC_SCAN,
@@ -51,8 +56,10 @@ _LOADED_THREAD_RESUME_SID_RE = re.compile(
     r"([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})\b"
 )
 _TERMINAL_EVENTS = frozenset({
-    "task_complete", "turn_aborted", "task_failed", "task_cancelled",
+    "task_complete", "turn_aborted", "task_failed", "turn_failed",
+    "task_error", "task_cancelled",
 })
+_SAFE_WIRE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
 _RESUME_OPTIONS_WITH_VALUE = frozenset({
     b"-c", b"--config", b"--enable", b"--disable", b"--remote",
     b"--remote-auth-token-env", b"-m", b"--model", b"--local-provider",
@@ -62,12 +69,21 @@ _RESUME_OPTIONS_WITH_VALUE = frozenset({
 
 
 @dataclass(frozen=True)
+class RolloutTerminalMarker:
+    turn_id: str
+    status: str
+    duration_ms: int | None = None
+    completed_at: float | None = None
+
+
+@dataclass(frozen=True)
 class TurnMarkers:
     started: frozenset[str]
     finished: frozenset[str]
     partial: bytes
     ordered: tuple[tuple[str, str], ...] = ()
     has_visible_user_message: bool = False
+    terminals: tuple[RolloutTerminalMarker, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -800,11 +816,12 @@ def parse_turn_markers(data: bytes, partial: bytes = b"") -> TurnMarkers:
     started: set[str] = set()
     finished: set[str] = set()
     ordered: list[tuple[str, str]] = []
+    terminals: list[RolloutTerminalMarker] = []
     has_visible_user_message = False
     for line in lines:
         try:
             record = json.loads(line)
-        except (json.JSONDecodeError, UnicodeDecodeError):
+        except (UnicodeDecodeError, ValueError, RecursionError):
             continue
         if not isinstance(record, dict) or record.get("type") != "event_msg":
             continue
@@ -816,7 +833,7 @@ def parse_turn_markers(data: bytes, partial: bytes = b"") -> TurnMarkers:
         if user is not None and user.prompt:
             has_visible_user_message = True
         turn_id = payload.get("turn_id")
-        if not isinstance(turn_id, str) or not turn_id or len(turn_id) > 128:
+        if not isinstance(turn_id, str) or not _SAFE_WIRE_ID.fullmatch(turn_id):
             continue
         if kind == "task_started":
             started.add(turn_id)
@@ -824,9 +841,46 @@ def parse_turn_markers(data: bytes, partial: bytes = b"") -> TurnMarkers:
         elif kind in _TERMINAL_EVENTS:
             finished.add(turn_id)
             ordered.append((kind, turn_id))
+            reason = str(payload.get("reason") or "").lower()
+            status = (
+                "completed"
+                if kind == "task_complete"
+                else "interrupted"
+                if kind == "task_cancelled" or (
+                    kind == "turn_aborted"
+                    and reason not in {"error", "failed", "crash"}
+                )
+                else "failed"
+            )
+            duration = payload.get("duration_ms")
+            duration_ms = (
+                int(duration)
+                if isinstance(duration, (int, float))
+                and not isinstance(duration, bool)
+                and (not isinstance(duration, float) or math.isfinite(duration))
+                and duration > 0
+                and duration <= MAX_SAFE_WIRE_INTEGER
+                else None
+            )
+            completed = payload.get("completed_at")
+            completed_at = (
+                float(completed)
+                if isinstance(completed, (int, float))
+                and not isinstance(completed, bool)
+                and (not isinstance(completed, float) or math.isfinite(completed))
+                and completed >= 0
+                and completed <= MAX_SAFE_WIRE_TIMESTAMP_SECONDS
+                else None
+            )
+            terminals.append(RolloutTerminalMarker(
+                turn_id=turn_id,
+                status=status,
+                duration_ms=duration_ms,
+                completed_at=completed_at,
+            ))
     return TurnMarkers(
         frozenset(started), frozenset(finished), carry, tuple(ordered),
-        has_visible_user_message,
+        has_visible_user_message, tuple(terminals),
     )
 
 

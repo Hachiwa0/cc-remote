@@ -13,7 +13,13 @@ from pathlib import Path
 
 import pytest
 
-from cc_remote.protocol import History, Query, SessionActivity, Takeover
+from cc_remote.protocol import (
+    MAX_SAFE_WIRE_INTEGER,
+    History,
+    Query,
+    SessionActivity,
+    Takeover,
+)
 from cc_remote.wrapper import machine as machine_module
 from cc_remote.wrapper.codex_external import (
     CodexTuiLogTracker, HolderScan, ProcessIdentity,
@@ -920,6 +926,55 @@ def test_turn_marker_parser_preserves_partial_and_skips_malformed():
         ("task_started", "external-1"),
         ("task_complete", "external-1"),
     )
+
+
+def test_turn_marker_parser_bounds_terminal_wire_metadata():
+    records = [
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "task_complete",
+                "turn_id": "valid-terminal",
+                "duration_ms": float("inf"),
+                "completed_at": float("nan"),
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "task_complete",
+                "turn_id": "oversized-terminal",
+                "duration_ms": MAX_SAFE_WIRE_INTEGER + 1,
+                "completed_at": MAX_SAFE_WIRE_INTEGER + 1,
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "task_complete",
+                "turn_id": "not/a/wire/id",
+                "duration_ms": 1,
+            },
+        },
+    ]
+    parsed = parse_turn_markers(
+        (
+            b'{"type":"event_msg","payload":{"type":"task_complete",'
+            b'"turn_id":"huge-number","duration_ms":'
+            + b"9" * 5000
+            + b"}}\n"
+            + b"".join(
+                (json.dumps(record) + "\n").encode() for record in records
+            )
+        )
+    )
+
+    assert {"valid-terminal", "oversized-terminal"} <= parsed.finished
+    assert "not/a/wire/id" not in parsed.finished
+    by_id = {marker.turn_id: marker for marker in parsed.terminals}
+    for turn_id in ("valid-terminal", "oversized-terminal"):
+        assert by_id[turn_id].duration_ms is None
+        assert by_id[turn_id].completed_at is None
 
 
 def test_turn_marker_parser_reports_visible_user_message_without_turn_id():
@@ -2056,6 +2111,45 @@ def test_cold_codex_watcher_seeds_unfinished_external_turn(tmp_path, monkeypatch
     assert watch["external"] is True
 
 
+def test_cold_codex_watcher_seeds_latest_completed_terminal_fence(
+    tmp_path, monkeypatch,
+):
+    path = tmp_path / "rollout.jsonl"
+    path.write_bytes(
+        _event("task_started", "cold-completed")
+        + _event("task_complete", "cold-completed")
+    )
+    machine, _ = _mk_machine()
+    monkeypatch.setattr(
+        machine_module, "codex_rollout_path",
+        lambda sid: str(path) if sid == "cold-completed-session" else None,
+    )
+    monkeypatch.setattr(machine_module, "transcript_path", lambda _sid: None)
+
+    machine._watch_session("cold-completed-session")
+
+    fences = machine._codex_terminal_ledger.snapshot(
+        "cold-completed-session",
+        path,
+        revision=machine._history_revision("cold-completed-session"),
+    )
+    assert [(fence.turn_id, fence.status) for fence in fences] == [
+        ("cold-completed", "completed")]
+    assert not machine._codex_terminal_persist_tasks
+
+    # Falling back from an incomplete official projection advances only the
+    # read-side History revision. The source-bound cold terminal must remain
+    # available to the rollout page assembled under that new revision.
+    machine._activate_codex_rollout_history("cold-completed-session")
+    rebased = machine._codex_terminal_ledger.snapshot(
+        "cold-completed-session",
+        path,
+        revision=machine._history_revision("cold-completed-session"),
+    )
+    assert [(fence.turn_id, fence.status) for fence in rebased] == [
+        ("cold-completed", "completed")]
+
+
 def test_sidebar_watch_preserves_private_app_seed_without_stable_writer(
         tmp_path, monkeypatch):
     async def go():
@@ -2111,6 +2205,156 @@ def test_sidebar_watch_emits_running_and_idle_lifecycle(tmp_path, monkeypatch):
             ("private-app", "running"),
             ("private-app", "idle"),
         ]
+
+    asyncio.run(go())
+
+
+def test_interrupted_rollout_terminal_commits_after_quiet_grace_even_with_writer(
+    tmp_path,
+):
+    async def go():
+        path = tmp_path / "interrupted.jsonl"
+        path.write_bytes(b"")
+        machine, _ = _mk_machine()
+        sid = "interrupted-session"
+        ctx = _mk_ctx(sid, sid)
+        ctx.engine = "codex"
+        ctx.sdk = _CodexSdk()
+        machine.sessions[sid] = ctx
+        watch = _watch(path)
+        machine._watch[sid] = watch
+        machine._codex_rollout_for_wire = lambda _sid: str(path)
+        machine._push_mirrored_history = lambda sid: _record_async([], sid)
+        passive_writer = ProcessIdentity(901, 9001)
+
+        path.write_bytes(
+            _event("task_started", "interrupted-turn")
+            + _event("turn_aborted", "interrupted-turn")
+        )
+        await machine._poll_codex_watch(
+            sid,
+            watch,
+            set(),
+            1000.0,
+            writers={passive_writer},
+        )
+        assert machine._codex_terminal_ledger.snapshot(
+            sid, path, revision=machine._history_revision(sid),
+        ) == ()
+
+        with path.open("ab") as stream:
+            stream.write(
+                b'{"type":"event_msg","payload":{"type":"agent_message",'
+                b'"message":"trailing flush"}}\n'
+            )
+        await machine._poll_codex_watch(
+            sid,
+            watch,
+            set(),
+            1002.0,
+            writers={passive_writer},
+        )
+        await machine._poll_codex_watch(
+            sid,
+            watch,
+            set(),
+            1004.0,
+            writers={passive_writer},
+        )
+        assert machine._codex_terminal_ledger.snapshot(
+            sid, path, revision=machine._history_revision(sid),
+        ) == ()
+
+        await machine._poll_codex_watch(
+            sid,
+            watch,
+            set(),
+            1006.0,
+            writers={passive_writer},
+        )
+        fences = machine._codex_terminal_ledger.snapshot(
+            sid, path, revision=machine._history_revision(sid),
+        )
+        assert [(fence.turn_id, fence.status) for fence in fences] == [
+            ("interrupted-turn", "interrupted")]
+        tasks = list(machine._codex_terminal_persist_tasks)
+        if tasks:
+            await asyncio.gather(*tasks)
+
+    asyncio.run(go())
+
+
+def test_interrupted_rollout_terminal_drops_proven_compaction_continuation(
+    tmp_path,
+):
+    async def go():
+        path = tmp_path / "compact-continuation.jsonl"
+        path.write_bytes(b"")
+        machine, _ = _mk_machine()
+        sid = "compact-continuation-session"
+        ctx = _mk_ctx(sid, sid)
+        ctx.engine = "codex"
+        ctx.sdk = _CodexSdk()
+        ctx.sdk.compaction_continuation_turn_ids = frozenset({"compact-turn"})
+        machine.sessions[sid] = ctx
+        watch = _watch(path)
+        machine._watch[sid] = watch
+        machine._codex_rollout_for_wire = lambda _sid: str(path)
+        machine._push_mirrored_history = lambda sid: _record_async([], sid)
+
+        path.write_bytes(
+            _event("task_started", "compact-turn")
+            + _event("turn_aborted", "compact-turn")
+        )
+        await machine._poll_codex_watch(sid, watch, set(), 1000.0)
+        await machine._poll_codex_watch(sid, watch, set(), 1004.0)
+
+        assert watch["terminal_candidates"] == {}
+        assert machine._codex_terminal_ledger.snapshot(
+            sid, path, revision=machine._history_revision(sid),
+        ) == ()
+
+    asyncio.run(go())
+
+
+def test_newer_rollout_lifecycle_retires_provisional_interrupt(tmp_path):
+    async def go():
+        path = tmp_path / "newer-lifecycle.jsonl"
+        path.write_bytes(b"")
+        machine, _ = _mk_machine()
+        sid = "newer-lifecycle-session"
+        ctx = _mk_ctx(sid, sid)
+        ctx.engine = "codex"
+        ctx.sdk = _CodexSdk()
+        machine.sessions[sid] = ctx
+        watch = _watch(path)
+        machine._watch[sid] = watch
+        machine._codex_rollout_for_wire = lambda _sid: str(path)
+        machine._push_mirrored_history = lambda sid: _record_async([], sid)
+
+        path.write_bytes(
+            _event("task_started", "old-interrupt")
+            + _event("turn_aborted", "old-interrupt")
+        )
+        await machine._poll_codex_watch(sid, watch, set(), 1000.0)
+        assert set(watch["terminal_candidates"]) == {"old-interrupt"}
+
+        with path.open("ab") as stream:
+            stream.write(
+                _event("task_started", "new-completion")
+                + _event("task_complete", "new-completion")
+            )
+        await machine._poll_codex_watch(sid, watch, set(), 1001.0)
+
+        assert watch["terminal_candidates"] == {}
+        fences = machine._codex_terminal_ledger.snapshot(
+            sid, path, revision=machine._history_revision(sid),
+        )
+        assert [(fence.turn_id, fence.status) for fence in fences] == [
+            ("new-completion", "completed")]
+        tasks = list(machine._codex_terminal_persist_tasks)
+        if tasks:
+            await asyncio.gather(*tasks)
 
     asyncio.run(go())
 
