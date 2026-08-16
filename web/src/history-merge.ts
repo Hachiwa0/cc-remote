@@ -728,7 +728,14 @@ function mergeTurn(
     completedTextAuthority,
     settledCanonicalText,
   );
-  const hasVisibleDetail = blocks.some((block) => !isFinalTextBlock(block));
+  // A Plan is durable session-level progress and ChatView may lift it into the
+  // composer-adjacent progress strip.  It therefore cannot prove that this
+  // turn's heavyweight process projection is still resident: treating a lone
+  // Plan as loaded detail leaves no inline process after that lift and hides
+  // the server-advertised collapsed "已处理" affordance.
+  const hasLoadedDetailPayload = blocks.some((block) =>
+    !isFinalTextBlock(block)
+    && (block as ProcessBlock).processKind !== "plan");
   if (preserveCompleteLiveOrder) {
     const historyIds = history.blocks.map(blockIdentity);
     const liveOrders = live.blocks.map((block) => block.liveOrder);
@@ -790,11 +797,12 @@ function mergeTurn(
     // evicted or invalidated.  That contradictory state hides the collapsed
     // process affordance entirely (the final answer remains, but "已处理"
     // disappears).  Keep loaded monotonic only while there is an actual detail
-    // projection or visible non-final payload to justify it.
-    detailLoaded: !!detailProjection || (hasVisibleDetail
-      && (!!live.detailLoaded || !!history.detailLoaded))
-      || ((history.detailEventCount ?? 0) <= 0
-        && (!!live.detailLoaded || !!history.detailLoaded)),
+    // projection or visible turn-detail payload to justify it. A standalone
+    // Plan is intentionally not such payload because it renders outside the
+    // turn timeline.
+    detailLoaded: !!(detailProjection
+      || (live.detailLoaded || history.detailLoaded)
+        && (hasLoadedDetailPayload || !history.detailEventCount)),
     detailLoading: live.detailLoading ?? history.detailLoading,
     detailError: live.detailError ?? history.detailError,
     detailHasMore: detailProjection

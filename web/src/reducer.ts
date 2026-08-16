@@ -86,6 +86,9 @@ import type {
   ToolBlock,
   Turn,
 } from "./domain/conversation";
+
+const DETAIL_PARSE_ERROR = "过程解析失败";
+
 export type {
   Block,
   ProcessBlock,
@@ -1473,6 +1476,14 @@ function finishOpenBlocks(
   }
 }
 
+/** Settle stale children only at a projection boundary with no active task. */
+function finishCompletedTurnChildren(turn: Turn): void {
+  if (!turn.done) return;
+  const status = turn.interrupted
+    ? "interrupted" : turn.error ? "failed" : "succeeded";
+  finishOpenBlocks(turn, status, status !== "succeeded");
+}
+
 /** Close only one newly-installed detail projection. A completed turn may have
  * acquired real background process events after TurnEnd; a late old
  * TurnDetail response must not close those live blocks again. */
@@ -2656,7 +2667,7 @@ export function reduce(state: AppState, action: Action): AppState {
           browse, action.turnId, false, {
             expectedScopeKey: action.scopeKey,
             expectedViewId: action.viewId,
-          }, false, "详细过程无法解析，请重试", {
+          }, false, DETAIL_PARSE_ERROR, {
             before: target.detailRetryBefore ?? action.before ?? null,
             direction: target.detailRetryDirection
               ?? (action.before == null
@@ -2737,7 +2748,8 @@ export function reduce(state: AppState, action: Action): AppState {
             rt, cacheGeneration);
           if (control) applySessionControl(rt, control);
           if (action.turns.length) {
-            replaceWithBoundedTurns(rt, action.turns.map((turn) => (
+            replaceWithBoundedTurns(rt, cloneTurns(action.turns).map((turn) => (
+              finishCompletedTurnChildren(turn),
               !turn.forkPointId && turn.codexTurnId
                 ? { ...turn, forkPointId: turn.codexTurnId }
                 : turn
@@ -3674,6 +3686,8 @@ function reduceEvent(
         && base.lastLiveSeq > e.live_seq;
       const settledHistory = !e.before && !racedLiveEvent
         && e.in_progress === false;
+      const settledCodexHistory = settledHistory && state.sessions.some(
+        (session) => session.session_id === sid && session.engine === "codex");
       const resolveUnknownSteerFromIdle = settledHistory
         && base.acceptanceKind === "steer_unknown"
         && !!base.acceptancePending
@@ -3744,9 +3758,7 @@ function reduceEvent(
           newestHistoryId: e.newest_id ?? null,
           activeOwnerId: base.liveOwner?.turnId ?? null,
           reconcileReplayOrphans: true,
-        }, settledHistory
-          && state.sessions.find((session) =>
-            session.session_id === sid)?.engine === "codex");
+        }, settledCodexHistory);
         if (acceptanceConfirmed && base.acceptancePending
             && (base.acceptanceKind === "steer"
               || base.acceptanceKind === "steer_unknown")
@@ -3907,6 +3919,15 @@ function reduceEvent(
         },
       );
       turns = terminalRuntime.turns;
+      if (settledCodexHistory) {
+        // A passive CLI holder shares the daemon but owns no active task. Once
+        // the newest exact Codex History page is idle and no newer live frame
+        // raced it, its completed rows are the terminal fence for browser-only
+        // process projections. Preserve every payload/disclosure, but never let
+        // an old item/started replay animate the session again.
+        turns = cloneTurns(turns);
+        turns.forEach(finishCompletedTurnChildren);
+      }
       turns = turns.map(withLimitedTurnBlocks);
       const boundedTurns = boundRuntimeTurns(turns);
       const historyTrimmed = boundedTurns.length < turns.length;
@@ -4155,7 +4176,7 @@ function reduceEvent(
                 ...turn,
                 detailLoading: false,
                 detailAutoLoad: false,
-                detailError: "详细过程无法解析，请重试",
+                detailError: DETAIL_PARSE_ERROR,
                 detailRetryBefore:
                   turn.detailRetryBefore ?? e.before ?? null,
                 detailRetryDirection: turn.detailRetryDirection
@@ -4515,6 +4536,13 @@ function reduceEvent(
           }
           resolveUnknownPendingSteer(
             rt, turns, doneTs);
+          if (state.sessions.some((session) =>
+            session.session_id === e.sid && session.engine === "codex")) {
+            // A direct idle frame is the exact shared-daemon boundary between
+            // native tasks. Close only stale display children of already-done
+            // turns; a later real background event can still reopen its item.
+            turns.forEach(finishCompletedTurnChildren);
+          }
         }
         rt.turns = turns;
       });

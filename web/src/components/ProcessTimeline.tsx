@@ -36,6 +36,8 @@ import {
 } from "../pointer-tap";
 import type { Engine } from "../protocol";
 
+const DETAIL_REQUEST_ERROR = "详情请求失败";
+
 const PlanProgressPopover = lazy(() => import("./PlanProgressPopover").then(
   ({ PlanProgressPopover: Popover }) => ({ default: Popover }),
 ));
@@ -758,13 +760,13 @@ export function ProcessTimeline({ blocks, done, active, durationMs, startTs, don
   const requestDetail = () => {
     setLocalDetailError(null);
     if (onLoadDetail?.() === false) {
-      setLocalDetailError("无法发起详情请求，请重试");
+      setLocalDetailError(DETAIL_REQUEST_ERROR);
     }
   };
   const retryDetail = () => {
     setLocalDetailError(null);
     if ((onRetryDetail ?? onLoadDetail)?.() === false) {
-      setLocalDetailError("无法发起详情请求，请重试");
+      setLocalDetailError(DETAIL_REQUEST_ERROR);
     }
   };
   const toggle = () => {
