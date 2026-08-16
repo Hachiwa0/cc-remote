@@ -168,8 +168,10 @@ body{
   display:grid; grid-template-columns:28px minmax(0,1fr) auto; align-items:center; gap:9px;
   width:100%; min-height:54px; padding:8px 9px; border:1px solid transparent;
   border-radius:10px; text-align:left; transition:background .14s,border-color .14s; }
+.engine-picker-option.engine-claude{ --engine-color:#C15F3C; --engine-weak:#F2E7DF; }
 .engine-picker-option.engine-codex{ --engine-color:#2E6FF0; --engine-weak:rgba(46,111,240,.09); }
 .engine-picker-option.engine-dsh{ --engine-color:#147D8A; --engine-weak:rgba(20,125,138,.09); }
+:root[data-theme="dark"] .engine-picker-option.engine-claude{ --engine-color:#DB7C5E; --engine-weak:#352520; }
 :root[data-theme="dark"] .engine-picker-option.engine-codex{ --engine-color:#A3ACFF; --engine-weak:rgba(133,144,255,.13); }
 :root[data-theme="dark"] .engine-picker-option.engine-dsh{ --engine-color:#4EC3CF; --engine-weak:rgba(78,195,207,.14); }
 .engine-picker-option:hover:not(:disabled),.engine-picker-option.selected{ background:var(--engine-weak); border-color:color-mix(in srgb,var(--engine-color) 30%,transparent); }

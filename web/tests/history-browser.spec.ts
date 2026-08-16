@@ -292,6 +292,68 @@ test("dark desktop code block and copy action stay visually distinct", async ({
   expect(appearance.foreground).toEqual(appearance.expectedForeground);
 });
 
+test("engine picker keeps every brand color across active engine skins", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html");
+
+  const palettes = await page.evaluate(() => {
+    const host = document.createElement("div");
+    host.className = "engine-picker-options";
+    host.innerHTML = ["claude", "codex", "dsh"].map((engine) => `
+      <button class="engine-picker-option engine-${engine}">
+        <span class="engine-picker-mark">*</span>
+        <span class="engine-picker-copy"><b>${engine}</b></span>
+        <span class="engine-picker-state available"><i></i></span>
+      </button>
+    `).join("");
+    document.body.append(host);
+
+    const root = document.documentElement;
+    const readTheme = (theme: "light" | "dark") => {
+      root.dataset.theme = theme;
+      return Object.fromEntries(
+        (["claude", "codex", "dsh"] as const).map((activeEngine) => {
+          root.dataset.engine = activeEngine;
+          return [activeEngine, Object.fromEntries(
+            (["claude", "codex", "dsh"] as const).map((candidate) => {
+              const option = host.querySelector<HTMLElement>(
+                `.engine-${candidate}`,
+              );
+              const mark = option?.querySelector<HTMLElement>(
+                ".engine-picker-mark",
+              );
+              const state = option?.querySelector<HTMLElement>(
+                ".engine-picker-state",
+              );
+              if (!mark || !state) throw new Error("engine option is missing");
+              const markStyle = getComputedStyle(mark);
+              return [candidate, {
+                color: markStyle.color,
+                background: markStyle.backgroundColor,
+                stateColor: getComputedStyle(state).color,
+              }];
+            }),
+          )];
+        }),
+      );
+    };
+
+    return { light: readTheme("light"), dark: readTheme("dark") };
+  });
+
+  for (const theme of ["light", "dark"] as const) {
+    expect(palettes[theme].codex).toEqual(palettes[theme].claude);
+    expect(palettes[theme].dsh).toEqual(palettes[theme].claude);
+  }
+  expect(palettes.light.claude.claude.color).toBe("rgb(193, 95, 60)");
+  expect(palettes.light.claude.codex.color).toBe("rgb(46, 111, 240)");
+  expect(palettes.light.claude.dsh.color).toBe("rgb(20, 125, 138)");
+  expect(palettes.dark.claude.claude.color).toBe("rgb(219, 124, 94)");
+  expect(palettes.dark.claude.codex.color).toBe("rgb(163, 172, 255)");
+  expect(palettes.dark.claude.dsh.color).toBe("rgb(78, 195, 207)");
+});
+
 test("local Markdown file link reveals its complete path without native title", async ({
   page,
 }) => {
