@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import { createServer } from "vite";
 
 import type { ServerEvent } from "../src/protocol.ts";
 import {
   mergeInitialHistory,
   restoreCachedTurnDetails,
+  restoreObservedLiveTurnDetails,
 } from "../src/history-merge.ts";
 import type { Block, Turn } from "../src/reducer.ts";
 
@@ -31,6 +34,27 @@ assert.equal(
   "succeeded",
   "a stale cached child cannot restart the working spark after refresh",
 );
+
+const staleObservedTurn: Turn = {
+  id: "completed-cli-observed", prompt: "inspect", done: true,
+  blocks: [{
+    kind: "process", item_id: "replayed-cli-command",
+    processKind: "command", phase: "start", status: "running",
+    title: "retained command", output: "retained output", done: false,
+  }],
+};
+const completedCliSummary: Turn = {
+  id: staleObservedTurn.id, prompt: "inspect", done: true,
+  blocks: [{ kind: "text", message_id: "completed-cli-final",
+    channel: "final", text: "done", done: true }],
+};
+const preservedBackground = restoreObservedLiveTurnDetails(
+  [completedCliSummary], [staleObservedTurn],
+)[0];
+assert.equal(preservedBackground.detailProjection?.blocks[0]?.done, false,
+  "without an idle Codex fence genuine late activity stays live");
+assert.equal(staleObservedTurn.blocks[0].done, false,
+  "observed-detail restoration never mutates reducer input");
 
 const interleavedLiveBlocks: Block[] = [
   { kind: "text", message_id: "ordered-comment-a", text: "A", done: true,
@@ -108,6 +132,75 @@ assert.deepEqual(
     "ordered-tool-a", "ordered-tool-b"],
   "a duplicate History block identity fails closed instead of disappearing during live-order repair",
 );
+
+const deferredPlan: Block = {
+  kind: "process", item_id: "deferred-session-plan", processKind: "plan",
+  phase: "snapshot", status: "succeeded", title: "计划", done: true,
+  plan: [{ step: "完成修复", status: "inProgress" }],
+};
+const deferredPlanSummary: Turn = {
+  id: "native-plan-summary-turn", clientMsgId: "browser-plan-turn",
+  prompt: "继续执行计划。", done: true,
+  detailEventCount: 75, detailLoaded: false,
+  blocks: [deferredPlan, {
+    kind: "text", message_id: "plan-summary-final", channel: "final",
+    text: "阶段工作已完成。", done: true,
+  }],
+};
+const repairedPlanOnlyDeferredDetail = mergeInitialHistory(
+  [deferredPlanSummary],
+  [{
+    ...deferredPlanSummary,
+    id: "browser-plan-turn",
+    historyTurnId: deferredPlanSummary.id,
+    detailLoaded: true,
+  }],
+)[0];
+assert.equal(repairedPlanOnlyDeferredDetail.detailLoaded, false,
+  "an externalized Plan cannot suppress deferred process history");
+
+const loadedPlanDetail = mergeInitialHistory(
+  [{ ...deferredPlanSummary, id: "loaded-plan-detail-turn",
+    clientMsgId: undefined }],
+  [{
+    ...deferredPlanSummary,
+    id: "loaded-plan-detail-turn",
+    clientMsgId: undefined,
+    detailLoaded: true,
+    detailProjection: {
+      segments: [{
+        pageKey: "loaded-plan-detail-page", before: null, events: [],
+        hasMore: false, oldestCursor: null, hasNewer: false,
+        newerCursor: null, encodedChars: 0,
+      }],
+      blocks: [{
+        kind: "tool", message_id: "loaded-tool-message",
+        tool_use_id: "loaded-tool", tool: "Read", input: {}, done: true,
+      }],
+      capped: false, hasMore: false, oldestCursor: null,
+      hasNewer: false, newerCursor: null,
+    },
+  }],
+)[0];
+assert.equal(loadedPlanDetail.detailLoaded, true,
+  "a real same-turn detail projection remains loaded across summary refresh");
+
+const runningInlineDetail = mergeInitialHistory(
+  [{ ...deferredPlanSummary, id: "running-inline-detail", done: false }],
+  [{
+    ...deferredPlanSummary,
+    id: "running-inline-detail",
+    done: false,
+    detailLoaded: true,
+    blocks: [deferredPlan, {
+      kind: "tool", message_id: "running-tool-message",
+      tool_use_id: "running-tool", tool: "Read", input: {}, done: false,
+    }],
+  }],
+  { preserveLiveTailOpen: true },
+)[0];
+assert.equal(runningInlineDetail.detailLoaded, true,
+  "a raced running summary keeps genuine inline process detail loaded");
 
 const reducerHarness = await createServer({
   root: process.cwd(),
@@ -211,6 +304,222 @@ try {
     "chronology restoration must retain the live tool result");
   assert.equal(toolResult?.is_error, false,
     "chronology restoration must retain the live tool lifecycle");
+
+  const idleSid = "codex-shared-cli-idle-projection";
+  const idleRevision = "codex-shared-cli-idle-r1";
+  const idleGeneration = "codex-shared-cli-idle-g1";
+  const openObserved = (): Turn => ({
+    id: "shared-cli-completed-row", prompt: "done already", done: true,
+    detailEventCount: 1,
+    blocks: [{ kind: "process", item_id: "shared-cli-replayed-process",
+      processKind: "command", phase: "start", status: "running",
+      title: "CLI replay", output: "keep this output", done: false }],
+  });
+  const summaryTurn = {
+    id: "shared-cli-completed-row", prompt: "done already", done: true,
+    detailEventCount: 1, detailLoaded: false,
+    blocks: [{ kind: "text" as const, message_id: "shared-cli-final",
+      channel: "final" as const, text: "complete", done: true }],
+  };
+  const idleHistory = event({
+    type: "history", sid: idleSid, session_id: idleSid,
+    revision: idleRevision, generation: idleGeneration,
+    build_seq: 2, live_seq: 40, authoritative: true,
+    detail: "summary", in_progress: false, has_more: false,
+    newest_id: summaryTurn.id, events: [], turns: [summaryTurn],
+  });
+  let idleState = {
+    ...initialState,
+    focusedSid: idleSid,
+    sessions: [{ session_id: idleSid, engine: "codex" as const }],
+    runtimes: {
+      [idleSid]: {
+        ...createRuntime(), state: "idle" as const,
+        historyRevision: idleRevision, historyGeneration: idleGeneration,
+        lastLiveSeq: 40, liveDetailTurnIds: [summaryTurn.id],
+        turns: [openObserved()],
+      },
+    },
+  };
+  idleState = reduce(idleState, { type: "event", event: idleHistory });
+  const repaired = idleState.runtimes[idleSid].turns[0];
+  const repairedProcess = repaired.detailProjection?.blocks.find(
+    (block: Block) => block.kind === "process");
+  assert.equal(idleState.runtimes[idleSid].state, "idle");
+  assert.equal(repairedProcess?.done, true,
+    "a passive shared CLI holder cannot reactivate completed Codex detail");
+  assert.equal(repairedProcess?.kind === "process"
+    ? repairedProcess.output : null, "keep this output",
+  "idle History repair retains the collapsed process payload");
+  const { ChatView } = await reducerHarness.ssrLoadModule(
+    "/src/components/ChatView.tsx");
+  const idleMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: idleSid, turns: [repaired], engine: "codex",
+    onEdit: () => {}, onGetDiff: () => {}, onLoadDetail: () => {},
+  }));
+  assert.doesNotMatch(idleMarkup, /class="turn-working"/,
+    "a passive CLI holder cannot leave the working spark animated");
+  assert.match(idleMarkup, /class="turn-done-mark"/,
+    "the completed row returns to its static terminal spark");
+  assert.match(idleMarkup, /aria-expanded="false"/,
+    "the completed process disclosure stays settled instead of flapping open");
+
+  const repairedPlanOnlyMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: "repaired-plan-summary-session",
+    turns: [repairedPlanOnlyDeferredDetail],
+    engine: "codex", onEdit: () => {}, onGetDiff: () => {},
+    onLoadDetail: () => {},
+    externalPlanProgress: {
+      turnId: repairedPlanOnlyDeferredDetail.id,
+      itemId: deferredPlan.kind === "process" ? deferredPlan.item_id : "",
+    },
+  }));
+  assert.match(repairedPlanOnlyMarkup, /已处理/,
+    "lifting a Plan into the session strip retains the process disclosure");
+  assert.match(repairedPlanOnlyMarkup, /75 项/);
+
+  const directAnswerMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: "direct-answer-session",
+    turns: [{
+      id: "direct-answer-turn", prompt: "你好", done: true,
+      detailEventCount: 0, detailLoaded: false,
+      blocks: [{
+        kind: "text", message_id: "direct-answer-final", channel: "final",
+        text: "你好。", done: true,
+      }],
+    }],
+    engine: "codex", onEdit: () => {}, onGetDiff: () => {},
+    onLoadDetail: () => {},
+  }));
+  assert.doesNotMatch(directAnswerMarkup, /已处理/,
+    "a direct answer with no process remains free of a synthetic disclosure");
+
+  const currentRunningState = reduce({
+    ...initialState,
+    focusedSid: idleSid,
+    sessions: [{ session_id: idleSid, engine: "codex" as const }],
+    runtimes: { [idleSid]: {
+      ...createRuntime(), state: "running" as const,
+      historyRevision: idleRevision, historyGeneration: idleGeneration,
+      lastLiveSeq: 40, liveDetailTurnIds: [summaryTurn.id],
+      turns: [openObserved()],
+    } },
+  }, { type: "event", event: event({
+    ...idleHistory,
+    in_progress: true,
+  }) });
+  assert.equal(currentRunningState.runtimes[idleSid].turns[0]
+    .detailProjection?.blocks.find(
+      (block: Block) => block.kind === "process")?.done, false,
+  "a currently running History page preserves genuine Codex process activity");
+
+  const racedLiveState = reduce({
+    ...initialState,
+    focusedSid: idleSid,
+    sessions: [{ session_id: idleSid, engine: "codex" as const }],
+    runtimes: { [idleSid]: {
+      ...createRuntime(), state: "running" as const,
+      historyRevision: idleRevision, historyGeneration: idleGeneration,
+      lastLiveSeq: 41, liveDetailTurnIds: [summaryTurn.id],
+      turns: [openObserved()],
+    } },
+  }, { type: "event", event: idleHistory });
+  const racedTurn = racedLiveState.runtimes[idleSid].turns[0];
+  const racedProcess = [
+    ...(racedTurn.detailProjection?.blocks ?? []),
+    ...(racedTurn.liveSpillBlocks ?? []),
+    ...racedTurn.blocks,
+  ].find((block: Block) => block.kind === "process");
+  assert.equal(racedProcess?.done, false,
+    "an older idle History page cannot settle a newer live process event");
+
+  const cachedInput = openObserved();
+  const cachedState = reduce({
+    ...initialState,
+    focusedSid: idleSid,
+    sessions: [{ session_id: idleSid, engine: "codex" as const }],
+    runtimes: { [idleSid]: createRuntime() },
+  }, {
+    type: "hydrate_cache", sid: idleSid, turns: [cachedInput],
+    revision: idleRevision, generation: idleGeneration,
+  });
+  assert.equal(cachedState.runtimes[idleSid].turns[0].blocks[0].done, true,
+    "an IndexedDB paint cannot animate stale completed child activity");
+  assert.equal(cachedInput.blocks[0].done, false,
+    "cache hydration cannot mutate its action payload");
+
+  const idleBoundaryState = reduce({
+    ...initialState,
+    focusedSid: idleSid,
+    sessions: [{ session_id: idleSid, engine: "codex" as const }],
+    runtimes: { [idleSid]: {
+      ...createRuntime(), state: "running" as const,
+      turns: [openObserved()],
+    } },
+  }, { type: "event", event: event({
+    type: "state", sid: idleSid, state: "idle", seq: 42,
+  }) });
+  assert.equal(idleBoundaryState.runtimes[idleSid].turns[0].blocks[0].done,
+    true, "an exact Codex idle frame settles stale display-only activity");
+  assert.equal(idleBoundaryState.runtimes[idleSid].turns[0].blocks[0].kind
+    === "process"
+    ? idleBoundaryState.runtimes[idleSid].turns[0].blocks[0].output : null,
+  "keep this output", "the idle boundary preserves process payloads");
+
+  const resumedBackgroundState = reduce(idleBoundaryState, {
+    type: "event", event: event({
+      type: "process", sid: idleSid, seq: 43,
+      item_id: "shared-cli-replayed-process", kind: "command",
+      phase: "update", status: "running", turn_id: summaryTurn.id,
+      title: "real background work resumed",
+    }),
+  });
+  assert.equal(resumedBackgroundState.runtimes[idleSid].turns[0]
+    .blocks[0].done, false,
+  "a later real process event can reopen its exact settled child");
+
+  const runningBoundaryState = reduce({
+    ...initialState,
+    focusedSid: idleSid,
+    sessions: [{ session_id: idleSid, engine: "codex" as const }],
+    runtimes: { [idleSid]: {
+      ...createRuntime(), state: "idle" as const,
+      turns: [openObserved()],
+    } },
+  }, { type: "event", event: event({
+    type: "state", sid: idleSid, state: "running", seq: 42,
+  }) });
+  assert.equal(runningBoundaryState.runtimes[idleSid].turns[0].blocks[0].done,
+    false, "a running frame cannot settle genuine Codex process activity");
+
+  const claudeSid = "claude-background-after-terminal-history";
+  let claudeState = {
+    ...initialState,
+    focusedSid: claudeSid,
+    sessions: [{ session_id: claudeSid, engine: "claude" as const }],
+    runtimes: { [claudeSid]: {
+      ...createRuntime(), state: "idle" as const,
+      historyRevision: "claude-background-r1",
+      historyGeneration: "claude-background-g1", lastLiveSeq: 50,
+      liveDetailTurnIds: ["claude-background-row"],
+      turns: [{ id: "claude-background-row", prompt: "delegate", done: true,
+        blocks: [{ kind: "process" as const,
+          item_id: "claude-background-agent", processKind: "agent" as const,
+          phase: "start" as const, status: "running" as const,
+          title: "background", done: false }] }],
+    } },
+  };
+  claudeState = reduce(claudeState, { type: "event", event: event({
+    type: "history", sid: claudeSid, session_id: claudeSid,
+    revision: "claude-background-r1", generation: "claude-background-g1",
+    build_seq: 2, live_seq: 50, authoritative: true, detail: "summary",
+    in_progress: false, has_more: false, newest_id: "claude-background-row",
+    events: [], turns: [{ id: "claude-background-row", prompt: "delegate",
+      done: true, detailEventCount: 1, detailLoaded: false, blocks: [] }],
+  }) });
+  assert.equal(claudeState.runtimes[claudeSid].turns[0]
+    .detailProjection?.blocks[0]?.done, false,
+  "Codex idle repair cannot close a genuine Claude background process");
 } finally {
   await reducerHarness.close();
 }
