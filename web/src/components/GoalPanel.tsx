@@ -93,6 +93,10 @@ export function GoalPanel(p: Props) {
   const engineName = p.engine === "codex" ? "Codex" : "Claude";
   const planPresentation = p.plan
     ? planProgressPresentation(p.plan.block, p.plan.detailLoading) : null;
+  const planHeadline = planPresentation?.stale
+    ? planPresentation.stateLabel
+    : planPresentation?.currentStep ?? planPresentation?.description
+      ?? planPresentation?.stateLabel;
   const openGoal = () => p.onOpen();
 
   return <>
@@ -105,15 +109,14 @@ export function GoalPanel(p: Props) {
             if (next) p.onLoadPlanDetail?.();
             setPlanOpen(next);
           }} aria-label={`查看计划进度，${planPresentation.progressLabel}`}>
-          <span className={`goal-chip-ring plan-chip-ring${planPresentation.complete ? " complete" : ""}${planPresentation.failed ? " failed" : ""}`}
+          <span className={`goal-chip-ring plan-chip-ring${planPresentation.complete ? " complete" : ""}${planPresentation.failed ? " failed" : ""}${planPresentation.stale ? " stale" : ""}`}
             aria-hidden="true"
             style={{ "--goal-progress": `${planPresentation.progress * 3.6}deg` } as CSSProperties}>
             <Icon name={planPresentation.complete ? "verify" : "plan"} size={11} />
           </span>
           <span className="goal-chip-label">计划</span>
           <span className="goal-chip-objective">
-            {planPresentation.currentStep ?? planPresentation.description
-              ?? planPresentation.stateLabel}
+            {planHeadline}
           </span>
           <span className="goal-chip-status">{planPresentation.progressLabel}</span>
         </button>
@@ -177,16 +180,14 @@ export function GoalPanel(p: Props) {
                 if (next) p.onLoadPlanDetail?.();
                 setPlanOpen(next);
               }}>
-              <span className={`goal-chip-ring plan-chip-ring${planPresentation.complete ? " complete" : ""}${planPresentation.failed ? " failed" : ""}`}
+              <span className={`goal-chip-ring plan-chip-ring${planPresentation.complete ? " complete" : ""}${planPresentation.failed ? " failed" : ""}${planPresentation.stale ? " stale" : ""}`}
                 aria-hidden="true"
                 style={{ "--goal-progress": `${planPresentation.progress * 3.6}deg` } as CSSProperties}>
                 <Icon name={planPresentation.complete ? "verify" : "plan"} size={11} />
               </span>
               <span className="goal-plan-entry-copy">
                 <b>计划</b>
-                <small>{planPresentation.currentStep
-                  ?? planPresentation.description
-                  ?? planPresentation.stateLabel}</small>
+                <small>{planHeadline}</small>
               </span>
               <strong>{planPresentation.progressLabel}</strong>
               <span className={`goal-plan-entry-chev${planOpen ? " open" : ""}`}

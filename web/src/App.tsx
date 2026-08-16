@@ -70,7 +70,7 @@ import {
   type GoalUiPreferences,
 } from "./scoped-goal-ui";
 import { shouldOpenCodexStatus } from "./status-capabilities";
-import { permsFor, type Catalog } from "./data";
+import { dshHeaderPresetLabel, permsFor, type Catalog } from "./data";
 import {
   normalizeSessionList,
   shouldAcceptSessionList,
@@ -806,6 +806,13 @@ export default function App() {
       state.codexProfiles,
       state.defaultCodexProfileId,
       focusedSession.codex_profile_id,
+    )
+    : null;
+  const focusedDshPresetLabel = focusedEngine === "dsh" && !state.newChat
+    ? dshHeaderPresetLabel(
+      focusedSession?.dsh_agent_preset,
+      state.dshPresets,
+      state.defaultDshPresetId,
     )
     : null;
   const focusedNativeSessionId = focusedSession?.native_session_id
@@ -2936,13 +2943,7 @@ export default function App() {
           }
           // refresh the context ring after each turn (local SDK query, no model tokens)
           if (msg.type === "turn_end" && msg.sid) {
-            const listedSession = Object.values(
-              sessionListsBySurfaceRef.current,
-            ).flat().find((session) => session.session_id === msg.sid);
-            const eventEngine = listedSession?.engine
-              ?? (stateRef.current.focusedSid === msg.sid
-                ? engineRef.current : undefined);
-            if (eventEngine !== "dsh") ws.sendGetContextTo(msg.sid);
+            ws.sendGetContextTo(msg.sid);
             if (sessionActivityPendingRef.current.delete(msg.sid)) {
               const listed = Object.values(sessionListsBySurfaceRef.current)
                 .flat().find((session) => session.session_id === msg.sid);
@@ -3364,15 +3365,18 @@ export default function App() {
             rt.collaborationMode === "plan" ? "default" : "plan");
           return;
         }
-        const modes = permsFor(focusedEngine).map((p) => p.id);
+        const modes = permsFor(
+          focusedEngine, rt.permOptions,
+        ).map((p) => p.id);
+        if (modes.length === 0) return;
         const current = modes.indexOf(rt.perm);
         setPerm(modes[current < 0 ? 0 : (current + 1) % modes.length]);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [authed, focusedSid, rt.perm, rt.collaborationMode, rt.control,
-    rt.external, focusedEngine]);
+  }, [authed, focusedSid, rt.perm, rt.permOptions,
+    rt.collaborationMode, rt.control, rt.external, focusedEngine]);
 
   const requestHistoryTurnDetail = useCallback((
     displayTurnId: string, before?: string | null,
@@ -3484,7 +3488,6 @@ export default function App() {
   // that the replacement wrapper has finished restoring resident sessions.
   useEffect(() => {
     if (!authed || !focusedSid || state.newChat
-        || focusedEngine === "dsh"
         || state.connState !== "connected" || !state.wrapperOnline) return;
     if (stateRef.current.runtimes[focusedSid]?.contextRequestId) return;
     const requestId = wsRef.current?.sendGetContext();
@@ -4067,6 +4070,8 @@ export default function App() {
     wsRef.current?.sendSetServiceTier(tier);
   };
   const setPerm = (perm: string) => {
+    if (perm === "danger-full-access"
+        && !window.confirm("启用 Full access？")) return;
     wsRef.current?.sendSetPerm(perm);
   };
   const getPermissionProfiles = () => {
@@ -4149,7 +4154,7 @@ export default function App() {
     refreshStatus();
   };
   const requestContext = () => {
-    if (!focusedSid || focusedEngine === "dsh") return;
+    if (!focusedSid) return;
     const requestId = wsRef.current?.sendGetContext();
     if (requestId) {
       dispatch({ type: "begin_context_request", sid: focusedSid, requestId });
@@ -4639,6 +4644,12 @@ export default function App() {
                   {focusedWorkProfile.name}
                 </span>
               )}
+              {focusedDshPresetLabel && (
+                <span className="dsh-agent-preset"
+                  title={`DSH Agent：${focusedDshPresetLabel}`}>
+                  Agent · {focusedDshPresetLabel}
+                </span>
+              )}
             </div>
             <div className="sub">{space === "work" ? "私有工作区 · " : ""}{focusedNativeSessionId ? `session ${focusedNativeSessionId.slice(0, 8)}` : "connected"}</div>
           </div>
@@ -4866,6 +4877,7 @@ export default function App() {
           model={rt.model}
           effort={rt.effort}
           perm={rt.perm}
+          permOptions={rt.permOptions}
           permissionProfile={rt.permissionProfile}
           permissionProfiles={rt.permissionProfiles}
           webSearch={rt.webSearch}

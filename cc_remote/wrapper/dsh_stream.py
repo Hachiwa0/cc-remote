@@ -226,6 +226,10 @@ class DshStreamTranslator:
     next_step_pending: list[str] = field(default_factory=list)
     next_step_claimed: set[str] = field(default_factory=set)
     commands: dict[str, _CommandBlock] = field(default_factory=dict)
+    # Permission changes are composer controls in DSH, not conversation turns.
+    # Retain their ids only until command/done so both live and rebuilt history
+    # omit the native control lifecycle.
+    hidden_commands: set[str] = field(default_factory=set)
 
     MAX_ACTIVE_BLOCKS = 4096
     MAX_INBOX_IDENTITIES = 4096
@@ -451,9 +455,12 @@ class DshStreamTranslator:
 
         if event_type == "command/run":
             command_id = self._command_id(data)
-            if command_id in self.commands:
+            if command_id in self.commands or command_id in self.hidden_commands:
                 raise DshEventError("DSH command/run repeated commandId")
-            if len(self.commands) >= self.MAX_ACTIVE_COMMANDS:
+            if (
+                len(self.commands) + len(self.hidden_commands)
+                >= self.MAX_ACTIVE_COMMANDS
+            ):
                 raise DshEventError("DSH active command limit reached")
             name = data.get("name")
             args = data.get("args")
@@ -467,6 +474,9 @@ class DshStreamTranslator:
                 or source.get("kind") != "user"
             ):
                 raise DshEventError("DSH command/run has an invalid payload")
+            if name == "permission":
+                self.hidden_commands.add(command_id)
+                return []
             client_id = (
                 command_client_id
                 if self._valid_wire_id(command_client_id) else None
@@ -521,6 +531,9 @@ class DshStreamTranslator:
                 )
             ):
                 raise DshEventError("DSH command/done has an invalid payload")
+            if command_id in self.hidden_commands:
+                self.hidden_commands.discard(command_id)
+                return []
             block = self.commands.pop(command_id, None)
             client_id = (
                 command_client_id

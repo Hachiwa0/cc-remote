@@ -4,7 +4,9 @@ import {
   type Cmd, type CmdGroup, type Catalog,
 } from "../data";
 import { Icon } from "../icons";
-import type { Engine, PermissionProfileInfo } from "../protocol";
+import type {
+  Engine, PermissionModeInfo, PermissionProfileInfo,
+} from "../protocol";
 
 interface Props {
   open: boolean;
@@ -22,6 +24,7 @@ interface Props {
   currentEffort?: string;
   onPickEffort?: (effort: string) => void;
   currentPerm?: string;
+  permOptions?: PermissionModeInfo[] | null;
   onPickPerm?: (perm: string) => void;
   currentPermissionProfile?: string | null;
   permissionProfiles?: PermissionProfileInfo[] | null;
@@ -33,7 +36,7 @@ interface Props {
 export function CommandSheet({
   open, kind, engine, catalog, filter = "", onClose, onPickCommand,
   currentModel, onPickModel, currentEffort, onPickEffort, currentPerm,
-  onPickPerm, currentPermissionProfile, permissionProfiles,
+  permOptions, onPickPerm, currentPermissionProfile, permissionProfiles,
   onPickPermissionProfile, currentWebSearch, onPickWebSearch,
 }: Props) {
   const isCmdMode = kind === "commands";
@@ -42,7 +45,9 @@ export function CommandSheet({
   const f = filter.toLowerCase();
   // Effort levels are per-model, so the effort sheet must be built from the model
   // currently selected, not just the engine.
-  const MODELS = modelsFor(engine, catalog), EFFORTS = effortsFor(engine, currentModel, catalog), PERMS = permsFor(engine);
+  const MODELS = modelsFor(engine, catalog);
+  const EFFORTS = effortsFor(engine, currentModel, catalog);
+  const PERMS = permsFor(engine, permOptions);
   const PROFILES = permissionProfilesFor(permissionProfiles);
 
   // Prefix-match on the slash (same rule the composer uses to decide visibility),
@@ -99,7 +104,7 @@ export function CommandSheet({
                     className={"cmd" + (p.id === currentPerm ? " sel" : "") + (p.danger ? " danger" : "")}
                     onClick={() => onPickPerm?.(p.id)}
                   >
-                    <span className="cmd-ic"><Icon name={p.ic} size={17} /></span>
+                    <span className="cmd-ic"><Icon name={p.ic ?? (p.danger ? "bolt" : "shield")} size={17} /></span>
                     <span className="cmd-tx">
                       <span className="cmd-nm">{p.name}</span>
                       <span className="cmd-ds">{p.ds}</span>

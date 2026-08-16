@@ -237,6 +237,19 @@ try {
     presentCommandProblem({ code: "protocol", message: hiddenDiagnostic }),
     /crash|wrapper|private|protocol/i);
   assert.equal(presentHistoricalTurnProblem("error"), "该轮未正常结束");
+  const unsupportedDshImage = "当前 DSH 模型不支持图片输入。";
+  assert.equal(
+    presentTurnProblem({ code: "bad_prompt", message: unsupportedDshImage }),
+    unsupportedDshImage,
+  );
+  assert.equal(
+    presentCommandProblem({ code: "not_steerable", message: unsupportedDshImage }),
+    unsupportedDshImage,
+  );
+  assert.equal(
+    presentHistoricalTurnProblem(unsupportedDshImage),
+    unsupportedDshImage,
+  );
   assert.equal(
     presentHistoricalTurnProblem(
       "provider crash at /private/token; Authorization: Bearer secret",

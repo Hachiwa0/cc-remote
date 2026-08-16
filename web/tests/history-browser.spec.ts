@@ -3134,20 +3134,20 @@ test("a long active turn keeps its plan beside the composer", async ({ page }) =
     .toContainText("验证计划弹层");
 });
 
-test("an old session lifts its earlier plan out of the first message", async ({
+test("an old terminal plan stays with its historical turn", async ({
   page,
 }, testInfo) => {
   await page.goto("/tests/history-browser.html?historical-plan=1");
 
-  const chip = page.getByRole("button", { name: /查看计划进度/ });
-  await expect(chip).toBeVisible();
   await scrollThreadToEdge(page, "start", testInfo.project.name);
   const planTurn = page.locator('[data-turn-id="historical-plan"]');
   await expect(planTurn).toBeVisible();
-  await expect(planTurn.getByRole("button", { name: /查看计划进度/ }))
-    .toHaveCount(0);
+  const trigger = planTurn.getByRole("button", { name: /查看计划进度/ });
+  await expect(trigger).toBeVisible();
+  await expect(page.getByRole("button", { name: /查看计划进度/ }))
+    .toHaveCount(1);
 
-  await chip.click();
+  await trigger.click();
   await expect(page.getByRole("dialog", { name: "计划进度" }))
     .toContainText("验证计划弹层");
 });
@@ -3175,7 +3175,7 @@ test("terminal turn does not mark unfinished structured plan complete", async ({
   await page.getByRole("button", { name: /查看计划进度/ }).click();
   const popover = page.getByRole("dialog", { name: "计划进度" });
   await expect(popover).toContainText("1 / 3");
-  await expect(popover).toContainText("执行已结束");
+  await expect(popover).toContainText("本轮已结束，计划未更新");
   await expect(popover).not.toContainText("全部完成");
 });
 

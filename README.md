@@ -4,7 +4,7 @@
 
 自托管 · 三后端 · 多会话 · 实时过程 · 响应式 Web
 
-**当前版本：v3.0.0** · Wire protocol v36
+**当前版本：v3.0.0** · Wire protocol v37
 
 [English](README_en.md) ·
 [5 分钟上手](#本地快速开始一台机器5-分钟) ·
@@ -59,7 +59,7 @@ v3 把 cc-remote 从“能在网页控制 CLI”推进为一个本地优先、�
 | **原生 App / CLI 协同** | Claude CLI/Desktop/Agent View 与 Codex shared daemon/App/CLI 使用各自的所有权模型。v3 对齐 running、只读、打断、steer、compact、turn binding 和终止状态，避免兄弟会话误锁、历史回合串到尾部或留下“假思考中”。 |
 | **多设备隔离** | Device Center 提供一次性配对、独立可撤销的机器凭据和在线状态；relay 按用户允许的 `machine_id` 路由。设备、Code / Work、引擎、连接 generation 和会话归属分别隔离，延迟帧不能污染当前视图。 |
 | **移动端与文件体验** | 历史到顶继续拉取时保留滚动锚点；图片按需加载，支持灯箱、再次点击收起和双指缩放；Markdown、源码、HTML、PDF 与 Office 预览仍在本机安全边界内完成。工作目录外的精确文件会先在请求它的会话中确认，只授权当前文件身份；用户确认的 Markdown 保持只读，只有本会话成功写入的文件才可保存。PWA 图标、窄屏弹层、错误提示和过程时间线也统一收敛。 |
-| **可回滚发布** | 产品版本统一为 v3.0.0，wire protocol 为 v36。构建和部署同时校验产品版本与协议版本；VPS 使用不可变 release、独立 venv、原子 `current` 切换和失败回滚，避免直接覆盖正在运行的目录。 |
+| **可回滚发布** | 产品版本统一为 v3.0.0，wire protocol 为 v37。构建和部署同时校验产品版本与协议版本；VPS 使用不可变 release、独立 venv、原子 `current` 切换和失败回滚，避免直接覆盖正在运行的目录。 |
 
 > **信任边界没有改变：**模型账号、API key、会话源文件和工具执行仍留在
 > wrapper 所在机器；VPS relay 不保存对话或 Artifact。浏览历史只读取本地
@@ -166,8 +166,9 @@ Code 会话按两家 CLI 的真实控制面协同，不替换官方命令：
   `npx @deepseek-ai/dsh@0.1.0-rc.6 web`。首版适配固定于这个 RC；升级 DSH 前需重新
   验证 RPC、事件日志和打断契约。
   wrapper 默认只探测 `http://127.0.0.1:3080`，健康时才在 Code 引擎选择器中显示
-  DSH。Remote 支持会话、新建/恢复、历史、图片、模型与思考强度、引导、打断、派生、
-  重命名、置顶和归档；新建时还可选择 DSH 的 Agent Preset。
+  DSH。Remote 支持会话、新建/恢复、历史、图片、模型与思考强度、上下文占用、引导、
+  打断、派生、重命名、置顶和归档；新建时可选择 Agent Preset，进入会话后标题会显示
+  该固定 Preset，左下角权限选择器可切换 DSH 为当前 Agent 公布的会话权限预设。
 - **DSH 插件边界：**插件仍由 DSH/Cordis 在本机负责安装、启停、组合、权限、配置和
   凭据。cc-remote 不加载插件前端，也不复制插件管理器；它只读展示当前 Agent 的有效
   Skills，并把插件工具、Hook、子 Agent 与标记为可忽略的未知事件降级渲染为通用
@@ -480,12 +481,12 @@ npm --prefix web run build   # 产出 web/dist/
 
 > 现在网页**不再把 token 烤进 JS**：登录改为向中继 POST 口令换取短期会话 token。所以构建不需要任何 `VITE_*` 变量。
 
-> **升级到协议 v36**：线协议会严格拒绝版本不一致。请在同一次维护窗口部署
+> **升级到协议 v37**：线协议会严格拒绝版本不一致。请在同一次维护窗口部署
 > `cc_remote/` 和新的 `web/dist/`，然后依次重启 relay、wrapper；不要新旧版本滚动混跑。
 > 升级期间已有 WebSocket 会短暂重连，relay 重启也会要求浏览器重新登录。已打开的
 > 旧版页面必须做一次**硬刷新**（重新加载新的带 hash 静态资源），仅重新登录不够。
-> 手工发布时先停本机 wrapper，再停服更新 relay + web，最后启动 v36 relay 和
-> v36 wrapper；这样旧 wrapper 不会占住同一 `machine_id` 的连接槽。若从 v34 以前的
+> 手工发布时先停本机 wrapper，再停服更新 relay + web，最后启动 v37 relay 和
+> v37 wrapper；这样旧 wrapper 不会占住同一 `machine_id` 的连接槽。若从 v34 以前的
 > 版本跨级升级，仍须执行 v34 引入的 Work SQLite 迁移保护：启动新 wrapper 前用
 > `deploy/work_registry_snapshot.py snapshot` 保存两个注册表。回滚时先停新版本、恢复
 > 该快照，再切回旧代码；不要在 wrapper 运行时只复制主 `.sqlite3` 文件而漏掉 WAL。
@@ -542,7 +543,7 @@ sudo bash ~/cc-remote-upload/deploy/setup-vps.sh \
 脚本会：装 `python3-venv` + Caddy、建 `ccremote` 系统用户、创建不可变 release
 和 release-local venv、合并 Caddy 配置、原子切换 `current`，再重启 relay。若新
 relay 重启或健康检查失败，`current`、Caddyfile、systemd unit 会作为一个事务全部
-恢复，并验证旧 release 的 `/healthz`。成功后再启动 v36 wrapper。
+恢复，并验证旧 release 的 `/healthz`。成功后再启动 v37 wrapper。
 
 验证：
 

@@ -338,6 +338,10 @@ body{
   color:color-mix(in srgb,var(--profile-color) 72%,var(--text));
   font:650 9px/1 var(--mono); letter-spacing:.035em; flex:none; }
 .work-profile-owner .profile-tone{ width:6px; height:6px; }
+.dsh-agent-preset{ display:inline-flex; align-items:center; min-width:0; max-width:112px;
+  height:19px; padding:0 7px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  border:1px solid var(--border); border-radius:6px; color:var(--dim);
+  background:var(--raised); font:600 9px/1 var(--mono); letter-spacing:.015em; flex:none; }
 
 /* CONNECTION BANNER */
 .banner{ display:none; align-items:center; gap:8px;
@@ -615,6 +619,7 @@ button.message-image-error{ font:inherit; cursor:pointer; }
 .plan-progress-trigger[aria-expanded="true"]{ background:var(--accent-weak); }
 .plan-progress-trigger.complete{ color:var(--ok); }
 .plan-progress-trigger.failed{ color:var(--danger); }
+.plan-progress-trigger.stale{ color:var(--faint); }
 .plan-progress-ring{ --plan-progress:0deg; position:relative; width:24px; height:24px; display:grid;
   place-items:center; border-radius:50%; background:conic-gradient(currentColor var(--plan-progress),var(--border-strong) 0); }
 .plan-progress-ring::before{ content:""; position:absolute; inset:3px; border-radius:50%; background:var(--bg); }
@@ -634,6 +639,7 @@ button.message-image-error{ font:inherit; cursor:pointer; }
   border-radius:9px; color:var(--accent); background:var(--accent-weak); }
 .plan-progress-mark.complete{ color:var(--ok); background:var(--ok-weak); }
 .plan-progress-mark.failed{ color:var(--danger); background:var(--danger-weak); }
+.plan-progress-mark.stale{ color:var(--faint); background:var(--surface-soft); }
 .plan-progress-content>p{ margin:10px 1px 8px; color:var(--dim); font-size:11.5px;
   line-height:1.45; white-space:pre-wrap; overflow-wrap:anywhere; }
 .plan-progress-fallback{ margin:9px 0 0; padding:9px 10px; border-radius:9px; overflow:auto;
@@ -648,6 +654,7 @@ button.message-image-error{ font:inherit; cursor:pointer; }
 .plan-progress-content li.plan-step-completed{ color:var(--faint); }
 .plan-progress-content li.plan-step-completed>span:first-child{ color:var(--ok); }
 .plan-progress-content li.plan-step-inProgress{ color:var(--text); background:var(--accent-weak); font-weight:600; }
+.plan-progress-content.stale li.plan-step-inProgress{ color:var(--dim); background:transparent; font-weight:400; }
 .plan-progress-content li.plan-step-inProgress>span:first-child i{ width:8px; height:8px; border-radius:50%;
   background:var(--accent); box-shadow:0 0 0 4px color-mix(in srgb,var(--accent) 16%,transparent); animation:pulse 1.4s ease-in-out infinite; }
 .plan-progress-content li.plan-step-pending>span:first-child em{ font-style:normal; font:9.5px/1 var(--mono); }

@@ -42,6 +42,7 @@ class DshHistoryPage:
     newest_id: str | None
     last_seq: int
     projections: dict[str, Any]
+    projection_seq: int
     translator: DshStreamTranslator
 
 
@@ -298,8 +299,20 @@ class DshHistory:
             projections.get("values")
             if isinstance(projections, dict) else {}
         )
-        if not isinstance(projection_values, dict):
-            projection_values = {}
+        projection_seq = (
+            projections.get("asOfSeq")
+            if isinstance(projections, dict) else -1
+        )
+        if (
+            not isinstance(projection_values, dict)
+            or not isinstance(projection_seq, int)
+            or isinstance(projection_seq, bool)
+            or projection_seq < -1
+            or projection_seq > 9_007_199_254_740_991
+        ):
+            raise DshProtocolError(
+                "session.history returned invalid projections"
+            )
         return DshHistoryPage(
             events=tuple(translated),
             turns=turns,
@@ -308,6 +321,7 @@ class DshHistory:
             newest_id=turns[-1].id if turns else None,
             last_seq=last_seq,
             projections=dict(projection_values),
+            projection_seq=projection_seq,
             translator=translator,
         )
 

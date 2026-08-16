@@ -441,3 +441,100 @@ async def test_model_switch_drops_an_effort_the_target_does_not_support():
 
     assert client.selected_payload["reasoningEffort"] == "low"
     assert handle.effort == "low"
+
+
+def test_session_projections_are_bounded_and_newer_sequence_wins():
+    handle = DshSessionHandle(object(), "native-session", "/tmp")
+    assert handle.apply_projections({
+        "permissions": {
+            "options": [
+                {"value": "workspace-write", "name": "workspace-write"},
+                {"value": "custom", "name": "Custom"},
+            ],
+            "currentValue": "custom",
+        },
+        "contextPressure": {
+            "pressureTokens": 10,
+            "projectedTokens": 12,
+            "contextWindow": 100,
+        },
+    }, 7) == {"permissions", "contextPressure"}
+    assert handle.permission_mode == "custom"
+    assert [row["id"] for row in handle.permission_options] == [
+        "workspace-write",
+    ]
+    assert handle.permission_options[0]["name"] == "Workspace Write"
+    assert handle.context_pressure["projectedTokens"] == 12
+
+    assert handle.apply_projection(
+        "contextPressure",
+        {"projectedTokens": 3, "contextWindow": 100},
+        6,
+    ) is False
+    assert handle.context_pressure["projectedTokens"] == 12
+    with pytest.raises(DshProtocolError, match="conflicts"):
+        handle.apply_projection(
+            "contextPressure",
+            {"projectedTokens": 13, "contextWindow": 100},
+            7,
+        )
+    with pytest.raises(DshProtocolError, match="omitted its current option"):
+        handle.apply_projection("permissions", {
+            "options": [
+                {"value": "workspace-write", "name": "workspace-write"},
+            ],
+            "currentValue": "missing",
+        }, 8)
+    with pytest.raises(DshProtocolError, match="invalid sequence"):
+        handle.apply_projection(
+            "contextPressure",
+            {"projectedTokens": 13, "contextWindow": 100},
+            9_007_199_254_740_992,
+        )
+
+
+@pytest.mark.asyncio
+async def test_permission_switch_reconciles_lost_receipt_without_reexecution():
+    class StubClient:
+        def __init__(self):
+            self.history_reads = 0
+            self.command_calls = 0
+
+        async def call(self, method, payload, **_kwargs):
+            if method == "session.history":
+                self.history_reads += 1
+                current = (
+                    "danger-full-access"
+                    if self.command_calls else "workspace-write"
+                )
+                return {
+                    "events": [],
+                    "hasMore": False,
+                    "projections": {
+                        "asOfSeq": self.history_reads + self.command_calls,
+                        "values": {"permissions": {
+                            "options": [
+                                {"value": "workspace-write", "name": "workspace-write"},
+                                {"value": "danger-full-access", "name": "danger-full-access"},
+                            ],
+                            "currentValue": current,
+                        }},
+                    },
+                }
+            assert method == "commands/execute"
+            assert payload["args"]["line"] == "/permission danger-full-access"
+            self.command_calls += 1
+            raise DshUnavailable("receipt lost after commit")
+
+    client = StubClient()
+    handle = DshSessionHandle(client, "native-session", "/tmp")
+
+    assert await handle.set_permission_mode(
+        "danger-full-access", rpc_id="permission-1",
+    ) == "danger-full-access"
+    # A reliable retry reads the already-applied projection and returns without
+    # executing the non-idempotent native command a second time.
+    assert await handle.set_permission_mode(
+        "danger-full-access", rpc_id="permission-1",
+    ) == "danger-full-access"
+    assert client.command_calls == 1

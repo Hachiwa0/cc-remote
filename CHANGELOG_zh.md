@@ -4,6 +4,10 @@
 
 ## 未发布
 
+- Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v37。DSH 会话现在会在通用
+  上下文入口显示原生上下文投影，在 Code 标题中标明不可变的 Agent Preset，并把
+  当前 Agent 提供的权限选项同步到左下角通用选择器；切换后通过 DSH 原生权限命令
+  真实作用于当前会话。
 - Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v36，并新增可选的第三个
   Code 后端 DeepSeek Harness。仅 loopback 的适配器提供会话、流式过程、历史分页、
   图片、模型/思考强度、Agent Preset、有效 Skills、引导/打断、派生、重命名、置顶和

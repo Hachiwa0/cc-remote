@@ -763,7 +763,10 @@ export class RelayWs {
   }
 
   sendSetPerm(mode: string): void {
-    this.send({ v: PROTOCOL_VERSION, type: "set_perm", mode, ts: nowTs(), ...this.sidObj() });
+    this.send({
+      v: PROTOCOL_VERSION, type: "set_perm", mode,
+      engine: this.activeEngine, ts: nowTs(), ...this.sidObj(),
+    });
   }
 
   sendGetPermissionProfiles(

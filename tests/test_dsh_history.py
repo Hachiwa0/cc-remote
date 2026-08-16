@@ -313,6 +313,21 @@ async def test_history_rejects_an_event_count_beyond_the_cpu_bound():
         await history.page("session-a", before=None, limit=4)
 
 
+@pytest.mark.asyncio
+async def test_history_rejects_an_unbounded_projection_sequence():
+    history = DshHistory(FakeClient({
+        "events": [],
+        "hasMore": False,
+        "projections": {
+            "asOfSeq": 9_007_199_254_740_992,
+            "values": {},
+        },
+    }))  # type: ignore[arg-type]
+
+    with pytest.raises(DshProtocolError, match="invalid projections"):
+        await history.page("session-a", before=None, limit=4)
+
+
 def test_detail_cache_is_bounded_by_entries_and_bytes():
     history = DshHistory(FakeClient({}))  # type: ignore[arg-type]
     history.DETAIL_CACHE_ENTRIES = 2

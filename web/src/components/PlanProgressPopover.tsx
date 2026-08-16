@@ -24,9 +24,9 @@ export function PlanProgressContent({ block, detailLoading = false }: {
 }) {
   const presentation = planProgressPresentation(block, detailLoading);
   const steps = block.plan ?? [];
-  return <div className="plan-progress-content">
+  return <div className={`plan-progress-content${presentation.stale ? " stale" : ""}`}>
     <header>
-      <span className={`plan-progress-mark${presentation.complete ? " complete" : ""}${presentation.failed ? " failed" : ""}`}>
+      <span className={`plan-progress-mark${presentation.complete ? " complete" : ""}${presentation.failed ? " failed" : ""}${presentation.stale ? " stale" : ""}`}>
         <Icon name={presentation.complete ? "verify" : "plan"} size={15} />
       </span>
       <span>
@@ -125,7 +125,7 @@ export function PlanProgressPopover({ block, openOverride, onOpenChange,
 
   return <div ref={rootRef} className="plan-progress-control">
     <button type="button"
-      className={`plan-progress-trigger${presentation.complete ? " complete" : ""}${presentation.failed ? " failed" : ""}`}
+      className={`plan-progress-trigger${presentation.complete ? " complete" : ""}${presentation.failed ? " failed" : ""}${presentation.stale ? " stale" : ""}`}
       aria-expanded={open} aria-controls={labelId}
       aria-label={`查看计划进度，${presentation.progressLabel}`}
       title={`计划进度 · ${presentation.progressLabel}`}

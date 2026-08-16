@@ -1252,6 +1252,7 @@ def test_codex_turn_detail_lazily_recovers_missing_official_image_view(
         ctx = _mk_ctx("session-image-view", "session-image-view")
         ctx.engine = "codex"
         machine.sessions[ctx.key] = ctx
+
         revision = machine._history_revision("session-image-view")
 
         detail = await machine._handle_get_turn_detail(SimpleNamespace(
@@ -1441,8 +1442,8 @@ def test_requested_codex_summary_uses_official_turns_without_rollout_parse(
     asyncio.run(run())
 
 
-def test_codex_plan_snapshot_survives_native_summary_omission():
-    """A fresh browser recovers a live plan absent from app-server history."""
+def test_codex_plan_snapshot_recovers_as_settled_after_native_terminal():
+    """A stale Plan remains auditable without impersonating active work."""
     events = (
         UserMsg(
             sid="plan-summary", msg_id="user-1", prompt="implement",
@@ -1471,6 +1472,15 @@ def test_codex_plan_snapshot_survives_native_summary_omission():
         ctx = _mk_ctx("plan-summary", "plan-summary")
         ctx.engine = "codex"
         machine.sessions[ctx.key] = ctx
+
+        async def terminal_snapshot(_sid, _revision):
+            return (CodexTerminalFence(
+                turn_id="native-1",
+                status="completed",
+                duration_ms=1000,
+            ),)
+
+        machine._codex_terminal_snapshot = terminal_snapshot
 
         await machine._emit_locked(ctx, TurnPlan(
             item_id="plan:native-1",
@@ -1505,13 +1515,18 @@ def test_codex_plan_snapshot_survives_native_summary_omission():
         assert plans[0]["item_id"] == "plan:native-1"
         assert plans[0]["plan"][1] == {
             "step": "implement", "status": "inProgress"}
+        assert plans[0]["done"] is True
+        assert plans[0]["status"] == "succeeded"
+        repaired = machine._session_plans.get("plan-summary")
+        assert repaired is not None
+        assert repaired.terminal_status == "succeeded"
         assert history.to == "client-1"
         assert transport.sent[-1] is history
 
     asyncio.run(run())
 
 
-def test_codex_next_user_boundary_retires_only_completed_plan_snapshot():
+def test_codex_next_user_boundary_retires_only_settled_plan_snapshot():
     async def run():
         machine, _transport = _mk_machine()
         ctx = _mk_ctx("plan-lifecycle", "plan-lifecycle")
@@ -1550,9 +1565,30 @@ def test_codex_next_user_boundary_retires_only_completed_plan_snapshot():
                 {"step": "fix", "status": "inProgress"},
             ],
         ))
-        await machine._emit_locked(ctx, UserMsg(
-            msg_id="turn-4", prompt="clarification"))
+        await machine._emit_locked(ctx, TurnEnd(
+            turn_id="turn-3",
+            result=TurnResult(
+                subtype="steered", duration_ms=0, is_error=False),
+        ))
+        steered = machine._session_plans.get("plan-lifecycle")
+        assert steered is not None
+        assert steered.terminal_status is None
+        await machine._emit_locked(ctx, TurnSteered(
+            msg_id="turn-4", turn_id="turn-3", prompt="clarification"))
         assert machine._session_plans.get("plan-lifecycle") is not None
+
+        await machine._emit_locked(ctx, TurnEnd(
+            turn_id="turn-3",
+            result=TurnResult(
+                subtype="success", duration_ms=1000, is_error=False),
+        ))
+        terminal = machine._session_plans.get("plan-lifecycle")
+        assert terminal is not None
+        assert terminal.terminal_status == "succeeded"
+        assert terminal.complete is False
+        await machine._emit_locked(ctx, UserMsg(
+            msg_id="turn-4b", prompt="new task after terminal"))
+        assert machine._session_plans.get("plan-lifecycle") is None
 
         await machine._emit_locked(ctx, TurnPlan(
             item_id="plan:turn-5",
@@ -1565,6 +1601,48 @@ def test_codex_next_user_boundary_retires_only_completed_plan_snapshot():
         assert machine._session_plans.get("plan-lifecycle") is None
 
     asyncio.run(run())
+
+
+def test_materialized_steer_keeps_plan_open_until_exact_terminal():
+    def projection(subtype: str):
+        return materialize_history_turns([
+            {"type": "user_msg", "msg_id": "user-1", "prompt": "work"},
+            {
+                "type": "turn_plan",
+                "item_id": "plan:turn-1",
+                "turn_id": "turn-1",
+                "plan": [
+                    {"step": "inspect", "status": "completed"},
+                    {"step": "fix", "status": "inProgress"},
+                ],
+            },
+            {
+                "type": "turn_end",
+                "turn_id": "turn-1",
+                "result": {
+                    "subtype": subtype,
+                    "duration_ms": 0,
+                    "is_error": False,
+                },
+            },
+        ], include_live_detail=True)
+
+    steered = projection("steered")[0]
+    steered_plan = next(
+        block for block in steered["blocks"]
+        if block.get("processKind") == "plan"
+    )
+    assert steered["done"] is True
+    assert steered_plan["done"] is False
+    assert steered_plan["status"] == "running"
+
+    completed = projection("success")[0]
+    completed_plan = next(
+        block for block in completed["blocks"]
+        if block.get("processKind") == "plan"
+    )
+    assert completed_plan["done"] is True
+    assert completed_plan["status"] == "succeeded"
 
 
 @pytest.mark.parametrize("plan_turn_id", ["native-1", None])
@@ -5008,6 +5086,69 @@ def test_newest_history_builds_are_monotonic_and_capture_live_seq(monkeypatch):
         assert older.live_seq == 7
         assert newer.live_seq == 8
         assert page.build_seq == newer.build_seq
+
+    asyncio.run(go())
+
+
+def test_official_codex_history_captures_live_seq_before_async_read():
+    """An old idle page must not outrank a first-turn running event.
+
+    Automatic compaction can leave the official history read in flight long
+    enough for the first managed turn to start.  The page must retain the
+    sequence observed with its idle lifecycle snapshot, rather than borrowing
+    the newer sequence after the await and falsely settling that live turn.
+    """
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    class Official:
+        async def summary_page(self, _sid, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                entered.set()
+                await release.wait()
+            return CodexHistoryPage(
+                events=(),
+                turns=(),
+                has_more=False,
+                oldest_id=None,
+                newest_id=None,
+            )
+
+    async def go():
+        machine, _ = _mk_machine()
+        machine._codex_history = Official()
+        machine._codex_rollout_for_wire = lambda _sid: None
+        ctx = _mk_ctx("official-seq-race", "official-seq-race")
+        ctx.engine = "codex"
+        ctx.state = "idle"
+        ctx.seq = 7
+        machine.sessions[ctx.key] = ctx
+
+        older_task = asyncio.create_task(
+            machine._build_official_codex_history(
+                "official-seq-race", before=None, limit=4,
+            )
+        )
+        await asyncio.wait_for(entered.wait(), timeout=2)
+
+        # This represents the sequenced StateEvent(state="running") emitted
+        # while the cold history page is still waiting on app-server I/O.
+        ctx.state = "running"
+        ctx.seq = 8
+        newer = await machine._build_official_codex_history(
+            "official-seq-race", before=None, limit=4,
+        )
+        release.set()
+        older = await older_task
+
+        assert older.build_seq < newer.build_seq
+        assert older.in_progress is False
+        assert older.live_seq == 7
+        assert newer.in_progress is True
+        assert newer.live_seq == 8
 
     asyncio.run(go())
 

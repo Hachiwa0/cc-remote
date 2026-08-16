@@ -695,8 +695,13 @@ class DshSessionHandle:
         self.model = model
         self.effort = effort
         self.agent_preset = agent_preset
-        # Generic wrapper presentation reads this field for non-Codex engines.
-        self.permission_mode = "bypassPermissions"
+        # These are DSH session projections, not cc-remote defaults.  Keep them
+        # unknown until the host supplies the selected Agent's actual values.
+        self.permission_mode = ""
+        self.permission_options: tuple[dict[str, Any], ...] = ()
+        self.context_pressure: dict[str, int] = {}
+        self.context_breakdown: dict[str, int] = {}
+        self._projection_seq: dict[str, int] = {}
 
     async def disconnect(self) -> None:
         return None
@@ -869,6 +874,233 @@ class DshSessionHandle:
             text=result.get("text"),
             source_event_seq=source_seq,
         )
+
+    @staticmethod
+    def _projection_integer(value: Any, *, field: str) -> int:
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 0
+            or value > 9_007_199_254_740_991
+        ):
+            raise DshProtocolError(
+                f"DSH projection has an invalid {field} value"
+            )
+        return value
+
+    @classmethod
+    def _permission_projection(
+        cls, value: Any,
+    ) -> tuple[str, tuple[dict[str, Any], ...]]:
+        if not isinstance(value, dict):
+            raise DshProtocolError("DSH permissions projection is invalid")
+        current = value.get("currentValue")
+        options = value.get("options")
+        if (
+            not isinstance(current, str)
+            or not 0 < len(current) <= 256
+            or not isinstance(options, list)
+            or len(options) > 64
+        ):
+            raise DshProtocolError("DSH permissions projection is invalid")
+        projected: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for option in options:
+            if not isinstance(option, dict):
+                raise DshProtocolError(
+                    "DSH permissions projection has an invalid option"
+                )
+            option_id = option.get("value")
+            name = option.get("name")
+            description = option.get("description")
+            if (
+                not isinstance(option_id, str)
+                or not 0 < len(option_id) <= 256
+                or not isinstance(name, str)
+                or not 0 < len(name) <= 256
+                or option_id in seen
+                or (
+                    description is not None
+                    and (
+                        not isinstance(description, str)
+                        or len(description) > 2048
+                    )
+                )
+            ):
+                raise DshProtocolError(
+                    "DSH permissions projection has an invalid option"
+                )
+            seen.add(option_id)
+            # ``custom`` is a derived display state in DSH and cannot be a
+            # command target.  Preserve it as the current mode, never as a
+            # selectable row.
+            if option_id == "custom":
+                continue
+            display_name = (
+                "Full Access"
+                if option_id == "danger-full-access"
+                else " ".join(
+                    word[:1].upper() + word[1:]
+                    for word in name.split("-")
+                )
+                if re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", name)
+                else name
+            )
+            projected.append({
+                "id": option_id,
+                "name": display_name,
+                **(
+                    {"description": description}
+                    if description is not None else {}
+                ),
+                "danger": option_id == "danger-full-access",
+            })
+        if current not in seen:
+            raise DshProtocolError(
+                "DSH permissions projection omitted its current option"
+            )
+        return current, tuple(projected)
+
+    @classmethod
+    def _context_pressure_projection(cls, value: Any) -> dict[str, int]:
+        if not isinstance(value, dict):
+            raise DshProtocolError("DSH contextPressure projection is invalid")
+        projected: dict[str, int] = {}
+        for field in ("pressureTokens", "projectedTokens", "contextWindow"):
+            raw = value.get(field)
+            if raw is not None:
+                projected[field] = cls._projection_integer(raw, field=field)
+        return projected
+
+    @classmethod
+    def _context_breakdown_projection(cls, value: Any) -> dict[str, int]:
+        if not isinstance(value, dict):
+            raise DshProtocolError("DSH contextBreakdown projection is invalid")
+        projected: dict[str, int] = {}
+        for field in ("systemTokens", "toolsTokens", "messageTokens"):
+            raw = value.get(field)
+            if raw is None:
+                continue
+            projected[field] = cls._projection_integer(raw, field=field)
+        return projected
+
+    def apply_projection(self, key: str, value: Any, seq: int) -> bool:
+        """Apply one DSH last-wins projection without letting an older page
+        overwrite a newer mux frame.  Returns whether the visible value changed.
+        """
+        if (
+            not isinstance(seq, int)
+            or isinstance(seq, bool)
+            or seq < -1
+            or seq > 9_007_199_254_740_991
+        ):
+            raise DshProtocolError("DSH projection has an invalid sequence")
+        if key == "permissions":
+            parsed: Any = self._permission_projection(value)
+            current_value: Any = (
+                self.permission_mode, self.permission_options
+            )
+        elif key == "contextPressure":
+            parsed = self._context_pressure_projection(value)
+            current_value = self.context_pressure
+        elif key == "contextBreakdown":
+            parsed = self._context_breakdown_projection(value)
+            current_value = self.context_breakdown
+        else:
+            return False
+        previous_seq = self._projection_seq.get(key, -2)
+        if seq < previous_seq:
+            return False
+        if seq == previous_seq and parsed != current_value:
+            raise DshProtocolError(
+                f"DSH {key} projection conflicts at sequence {seq}"
+            )
+        self._projection_seq[key] = seq
+        if parsed == current_value:
+            return False
+        if key == "permissions":
+            self.permission_mode, self.permission_options = parsed
+        elif key == "contextPressure":
+            self.context_pressure = parsed
+        else:
+            self.context_breakdown = parsed
+        return True
+
+    def apply_projections(
+        self, values: Mapping[str, Any], seq: int,
+    ) -> set[str]:
+        changed: set[str] = set()
+        for key in ("permissions", "contextPressure", "contextBreakdown"):
+            if key in values and self.apply_projection(key, values[key], seq):
+                changed.add(key)
+        return changed
+
+    async def refresh_projections(self) -> set[str]:
+        """Read the host-folded session projections without creating a turn."""
+        raw = await self.client.call("session.history", {
+            "sessionId": self.session_id,
+            "maxMessages": 8,
+        })
+        if not isinstance(raw, dict):
+            raise DshProtocolError("session.history did not return an object")
+        projections = raw.get("projections")
+        if projections is None:
+            return set()
+        if not isinstance(projections, dict):
+            raise DshProtocolError("session.history projections are invalid")
+        seq = projections.get("asOfSeq")
+        values = projections.get("values")
+        if (
+            not isinstance(seq, int)
+            or isinstance(seq, bool)
+            or seq < -1
+            or seq > 9_007_199_254_740_991
+            or not isinstance(values, dict)
+        ):
+            raise DshProtocolError("session.history projections are invalid")
+        return self.apply_projections(values, seq)
+
+    async def set_permission_mode(self, mode: str, *, rpc_id: str) -> str:
+        """Switch one live DSH session through its native /permission command.
+
+        The projection is read before execution so a reliable retry becomes a
+        no-op after a lost success receipt, and again afterwards so Web only
+        announces a value the durable DSH log actually confirms.
+        """
+        if not isinstance(mode, str) or not 0 < len(mode) <= 256:
+            raise ValueError("invalid DSH permission preset")
+        await self.refresh_projections()
+        allowed = {option["id"] for option in self.permission_options}
+        if mode not in allowed:
+            raise ValueError("DSH permission preset is not selectable")
+        if self.permission_mode == mode:
+            return mode
+        receipt_error: DshError | None = None
+        try:
+            execution = await self.execute_command(
+                f"/permission {mode}", rpc_id=rpc_id,
+            )
+        except (DshUnavailable, DshProtocolError) as exc:
+            receipt_error = exc
+        else:
+            if execution.kind != "success":
+                raise DshRpcError(
+                    "permission-switch-failed",
+                    execution.text or "DSH rejected the permission preset",
+                )
+        try:
+            await self.refresh_projections()
+        except DshError:
+            if receipt_error is not None:
+                raise receipt_error
+            raise
+        if self.permission_mode != mode:
+            if receipt_error is not None:
+                raise receipt_error
+            raise DshProtocolError(
+                "DSH permission projection did not confirm the selection"
+            )
+        return mode
 
     async def cancel(self) -> Any:
         value = await self.client.call(

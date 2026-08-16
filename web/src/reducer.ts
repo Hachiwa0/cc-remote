@@ -12,6 +12,7 @@
 import type { ConnState, EventOwnership } from "./ws";
 import type {
   ServerEvent, SessionInfo, State, ContextReport, StatusReport, ThreadGoal,
+  PermissionModeInfo,
   QueryImg, QueryFile, DirEntry, AssistantChannel, ProcessStatus,
   CollaborationModeName, Notice, RateLimitUpdate,
   StatusRateLimit, StatusRateWindow, SessionControl, PermissionProfileInfo,
@@ -204,6 +205,7 @@ export interface SessionRuntime {
   model: string;
   effort: string;
   perm: string;
+  permOptions: PermissionModeInfo[] | null;
   permissionProfile: string | null;
   permissionProfiles: PermissionProfileInfo[] | null;
   webSearch: "cached" | "live" | null;
@@ -424,7 +426,7 @@ export function createRuntime(): SessionRuntime {
     // has not heard them yet, so keep them unknown instead of briefly claiming a
     // model, effort, or permission policy that may not match the native CLI.
     turns: [], state: "idle", mirroredRunning: false,
-    model: "", effort: "", perm: "",
+    model: "", effort: "", perm: "", permOptions: null,
     permissionProfile: null, permissionProfiles: null, webSearch: null,
     collaborationMode: "default",
     fast: null,
@@ -1469,10 +1471,13 @@ function finishOpenBlocks(
   turn: Turn,
   status: "succeeded" | "failed" | "interrupted",
   isError: boolean,
+  preserveOpenPlans = false,
 ): void {
-  finishOpenBlockList(mutableTurnBlocks(turn), status, isError);
+  finishOpenBlockList(
+    mutableTurnBlocks(turn), status, isError, preserveOpenPlans);
   if (turn.detailProjection) {
-    finishOpenBlockList(turn.detailProjection.blocks, status, isError);
+    finishOpenBlockList(
+      turn.detailProjection.blocks, status, isError, preserveOpenPlans);
   }
 }
 
@@ -1481,7 +1486,10 @@ function finishCompletedTurnChildren(turn: Turn): void {
   if (!turn.done) return;
   const status = turn.interrupted
     ? "interrupted" : turn.error ? "failed" : "succeeded";
-  finishOpenBlocks(turn, status, status !== "succeeded");
+  // A summary/cache row can be a neutral Codex steer segment. Its open Plan
+  // deliberately spans the following user clarification; only an exact live
+  // terminal or lifecycle fence may settle that Plan.
+  finishOpenBlocks(turn, status, status !== "succeeded", true);
 }
 
 /** Close only one newly-installed detail projection. A completed turn may have
@@ -1493,7 +1501,10 @@ function finishOpenDetailBlocks(
   isError: boolean,
 ): void {
   if (turn.detailProjection) {
-    finishOpenBlockList(turn.detailProjection.blocks, status, isError);
+    // Exact terminal translations already close their Plan. Preserve an open
+    // one because it identifies a neutral Codex steer segment.
+    finishOpenBlockList(
+      turn.detailProjection.blocks, status, isError, true);
   }
 }
 
@@ -1501,11 +1512,13 @@ function finishOpenBlockList(
   blocks: Block[],
   status: "succeeded" | "failed" | "interrupted",
   isError: boolean,
+  preserveOpenPlans = false,
 ): void {
   for (const block of blocks) {
     if (block.kind === "text") {
       block.done = true;
     } else if (block.kind === "process" && !block.done) {
+      if (preserveOpenPlans && block.processKind === "plan") continue;
       block.done = true;
       if (!terminalProcessStatus(block.status)) block.status = status;
     } else if (block.kind === "tool" && !block.done) {
@@ -4655,7 +4668,10 @@ function reduceEvent(
       };
     }
     case "perm":
-      return patch(state, e.sid, (rt) => { rt.perm = e.mode; });
+      return patch(state, e.sid, (rt) => {
+        rt.perm = e.mode;
+        rt.permOptions = e.options ?? null;
+      });
     case "permission_profile":
       return patch(state, e.sid, (rt) => {
         rt.permissionProfile = e.profile ?? null;
@@ -5600,8 +5616,12 @@ function reduceEvent(
           // without a client-side start time (i.e. everything after a refresh,
           // where turns come from history replay). Fall back to start time, then now.
           t.doneTs = e.ts ? Math.round(e.ts * 1000) : (t.ts || Date.now());
-          finishOpenBlocks(t, e.result.is_error ? "interrupted" : "succeeded",
-            e.result.is_error);
+          finishOpenBlocks(
+            t,
+            e.result.is_error ? "interrupted" : "succeeded",
+            e.result.is_error,
+            e.result.subtype === "steered",
+          );
           if (t.liveBlocksSpilled) {
             // Refresh the newest source-backed page at the terminal boundary.
             // If a running snapshot is already in flight, keep this pending

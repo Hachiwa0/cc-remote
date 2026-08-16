@@ -417,7 +417,7 @@ def test_sdk_controls_persist_for_next_broker_resume(monkeypatch, tmp_path):
         machine._claude_broker = Client()
         machine._claude_broker_enabled = True
 
-        async def ready(_ctx, *, action):
+        async def ready(_ctx, *, action, **_envelope):
             assert action
             return None
 

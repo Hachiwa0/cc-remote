@@ -455,6 +455,7 @@ def materialize_history_turns(
         fork_point = None
         checkpoint_id = None
         done = False
+        steered = False
         interrupted = False
         error = None
         channels: dict[str, str] = {}
@@ -552,6 +553,7 @@ def materialize_history_turns(
                 result = event.get("result")
                 if isinstance(result, dict):
                     subtype = str(result.get("subtype") or "")
+                    steered = subtype == "steered"
                     if (
                         subtype != "steered"
                         and isinstance(result.get("duration_ms"), int)
@@ -749,6 +751,12 @@ def materialize_history_turns(
                 )
                 for block in candidates:
                     if block.get("done"):
+                        continue
+                    if (
+                        steered
+                        and block.get("kind") == "process"
+                        and block.get("processKind") == "plan"
+                    ):
                         continue
                     block["done"] = True
                     if block.get("kind") == "process":

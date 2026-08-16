@@ -8,6 +8,7 @@ import pytest
 
 from cc_remote.protocol import (
     ERR_FORK_RECONCILING,
+    ERR_BAD_PROMPT,
     ERR_NOT_STEERABLE,
     ERR_PROTOCOL,
     ERR_STEER_UNKNOWN,
@@ -26,13 +27,18 @@ from cc_remote.protocol import (
     Query,
     RenameSession,
     SetEffort,
+    SetPerm,
     Steer,
     SwitchSession,
     TurnEnd,
     UserMsg,
 )
 from cc_remote.wrapper import machine as machine_module
-from cc_remote.wrapper.dsh_client import DshSessionHandle, DshUnavailable
+from cc_remote.wrapper.dsh_client import (
+    DshRpcError,
+    DshSessionHandle,
+    DshUnavailable,
+)
 from cc_remote.wrapper.dsh_forks import DshForkJournalError
 from cc_remote.wrapper.dsh_history import DshHistoryPage
 from cc_remote.wrapper.dsh_stream import DshStreamTranslator
@@ -49,6 +55,7 @@ class _DshClient:
         fork_error: Exception | None = None,
         cancel_error: Exception | None = None,
         models_value: dict | None = None,
+        history_value: dict | None = None,
     ) -> None:
         self.running = running
         self.prompt_error = prompt_error
@@ -56,6 +63,7 @@ class _DshClient:
         self.fork_error = fork_error
         self.cancel_error = cancel_error
         self.models_value = models_value
+        self.history_value = history_value
         self.calls: list[tuple[str, dict, str | None]] = []
         self.response_errors: list[tuple[str, str]] = []
 
@@ -80,6 +88,12 @@ class _DshClient:
             return {"accepted": True}
         if method == "session.models" and self.models_value is not None:
             return self.models_value
+        if method == "session.history":
+            return self.history_value or {
+                "events": [],
+                "hasMore": False,
+                "projections": {"asOfSeq": -1, "values": {}},
+            }
         if method == "session.list":
             return {
                 "items": [{
@@ -139,6 +153,7 @@ def _history_page(*client_message_ids: str) -> DshHistoryPage:
                    if client_message_ids else None),
         last_seq=len(client_message_ids),
         projections={},
+        projection_seq=len(client_message_ids),
         translator=DshStreamTranslator(),
     )
 
@@ -272,6 +287,42 @@ def _install_running_session(machine, client: _DshClient, cwd: str = "/tmp"):
     ctx.sdk = DshSessionHandle(client, "native-session", cwd)
     machine.sessions[ctx.key] = ctx
     return ctx
+
+
+@pytest.mark.asyncio
+async def test_dsh_image_model_rejection_uses_explicit_user_copy():
+    machine, _transport = _mk_machine()
+    client = _DshClient(prompt_error=DshRpcError(
+        "attachment-error",
+        'Model "deepseek-v4-pro" does not support image input.',
+        details={"reason": "MODEL_DOES_NOT_SUPPORT_IMAGES"},
+    ))
+    history = _DshHistory(lambda: _history_page())
+    await _install_dsh(machine, client, history)
+    ctx = _install_running_session(machine, client)
+    ctx.state = "idle"
+    ctx.active_msg_id = None
+
+    result = await machine._handle_immediate_query(ctx, Query(
+        sid=ctx.key,
+        prompt="查看图片",
+        images=[{
+            "media_type": "image/png",
+            "data": (
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwC"
+                "AAAAC0lEQVR42mP8/x8AAusB9Y9ZQmcAAAAASUVORK5CYII="
+            ),
+        }],
+        msg_id="unsupported-image-message",
+        cmd_id="query-command",
+        client_id="client-1",
+    ))
+
+    assert isinstance(result, Error)
+    assert result.code == ERR_BAD_PROMPT
+    assert result.message == "当前 DSH 模型不支持图片输入。"
+    assert ctx.state == "idle"
+    assert client.calls[0][1]["content"][1]["type"] == "image"
 
 
 @pytest.mark.asyncio
@@ -616,7 +667,7 @@ async def test_dsh_live_acceptance_wins_over_an_older_idle_catalog_read():
 
 
 @pytest.mark.asyncio
-async def test_dsh_context_read_reports_unavailable_without_calling_sdk_api():
+async def test_dsh_context_read_reports_unavailable_before_projection_exists():
     machine, transport = _mk_machine()
     client = _DshClient()
     history = _DshHistory(lambda: _history_page())
@@ -634,7 +685,175 @@ async def test_dsh_context_read_reports_unavailable_without_calling_sdk_api():
     assert result.total_tokens == 0
     assert result.max_tokens == 0
     assert result.percentage == 0.0
-    assert client.calls == []
+    assert client.calls == [(
+        "session.history",
+        {"sessionId": "native-session", "maxMessages": 8},
+        None,
+    )]
+    assert transport.sent[-1] is result
+
+
+@pytest.mark.asyncio
+async def test_dsh_context_and_permissions_use_native_session_projections():
+    machine, transport = _mk_machine()
+    client = _DshClient(history_value={
+        "events": [],
+        "hasMore": False,
+        "projections": {
+            "asOfSeq": 12,
+            "values": {
+                "permissions": {
+                    "options": [
+                        {"value": "workspace-write", "name": "workspace-write"},
+                        {"value": "danger-full-access", "name": "danger-full-access"},
+                    ],
+                    "currentValue": "workspace-write",
+                },
+                "contextPressure": {
+                    "pressureTokens": 15000,
+                    "projectedTokens": 15854,
+                    "contextWindow": 1_000_000,
+                },
+                "contextBreakdown": {
+                    "systemTokens": 8893,
+                    "toolsTokens": 224,
+                    "messageTokens": 4345,
+                },
+            },
+        },
+    })
+    history = _DshHistory(lambda: _history_page())
+    await _install_dsh(machine, client, history)
+    ctx = _install_running_session(machine, client)
+
+    result = await machine._handle_get_context(GetContext(
+        sid=ctx.key,
+        cmd_id="context-command",
+        client_id="client-1",
+    ))
+
+    assert isinstance(result, ContextReport)
+    assert result.available is None
+    assert result.total_tokens == 15854
+    assert result.max_tokens == 1_000_000
+    assert result.percentage == pytest.approx(1.5854)
+    assert [row["name"] for row in result.categories] == [
+        "≈ 系统提示词", "≈ 工具", "≈ 消息",
+    ]
+    assert [row["tokens"] for row in result.categories] == [8893, 224, 4345]
+    permission = next(
+        event for event in transport.sent if event.type == "perm"
+    )
+    assert permission.mode == "workspace-write"
+    assert [option.id for option in permission.options or ()] == [
+        "workspace-write", "danger-full-access",
+    ]
+    assert [option.name for option in permission.options or ()] == [
+        "Workspace Write", "Full Access",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_dsh_live_permission_projection_updates_the_session_control():
+    machine, transport = _mk_machine()
+    client = _DshClient()
+    history = _DshHistory(lambda: _history_page())
+    await _install_dsh(machine, client, history)
+    ctx = _install_running_session(machine, client)
+    projection = {
+        "options": [
+            {"value": "workspace-write", "name": "workspace-write"},
+            {"value": "danger-full-access", "name": "danger-full-access"},
+        ],
+        "currentValue": "danger-full-access",
+    }
+
+    await machine._on_dsh_mux({
+        "rpcId": "projection-rpc",
+        "payload": {
+            "type": "session/projection",
+            "sessionId": "native-session",
+            "key": "permissions",
+            "value": projection,
+            "seq": 12,
+        },
+    })
+
+    assert ctx.sdk.permission_mode == "danger-full-access"
+    assert transport.sent[-1].type == "perm"
+    assert transport.sent[-1].mode == "danger-full-access"
+    assert transport.sent[-1].options[-1].name == "Full Access"
+    sent = len(transport.sent)
+    projection["currentValue"] = "workspace-write"
+    await machine._on_dsh_mux({
+        "rpcId": "older-projection-rpc",
+        "payload": {
+            "type": "session/projection",
+            "sessionId": "native-session",
+            "key": "permissions",
+            "value": projection,
+            "seq": 11,
+        },
+    })
+    assert ctx.sdk.permission_mode == "danger-full-access"
+    assert len(transport.sent) == sent
+
+
+@pytest.mark.asyncio
+async def test_dsh_permission_control_requires_engine_scope_and_confirms_projection():
+    class PermissionClient(_DshClient):
+        def __init__(self):
+            super().__init__()
+            self.current = "workspace-write"
+
+        async def call(
+            self, method, payload=None, *, rpc_id=None, no_timeout=False,
+        ):
+            body = dict(payload or {})
+            self.calls.append((method, body, rpc_id))
+            if method == "session.history":
+                return {
+                    "events": [],
+                    "hasMore": False,
+                    "projections": {"asOfSeq": len(self.calls), "values": {
+                        "permissions": {
+                            "options": [
+                                {"value": "workspace-write", "name": "workspace-write"},
+                                {"value": "danger-full-access", "name": "danger-full-access"},
+                            ],
+                            "currentValue": self.current,
+                        },
+                    }},
+                }
+            if method == "commands/execute":
+                assert no_timeout is True
+                assert body["args"]["line"] == "/permission danger-full-access"
+                self.current = "danger-full-access"
+                return {
+                    "commandId": "permission-command",
+                    "result": {"kind": "success", "sourceEventSeq": 20},
+                }
+            return await super().call(
+                method, payload, rpc_id=rpc_id, no_timeout=no_timeout,
+            )
+
+    machine, transport = _mk_machine()
+    client = PermissionClient()
+    history = _DshHistory(lambda: _history_page())
+    await _install_dsh(machine, client, history)
+    ctx = _install_running_session(machine, client)
+    ctx.state = "idle"
+
+    result = await machine._handle_set_perm(SetPerm(
+        sid=ctx.key,
+        engine="dsh",
+        mode="danger-full-access",
+        cmd_id="permission-scoped",
+        client_id="client-1",
+    ))
+    assert result.type == "perm"
+    assert result.mode == "danger-full-access"
+    assert result.options and result.options[-1].danger is True
     assert transport.sent[-1] is result
 
 
@@ -782,6 +1001,7 @@ async def test_dsh_interrupt_receipt_loss_does_not_force_a_running_turn_idle():
         newest_id=page.newest_id,
         last_seq=1,
         projections=page.projections,
+        projection_seq=1,
         translator=translator,
     )
     history = _DshHistory(lambda: active_page)

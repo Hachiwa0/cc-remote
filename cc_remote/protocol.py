@@ -28,7 +28,7 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 36
+PROTOCOL_VERSION = 37
 
 # Codex Desktop renders a 53-week daily token-activity calendar. Keep the wire
 # payload to that same bounded window so an account response can never turn a
@@ -69,6 +69,9 @@ EffortName = Annotated[str, StringConstraints(min_length=1, max_length=64)]
 PermissionMode = Literal[
     "default", "acceptEdits", "plan", "auto", "bypassPermissions",
     "never", "on-request", "untrusted",
+]
+PermissionModeName = Annotated[
+    str, StringConstraints(min_length=1, max_length=256),
 ]
 CollaborationModeName = Literal["default", "plan"]
 WebSearchMode = Literal["cached", "live"]
@@ -1707,14 +1710,39 @@ class EngineCapabilities(_Base):
 class SetPerm(_Command):
     """client -> wrapper: switch the cc session's permission mode (runtime, no reconnect)."""
     type: Literal["set_perm"] = "set_perm"
-    mode: PermissionMode
+    # DSH permission presets are plugin-defined opaque ids.  As with DSH
+    # reasoning efforts, the explicit engine discriminator opens that dynamic
+    # namespace while Claude/Codex retain their closed protocol enum.
+    engine: Optional[Engine] = None
+    mode: PermissionModeName
+
+    @model_validator(mode="after")
+    def permission_matches_engine(self):
+        if self.engine != "dsh" and self.mode not in PermissionMode.__args__:
+            raise ValueError("unsupported permission mode")
+        return self
+
+
+class PermissionModeInfo(BaseModel):
+    """One bounded, session-local permission choice advertised by an engine."""
+    model_config = ConfigDict(extra="forbid")
+
+    id: PermissionModeName
+    name: str = Field(min_length=1, max_length=256)
+    description: Optional[str] = Field(default=None, max_length=2048)
+    danger: bool = False
 
 
 class Perm(_Base):
     """The cc session's current permission mode. Downstream so a reconnecting
     client restores the readout."""
     type: Literal["perm"] = "perm"
-    mode: str
+    mode: PermissionModeName
+    # Omitted for Claude/Codex, whose stable choices already ship in Web.
+    # DSH supplies its selected Agent's live plugin-defined preset table.
+    options: Optional[list[PermissionModeInfo]] = Field(
+        default=None, max_length=64,
+    )
 
 
 class PermissionProfileInfo(BaseModel):

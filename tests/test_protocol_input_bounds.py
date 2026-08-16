@@ -207,6 +207,9 @@ def test_known_dynamic_control_values_remain_supported():
     assert SetCollaborationMode(mode="plan").mode == "plan"
     assert SetCollaborationMode(mode="default").mode == "default"
     assert SetPerm(mode="on-request").mode == "on-request"
+    assert SetPerm(
+        engine="dsh", mode="workspace-write"
+    ).mode == "workspace-write"
     assert GetModels(engine="cc", cwd="/tmp/project").cwd == "/tmp/project"
     assert GetEngineCapabilities(
         engine="codex", skills_only=True

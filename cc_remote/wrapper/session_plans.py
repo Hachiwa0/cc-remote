@@ -8,7 +8,7 @@ browser can recover the same plan affordance without replaying a model turn.
 from __future__ import annotations
 
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import os
 from pathlib import Path
@@ -25,6 +25,7 @@ from cc_remote.protocol import TurnPlan
 _SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$")
 _MAX_ENTRIES = 4096
 _MAX_FILE_BYTES = 16 * 1024 * 1024
+_TERMINAL_STATUSES = frozenset({"succeeded", "failed", "interrupted"})
 
 
 class SessionPlanStoreError(RuntimeError):
@@ -38,11 +39,27 @@ class SessionPlanSnapshot:
     explanation: str | None
     plan: tuple[dict[str, str], ...]
     updated_at: float
+    terminal_status: str | None = None
 
     @property
     def complete(self) -> bool:
         return bool(self.plan) and all(
             entry["status"] == "completed" for entry in self.plan)
+
+    @property
+    def settled(self) -> bool:
+        return self.complete or self.terminal_status is not None
+
+    @property
+    def owner_turn_ids(self) -> frozenset[str]:
+        if self.turn_id is not None:
+            return frozenset({self.turn_id})
+        owners: set[str] = set()
+        if self.item_id.startswith("plan:"):
+            derived = self.item_id.removeprefix("plan:")
+            if derived and derived != "current":
+                owners.add(derived)
+        return frozenset(owners)
 
     @classmethod
     def from_event(
@@ -50,17 +67,24 @@ class SessionPlanSnapshot:
         event: TurnPlan,
         *,
         updated_at: float | None = None,
+        terminal_status: str | None = None,
     ) -> "SessionPlanSnapshot":
         # TurnPlan is the public bounded schema. Re-validating a copied payload
         # keeps this private store aligned if a caller supplies a subclass or a
         # test double instead of the exact model instance.
         clean = TurnPlan.model_validate(event.model_dump(mode="python"))
+        if (
+            terminal_status is not None
+            and terminal_status not in _TERMINAL_STATUSES
+        ):
+            raise SessionPlanStoreError("Codex plan terminal status is invalid")
         return cls(
             item_id=clean.item_id,
             turn_id=clean.turn_id,
             explanation=clean.explanation,
             plan=tuple(dict(entry) for entry in clean.plan),
             updated_at=time.time() if updated_at is None else updated_at,
+            terminal_status=terminal_status,
         )
 
     def as_event(self) -> TurnPlan:
@@ -72,16 +96,19 @@ class SessionPlanSnapshot:
         )
 
     def as_process_block(self) -> dict[str, Any]:
+        status = self.terminal_status or (
+            "succeeded" if self.complete else "running"
+        )
         return {
             "kind": "process",
             "item_id": self.item_id,
             "processKind": "plan",
             "phase": "snapshot",
-            "status": "succeeded" if self.complete else "running",
+            "status": status,
             "turn_id": self.turn_id,
             "parent_id": None,
             "title": "计划",
-            "done": self.complete,
+            "done": self.settled,
             "explanation": self.explanation,
             "plan": [dict(entry) for entry in self.plan],
         }
@@ -93,6 +120,7 @@ class SessionPlanSnapshot:
             "explanation": self.explanation,
             "plan": [dict(entry) for entry in self.plan],
             "updated_at": self.updated_at,
+            "terminal_status": self.terminal_status,
         }
 
 
@@ -102,10 +130,13 @@ def _session_id(value: object) -> str:
     return value
 
 
-def _snapshot(value: object) -> SessionPlanSnapshot:
-    if not isinstance(value, dict) or set(value) != {
+def _snapshot(value: object, *, version: int) -> SessionPlanSnapshot:
+    expected = {
         "item_id", "turn_id", "explanation", "plan", "updated_at",
-    }:
+    }
+    if version >= 3:
+        expected.add("terminal_status")
+    if not isinstance(value, dict) or set(value) != expected:
         raise SessionPlanStoreError("Codex plan snapshot has an invalid shape")
     updated_at = value.get("updated_at")
     if (
@@ -124,7 +155,13 @@ def _snapshot(value: object) -> SessionPlanSnapshot:
     except Exception as exc:
         raise SessionPlanStoreError(
             "Codex plan snapshot payload is invalid") from exc
-    return SessionPlanSnapshot.from_event(event, updated_at=float(updated_at))
+    return SessionPlanSnapshot.from_event(
+        event,
+        updated_at=float(updated_at),
+        terminal_status=(
+            value.get("terminal_status") if version >= 3 else None
+        ),
+    )
 
 
 class SessionPlanStore:
@@ -188,6 +225,34 @@ class SessionPlanStore:
             self._plans = updated
         return snapshot
 
+    def mark_terminal(
+        self,
+        session_id: str,
+        *,
+        turn_id: str,
+        status: str,
+    ) -> SessionPlanSnapshot | None:
+        """Attach an exact engine terminal without inventing step progress."""
+        session_id = _session_id(session_id)
+        turn_id = _session_id(turn_id)
+        if status not in _TERMINAL_STATUSES:
+            raise SessionPlanStoreError("Codex plan terminal status is invalid")
+        with self._lock:
+            snapshot = self._plans.get(session_id)
+            if snapshot is None:
+                return None
+            if turn_id not in snapshot.owner_turn_ids:
+                return None
+            if snapshot.terminal_status is not None:
+                return snapshot
+            terminal = replace(snapshot, terminal_status=status)
+            updated = OrderedDict(self._plans)
+            updated.pop(session_id, None)
+            updated[session_id] = terminal
+            self._persist_bounded(updated)
+            self._plans = updated
+            return terminal
+
     def move(self, old_session_id: str, session_id: str) -> None:
         old_session_id = _session_id(old_session_id)
         session_id = _session_id(session_id)
@@ -214,13 +279,13 @@ class SessionPlanStore:
             self._persist_bounded(updated)
             self._plans = updated
 
-    def retire_completed(
+    def retire_settled(
         self,
         session_id: str,
         *,
         current_turn_ids: frozenset[str] = frozenset(),
     ) -> bool:
-        """Delete a completed Plan when a later user message begins.
+        """Delete a completed or terminal Plan at the next user boundary.
 
         A replay of the Plan's own ``UserMsg`` is not a later message, so its
         known native/client identity may protect the snapshot. A steer is
@@ -231,11 +296,8 @@ class SessionPlanStore:
             snapshot = self._plans.get(session_id)
             if (
                 snapshot is None
-                or not snapshot.complete
-                or (
-                    snapshot.turn_id is not None
-                    and snapshot.turn_id in current_turn_ids
-                )
+                or not snapshot.settled
+                or not snapshot.owner_turn_ids.isdisjoint(current_turn_ids)
             ):
                 return False
             updated = OrderedDict(self._plans)
@@ -243,6 +305,16 @@ class SessionPlanStore:
             self._persist_bounded(updated)
             self._plans = updated
             return True
+
+    def retire_completed(
+        self,
+        session_id: str,
+        *,
+        current_turn_ids: frozenset[str] = frozenset(),
+    ) -> bool:
+        """Compatibility alias for callers predating terminal snapshots."""
+        return self.retire_settled(
+            session_id, current_turn_ids=current_turn_ids)
 
     def _load(
         self,
@@ -260,7 +332,7 @@ class SessionPlanStore:
                 {"version", "profile_revision", "plans"},
             ):
                 raise ValueError("session plan store has an invalid envelope")
-            if raw.get("version") not in {1, 2} or not isinstance(
+            if raw.get("version") not in {1, 2, 3} or not isinstance(
                 raw.get("plans"), dict
             ):
                 raise ValueError("session plan store version is unsupported")
@@ -273,8 +345,10 @@ class SessionPlanStore:
             ):
                 raise ValueError("session plan profile revision is invalid")
             loaded: OrderedDict[str, SessionPlanSnapshot] = OrderedDict()
+            version = raw["version"]
             for session_id, value in raw["plans"].items():
-                loaded[_session_id(session_id)] = _snapshot(value)
+                loaded[_session_id(session_id)] = _snapshot(
+                    value, version=version)
             if len(loaded) > _MAX_ENTRIES:
                 raise ValueError("session plan store has too many entries")
             return loaded, profile_revision
@@ -291,7 +365,7 @@ class SessionPlanStore:
         profile_revision: int,
     ) -> bytes:
         return json.dumps({
-            "version": 2,
+            "version": 3,
             "profile_revision": profile_revision,
             "plans": {
                 session_id: snapshot.as_dict()

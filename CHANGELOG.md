@@ -4,6 +4,11 @@
 
 ## Unreleased
 
+- Upgrade the coordinated Wrapper/Relay/Web gate to protocol v37. DSH sessions
+  now expose their native context projection in the shared context control,
+  identify the immutable Agent Preset in the Code header, and publish the
+  current Agent's permission choices so the shared bottom-left selector changes
+  the live session through DSH's native permission command.
 - Upgrade the coordinated Wrapper/Relay/Web gate to protocol v36 and add
   DeepSeek Harness as an optional third Code backend. A loopback-only adapter
   provides sessions, streaming, paged history, images, model/effort controls,

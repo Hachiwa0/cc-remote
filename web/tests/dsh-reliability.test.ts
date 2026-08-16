@@ -3,7 +3,13 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { createServer } from "vite";
 
-import { clientSlashesFor, commandsFor } from "../src/data.ts";
+import {
+  clientSlashesFor,
+  commandsFor,
+  dshHeaderPresetLabel,
+  permissionNameForDisplay,
+  permsFor,
+} from "../src/data.ts";
 import { resolvedEngineOptions } from "../src/engine-picker-options.ts";
 import { parseNotificationFragment } from "../src/notification-route.ts";
 import type { AppState } from "../src/reducer.ts";
@@ -45,7 +51,7 @@ assert.equal(siblingSpaceForPrefetch("claude", "work"), "code");
 const dshSlashes = commandsFor("dsh", "work")
   .filter((command) => "slash" in command)
   .map((command) => command.slash);
-for (const unsupported of ["goal", "btw", "context", "status", "permissions"]) {
+for (const unsupported of ["goal", "btw", "status"]) {
   assert.equal(dshSlashes.includes(unsupported), false,
     `DSH must not expose /${unsupported}, even under a poisoned Work surface`);
 }
@@ -53,6 +59,41 @@ assert.equal(clientSlashesFor("dsh").has("compact"), false,
   "DSH native /compact must pass through instead of becoming a Remote control");
 assert.equal(clientSlashesFor("dsh").has("skills"), true,
   "DSH Skills remain a local read-only catalog action");
+assert.deepEqual(permsFor("dsh", [{
+  id: "workspace-write", name: "Workspace Write",
+  description: "Writes stay in the workspace", danger: false,
+}, {
+  id: "danger-full-access", name: "Full Access", danger: true,
+}]).map(({ id, name, short, ds, ic, danger }) => ({
+  id, name, short, ds, ic, danger,
+})), [{
+  id: "workspace-write", name: "Workspace Write", short: "Workspace Write",
+  ds: "Writes stay in the workspace", ic: "shield", danger: false,
+}, {
+  id: "danger-full-access", name: "Full Access", short: "Full Access",
+  ds: undefined, ic: "bolt", danger: true,
+}], "DSH permission choices, descriptions, and risk state must use the shared UI shape");
+assert.equal(permissionNameForDisplay("custom"), "Custom",
+  "a derived DSH permission remains a real readable current state");
+assert.equal(permissionNameForDisplay("plugin.permission"), "plugin.permission",
+  "an opaque plugin permission id must not be rewritten");
+assert.equal(permissionNameForDisplay(""), null,
+  "only a genuinely missing permission is loading");
+
+const dshPresets = [{
+  id: "code", name: "Code", trust: "system" as const, is_default: true,
+}, {
+  id: "reviewer", name: "Code Reviewer", trust: "user" as const,
+}];
+assert.equal(dshHeaderPresetLabel("code", dshPresets, "code"), null,
+  "the default Code Agent must not repeat the Code surface title");
+assert.equal(
+  dshHeaderPresetLabel("reviewer", dshPresets, "code"),
+  "Code Reviewer",
+  "a custom Agent uses its friendly catalog name instead of its raw id",
+);
+assert.equal(dshHeaderPresetLabel("missing", dshPresets, "code"), null,
+  "missing catalog metadata must not flash a raw transport id");
 
 const notification = {
   machine_id: "nono",
@@ -120,6 +161,10 @@ relay.sendSetEffort("off");
 const dshEffort = JSON.parse(socket.sent.at(-1) ?? "{}");
 assert.equal(dshEffort.engine, "dsh",
   "opaque DSH effort ids must carry an explicit engine scope");
+relay.sendSetPerm("workspace-write");
+const dshPermission = JSON.parse(socket.sent.at(-1) ?? "{}");
+assert.equal(dshPermission.engine, "dsh",
+  "opaque DSH permission ids must carry an explicit engine scope");
 
 relay.setSurface("codex", "code");
 relay.setFocusedSid("codex-session", "codex", "code");
@@ -296,9 +341,23 @@ assert.doesNotMatch(
   /if \(!current \|\| current\.available\) return;[\s\S]{0,300}switchEngine\(fallback\.id\)/,
   "a temporarily unavailable DSH catalog must not overwrite the saved surface",
 );
-assert.match(
+assert.doesNotMatch(
   appSource,
-  /!authed \|\| !focusedSid \|\| state\.newChat[\s\S]{0,100}focusedEngine === "dsh"[\s\S]{0,220}sendGetContext\(\)/,
-  "focusing DSH must not request an unsupported context-usage API",
+  /!authed \|\| !focusedSid \|\| state\.newChat[\s\S]{0,100}focusedEngine === "dsh"/,
+  "focusing DSH must request its native context projection like other engines",
 );
+assert.doesNotMatch(appSource, /` · \$\{focusedSession\.dsh_agent_preset\}`/,
+  "the Code title must not expose a raw DSH Agent Preset id");
+assert.match(appSource, /Agent · \{focusedDshPresetLabel\}/,
+  "a non-default DSH Agent must retain a friendly title badge");
+assert.match(appSource,
+  /perm === "danger-full-access"[\s\S]{0,100}window\.confirm/,
+  "DSH Full access must keep its native explicit risk confirmation");
+const composerSource = readFileSync(
+  resolve(process.cwd(), "src/components/Composer.tsx"), "utf8");
+assert.doesNotMatch(composerSource,
+  /p\.engine === "dsh"[\s\S]{0,180}>\s*Skills\s*<\/button>/,
+  "DSH must use the shared context slot instead of a dedicated Skills chip");
+assert.match(composerSource, /permOptions=\{p\.permOptions\}/,
+  "the permission sheet must receive DSH's live session choices");
 relay.stop();

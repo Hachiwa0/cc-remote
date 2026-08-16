@@ -6,7 +6,8 @@
 // chips drive set_model / set_permission_mode on the wrapper.
 
 import type {
-  CatalogModel, EngineCapabilityItem, PermissionProfileInfo,
+  CatalogModel, DshPresetInfo, EngineCapabilityItem, PermissionModeInfo,
+  PermissionProfileInfo,
 } from "./protocol";
 
 export interface CmdGroup { g: string }
@@ -135,6 +136,24 @@ export const DSH_COMMANDS: Command[] = [
   { slash: "preview", name: "预览文件", ds: "/preview <路径> 打开 Markdown 或 UTF-8 源文件", ic: "read" },
   { slash: "clear", name: "新会话", ds: "开始新的 DeepSeek Harness 会话", ic: "close" },
 ];
+
+/** Present a non-default DSH Agent without leaking its transport identifier.
+ *
+ * The page title already says Code, so the built-in `code` preset would read
+ * as the meaningless `Code · code`. Wait for catalog metadata, suppress the
+ * default, and use only the catalog's display-safe friendly name.
+ */
+export const dshHeaderPresetLabel = (
+  selectedId: string | null | undefined,
+  presets: readonly DshPresetInfo[],
+  defaultId: string | null | undefined,
+): string | null => {
+  if (!selectedId) return null;
+  const preset = presets.find((candidate) => candidate.id === selectedId);
+  if (!preset || preset.is_default || selectedId === defaultId) return null;
+  return preset.name;
+};
+
 export const CODEX_PERMS: Perm[] = [
   { id: "never", name: "Never", short: "Never", ds: "不询问 · 需要审批时拒绝", ic: "shield" },
   { id: "on-request", name: "On Request", short: "On Request", ds: "需要时才询问", ic: "shield" },
@@ -301,9 +320,34 @@ export const defaultEffortFor = (engine?: string, model?: string | null, catalog
     null,
   )?.id ?? "";
 };
-export const permsFor = (engine?: string): Perm[] => (
-  engine === "dsh" ? [] : engine === "codex" ? CODEX_PERMS : PERMS
+export const permsFor = (
+  engine?: string,
+  dynamic?: PermissionModeInfo[] | null,
+): Perm[] => (
+  engine === "dsh" ? (dynamic ?? []).map((option) => ({
+    id: option.id,
+    name: option.name,
+    short: option.name,
+    ds: option.description ?? undefined,
+    ic: option.danger ? "bolt" : "shield",
+    danger: option.danger,
+  }))
+    : engine === "codex" ? CODEX_PERMS : PERMS
 );
+
+/** Display an opaque host-owned permission state which is not selectable.
+ * DSH's derived `custom` state is intentionally omitted from its command
+ * options, but it is still a real current value and must not look like loading.
+ */
+export function permissionNameForDisplay(
+  id: string | null | undefined,
+): string | null {
+  const normalized = id?.trim();
+  if (!normalized) return null;
+  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(normalized)) return normalized;
+  return normalized.split("-").map((word) =>
+    word.slice(0, 1).toUpperCase() + word.slice(1)).join(" ");
+}
 
 // Map a cc-reported model id (e.g. "claude-mythos-5[1m]") to a MODELS entry id.
 // An id we don't know (any codex model) passes through verbatim — the codex chips
@@ -321,7 +365,14 @@ export function matchModelId(m: string, engine?: string): string {
   return hit ? hit.id : m;
 }
 
-export interface Perm { id: string; name: string; short: string; ds: string; ic: string; danger?: boolean }
+export interface Perm {
+  id: string;
+  name: string;
+  short?: string;
+  ds?: string;
+  ic?: string;
+  danger?: boolean;
+}
 export const PERMS: Perm[] = [
   { id: "default", name: "Default", short: "Default", ds: "每次动作前询问", ic: "shield" },
   { id: "acceptEdits", name: "Accept Edits", short: "Accept Edits", ds: "文件编辑免询问，命令仍询问", ic: "edit" },

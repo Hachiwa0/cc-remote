@@ -9,6 +9,7 @@ import {
 } from "react";
 import type {
   State, QueryImg, QueryFile, ContextReport, StatusReport,
+  PermissionModeInfo,
   CollaborationModeName, SessionControl, EngineCapabilityKind,
   Engine, EngineCapabilityItem, PermissionProfileInfo,
 } from "../protocol";
@@ -19,7 +20,7 @@ import {
   clientSlashesFor, CODEX_PROMPTS, isKnownCodeOnlySlash, slashToken,
   matchCommands, matchSkills, parseSlash, skillToken,
   modelsFor, effortNameForDisplay, permsFor,
-  permissionProfileLabel, type Catalog,
+  permissionNameForDisplay, permissionProfileLabel, type Catalog,
 } from "../data";
 import { CommandSheet } from "./CommandSheet";
 import { attachmentBytes, pickFiles } from "../img";
@@ -64,6 +65,7 @@ interface Props {
   model: string;
   effort: string;
   perm: string;
+  permOptions: PermissionModeInfo[] | null;
   permissionProfile: string | null;
   permissionProfiles: PermissionProfileInfo[] | null;
   webSearch: "cached" | "live" | null;
@@ -159,7 +161,6 @@ export function Composer(p: Props) {
   // popover DERIVED from the composer text (no second input box).
   const [sheetKind, setSheetKind] = useState<"models" | "efforts" | "perms" | null>(null);
   const openPermissions = () => {
-    if (p.engine === "dsh") return;
     setSheetKind("perms");
     if (p.engine === "codex") p.onGetPermissionProfiles();
   };
@@ -653,7 +654,8 @@ export function Composer(p: Props) {
     || isSettlingStopDisabled(p.state, hasText || hasAttachments);
   // Fall back to the raw id (not MODELS[0]) so a hidden model set via
   // "/model <id>" shows its actual id on the chip instead of "Mythos 5".
-  const MODELS_E = modelsFor(p.engine, p.catalog), PERMS_E = permsFor(p.engine);
+  const MODELS_E = modelsFor(p.engine, p.catalog);
+  const PERMS_E = permsFor(p.engine, p.permOptions);
   const workSurface = p.surface === "work";
   const contextAvailable = p.contextReport?.available !== false;
   const workContext = workSurface && p.contextReport && contextAvailable
@@ -673,9 +675,8 @@ export function Composer(p: Props) {
     : null;
   const permissionProfileName = permissionProfileLabel(
     p.permissionProfile, p.permissionProfiles);
-  const modeLabel = p.engine === "codex"
-    ? (permissionProfileName ?? perm?.short ?? "环境读取中")
-    : (perm?.short ?? "Mode loading");
+  const modeLabel = permissionProfileName ?? perm?.short ?? perm?.name
+    ?? permissionNameForDisplay(p.perm) ?? "权限读取中";
   const stateZh: Record<State, string> = { idle: "空闲", running: "运行中", interrupting: "打断中", draining: "收尾中" };
   const modeCls = perm?.id === "plan" ? " plan"
     : (perm?.danger || p.permissionProfile === ":danger-full-access")
@@ -910,11 +911,11 @@ export function Composer(p: Props) {
             {sendControl}
           </div>
           <div className="hint">
-          {p.engine !== "dsh" && <button
+          <button
               type="button"
               className={"hint-mode" + modeCls}
               onClick={openPermissions}
-              disabled={locked}
+              disabled={locked || PERMS_E.length === 0}
               title={deferredClaudeControls
                 ? `${externalClaudeOwner} 当前权限模式未公开`
                 : (p.engine === "codex"
@@ -925,7 +926,7 @@ export function Composer(p: Props) {
                 ? externalClaudeOwner
                 : modeLabel}
               {!deferredClaudeControls && <span className="hint-mode-ch">▾</span>}
-            </button>}
+            </button>
           <span className="hint-kbds"><kbd>Enter</kbd> 发送 · <kbd>Shift+Tab</kbd> 切模式 · <kbd>/</kbd> 命令{
             p.engine === "codex" && <> · <kbd>$</kbd> Skills</>
           }</span>
@@ -946,12 +947,6 @@ export function Composer(p: Props) {
               title={deferredClaudeControls
                 ? `Remote 接管后思考强度：${effortName ?? "读取中"}；不是${externalClaudeOwner}当前强度`
                 : "思考强度"}>{effortName ?? "强度读取中"}</button>
-            {p.engine === "dsh" && (
-              <button className="hint-ctl" onClick={() => p.onOpenExtensions?.("skill")}
-                disabled={locked} title="只读查看当前 Agent Preset 的 Skills">
-                Skills
-              </button>
-            )}
             {p.engine === "codex" && p.collaborationMode === "plan" && (
               <button
                 className="hint-ctl collaboration-chip plan"
@@ -988,7 +983,7 @@ export function Composer(p: Props) {
                 } : undefined}
               />
             )}
-            {p.engine !== "dsh" && <button
+            <button
               className={"hint-ring" + (contextAvailable ? "" : " unavailable")}
               aria-label="上下文占用"
               title="上下文占用"
@@ -1009,13 +1004,13 @@ export function Composer(p: Props) {
                   transform="rotate(-90 18 18)"
                 />
               </svg>
-            </button>}
-            {p.engine !== "dsh" && ctxOpen && (
+            </button>
+            {ctxOpen && (
               <div className="ctx-pop" role="dialog" aria-label="上下文占用">
                 {p.contextError ? (
                   <div className="ctx-pop-loading" role="alert">{p.contextError}</div>
                 ) : p.contextReport?.available === false ? (
-                  <div className="ctx-pop-loading">尚未收到 Codex 的 tokenUsage；完成一次模型回合后会自动更新。上下文仍由 Codex 原生管理。</div>
+                  <div className="ctx-pop-loading">尚未收到上下文用量；完成一次模型回合后会自动更新。</div>
                 ) : p.contextReport ? (
                   <>
                     <div className="ctx-pop-row">
@@ -1060,6 +1055,7 @@ export function Composer(p: Props) {
         currentEffort={p.effort}
         onPickEffort={(ef) => { p.onSetEffort(ef); setSheetKind(null); }}
         currentPerm={p.perm}
+        permOptions={p.permOptions}
         onPickPerm={(perm) => {
           p.onSetPerm(perm);
           if (p.engine !== "codex") setSheetKind(null);

@@ -103,7 +103,8 @@ from cc_remote.protocol import (
     QueuedQueryUpdated,
     Interrupt, CommandAck, Model, Models, EngineCatalog, EngineInfo,
     EngineCapabilities, Effort, Fast,
-    CollaborationMode, Perm, PermissionProfile, PermissionProfiles, WebSearch,
+    CollaborationMode, Perm, PermissionModeInfo, PermissionProfile,
+    PermissionProfiles, WebSearch,
     BtwOpened, ContextReport, StatusReport, Notice,
     RateLimitUpdate, DiffReport, FilePreview, FileSaveResult, PreviewAsset,
     PreviewAuthorizationRequired, PreviewAuthorizationResult,
@@ -976,7 +977,44 @@ def _session_permission_mode(ctx: SessionContext) -> str:
     """Return the permission mode actually configured on this live engine."""
     if ctx.engine == "codex":
         return getattr(ctx.sdk, "approval", "never")
-    return getattr(ctx.sdk, "permission_mode", "bypassPermissions")
+    default = "" if ctx.engine == "dsh" else "bypassPermissions"
+    return getattr(ctx.sdk, "permission_mode", default)
+
+
+_DSH_IMAGE_INPUT_UNSUPPORTED = "当前 DSH 模型不支持图片输入。"
+
+
+def _dsh_prompt_rejection_message(
+    error: DshRpcError,
+    *,
+    fallback: str,
+) -> str:
+    """Map stable DSH prompt failures onto authored user-facing copy."""
+    if (
+        error.code == "attachment-error"
+        and error.details.get("reason") == "MODEL_DOES_NOT_SUPPORT_IMAGES"
+    ):
+        return _DSH_IMAGE_INPUT_UNSUPPORTED
+    return error.message[:4096] or fallback
+
+
+def _session_permission_event(
+    ctx: SessionContext, **envelope,
+) -> Perm | None:
+    """Build the live permission projection for one resident session.
+
+    Claude/Codex keep their static choices in Web. DSH's choices belong to the
+    selected Agent's plugin composition and therefore travel with the value.
+    """
+    mode = _session_permission_mode(ctx)
+    if not isinstance(mode, str) or not mode:
+        return None
+    options = None
+    if ctx.engine == "dsh":
+        raw_options = getattr(ctx.sdk, "permission_options", ())
+        options = [PermissionModeInfo.model_validate(option)
+                   for option in raw_options]
+    return Perm(mode=mode, options=options, **envelope)
 
 
 def _session_permission_profile(ctx: SessionContext) -> Optional[str]:
@@ -3148,8 +3186,39 @@ class WrapperMachine:
                 ctx.dsh_last_source_seq = max(ctx.dsh_last_source_seq, last_seq)
             return
         if frame_type == "session/projection":
-            if payload.get("key") == "title":
+            key = payload.get("key")
+            projection_seq = payload.get("seq")
+            if (
+                not isinstance(key, str)
+                or not key
+                or not isinstance(projection_seq, int)
+                or isinstance(projection_seq, bool)
+                or projection_seq < 0
+                or projection_seq > 9_007_199_254_740_991
+            ):
+                raise DshProtocolError("DSH projection frame is invalid")
+            if key == "title":
                 await self._invalidate_session_list("dsh", "code")
+                return
+            if (
+                ctx is not None
+                and ctx.engine == "dsh"
+                and key in {
+                    "permissions", "contextPressure", "contextBreakdown",
+                }
+            ):
+                if not isinstance(ctx.sdk, DshSessionHandle):
+                    raise DshProtocolError(
+                        "DSH projection target has no session handle"
+                    )
+                changed = ctx.sdk.apply_projection(
+                    key, payload.get("value"), projection_seq,
+                )
+                if changed and key == "permissions":
+                    permission = _session_permission_event(ctx)
+                    if permission is not None:
+                        ctx.announced_perm = permission.mode
+                        await self._emit(ctx, permission)
             return
         if frame_type in {"session/queue", "session/jobs"}:
             # DSH owns these transient plugin surfaces. cc-remote's first
@@ -7680,17 +7749,17 @@ class WrapperMachine:
             else:
                 current_turn_ids = frozenset()
             try:
-                # Completed Plan state belongs to the task which just ended.
+                # Settled Plan state belongs to the task which just ended.
                 # Retire it before broadcasting the next user boundary so a
-                # reconnect cannot recover the old green monitor.
+                # reconnect cannot recover the old task monitor as active.
                 await asyncio.to_thread(
-                    self._session_plans.retire_completed,
+                    self._session_plans.retire_settled,
                     msg.sid,
                     current_turn_ids=current_turn_ids,
                 )
             except SessionPlanStoreError:
                 log.warning(
-                    "Codex completed plan snapshot could not be retired",
+                    "Codex settled plan snapshot could not be retired",
                     session_id=msg.sid,
                 )
         if (
@@ -7709,6 +7778,38 @@ class WrapperMachine:
                 # plan notification or abort the model turn.
                 log.warning(
                     "Codex session plan snapshot could not be persisted",
+                    session_id=msg.sid,
+                )
+        if (
+            isinstance(msg, TurnEnd)
+            and ctx.engine == "codex"
+            and not ctx.btw
+            and self._session_plans is not None
+            and msg.sid
+            and msg.turn_id
+            and msg.result.subtype != "steered"
+        ):
+            terminal_status = (
+                "succeeded"
+                if not msg.result.is_error
+                else "interrupted"
+                if msg.result.subtype == "error_during_execution"
+                else "failed"
+            )
+            try:
+                # Persist the exact terminal separately from step progress.
+                # A successful turn does not prove that omitted Plan updates
+                # ran, but it does prove the old inProgress marker is no longer
+                # active and must not be rebound to a later user turn.
+                await asyncio.to_thread(
+                    self._session_plans.mark_terminal,
+                    msg.sid,
+                    turn_id=msg.turn_id,
+                    status=terminal_status,
+                )
+            except SessionPlanStoreError:
+                log.warning(
+                    "Codex plan terminal could not be persisted",
                     session_id=msg.sid,
                 )
         if isinstance(msg, TurnEnd):
@@ -9139,14 +9240,15 @@ class WrapperMachine:
                 # Permission/collaboration modes are live control state, not
                 # transcript history. Always seed them on hello even when the
                 # browser's replay cursor is already at the ring tail.
-                permission_mode = _session_permission_mode(ctx)
-                ctx.announced_perm = permission_mode
-                await self.transport.send(Perm(
-                    mode=permission_mode,
+                permission_event = _session_permission_event(
+                    ctx,
                     sid=sid,
                     to=cmd.client_id,
                     route_id=getattr(cmd, "route_id", None),
-                ))
+                )
+                if permission_event is not None:
+                    ctx.announced_perm = permission_event.mode
+                    await self.transport.send(permission_event)
                 if ctx.engine == "codex":
                     permission_profile = _session_permission_profile(ctx)
                     ctx.announced_permission_profile = permission_profile
@@ -11879,6 +11981,13 @@ class WrapperMachine:
         else:
             build_seq = self._history_build_sequences.get(sid, 0)
         ctx = self._ctx_by_sid(sid)
+        # Bind this page to the live-stream position observed before any
+        # rollout/app-server I/O.  A cold newest-page read can overlap the
+        # first Query (and automatic compaction can make that overlap long).
+        # Sampling ``ctx.seq`` after the await would let an old idle snapshot
+        # masquerade as newer than the intervening running StateEvent, so Web
+        # could briefly settle and then reopen the exact same turn.
+        live_seq = ctx.seq if ctx is not None else None
         watch = self._watch.get(sid) or {}
         active_external_turns = watch.get("active_external_turns")
         active_turn_ids = (
@@ -12059,7 +12168,7 @@ class WrapperMachine:
             revision=revision,
             generation=self.instance_id,
             build_seq=build_seq,
-            live_seq=ctx.seq if ctx is not None else None,
+            live_seq=live_seq,
             authoritative=projection_outcome != "inconclusive",
             events=control_rows,
             turns=[
@@ -12126,6 +12235,10 @@ class WrapperMachine:
                 and ctx.engine == "dsh"
             ):
                 async with ctx.dsh_event_lock:
+                    if isinstance(ctx.sdk, DshSessionHandle):
+                        ctx.sdk.apply_projections(
+                            page.projections, page.projection_seq,
+                        )
                     if page.last_seq >= ctx.dsh_last_source_seq:
                         ctx.dsh_last_source_seq = page.last_seq
                         ctx.dsh_translator = page.translator
@@ -12452,21 +12565,51 @@ class WrapperMachine:
             if snapshot is not None:
                 turns = list(hist.turns)
                 target_index = None
-                if snapshot.turn_id:
+                owner_turn_ids = snapshot.owner_turn_ids
+                if owner_turn_ids:
                     for index in range(len(turns) - 1, -1, -1):
                         turn = turns[index]
-                        if snapshot.turn_id in {
+                        if owner_turn_ids.intersection({
                             turn.id,
                             turn.clientMsgId,
                             turn.forkPointId,
-                        }:
+                        }):
                             target_index = index
                             break
+                terminal_fence = next((
+                    fence
+                    for fence in hist.terminal_fences
+                    if fence.turn_id in owner_turn_ids
+                ), None)
+                if (
+                    terminal_fence is not None
+                    and snapshot.terminal_status is None
+                ):
+                    try:
+                        repaired = await asyncio.to_thread(
+                            self._session_plans.mark_terminal,
+                            sid,
+                            turn_id=terminal_fence.turn_id,
+                            status=(
+                                "interrupted"
+                                if terminal_fence.status == "interrupted"
+                                else "failed"
+                                if terminal_fence.status == "failed"
+                                else "succeeded"
+                            ),
+                        )
+                        if repaired is not None:
+                            snapshot = repaired
+                    except SessionPlanStoreError:
+                        log.warning(
+                            "Codex historical plan terminal could not be repaired",
+                            session_id=sid,
+                        )
                 # An unfinished Plan may legitimately span several steer turns
-                # after its owner fell off the newest page. A completed Plan
-                # must never be rebound to an unrelated newest turn: that would
+                # after its owner fell off the newest page. A settled Plan must
+                # never be rebound to an unrelated newest turn: that would
                 # resurrect it after the user already started another task.
-                if target_index is None and not snapshot.complete:
+                if target_index is None and not snapshot.settled:
                     target_index = len(turns) - 1
                 if target_index is not None:
                     target = turns[target_index]
@@ -13903,8 +14046,10 @@ class WrapperMachine:
                 await self._set_state(ctx, "idle")
                 error = Error(
                     code=ERR_BAD_PROMPT,
-                    message=(exc.message[:4096] or
-                             "DeepSeek Harness 拒绝了本次消息。"),
+                    message=_dsh_prompt_rejection_message(
+                        exc,
+                        fallback="DeepSeek Harness 拒绝了本次消息。",
+                    ),
                     msg_id=cmd.msg_id,
                 )
                 await self._emit(ctx, error)
@@ -14182,8 +14327,10 @@ class WrapperMachine:
             except DshRpcError as exc:
                 return await reject(
                     ERR_NOT_STEERABLE,
-                    exc.message[:4096]
-                    or "DeepSeek Harness 拒绝了本次引导。",
+                    _dsh_prompt_rejection_message(
+                        exc,
+                        fallback="DeepSeek Harness 拒绝了本次引导。",
+                    ),
                 )
             except (DshUnavailable, DshProtocolError) as exc:
                 # The HTTP response can disappear after DSH appended the steer.
@@ -16310,20 +16457,68 @@ class WrapperMachine:
         ctx = self._ctx_for(getattr(cmd, "sid", None))
         if ctx is None:
             return await self._missing_session_error(cmd, "切换权限模式")
-        if ctx.engine == "dsh":
+        requested_engine = getattr(cmd, "engine", None)
+        if (
+            (requested_engine is not None and requested_engine != ctx.engine)
+            or (ctx.engine == "dsh" and requested_engine != "dsh")
+        ):
             error = Error(
-                code=ERR_AUTH,
-                message=(
-                    "DeepSeek Harness 权限由本机 Agent Preset 与插件配置管理，"
-                    "Remote 不修改该权限。"
-                ),
+                code=ERR_PROTOCOL,
+                message="权限模式请求与当前会话引擎不匹配。",
+                request_id=getattr(cmd, "cmd_id", None),
+                to=getattr(cmd, "client_id", None),
             )
             await self._emit(ctx, error)
             return error
         control_error = await self._runtime_control_preflight(
-            ctx, action="切换权限模式")
+            ctx,
+            action="切换权限模式",
+            request_id=getattr(cmd, "cmd_id", None),
+            client_id=getattr(cmd, "client_id", None),
+        )
         if control_error is not None:
             return control_error
+        if ctx.engine == "dsh":
+            if not isinstance(ctx.sdk, DshSessionHandle):
+                error = Error(
+                    code=ERR_INTERNAL,
+                    message="DeepSeek Harness 会话控制器不可用。",
+                )
+                await self._emit(ctx, error)
+                return error
+            try:
+                applied = await ctx.sdk.set_permission_mode(
+                    cmd.mode,
+                    rpc_id=(
+                        getattr(cmd, "cmd_id", None)
+                        or f"dsh-permission-{uuid4().hex}"
+                    ),
+                )
+            except (DshError, ValueError) as exc:
+                log.warning(
+                    "DSH permission switch failed",
+                    session_id=self._ctx_wire_sid(ctx),
+                    error_type=type(exc).__name__,
+                )
+                error = Error(
+                    code=ERR_BAD_PROMPT,
+                    message="DeepSeek Harness 权限模式切换未完成，请重试。",
+                    request_id=getattr(cmd, "cmd_id", None),
+                    to=getattr(cmd, "client_id", None),
+                )
+                await self._emit(ctx, error)
+                return error
+            ctx.announced_perm = applied
+            event = _session_permission_event(ctx)
+            if event is None:
+                error = Error(
+                    code=ERR_INTERNAL,
+                    message="DeepSeek Harness 未返回切换后的权限状态。",
+                )
+                await self._emit(ctx, error)
+                return error
+            await self._emit(ctx, event)
+            return event
         if ctx.space == "work" and ctx.engine == "codex" and cmd.mode != "never":
             error = Error(
                 code=ERR_AUTH,
@@ -16816,18 +17011,70 @@ class WrapperMachine:
         if ctx is None:
             return await self._missing_session_error(cmd, "读取上下文")
         if ctx.engine == "dsh":
-            # DSH does not expose one authoritative context-usage RPC yet.  An
-            # older same-protocol Web/PWA bundle may still prime this read when
-            # focus moves to DSH, so treat it as an unavailable capability
-            # instead of a business/auth rejection.  This also lets the normal
-            # ContextReport response retire that client's pending read without
-            # showing a cross-surface command-error banner.
+            if not isinstance(ctx.sdk, DshSessionHandle):
+                event = ContextReport(
+                    total_tokens=0,
+                    max_tokens=0,
+                    percentage=0.0,
+                    available=False,
+                    categories=[],
+                )
+                await self._emit(ctx, event)
+                return event
+            changed: set[str] = set()
+            try:
+                changed = await ctx.sdk.refresh_projections()
+            except DshError as exc:
+                # A mux frame or earlier history read may still hold a useful
+                # last-wins projection.  Report that cache rather than turning
+                # a transient loopback read failure into a global error banner.
+                log.warning(
+                    "DSH context projection refresh failed",
+                    session_id=self._ctx_wire_sid(ctx),
+                    error_type=type(exc).__name__,
+                )
+            if "permissions" in changed:
+                permission = _session_permission_event(ctx)
+                if permission is not None:
+                    ctx.announced_perm = permission.mode
+                    await self._emit(ctx, permission)
+            pressure = ctx.sdk.context_pressure
+            raw_used = pressure.get(
+                "projectedTokens", pressure.get("pressureTokens")
+            )
+            raw_window = pressure.get("contextWindow")
+            available = (
+                isinstance(raw_used, int)
+                and not isinstance(raw_used, bool)
+                and raw_used >= 0
+                and isinstance(raw_window, int)
+                and not isinstance(raw_window, bool)
+                and raw_window > 0
+            )
+            used = raw_used if available else 0
+            window = raw_window if available else 0
+            breakdown = ctx.sdk.context_breakdown
+            categories = [
+                {
+                    "name": name,
+                    "tokens": breakdown[field],
+                    "color": color,
+                }
+                for field, name, color in (
+                    ("systemTokens", "≈ 系统提示词", "#7B83D9"),
+                    ("toolsTokens", "≈ 工具", "#D39B4A"),
+                    ("messageTokens", "≈ 消息", "#3E9B82"),
+                )
+                if field in breakdown
+            ]
             event = ContextReport(
-                total_tokens=0,
-                max_tokens=0,
-                percentage=0.0,
-                available=False,
-                categories=[],
+                total_tokens=used,
+                max_tokens=window,
+                percentage=min(100.0, used / window * 100.0) if window else 0.0,
+                available=None if available else False,
+                model=ctx.sdk.model,
+                is_auto_compact_enabled=None,
+                categories=categories,
             )
             await self._emit(ctx, event)
             return event
@@ -21604,11 +21851,11 @@ class WrapperMachine:
                 completion_event = self._completion_state(presentation)
                 await self._emit(ctx, completion_event)
                 cached_responses.append(completion_event)
-        permission_mode = _session_permission_mode(ctx)
-        ctx.announced_perm = permission_mode
-        permission_event = Perm(mode=permission_mode)
-        await self._emit(ctx, permission_event)
-        cached_responses.append(permission_event)
+        permission_event = _session_permission_event(ctx)
+        if permission_event is not None:
+            ctx.announced_perm = permission_event.mode
+            await self._emit(ctx, permission_event)
+            cached_responses.append(permission_event)
         if ctx.engine != "codex":
             model = _session_model(ctx)
             if model:
@@ -21982,11 +22229,11 @@ class WrapperMachine:
             effort_event = Effort(effort=initial_effort)
             await self._emit(ctx, effort_event)
             cached_responses.append(effort_event)
-        permission_mode = _session_permission_mode(ctx)
-        ctx.announced_perm = permission_mode
-        permission_event = Perm(mode=permission_mode)
-        await self._emit(ctx, permission_event)
-        cached_responses.append(permission_event)
+        permission_event = _session_permission_event(ctx)
+        if permission_event is not None:
+            ctx.announced_perm = permission_event.mode
+            await self._emit(ctx, permission_event)
+            cached_responses.append(permission_event)
         # Collaboration mode is a separate Codex-only control.
         if ctx.engine == "codex":
             permission_profile = _session_permission_profile(ctx)
@@ -26753,6 +27000,9 @@ class WrapperMachine:
                         error_type=type(exc).__name__,
                     )
                 else:
+                    handle.apply_projections(
+                        page.projections, page.projection_seq,
+                    )
                     ctx.dsh_translator = page.translator
                     ctx.dsh_last_source_seq = page.last_seq
             log.info(

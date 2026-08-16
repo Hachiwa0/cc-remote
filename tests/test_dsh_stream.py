@@ -370,6 +370,21 @@ def test_live_projection_also_refuses_unknown_required_event():
         translator.feed(event(2, "plugin/semantic-boundary", {"secret": "x"}))
 
 
+def test_permission_command_is_a_control_projection_not_a_conversation_turn():
+    translator = DshStreamTranslator()
+    assert translator.feed(event(1, "command/run", {
+        "commandId": "permission-command",
+        "name": "permission",
+        "args": " workspace-write",
+        "source": {"kind": "user"},
+    })) == []
+    assert translator.feed(event(2, "command/done", {
+        "commandId": "permission-command",
+        "kind": "success",
+        "sourceEventSeq": 1,
+    })) == []
+
+
 @pytest.mark.parametrize("event_type", [
     "hook/invoked",
     "hook/result",

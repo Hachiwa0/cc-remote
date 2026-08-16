@@ -366,8 +366,14 @@ export interface WorkDashboard extends Base { type: "work_dashboard"; engine: Wo
 export interface DirEntry { name: string; path: string }
 export interface ListDir extends Base { type: "list_dir"; path?: string | null }
 export interface DirList extends Base { type: "dir_list"; path: string; parent?: string | null; dirs: DirEntry[]; request_id?: string | null }
-export interface SetPerm extends Base { type: "set_perm"; mode: PermissionMode }
-export interface Perm extends Base { type: "perm"; mode: string }
+export interface SetPerm extends Base { type: "set_perm"; mode: string; engine?: Engine | null }
+export interface PermissionModeInfo {
+  id: string;
+  name: string;
+  description?: string | null;
+  danger?: boolean;
+}
+export interface Perm extends Base { type: "perm"; mode: string; options?: PermissionModeInfo[] | null }
 export interface PermissionProfileInfo {
   id: CodexPermissionProfileId;
   description?: string | null;
@@ -600,7 +606,7 @@ export type ServerEvent =
   | ProcessEvent | TurnPlan | TurnDiff | TurnBinding
   | TurnEnd | ErrorMsg | WrapperDisconnected | WrapperReconnected | Hello;
 
-export const PROTOCOL_VERSION = 36;
+export const PROTOCOL_VERSION = 37;
 
 const CONTROL_MODES = new Set<ControlMode>([
   "remote", "codex_shared", "claude_broker", "external_cli", "agent_view", "desktop",

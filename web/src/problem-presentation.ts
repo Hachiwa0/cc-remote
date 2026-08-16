@@ -5,6 +5,7 @@ const INCOMPLETE_CLAUDE_SESSION =
   "Claude 会话历史不完整，无法恢复；可从会话菜单删除该条目。";
 const PROVIDER_AUTH_TURN_FAILURE =
   "模型服务认证已失效或当前账号无权限，请检查当前服务的凭据或账号权限后重试。";
+const DSH_IMAGE_INPUT_UNSUPPORTED = "当前 DSH 模型不支持图片输入。";
 const LEGACY_CODEX_AUTH_TURN_FAILURE =
   "Codex 登录已失效或当前账号无权限，请重新登录后重试。";
 const SAFE_TURN_FAILURE_MESSAGES = new Set([
@@ -12,6 +13,7 @@ const SAFE_TURN_FAILURE_MESSAGES = new Set([
   "网络异常，连接失败，请重新尝试。",
   "网络连接异常，请检查网络后重试。",
   PROVIDER_AUTH_TURN_FAILURE,
+  DSH_IMAGE_INPUT_UNSUPPORTED,
   "请求过于频繁或当前额度受限，请稍后重试。",
   "请求超时，请重新尝试。",
   "Codex 上游服务暂时不可用，请稍后重试。",
@@ -36,6 +38,9 @@ function ownershipMessage(message: string): string | null {
 }
 
 export function presentTurnProblem(error: Pick<ErrorMsg, "code" | "message">): string {
+  if (error.message.trim() === DSH_IMAGE_INPUT_UNSUPPORTED) {
+    return DSH_IMAGE_INPUT_UNSUPPORTED;
+  }
   if (error.code === "busy") {
     return ownershipMessage(error.message)
       ?? "本次消息未发送，会话当前不可写，请稍后重试。";
@@ -59,6 +64,9 @@ export function presentTurnProblem(error: Pick<ErrorMsg, "code" | "message">): s
 export function presentCommandProblem(
   error: Pick<ErrorMsg, "code" | "message">,
 ): string {
+  if (error.message.trim() === DSH_IMAGE_INPUT_UNSUPPORTED) {
+    return DSH_IMAGE_INPUT_UNSUPPORTED;
+  }
   switch (error.code) {
     case "wrapper_offline":
       return "设备正在重新连接…";

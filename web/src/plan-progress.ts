@@ -247,10 +247,12 @@ function terminalPlanHasNewerTurn(
   newerTurns: readonly Turn[] = [],
 ): boolean {
   const presentation = planProgressPresentation(progress.block);
-  // An active unfinished Plan may span clarification turns. A negative
-  // terminal belongs to the interrupted attempt, though: keep it visible until
-  // acknowledged by the next user message, then wait for that turn's own Plan.
-  if (!presentation.complete && !presentation.failed) return false;
+  // An active unfinished Plan may span clarification turns. Once its owning
+  // turn has actually ended, though, the stale inProgress marker is an audit
+  // snapshot rather than active work. Keep it visible until acknowledged by
+  // the next user message, then wait for that turn's own Plan.
+  if (!progress.block.done
+      && !presentation.complete && !presentation.failed) return false;
   const ownerIndex = turns.findIndex((turn) =>
     turnOwnsProgress(turn, progress.turnId));
   if (ownerIndex >= 0
@@ -349,6 +351,7 @@ export interface PlanProgressPresentation {
   currentStep: string | null;
   failed: boolean;
   complete: boolean;
+  stale: boolean;
   progress: number;
   progressLabel: string;
   stateLabel: string;
@@ -369,21 +372,24 @@ export function planProgressPresentation(
   // A successful terminal turn does not imply that unfinished structured plan
   // steps ran; step state remains authoritative whenever it exists.
   const complete = !failed && steps.length > 0 && completed === steps.length;
+  const stale = block.done && !failed && !complete && steps.length > 0;
   const progress = steps.length > 0
     ? Math.min(100, completed / steps.length * 100)
     : 0;
   return {
     completed,
     total: steps.length,
-    currentStep: current?.step ?? null,
+    currentStep: stale ? null : current?.step ?? null,
     failed,
     complete,
+    stale,
     progress,
     progressLabel: steps.length > 0
       ? `${completed} / ${steps.length}`
       : block.done ? "已记录" : "执行中",
     stateLabel: detailLoading ? "正在同步" : failed ? "执行异常"
-      : complete ? "全部完成" : block.done ? "执行已结束"
+      : complete ? "全部完成" : stale ? "本轮已结束，计划未更新"
+        : block.done ? "执行已结束"
         : current ? "正在执行" : "等待执行",
     description: block.explanation || block.summary || null,
     fallbackDetail: steps.length === 0

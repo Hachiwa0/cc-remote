@@ -54,7 +54,7 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   transport, never the caller's Origin. Uvicorn trusts forwarded transport
   metadata only from loopback Caddy. Never put tokens in URLs or protocol
   message bodies; logging redacts token/password fields.
-- **Protocol version gate**: current wire protocol v36 is declared by
+- **Protocol version gate**: current wire protocol v37 is declared by
   `PROTOCOL_VERSION` in both `protocol.py` and `web/src/protocol.ts`.
   `deserialize` hard-rejects a version mismatch, and
   `_Base` is `extra="forbid"`, so ANY protocol change must be deployed to all
@@ -63,9 +63,11 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
 - **DSH is a loopback capability carrier, not a second plugin manager**: the
   wrapper may connect only to a credential-free loopback HTTP origin. DSH/Cordis
   owns plugin installation, composition, permissions, settings, and credentials;
-  cc-remote selects Agent Presets, reads effective Skills, and renders resulting
-  tool/Hook/subagent events. Never proxy DSH settings or credentials, load its
-  plugin frontends, or expose its authoring/mutation RPCs through the relay.
+  cc-remote selects Agent Presets at creation, reads effective Skills, may switch
+  only the live session permission presets DSH advertises through its native
+  `/permission` command, and renders resulting tool/Hook/subagent events. Never
+  proxy DSH settings or credentials, load its plugin frontends, or expose its
+  authoring/mutation RPCs through the relay.
 - **DSH is pinned to `@deepseek-ai/dsh@0.1.0-rc.6`**: its Typert RPC and event-log
   contracts are still release-candidate APIs. Keep the README launch command
   exact and re-run the DSH contract, history, interrupt, command, and fork tests
