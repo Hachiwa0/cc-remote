@@ -1,11 +1,12 @@
-import type {
-  Block,
-  ProcessBlock,
-  TextBlock,
-  ToolBlock,
-  Turn,
-  TurnDetailProjection,
-} from "./domain/conversation";
+import {
+  UNKNOWN_TERMINAL_ERROR,
+  type Block,
+  type ProcessBlock,
+  type TextBlock,
+  type ToolBlock,
+  type Turn,
+  type TurnDetailProjection,
+} from "./domain/conversation.ts";
 import { reconcileProvenCompactionOrphans } from "./compaction-orphans.ts";
 export { reconcileProvenCompactionOrphans } from "./compaction-orphans.ts";
 
@@ -359,6 +360,23 @@ function sharesExactTurnAlias(first: TurnIdentity, second: TurnIdentity): boolea
 
 function nativeTaskIdentity(turn: Turn): string | undefined {
   return turn.liveTaskId ?? turn.forkPointId ?? turn.codexTurnId;
+}
+
+function isIdleHistoryRestartOrphan(turn: Turn): boolean {
+  return turn.done
+    && turn.interrupted === true
+    && turn.error === UNKNOWN_TERMINAL_ERROR
+    && (turn.terminalSource == null
+      || turn.terminalSource === "idle_history_recovery")
+    && !turn.prompt
+    && !turn.clientMsgId
+    && !turn.historyTurnId
+    && !turn.checkpointId
+    && !turn.images?.length
+    && !turn.imageRefs?.length
+    && !turn.files?.length
+    && turn.blocks.length > 0
+    && turn.blocks.every((block) => block.done);
 }
 
 function blockIdentity(block: Block): string {
@@ -847,6 +865,24 @@ function restoreAuthoritativeLifecycle(merged: Turn, history: Turn): Turn {
   return restored;
 }
 
+function restoreUnownedHistoryIdentity(
+  merged: Turn,
+  history: Turn,
+  live: Turn,
+): Turn {
+  // A browser-owned optimistic row carries clientMsgId and deliberately keeps
+  // its stable React id after the native History id materializes. A prompt-less
+  // generation orphan has no such owner. Older bundles may already have copied
+  // History's prompt and historyTurnId onto that synthetic id, so an idle Codex
+  // page must canonicalize it again or the polluted id survives every refresh.
+  if (live.id === history.id || live.clientMsgId
+      || live.historyTurnId !== history.id) return merged;
+  const restored = { ...merged, id: history.id };
+  if (history.historyTurnId) restored.historyTurnId = history.historyTurnId;
+  else delete restored.historyTurnId;
+  return restored;
+}
+
 /** Merge previously-loaded heavyweight detail into a newer summary without
  * allowing stale detail lifecycle fields to reopen a steered/completed turn. */
 export function mergeAuthoritativeTurnDetail(
@@ -1267,7 +1303,15 @@ export function mergeInitialHistory(
       if (duplicateCandidates.length === 1) {
         const liveIndex = duplicateCandidates[0];
         matches[liveIndex] = authoritativeHistoryIndex;
-        authoritativeHeadDuplicateMatches.add(liveIndex);
+        if (settledCodex
+            && isIdleHistoryRestartOrphan(live[liveIndex])) {
+          // The fallback row owns no user identity. Keep History's canonical
+          // row id/lifecycle and use the uniquely overlapping blocks only as
+          // proof that this restart suffix is disposable.
+          replayOrphanMatches.add(liveIndex);
+        } else {
+          authoritativeHeadDuplicateMatches.add(liveIndex);
+        }
       }
     }
   }
@@ -1327,10 +1371,15 @@ export function mergeInitialHistory(
         !!options.preserveLiveTailOpen && !!options.reconcileReplayOrphans
           && liveIndex === activeOwnerIndex,
       );
-      merged[index] = settledCodex
-          && sharesExactTurnAlias(historyTurn, liveTurn)
-        ? restoreAuthoritativeLifecycle(bound, historyTurn)
-        : bound;
+      if (settledCodex && sharesExactTurnAlias(historyTurn, liveTurn)) {
+        merged[index] = restoreUnownedHistoryIdentity(
+          restoreAuthoritativeLifecycle(bound, historyTurn),
+          historyTurn,
+          liveTurn,
+        );
+      } else {
+        merged[index] = bound;
+      }
     } else {
       unmatched.push({ ...liveTurn, blocks: liveTurn.blocks.map((b) => ({ ...b })) });
     }

@@ -79,13 +79,14 @@ import {
   queryAcceptanceDescriptor,
   type QueryAcceptanceHistoryHead,
 } from "./outbox";
-import type {
-  Block,
-  ProcessBlock,
-  TextBlock,
-  ToolBlock,
-  Turn,
-} from "./domain/conversation";
+import {
+  UNKNOWN_TERMINAL_ERROR,
+  type Block,
+  type ProcessBlock,
+  type TextBlock,
+  type ToolBlock,
+  type Turn,
+} from "./domain/conversation.ts";
 
 const DETAIL_PARSE_ERROR = "过程解析失败";
 
@@ -1511,8 +1512,6 @@ function finishOpenBlockList(
   }
 }
 
-const UNKNOWN_TERMINAL_ERROR =
-  "会话已结束，但未收到完整的终止状态。";
 const UNKNOWN_STEER_TERMINAL_ERROR =
   "任务已结束，但本次引导是否生效未得到确认。";
 
@@ -1545,6 +1544,7 @@ function finishTurnFromIdleHistory(turn: Turn, doneTs: number): void {
   const allBlocksClosed = turn.blocks.every((block) => block.done);
   if (!turn.error && (!completedFinal || !allBlocksClosed)) {
     finishTurnWithoutTerminal(turn, doneTs);
+    turn.terminalSource = "idle_history_recovery";
     return;
   }
   turn.done = true;
