@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import os
+import plistlib
 import stat
 import threading
 from dataclasses import replace
@@ -177,6 +179,8 @@ def test_office_preview_converts_inside_ephemeral_sandbox(tmp_path, monkeypatch)
     source.write_bytes(b"office-source")
     machine, _ = _mk_machine()
 
+    monkeypatch.setattr(
+        type(machine), "_office_preview_platform", staticmethod(lambda: "linux"))
     monkeypatch.setattr("cc_remote.wrapper.machine.shutil.which",
                         lambda name: f"/usr/bin/{name}")
 
@@ -206,6 +210,72 @@ def test_office_preview_converts_inside_ephemeral_sandbox(tmp_path, monkeypatch)
     assert preview["data"] == b"%PDF-1.7\nconverted"
     assert preview["size"] == len(b"office-source")
     assert list(tmp_path.iterdir()) == [source]
+
+
+def test_macos_office_preview_uses_quicklook_and_inlines_assets(
+    tmp_path, monkeypatch,
+):
+    source = tmp_path / "deck.pptx"
+    source.write_bytes(b"office-source")
+    machine, _ = _mk_machine()
+    png = b"\x89PNG\r\n\x1a\npreview"
+
+    monkeypatch.setattr(
+        type(machine), "_office_preview_platform", staticmethod(lambda: "darwin"))
+
+    def fake_convert(cls, command, *, temp_home=None):
+        assert command[0] == "/usr/bin/qlmanage"
+        assert command[1:4] == ["-x", "-p", "-o"]
+        assert temp_home is not None
+        output = Path(command[4])
+        preview = output / "input.pptx.qlpreview"
+        preview.mkdir()
+        (preview / "Preview.html").write_text(
+            '<html><head><meta name="viewport" content="width=800">'
+            '</head><body><div class="slide">one</div>'
+            '<img src="Attachment1.png"></body></html>',
+            encoding="utf-8",
+        )
+        (preview / "Attachment1.png").write_bytes(png)
+        (preview / "PreviewProperties.plist").write_bytes(plistlib.dumps({
+            "AllowJavascript": True,
+            "AllowNetworkAccess": False,
+            "MimeType": "text/html",
+            "Attachments": {
+                "native-id": {
+                    "DumpedAttachmentFileName": "Attachment1.png",
+                    "MimeType": "image/png",
+                },
+            },
+        }))
+
+    monkeypatch.setattr(
+        type(machine), "_run_office_conversion", classmethod(fake_convert))
+
+    preview = machine._read_file_preview(str(tmp_path), "deck.pptx")
+
+    assert preview["format"] == "html"
+    assert preview["media_type"] == "text/html"
+    assert preview["converted_from"] == "pptx"
+    assert b"Attachment1.png" not in preview["data"]
+    assert (
+        b"data:image/png;base64," + base64.b64encode(png)
+    ) in preview["data"]
+    assert list(tmp_path.iterdir()) == [source]
+
+
+def test_macos_office_preview_rejects_unsafe_quicklook_bundle(tmp_path):
+    preview = tmp_path / "input.pptx.qlpreview"
+    preview.mkdir()
+    (preview / "Preview.html").write_text(
+        "<html><body>preview</body></html>", encoding="utf-8")
+    (preview / "PreviewProperties.plist").write_bytes(plistlib.dumps({
+        "AllowNetworkAccess": True,
+        "MimeType": "text/html",
+    }))
+
+    with pytest.raises(ValueError, match="安全属性"):
+        machine_module.WrapperMachine._read_quicklook_office_preview(preview)
 
 
 def test_office_converter_process_receives_only_minimal_environment(monkeypatch):

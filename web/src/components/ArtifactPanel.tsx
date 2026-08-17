@@ -15,6 +15,8 @@ import { parseLocalFileTarget } from "../file-link";
 import {
   buildInteractiveSandboxDocument,
   buildSandboxDocument,
+  decodePreviewHtmlData,
+  officePreviewViewport,
 } from "../html-preview";
 import { clampPanelWidth } from "../responsive-layout";
 import { isMermaidFenceClass } from "../mermaid";
@@ -26,6 +28,17 @@ import {
 } from "../markdown-math";
 import { MermaidBlock } from "./MermaidBlock";
 import { PreviewAuthorizationPrompt } from "./PreviewAuthorizationPrompt";
+import {
+  boundedPdfOutputScale,
+  decodeBase64Bytes,
+  residentPdfPages,
+} from "../pdf-preview";
+import type {
+  PDFDocumentLoadingTask,
+  PDFDocumentProxy,
+  PDFPageProxy,
+  RenderTask,
+} from "pdfjs-dist";
 
 const EMPTY_GIT_DIFF_SECTIONS: GitDiffSection[] = [];
 const MAX_PREVIEW_ASSETS = 12;
@@ -70,7 +83,12 @@ function MarkdownPreviewCode({
   return <code className={className}>{children}</code>;
 }
 
-function HtmlArtifactPreview({ content }: { content: string }) {
+function HtmlArtifactPreview({ content, data, mediaType, staticOnly = false }: {
+  content: string;
+  data?: string;
+  mediaType?: string;
+  staticOnly?: boolean;
+}) {
   const [document, setDocument] = useState<string | null>(null);
   const [interactiveDocument, setInteractiveDocument] =
     useState<string | null>(null);
@@ -82,8 +100,15 @@ function HtmlArtifactPreview({ content }: { content: string }) {
     let cancelled = false;
     const prepare = async () => {
       try {
+        let source = content;
+        if (data) {
+          if (mediaType !== "text/html") {
+            throw new Error("invalid rendered HTML media type");
+          }
+          source = decodePreviewHtmlData(data);
+        }
         const { default: DOMPurify } = await import("dompurify");
-        const clean = DOMPurify.sanitize(content, {
+        const clean = DOMPurify.sanitize(source, {
           WHOLE_DOCUMENT: true,
           FORBID_TAGS: ["script", "iframe", "object", "embed", "form", "base", "meta", "link"],
           FORBID_ATTR: ["srcset", "action", "formaction"],
@@ -109,44 +134,49 @@ function HtmlArtifactPreview({ content }: { content: string }) {
           if (UNSAFE_CSS.test(style.textContent || "")) style.remove();
         }
 
-        const runnable = new DOMParser().parseFromString(content, "text/html");
-        for (const element of Array.from(runnable.querySelectorAll(
-          "iframe,object,embed,form,base,link,meta[http-equiv],script[src]",
-        ))) {
-          element.remove();
-        }
-        for (const element of runnable.documentElement.querySelectorAll("*")) {
-          for (const attribute of Array.from(element.attributes)) {
-            const name = attribute.name.toLowerCase();
-            const value = attribute.value.trim();
-            if (name === "srcset" || name === "action"
-                || name === "formaction") {
-              element.removeAttribute(attribute.name);
-            } else if (URL_ATTRIBUTES.has(name)) {
-              const allowedAnchor = name === "href" && value.startsWith("#");
-              const allowedImage = name === "src"
-                && /^data:image\/(?:png|jpeg|gif|webp|avif|svg\+xml);base64,/i
-                  .test(value);
-              if (!allowedAnchor && !allowedImage) {
+        let runnableDocument: string | null = null;
+        if (!staticOnly) {
+          const runnable = new DOMParser().parseFromString(source, "text/html");
+          for (const element of Array.from(runnable.querySelectorAll(
+            "iframe,object,embed,form,base,link,meta[http-equiv],script[src]",
+          ))) {
+            element.remove();
+          }
+          for (const element of runnable.documentElement.querySelectorAll("*")) {
+            for (const attribute of Array.from(element.attributes)) {
+              const name = attribute.name.toLowerCase();
+              const value = attribute.value.trim();
+              if (name === "srcset" || name === "action"
+                  || name === "formaction") {
+                element.removeAttribute(attribute.name);
+              } else if (URL_ATTRIBUTES.has(name)) {
+                const allowedAnchor = name === "href" && value.startsWith("#");
+                const allowedImage = name === "src"
+                  && /^data:image\/(?:png|jpeg|gif|webp|avif|svg\+xml);base64,/i
+                    .test(value);
+                if (!allowedAnchor && !allowedImage) {
+                  element.removeAttribute(attribute.name);
+                }
+              } else if (name === "style" && UNSAFE_CSS.test(value)) {
                 element.removeAttribute(attribute.name);
               }
-            } else if (name === "style" && UNSAFE_CSS.test(value)) {
-              element.removeAttribute(attribute.name);
             }
           }
-        }
-        for (const style of runnable.documentElement.querySelectorAll("style")) {
-          if (UNSAFE_CSS.test(style.textContent || "")) style.remove();
+          for (const style of runnable.documentElement.querySelectorAll("style")) {
+            if (UNSAFE_CSS.test(style.textContent || "")) style.remove();
+          }
+          runnableDocument = buildInteractiveSandboxDocument(
+            runnable.body.innerHTML,
+            runnable.head.innerHTML,
+          );
         }
         if (cancelled) return;
         setDocument(buildSandboxDocument(
           parsed.body.innerHTML,
           parsed.head.innerHTML,
+          staticOnly ? officePreviewViewport(source) : undefined,
         ));
-        setInteractiveDocument(buildInteractiveSandboxDocument(
-          runnable.body.innerHTML,
-          runnable.head.innerHTML,
-        ));
+        setInteractiveDocument(runnableDocument);
         setInteractive(false);
         setError(null);
       } catch {
@@ -158,7 +188,7 @@ function HtmlArtifactPreview({ content }: { content: string }) {
     };
     void prepare();
     return () => { cancelled = true; };
-  }, [content]);
+  }, [content, data, mediaType, staticOnly]);
 
   const loadInteractiveDocument = useCallback(() => {
     if (!interactiveDocument) return;
@@ -172,10 +202,11 @@ function HtmlArtifactPreview({ content }: { content: string }) {
   if (!document) return <div className="diff-empty"><span className="thinking"><span/><span/><span/></span> 正在准备 HTML…</div>;
   return <div className="artifact-html-stage">
     <div className="artifact-html-controls">
-      <span>外部资源已禁用</span>
-      <button type="button" onClick={() => setInteractive((value) => !value)}>
-        {interactive ? "停止交互预览" : "运行交互预览"}
-      </button>
+      <span>{staticOnly ? "静态预览 · 外部资源和脚本已禁用" : "外部资源已禁用"}</span>
+      {!staticOnly && <button type="button"
+        onClick={() => setInteractive((value) => !value)}>
+          {interactive ? "停止交互预览" : "运行交互预览"}
+      </button>}
     </div>
     {interactive
       ? <iframe ref={interactiveFrameRef} className="artifact-html-preview"
@@ -187,10 +218,9 @@ function HtmlArtifactPreview({ content }: { content: string }) {
   </div>;
 }
 
-function BinaryArtifactPreview({ data, mediaType, kind, title }: {
+function BinaryArtifactPreview({ data, mediaType, title }: {
   data?: string;
   mediaType?: string;
-  kind: "image" | "pdf";
   title: string;
 }) {
   const [objectUrl, setObjectUrl] = useState<string | null>(null);
@@ -209,11 +239,7 @@ function BinaryArtifactPreview({ data, mediaType, kind, title }: {
       return;
     }
     try {
-      const binary = window.atob(data);
-      const bytes = new Uint8Array(binary.length);
-      for (let index = 0; index < binary.length; index += 1) {
-        bytes[index] = binary.charCodeAt(index);
-      }
+      const bytes = decodeBase64Bytes(data);
       const url = URL.createObjectURL(new Blob([bytes], { type: mediaType }));
       setObjectUrl(url);
       setError(null);
@@ -228,10 +254,175 @@ function BinaryArtifactPreview({ data, mediaType, kind, title }: {
   const resolvedError = mediaType === "image/svg+xml" ? svg.error : error;
   if (resolvedError) return <div className="preview-error"><Icon name="read" size={18} />{resolvedError}</div>;
   if (!resolvedUrl) return <div className="diff-empty"><span className="thinking"><span/><span/><span/></span> 正在准备预览…</div>;
-  if (kind === "image") {
-    return <div className="artifact-image-stage"><img src={resolvedUrl} alt={title} /></div>;
-  }
-  return <iframe className="artifact-pdf-preview" src={resolvedUrl} title={`${title} PDF 预览`} />;
+  return <div className="artifact-image-stage"><img src={resolvedUrl} alt={title} /></div>;
+}
+
+function PdfArtifactPreview({ data, title }: { data?: string; title: string }) {
+  const stageRef = useRef<HTMLDivElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const pagesRef = useRef<Map<number, PDFPageProxy>>(new Map());
+  const [document, setDocument] = useState<PDFDocumentProxy | null>(null);
+  const [pageProxy, setPageProxy] = useState<PDFPageProxy | null>(null);
+  const [page, setPage] = useState(1);
+  const [zoom, setZoom] = useState(1);
+  const [stageWidth, setStageWidth] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const stage = stageRef.current;
+    if (!stage) return;
+    const update = () => setStageWidth(Math.max(0, stage.clientWidth - 28));
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(stage);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    let task: PDFDocumentLoadingTask | null = null;
+    let loaded: PDFDocumentProxy | null = null;
+    pagesRef.current.clear();
+    setDocument(null);
+    setPageProxy(null);
+    setPage(1);
+    setZoom(1);
+    setLoading(true);
+    setError(null);
+
+    const load = async () => {
+      if (!data) throw new Error("missing PDF data");
+      const [{ GlobalWorkerOptions, getDocument }, worker] = await Promise.all([
+        import("pdfjs-dist"),
+        import("pdfjs-dist/build/pdf.worker.min.mjs?url"),
+      ]);
+      GlobalWorkerOptions.workerSrc = worker.default;
+      task = getDocument({
+        data: decodeBase64Bytes(data),
+        disableAutoFetch: true,
+        disableStream: true,
+        enableXfa: false,
+        isEvalSupported: false,
+        useSystemFonts: true,
+      });
+      loaded = await task.promise;
+      if (cancelled) {
+        await loaded.destroy();
+        return;
+      }
+      setDocument(loaded);
+      setLoading(false);
+    };
+    void load().catch(() => {
+      if (cancelled) return;
+      setLoading(false);
+      setError("PDF 预览数据损坏或不受支持");
+    });
+    return () => {
+      cancelled = true;
+      pagesRef.current.clear();
+      if (loaded) void loaded.destroy();
+      else if (task) void task.destroy();
+    };
+  }, [data]);
+
+  useEffect(() => {
+    if (!document) return;
+    let cancelled = false;
+    setPageProxy(null);
+    const wanted = residentPdfPages(page, document.numPages);
+    const loadPages = async () => {
+      const resolved = await Promise.all(wanted.map(async (pageNumber) => [
+        pageNumber,
+        pagesRef.current.get(pageNumber) || await document.getPage(pageNumber),
+      ] as const));
+      if (cancelled) return;
+      const next = new Map(resolved);
+      for (const [pageNumber, candidate] of pagesRef.current) {
+        if (!next.has(pageNumber)) candidate.cleanup();
+      }
+      pagesRef.current = next;
+      setPageProxy(next.get(page) || null);
+    };
+    void loadPages().catch(() => {
+      if (!cancelled) setError("PDF 页面读取失败");
+    });
+    return () => { cancelled = true; };
+  }, [document, page]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !pageProxy || stageWidth <= 0) return;
+    let cancelled = false;
+    let renderTask: RenderTask | null = null;
+    const base = pageProxy.getViewport({ scale: 1 });
+    if (!Number.isFinite(base.width) || !Number.isFinite(base.height)
+        || base.width <= 0 || base.height <= 0) {
+      setError("PDF 页面尺寸无效");
+      return;
+    }
+    const fitScale = Math.min(stageWidth / base.width, 8192 / base.height);
+    const viewport = pageProxy.getViewport({ scale: fitScale * zoom });
+    const outputScale = boundedPdfOutputScale(
+      viewport.width, viewport.height, window.devicePixelRatio,
+    );
+    canvas.width = Math.max(1, Math.floor(viewport.width * outputScale));
+    canvas.height = Math.max(1, Math.floor(viewport.height * outputScale));
+    canvas.style.width = `${Math.floor(viewport.width)}px`;
+    canvas.style.height = `${Math.floor(viewport.height)}px`;
+    const context = canvas.getContext("2d", { alpha: false });
+    if (!context) {
+      setError("浏览器无法创建 PDF 画布");
+      return;
+    }
+    const renderViewport = pageProxy.getViewport({
+      scale: fitScale * zoom * outputScale,
+    });
+    renderTask = pageProxy.render({
+      canvas,
+      canvasContext: context,
+      viewport: renderViewport,
+      intent: "display",
+    });
+    void renderTask.promise.catch(() => {
+      if (!cancelled) setError("PDF 页面渲染失败");
+    });
+    return () => {
+      cancelled = true;
+      renderTask?.cancel();
+    };
+  }, [pageProxy, stageWidth, zoom]);
+
+  if (error) return <div className="preview-error"><Icon name="read" size={18} />{error}</div>;
+  return <div className="artifact-pdf-stage" ref={stageRef}>
+    <div className="artifact-pdf-controls">
+      <div>
+        <button type="button" disabled={!document || page <= 1}
+          onClick={() => setPage((value) => Math.max(1, value - 1))}
+          aria-label="上一页">‹</button>
+        <span>{document ? `${page} / ${document.numPages}` : "– / –"}</span>
+        <button type="button" disabled={!document || page >= document.numPages}
+          onClick={() => setPage((value) => document
+            ? Math.min(document.numPages, value + 1) : value)}
+          aria-label="下一页">›</button>
+      </div>
+      <div>
+        <button type="button" disabled={!document || zoom <= 0.75}
+          onClick={() => setZoom((value) => Math.max(0.75, value - 0.25))}
+          aria-label="缩小">−</button>
+        <span>{Math.round(zoom * 100)}%</span>
+        <button type="button" disabled={!document || zoom >= 2}
+          onClick={() => setZoom((value) => Math.min(2, value + 0.25))}
+          aria-label="放大">＋</button>
+      </div>
+    </div>
+    <div className="artifact-pdf-page" aria-label={`${title} PDF 预览`}>
+      {loading || !pageProxy
+        ? <div className="diff-empty"><span className="thinking"><span/><span/><span/></span> 正在准备 PDF…</div>
+        : <canvas ref={canvasRef} />}
+    </div>
+  </div>;
 }
 
 function SourceFile({ content, targetLine, artifactKey }: {
@@ -635,7 +826,8 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
         {hasBtw ? <PanelTabs active={active} artifactKind={artifact.kind} onTab={switchPanelTab} />
           : <span className="artifact-title">{title}</span>}
         <span className="artifact-path" title={artifact.file}>{artifact.file || "所有改动"}</span>
-        {["md", "html"].includes(artifact.kind) && !loading && !artifact.error && <div
+        {["md", "html"].includes(artifact.kind) && !artifact.convertedFrom
+          && !loading && !artifact.error && <div
           className="preview-modes" role="group"
           aria-label={`${artifact.kind === "html" ? "HTML" : "Markdown"} 显示模式`}>
           <button className={mode === "preview" ? "on" : ""}
@@ -658,8 +850,8 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
         {artifact.kind === "md" && artifact.saveStatus === "saved" && !dirty
           && <span className="markdown-save-state ok">已保存</span>}
         {artifact.convertedFrom && <span className="artifact-converted"
-          title="由 nono 本机沙箱临时转换，VPS 不保存文件">
-          {artifact.convertedFrom.toUpperCase()} → PDF
+          title="由 Wrapper 本机隔离预览，VPS 不保存文件">
+          {artifact.convertedFrom.toUpperCase()} 预览
         </span>}
         {["md", "file", "html", "image", "pdf"].includes(artifact.kind) && <button className="iconbtn"
           onClick={() => onRefresh?.(artifact.file, artifact.line)}
@@ -725,13 +917,14 @@ export function ArtifactPanel({ artifact, active, hasBtw, onTab, onClose,
         ) : artifact.kind === "html" ? (
           mode === "source"
             ? <SourceFile content={artifact.content || ""} artifactKey={artifactKey} />
-            : <HtmlArtifactPreview content={artifact.content || ""} />
+            : <HtmlArtifactPreview content={artifact.content || ""}
+                data={artifact.data} mediaType={artifact.mediaType}
+                staticOnly={!!artifact.convertedFrom} />
         ) : artifact.kind === "image" ? (
           <BinaryArtifactPreview data={artifact.data} mediaType={artifact.mediaType}
-            kind="image" title={title} />
+            title={title} />
         ) : artifact.kind === "pdf" ? (
-          <BinaryArtifactPreview data={artifact.data} mediaType={artifact.mediaType}
-            kind="pdf" title={title} />
+          <PdfArtifactPreview data={artifact.data} title={title} />
         ) : artifact.kind === "file" ? (
           <>
             {artifact.truncated && <div className="preview-truncated">文件共 {artifact.size?.toLocaleString()} 字节，仅预览前 512 KiB。</div>}

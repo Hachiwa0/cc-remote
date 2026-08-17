@@ -4,6 +4,11 @@
 
 ## 未发布
 
+- Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v38。macOS 的 Office 文件
+  不再误走 Linux bubblewrap 路径，改用系统 Quick Look 隔离预览服务；有上限的多页
+  HTML 和清单内栅格图片会先经校验、内联，再作为二进制预览数据送入浏览器的无脚本
+  CSP 沙箱。Linux 保持 LibreOffice + bubblewrap 的 PDF 路径；延迟加载的 PDF.js
+  只驻留当前页和相邻页，并提供翻页与缩放。演示文稿脚本、宏和动画仍明确不执行。
 - Wrapper、Relay 与 Web 的协同 gate 升级到 protocol v37。DSH 会话现在会在通用
   上下文入口显示原生上下文投影，在 Code 标题中标明不可变的 Agent Preset，并把
   当前 Agent 提供的权限选项同步到左下角通用选择器；切换后通过 DSH 原生权限命令

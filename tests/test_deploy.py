@@ -638,15 +638,15 @@ def test_deploy_protocol_validation_reads_backend_and_manifest(tmp_path):
     backend = tmp_path / "protocol.py"
     manifest = tmp_path / "cc-remote-build.json"
     product.write_text('__version__ = "3.0.0"\n')
-    backend.write_text("PROTOCOL_VERSION = 37\n")
-    manifest.write_text('{"version":"3.0.0","protocol":37}\n')
-    assert validate_protocol_bundle(backend, manifest) == 37
+    backend.write_text("PROTOCOL_VERSION = 38\n")
+    manifest.write_text('{"version":"3.0.0","protocol":38}\n')
+    assert validate_protocol_bundle(backend, manifest) == 38
 
-    manifest.write_text('{"version":"3.0.0","protocol":36}\n')
-    with pytest.raises(ProtocolBundleError, match="backend v37, web v36"):
+    manifest.write_text('{"version":"3.0.0","protocol":37}\n')
+    with pytest.raises(ProtocolBundleError, match="backend v38, web v37"):
         validate_protocol_bundle(backend, manifest)
 
-    manifest.write_text('{"version":"2.9.0","protocol":37}\n')
+    manifest.write_text('{"version":"2.9.0","protocol":38}\n')
     with pytest.raises(
         ProtocolBundleError,
         match="backend v3.0.0, web v2.9.0",
@@ -661,7 +661,7 @@ def test_setup_protocol_gate_has_no_release_specific_literal():
     assert not re.search(r'"protocol"[^\n]*[0-9]+', source)
 
 
-def test_release_docs_and_examples_describe_one_atomic_v37_layout():
+def test_release_docs_and_examples_describe_one_atomic_v38_layout():
     deploy_readme = (ROOT / "deploy" / "README.md").read_text()
     readme = (ROOT / "README.md").read_text()
     readme_en = (ROOT / "README_en.md").read_text()
@@ -674,11 +674,11 @@ def test_release_docs_and_examples_describe_one_atomic_v37_layout():
     relay_env = (ROOT / "deploy" / "env.relay.example").read_text()
     unit = (ROOT / "deploy" / "cc-remote-relay.service").read_text()
 
-    assert "Protocol v37" in deploy_readme
+    assert "Protocol v38" in deploy_readme
     assert "v34 Codex ownership backfill" in deploy_readme
     assert "v14" not in deploy_readme
     for document in (deploy_readme, readme, readme_en):
-        assert "v37" in document
+        assert "v38" in document
         assert "v16" not in document
         assert "v18" not in document
         assert "sudo rsync -a --delete" not in document
@@ -715,7 +715,7 @@ def test_release_docs_and_examples_describe_one_atomic_v37_layout():
     assert "WorkingDirectory=/opt/cc-remote/current" in unit
     assert "ExecStart=/opt/cc-remote/current/.venv/bin/python" in unit
     assert "claude-agent-sdk==0.2.128" in claude
-    assert "protocol v37" in claude
+    assert "protocol v38" in claude
     assert "0.2.110" not in claude
     assert "protocol v10" not in claude
 

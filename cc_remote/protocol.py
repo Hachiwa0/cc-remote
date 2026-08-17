@@ -28,7 +28,7 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 37
+PROTOCOL_VERSION = 38
 
 # Codex Desktop renders a 53-week daily token-activity calendar. Keep the wire
 # payload to that same bounded window so an account response can never turn a
@@ -2008,8 +2008,10 @@ class FilePreview(_Base):
     """wrapper -> requesting client: bounded source or locally-rendered artifact.
 
     Binary previews are transported directly through the authenticated relay;
-    the relay never writes them to disk. Office files are converted by the
+    the relay never writes them to disk. Office files are rendered by the
     wrapper host and report their original extension in ``converted_from``.
+    Sandboxed rendered HTML uses the bounded binary ``data`` field rather than
+    the smaller editable/source ``content`` field.
     """
     type: Literal["file_preview"] = "file_preview"
     path: PreviewPath
@@ -2018,7 +2020,7 @@ class FilePreview(_Base):
     content: PreviewContent = ""
     media_type: Optional[Literal[
         "image/png", "image/jpeg", "image/gif", "image/webp", "image/avif",
-        "image/svg+xml", "application/pdf",
+        "image/svg+xml", "application/pdf", "text/html",
     ]] = None
     data: Optional[ArtifactPreviewData] = None
     converted_from: Optional[str] = Field(default=None, max_length=16)

@@ -142,6 +142,50 @@ test("HTML preview retains head CSS and runs scripts only after explicit consent
   );
 });
 
+test("Office Quick Look preview stays static and preserves multi-page layout", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?artifact-office-html=1");
+  await applyProductionCsp(page);
+
+  await expect(page.locator(".artifact-converted")).toHaveText("PPTX 预览");
+  await expect(page.getByRole("button", { name: "运行交互预览" }))
+    .toHaveCount(0);
+  const frame = page.frameLocator('iframe[title="HTML 静态预览"]');
+  await expect(frame.getByText("Quick Look slide one")).toBeVisible();
+  await expect(frame.getByText("Quick Look slide two")).toBeVisible();
+  await expect(frame.locator("body")).not.toHaveAttribute(
+    "data-script-ran",
+    "yes",
+  );
+});
+
+test("PDF preview renders one bounded page and navigates without a browser plugin", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?artifact-pdf=1");
+  await applyProductionCsp(page);
+
+  const canvas = page.locator(".artifact-pdf-page canvas");
+  await expect(canvas).toBeVisible();
+  await expect(page.locator(".artifact-pdf-controls")).toContainText("1 / 2");
+  await expect.poll(() => canvas.evaluate((node) => ({
+    width: (node as HTMLCanvasElement).width,
+    height: (node as HTMLCanvasElement).height,
+  }))).toMatchObject({ width: expect.any(Number), height: expect.any(Number) });
+  const first = await canvas.evaluate((node) => ({
+    width: (node as HTMLCanvasElement).width,
+    height: (node as HTMLCanvasElement).height,
+  }));
+  expect(first.width).toBeGreaterThan(0);
+  expect(first.height).toBeGreaterThan(0);
+  expect(first.width * first.height).toBeLessThanOrEqual(12 * 1024 * 1024);
+
+  await page.getByRole("button", { name: "下一页" }).click();
+  await expect(page.locator(".artifact-pdf-controls")).toContainText("2 / 2");
+  await expect(canvas).toBeVisible();
+});
+
 for (const fixture of ["artifact-svg", "artifact-markdown-svg"] as const) {
   test(`${fixture} sanitizes SVG before creating a blob URL`, async ({
     page,

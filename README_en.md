@@ -4,7 +4,7 @@
 
 Self-hosted · Three backends · Multi-session · Live process · Responsive Web
 
-**Current release: v3.0.0** · Wire protocol v37
+**Current release: v3.0.0** · Wire protocol v38
 
 [中文](README.md) ·
 [5-minute quick start](#quick-start-local-one-machine-5-min) ·
@@ -63,7 +63,7 @@ with the previous public release, the major changes are:
 | **Native App / CLI coordination** | Claude CLI/Desktop/Agent View and Codex shared daemon/App/CLI retain engine-specific ownership models. v3 reconciles running, read-only, interrupt, steer, compact, turn binding, and terminal state so sibling sessions do not lock each other, old turns do not move to the tail, and interrupted work does not leave ghost activity. |
 | **Multi-device isolation** | Device Center adds single-use pairing, independently revocable machine credentials, and presence. The relay routes only an account's allowed `machine_id` values. Device, Code / Work, engine, connection generation, and session ownership are isolated so delayed frames cannot mutate the active view. |
 | **Mobile and artifact UX** | Loading older history preserves the scroll anchor. Images load on demand and support a lightbox, tap-to-close, and pinch zoom. Markdown, source, HTML, PDF, and Office previews remain within the local security boundary. Exact files outside cwd require confirmation in the requesting session and are bound to that file identity; user-approved Markdown stays read-only, while only files successfully written by the session can be saved. PWA icons, narrow-screen sheets, error presentation, and process timelines are also aligned. |
-| **Rollback-safe releases** | The product version is v3.0.0 and the wire protocol is v37. Builds and deployments validate both values. The VPS uses immutable releases, release-local virtual environments, an atomic `current` switch, and rollback instead of overwriting a live directory. |
+| **Rollback-safe releases** | The product version is v3.0.0 and the wire protocol is v38. Builds and deployments validate both values. The VPS uses immutable releases, release-local virtual environments, an atomic `current` switch, and rollback instead of overwriting a live directory. |
 
 > **The trust boundary has not changed:** model accounts, API keys, session
 > sources, and tool execution stay on the wrapper machine. The VPS relay stores
@@ -265,10 +265,15 @@ new hooks should not rely on that compatibility path.
   network-blocked sandbox iframe.
 - PNG/JPEG/GIF/WebP/AVIF and PDF are path-, type-, and size-checked by the wrapper,
   then returned only to the requesting browser through the authenticated WebSocket.
-- DOC/DOCX/ODT/RTF, XLS/XLSX/ODS, and PPT/PPTX/ODP are converted to PDF by
-  LibreOffice on the **wrapper host**. On Linux, bubblewrap removes network and
-  user-directory access and mounts only that request's temporary directory. The
-  directory is deleted immediately after conversion.
+  The built-in PDF.js renderer keeps only the current and adjacent pages resident,
+  provides page and zoom controls, and does not depend on a system PDF plugin.
+- DOC/DOCX/ODT/RTF, XLS/XLSX/ODS, and PPT/PPTX/ODP are rendered statically on
+  the **wrapper host**. Linux converts them to PDF with LibreOffice inside
+  bubblewrap, which mounts only that request's temporary directory. macOS uses
+  the system Quick Look isolated preview service to produce multi-page HTML;
+  validated images are inlined before the browser sanitizes it. Both paths deny
+  external networking and scripts and delete the temporary directory afterward.
+  Presentation animations, macros, and interactive controls are never executed.
 - The VPS relay forwards bounded preview frames and stores neither originals nor
   converted files. Replacing the VPS requires no session migration. Moving to a
   new wrapper device means migrating the local transcripts/rollouts, Work roots,
@@ -569,14 +574,14 @@ npm --prefix web run build   # produces web/dist/
 
 > The web client no longer bakes any token into the JS: login POSTs the password to the relay for a short-lived session token. So the build needs no `VITE_*` variables.
 
-> **Upgrading to protocol v37:** the wire gate rejects mixed versions. Deploy
+> **Upgrading to protocol v38:** the wire gate rejects mixed versions. Deploy
 > `cc_remote/` and the new `web/dist/` in one maintenance window, then restart the
 > relay and wrapper; do not run a rolling mixture. Existing sockets reconnect
 > briefly, and a relay restart intentionally requires browsers to log in again.
 > Any already-open older page also needs one **hard refresh** to load the new hashed
 > assets; logging in again inside the old JavaScript bundle isn't sufficient.
 > For a manual release, stop the local wrapper first, stop and update relay + web,
-> then start the v37 relay and v37 wrapper so the old wrapper cannot occupy the
+> then start the v38 relay and v38 wrapper so the old wrapper cannot occupy the
 > slot for the same `machine_id`. When upgrading from a pre-v34 release, retain
 > the Work SQLite migration protection introduced by v34: a manual release must
 > run `deploy/work_registry_snapshot.py snapshot` before the new wrapper starts.
@@ -639,7 +644,7 @@ The script installs `python3-venv` + Caddy, creates the `ccremote` service user,
 builds an immutable release and its venv, merges Caddy configuration, atomically
 switches `current`, and restarts the relay. If restart/readiness fails, `current`,
 the Caddyfile, and the systemd unit roll back as one transaction and the previous
-release's `/healthz` is verified. Start the v37 wrapper after success.
+release's `/healthz` is verified. Start the v38 wrapper after success.
 
 Verify:
 

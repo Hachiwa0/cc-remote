@@ -54,7 +54,7 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   transport, never the caller's Origin. Uvicorn trusts forwarded transport
   metadata only from loopback Caddy. Never put tokens in URLs or protocol
   message bodies; logging redacts token/password fields.
-- **Protocol version gate**: current wire protocol v37 is declared by
+- **Protocol version gate**: current wire protocol v38 is declared by
   `PROTOCOL_VERSION` in both `protocol.py` and `web/src/protocol.ts`.
   `deserialize` hard-rejects a version mismatch, and
   `_Base` is `extra="forbid"`, so ANY protocol change must be deployed to all
@@ -141,6 +141,10 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   owned by the official app-server: cc-remote must page history and use native
   resume/compaction state, never re-upload a whole rollout. Browsing history is
   transcript/rollout I/O and must not create a model turn.
+- **PDF.js is pinned to `pdfjs-dist@5.4.624`**: it is lazy-loaded only for PDF
+  artifacts and supports the documented Node 20.19 build floor; PDF.js 6.x
+  raises that floor to Node 22. Keep rendering page-based, retain at most the
+  current and adjacent page proxies, and preserve the 12M-pixel canvas cap.
 
 ## Module map
 - `cc_remote/protocol.py` — pydantic wire schema; all modules depend on it.

@@ -12,6 +12,11 @@ import {
   classifyMessageImageTarget,
 } from "../src/inline-image-assets.ts";
 import { imageDimensionsFromBase64, queryImageDimensions } from "../src/img.ts";
+import {
+  boundedPdfOutputScale,
+  decodeBase64Bytes,
+  residentPdfPages,
+} from "../src/pdf-preview.ts";
 import { collectTurnFileChanges, filePathsFromInput, mutatedFilePaths } from "../src/file-changes.ts";
 import {
   MAX_MERMAID_SOURCE_CHARS,
@@ -49,6 +54,13 @@ assert.deepEqual(classifyPreviewTarget("README.md", "#section"), {
 });
 assert.equal(isMarkdownPath("docs/guide.MD#intro"), true);
 assert.equal(isMarkdownPath("docs/image.png"), false);
+assert.deepEqual(residentPdfPages(1, 5), [1, 2]);
+assert.deepEqual(residentPdfPages(3, 5), [2, 3, 4]);
+assert.deepEqual(residentPdfPages(5, 5), [4, 5]);
+assert.deepEqual([...decodeBase64Bytes("JVBERi0=")], [...Buffer.from("%PDF-")]);
+assert.equal(boundedPdfOutputScale(1000, 1000, 3), 2);
+assert.ok(boundedPdfOutputScale(5000, 5000, 2) < 1,
+  "large PDF pages must stay below the canvas pixel budget");
 assert.deepEqual(parseLocalFileTarget(
   "/home/nancy/project/codex_stream.py:731"), {
   path: "/home/nancy/project/codex_stream.py", line: 731, column: undefined,
@@ -428,7 +440,7 @@ try {
     "an even trailing slash run must stay escaped across the append boundary");
   const { ArtifactPanel } = await harness.ssrLoadModule(
     "/src/components/ArtifactPanel.tsx");
-  const { buildSandboxDocument } = await harness.ssrLoadModule(
+  const { buildSandboxDocument, decodePreviewHtmlData } = await harness.ssrLoadModule(
     "/src/html-preview.ts");
   const { MessageBlock } = await harness.ssrLoadModule(
     "/src/components/MessageBlock.tsx");
@@ -1185,8 +1197,33 @@ $$`,
     onClose: () => {},
   }));
   assert.match(pdfMarkup, /rendered-artifact-body/);
-  assert.match(pdfMarkup, /PPTX → PDF/);
-  assert.match(pdfMarkup, /正在准备预览/);
+  assert.match(pdfMarkup, /PPTX 预览/);
+  assert.match(pdfMarkup, /正在准备 PDF/);
+
+  const macOfficeMarkup = renderToStaticMarkup(createElement(ArtifactPanel, {
+    artifact: {
+      file: "deck.pptx",
+      kind: "html",
+      content: "",
+      data: Buffer.from("<html><body>slide</body></html>").toString("base64"),
+      mediaType: "text/html",
+      convertedFrom: "pptx",
+      size: 4096,
+      mtimeNs: "5",
+    },
+    active: "diff",
+    hasBtw: false,
+    onTab: () => {},
+    onClose: () => {},
+  }));
+  assert.match(macOfficeMarkup, /PPTX 预览/);
+  assert.doesNotMatch(macOfficeMarkup, /aria-label="HTML 显示模式"/,
+    "generated Office HTML must not expose source or interactive authoring UI");
+
+  assert.equal(
+    decodePreviewHtmlData(Buffer.from("<p>隔离预览</p>").toString("base64")),
+    "<p>隔离预览</p>",
+  );
 
   const sandbox = buildSandboxDocument("<h1>safe</h1>");
   assert.match(sandbox, /Content-Security-Policy/);

@@ -14,6 +14,7 @@ from cc_remote.protocol import (
     AnswerQuestion,
     AuthorizePreview,
     CollaborationMode,
+    FilePreview,
     ForkSessionWorktree,
     GetDiff,
     GetFilePreview,
@@ -249,6 +250,22 @@ def test_markdown_save_content_is_bounded_by_utf8_bytes():
     assert SaveMarkdown(content="界" * (FILE_PREVIEW_MAX_BYTES // 3), **common)
     with pytest.raises(ValidationError, match="UTF-8 bytes"):
         SaveMarkdown(content="界" * (FILE_PREVIEW_MAX_BYTES // 3 + 1), **common)
+
+
+def test_office_rendered_html_uses_bounded_binary_preview_transport():
+    rendered = "<html><body>隔离预览</body></html>".encode()
+    preview = FilePreview(
+        path="deck.pptx",
+        request_id="preview-1",
+        format="html",
+        media_type="text/html",
+        data=base64.b64encode(rendered).decode("ascii"),
+        converted_from="pptx",
+        size=1024,
+        mtime_ns="1",
+    )
+
+    assert deserialize(serialize(preview)) == preview
 
 
 def test_collaboration_mode_state_roundtrips_as_downstream():

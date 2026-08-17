@@ -45,11 +45,13 @@ import io
 import json
 import math
 import os
+import plistlib
 import re
 import signal
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import unicodedata
@@ -1463,6 +1465,12 @@ class WrapperMachine:
     })
     OFFICE_PREVIEW_INPUT_MAX_BYTES = 32 * 1024 * 1024
     OFFICE_PREVIEW_TIMEOUT_SECONDS = 45
+    OFFICE_PREVIEW_QUICKLOOK_PROPERTIES_MAX_BYTES = 1024 * 1024
+    OFFICE_PREVIEW_QUICKLOOK_ATTACHMENTS_MAX = 128
+    OFFICE_PREVIEW_QUICKLOOK_ATTACHMENT_NAME = re.compile(
+        r"^Attachment[1-9][0-9]*\.(?:png|jpe?g|gif|webp|avif)$",
+        re.IGNORECASE,
+    )
     HISTORY_REFRESH_MIN_INTERVAL_SECONDS = 1.0
     HISTORY_REFRESH_MAX_INTERVAL_SECONDS = 10.0
     # SessionList is one WebSocket frame. Keep the aggregate comfortably below
@@ -20333,16 +20341,9 @@ class WrapperMachine:
             allow_truncate=False,
             allowed_external_paths=allowed_external_paths,
         )
-        soffice = shutil.which("soffice") or shutil.which("libreoffice")
-        bwrap = shutil.which("bwrap")
-        if not soffice:
-            raise ValueError("本机未安装 LibreOffice，无法预览 Office 文件")
-        if not bwrap:
-            raise ValueError("本机未安装 bubblewrap，已拒绝不安全的 Office 转换")
-
         with tempfile.TemporaryDirectory(prefix="cc-remote-preview-") as temp:
             os.chmod(temp, 0o700)
-            root = Path(temp)
+            root = Path(temp).resolve()
             source = root / f"input{suffix}"
             output = root / "out"
             home = root / "home"
@@ -20357,67 +20358,247 @@ class WrapperMachine:
             source.write_bytes(data)
             source.chmod(0o600)
 
-            command = [
-                bwrap,
-                "--die-with-parent",
-                "--unshare-all",
-                "--new-session",
-                "--hostname", "cc-remote-preview",
-                "--clearenv",
-                "--ro-bind", "/usr", "/usr",
-                "--ro-bind", "/etc", "/etc",
-                "--ro-bind-try", "/lib", "/lib",
-                "--ro-bind-try", "/lib64", "/lib64",
-                "--symlink", "usr/bin", "/bin",
-                "--symlink", "usr/sbin", "/sbin",
-                "--proc", "/proc",
-                "--tmpfs", "/tmp",
-                "--tmpfs", "/run",
-                "--dev", "/dev",
-                "--dir", "/mnt",
-                "--bind", temp, "/mnt",
-                "--chdir", "/mnt",
-                "--cap-drop", "ALL",
-                "--setenv", "PATH", "/usr/bin:/bin",
-                "--setenv", "HOME", "/mnt/home",
-                "--setenv", "TMPDIR", "/mnt/home",
-                "--setenv", "LANG", "C.UTF-8",
-                "--setenv", "LC_ALL", "C.UTF-8",
-                "--setenv", "XDG_CONFIG_HOME", "/mnt/xdg-config",
-                "--setenv", "XDG_CACHE_HOME", "/mnt/xdg-cache",
-                "--setenv", "XDG_RUNTIME_DIR", "/mnt/xdg-runtime",
-                soffice,
-                "-env:UserInstallation=file:///mnt/profile",
-                "--headless",
-                "--convert-to", "pdf",
-                "--outdir", "/mnt/out",
-                f"/mnt/{source.name}",
-            ]
-            cls._run_office_conversion(command)
-            candidates = list(output.glob("*.pdf"))
-            if len(candidates) != 1:
-                raise ValueError("Office 文件未能生成可预览的 PDF")
-            converted = candidates[0]
-            converted_stat = converted.lstat()
-            if (not stat.S_ISREG(converted_stat.st_mode)
-                    or converted.is_symlink()):
-                raise ValueError("Office 转换结果无效")
-            if converted_stat.st_size > ARTIFACT_PREVIEW_MAX_BYTES:
-                raise ValueError("转换后的 PDF 超过 8 MiB 预览限制")
-            preview = converted.read_bytes()
-            cls._validate_rendered_preview("application/pdf", preview)
+            preview_platform = cls._office_preview_platform()
+            if preview_platform == "darwin":
+                preview = cls._convert_office_preview_quicklook(
+                    source, output, home)
+            elif preview_platform.startswith("linux"):
+                preview = cls._convert_office_preview_libreoffice(
+                    root, source, output)
+            else:
+                raise ValueError("当前系统没有安全的 Office 预览后端")
+
             return {
                 "path": relative,
-                "format": "pdf",
-                "media_type": "application/pdf",
-                "data": preview,
+                **preview,
                 "converted_from": suffix.removeprefix("."),
                 "size": file_stat.st_size,
                 "mtime_ns": file_stat.st_mtime_ns,
             }
 
+    @staticmethod
+    def _office_preview_platform() -> str:
+        return sys.platform
+
     @classmethod
-    def _run_office_conversion(cls, command: list[str]) -> None:
+    def _convert_office_preview_libreoffice(
+        cls,
+        root: Path,
+        source: Path,
+        output: Path,
+    ) -> dict[str, object]:
+        soffice = shutil.which("soffice") or shutil.which("libreoffice")
+        bwrap = shutil.which("bwrap")
+        if not soffice:
+            raise ValueError("本机未安装 LibreOffice，无法预览 Office 文件")
+        if not bwrap:
+            raise ValueError("本机未安装 bubblewrap，已拒绝不安全的 Office 转换")
+
+        command = [
+            bwrap,
+            "--die-with-parent",
+            "--unshare-all",
+            "--new-session",
+            "--hostname", "cc-remote-preview",
+            "--clearenv",
+            "--ro-bind", "/usr", "/usr",
+            "--ro-bind", "/etc", "/etc",
+            "--ro-bind-try", "/lib", "/lib",
+            "--ro-bind-try", "/lib64", "/lib64",
+            "--symlink", "usr/bin", "/bin",
+            "--symlink", "usr/sbin", "/sbin",
+            "--proc", "/proc",
+            "--tmpfs", "/tmp",
+            "--tmpfs", "/run",
+            "--dev", "/dev",
+            "--dir", "/mnt",
+            "--bind", str(root), "/mnt",
+            "--chdir", "/mnt",
+            "--cap-drop", "ALL",
+            "--setenv", "PATH", "/usr/bin:/bin",
+            "--setenv", "HOME", "/mnt/home",
+            "--setenv", "TMPDIR", "/mnt/home",
+            "--setenv", "LANG", "C.UTF-8",
+            "--setenv", "LC_ALL", "C.UTF-8",
+            "--setenv", "XDG_CONFIG_HOME", "/mnt/xdg-config",
+            "--setenv", "XDG_CACHE_HOME", "/mnt/xdg-cache",
+            "--setenv", "XDG_RUNTIME_DIR", "/mnt/xdg-runtime",
+            soffice,
+            "-env:UserInstallation=file:///mnt/profile",
+            "--headless",
+            "--nologo",
+            "--nodefault",
+            "--norestore",
+            "--nolockcheck",
+            "--convert-to", "pdf",
+            "--outdir", "/mnt/out",
+            f"/mnt/{source.name}",
+        ]
+        cls._run_office_conversion(command)
+        candidates = list(output.glob("*.pdf"))
+        if len(candidates) != 1:
+            raise ValueError("Office 文件未能生成可预览的 PDF")
+        converted = candidates[0]
+        converted_stat = converted.lstat()
+        if (not stat.S_ISREG(converted_stat.st_mode)
+                or converted.is_symlink()):
+            raise ValueError("Office 转换结果无效")
+        if converted_stat.st_size > ARTIFACT_PREVIEW_MAX_BYTES:
+            raise ValueError("转换后的 PDF 超过 8 MiB 预览限制")
+        preview = converted.read_bytes()
+        cls._validate_rendered_preview("application/pdf", preview)
+        return {
+            "format": "pdf",
+            "media_type": "application/pdf",
+            "data": preview,
+        }
+
+    @classmethod
+    def _convert_office_preview_quicklook(
+        cls,
+        source: Path,
+        output: Path,
+        home: Path,
+    ) -> dict[str, object]:
+        qlmanage = Path("/usr/bin/qlmanage")
+        if not qlmanage.is_file() or not os.access(qlmanage, os.X_OK):
+            raise ValueError("本机 Quick Look 不可用，无法预览 Office 文件")
+
+        # ``-x`` forces the system Quick Look service. Its Office generator is
+        # hosted in Apple's deny-by-default satellite sandbox; ``-o`` writes a
+        # preview bundle without opening a window. The source itself is already
+        # a bounded copy in this private one-shot directory.
+        cls._run_office_conversion(
+            [
+                str(qlmanage), "-x", "-p", "-o", str(output), str(source),
+            ],
+            temp_home=home,
+        )
+        candidates = list(output.glob("*.qlpreview"))
+        if len(candidates) != 1:
+            raise ValueError("Office 文件未能生成可预览内容")
+        preview_dir = candidates[0]
+        preview_stat = preview_dir.lstat()
+        if (not stat.S_ISDIR(preview_stat.st_mode)
+                or preview_dir.is_symlink()):
+            raise ValueError("Office 预览结果无效")
+        rendered = cls._read_quicklook_office_preview(preview_dir)
+        return {
+            "format": "html",
+            "media_type": "text/html",
+            "data": rendered,
+        }
+
+    @classmethod
+    def _read_quicklook_office_preview(cls, preview_dir: Path) -> bytes:
+        entries = list(preview_dir.iterdir())
+        if any(entry.is_symlink() or not entry.is_file() for entry in entries):
+            raise ValueError("Office 预览包含无效资源")
+
+        html_path = preview_dir / "Preview.html"
+        properties_path = preview_dir / "PreviewProperties.plist"
+        if html_path not in entries or properties_path not in entries:
+            raise ValueError("Office 预览内容不完整")
+        properties_stat = properties_path.stat()
+        if properties_stat.st_size > cls.OFFICE_PREVIEW_QUICKLOOK_PROPERTIES_MAX_BYTES:
+            raise ValueError("Office 预览元数据过大")
+        try:
+            properties = plistlib.loads(properties_path.read_bytes())
+        except (plistlib.InvalidFileException, ValueError) as exc:
+            raise ValueError("Office 预览元数据无效") from exc
+        if (not isinstance(properties, dict)
+                or properties.get("MimeType") != "text/html"
+                or properties.get("AllowNetworkAccess") is not False):
+            raise ValueError("Office 预览安全属性无效")
+
+        attachments = properties.get("Attachments", {})
+        if not isinstance(attachments, dict):
+            raise ValueError("Office 预览资源清单无效")
+        if len(attachments) > cls.OFFICE_PREVIEW_QUICKLOOK_ATTACHMENTS_MAX:
+            raise ValueError("Office 预览资源过多")
+
+        html_stat = html_path.stat()
+        if html_stat.st_size > ARTIFACT_PREVIEW_MAX_BYTES:
+            raise ValueError("Office 预览超过 8 MiB 限制")
+        html_bytes = html_path.read_bytes()
+        if b"\0" in html_bytes:
+            raise ValueError("Office 预览 HTML 无效")
+        try:
+            rendered = html_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("Office 预览 HTML 无效") from exc
+        if not re.search(r"<html(?:\s|>)", rendered, re.IGNORECASE):
+            raise ValueError("Office 预览 HTML 无效")
+
+        expected_entries = {html_path.name, properties_path.name}
+        for attachment in attachments.values():
+            if not isinstance(attachment, dict):
+                raise ValueError("Office 预览资源清单无效")
+            name = attachment.get("DumpedAttachmentFileName")
+            media_type = attachment.get("MimeType")
+            if (not isinstance(name, str)
+                    or not cls.OFFICE_PREVIEW_QUICKLOOK_ATTACHMENT_NAME.fullmatch(name)):
+                raise ValueError("Office 预览资源名称无效")
+            media_by_suffix = {
+                ".png": "image/png",
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+                ".gif": "image/gif",
+                ".webp": "image/webp",
+                ".avif": "image/avif",
+            }
+            expected_media = media_by_suffix.get(Path(name).suffix.lower())
+            if media_type != expected_media:
+                raise ValueError("Office 预览资源格式无效")
+            asset_path = preview_dir / name
+            if asset_path.name in expected_entries or not asset_path.is_file():
+                raise ValueError("Office 预览资源缺失")
+            expected_entries.add(asset_path.name)
+            asset_stat = asset_path.stat()
+            if asset_stat.st_size > ARTIFACT_PREVIEW_MAX_BYTES:
+                raise ValueError("Office 预览资源超过 8 MiB 限制")
+            asset = asset_path.read_bytes()
+            cls._validate_rendered_preview(expected_media, asset)
+            data_uri = (
+                f"data:{expected_media};base64,"
+                f"{base64.b64encode(asset).decode('ascii')}"
+            )
+            rendered, count = re.subn(
+                rf"(?P<prefix>\b(?:src|href|poster)\s*=\s*['\"])"
+                rf"{re.escape(name)}(?P<suffix>['\"])",
+                lambda match: (
+                    f"{match.group('prefix')}{data_uri}{match.group('suffix')}"
+                ),
+                rendered,
+                flags=re.IGNORECASE,
+            )
+            if count == 0:
+                raise ValueError("Office 预览资源未被引用")
+
+        if {entry.name for entry in entries} != expected_entries:
+            raise ValueError("Office 预览包含未声明资源")
+        encoded = rendered.encode("utf-8")
+        if len(encoded) > ARTIFACT_PREVIEW_MAX_BYTES:
+            raise ValueError("Office 预览超过 8 MiB 限制")
+        return encoded
+
+    @classmethod
+    def _run_office_conversion(
+        cls,
+        command: list[str],
+        *,
+        temp_home: Optional[Path] = None,
+    ) -> None:
+        environment = {
+            "PATH": os.defpath,
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+        }
+        if temp_home is not None:
+            environment.update({
+                "HOME": str(temp_home),
+                "TMPDIR": str(temp_home),
+            })
         process = subprocess.Popen(
             command,
             stdin=subprocess.DEVNULL,
@@ -20425,11 +20606,7 @@ class WrapperMachine:
             stderr=subprocess.DEVNULL,
             close_fds=True,
             start_new_session=True,
-            env={
-                "PATH": os.defpath,
-                "LANG": "C.UTF-8",
-                "LC_ALL": "C.UTF-8",
-            },
+            env=environment,
         )
         try:
             return_code = process.wait(timeout=cls.OFFICE_PREVIEW_TIMEOUT_SECONDS)

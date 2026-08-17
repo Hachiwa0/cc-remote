@@ -4,6 +4,14 @@
 
 ## Unreleased
 
+- Upgrade the coordinated Wrapper/Relay/Web gate to protocol v38. Office files
+  on macOS now use the system Quick Look isolated preview service instead of an
+  unavailable Linux bubblewrap path. Its bounded multi-page HTML and declared
+  raster attachments are validated, inlined, transported as binary preview
+  data, and rendered in the browser's scriptless CSP sandbox. Linux retains the
+  existing LibreOffice + bubblewrap PDF path, while a lazy PDF.js viewer renders
+  only the current and adjacent pages with page and zoom controls. Presentation
+  scripts, macros, and animations remain intentionally disabled.
 - Upgrade the coordinated Wrapper/Relay/Web gate to protocol v37. DSH sessions
   now expose their native context projection in the shared context control,
   identify the immutable Agent Preset in the Code header, and publish the

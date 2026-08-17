@@ -2477,8 +2477,44 @@ const UNSAFE_SVG = [
   "</svg>",
 ].join("");
 
+function pdfFixtureBase64(): string {
+  const pageOne = "BT /F1 24 Tf 72 720 Td (Page one) Tj ET";
+  const pageTwo = "BT /F1 24 Tf 72 720 Td (Page two) Tj ET";
+  const objects = [
+    "<</Type/Catalog/Pages 2 0 R>>",
+    "<</Type/Pages/Kids[3 0 R 4 0 R]/Count 2>>",
+    "<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Resources<</Font<</F1 7 0 R>>>>/Contents 5 0 R>>",
+    "<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Resources<</Font<</F1 7 0 R>>>>/Contents 6 0 R>>",
+    `<</Length ${pageOne.length}>>\nstream\n${pageOne}\nendstream`,
+    `<</Length ${pageTwo.length}>>\nstream\n${pageTwo}\nendstream`,
+    "<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>",
+  ];
+  let pdf = "%PDF-1.4\n";
+  const offsets = [0];
+  objects.forEach((object, index) => {
+    offsets.push(pdf.length);
+    pdf += `${index + 1} 0 obj\n${object}\nendobj\n`;
+  });
+  const xref = pdf.length;
+  pdf += `xref\n0 ${objects.length + 1}\n`;
+  pdf += "0000000000 65535 f \n";
+  pdf += offsets.slice(1).map(
+    (offset) => `${String(offset).padStart(10, "0")} 00000 n \n`,
+  ).join("");
+  pdf += `trailer\n<</Size ${objects.length + 1}/Root 1 0 R>>\n`;
+  pdf += `startxref\n${xref}\n%%EOF\n`;
+  return window.btoa(pdf);
+}
+
+function utf8Base64(content: string): string {
+  const bytes = new TextEncoder().encode(content);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return window.btoa(binary);
+}
+
 function ArtifactPreviewFixture({ kind }: {
-  kind: "html" | "svg" | "markdown-svg" | "markdown-source";
+  kind: "html" | "office-html" | "pdf" | "svg" | "markdown-svg" | "markdown-source";
 }) {
   const svgData = window.btoa(UNSAFE_SVG);
   const artifact = kind === "html"
@@ -2498,6 +2534,35 @@ function ArtifactPreviewFixture({ kind }: {
       size: 360,
       mtimeNs: "1",
       revision: "a".repeat(64),
+    }
+    : kind === "office-html"
+    ? {
+      file: "deck.pptx",
+      sid: "artifact-preview-session",
+      requestId: "artifact-preview-request",
+      kind: "html" as const,
+      content: "",
+      data: utf8Base64(`<!doctype html><html><head>
+        <meta name="viewport" content="width=800, maximum-scale=4.0">
+        <style>.slide{width:780px;height:420px;color:rgb(12,34,56)}</style>
+        </head><body><div class="slide">Quick Look slide one</div>
+        <div class="slide">Quick Look slide two</div>
+        <script>document.body.dataset.scriptRan="yes"</script></body></html>`),
+      mediaType: "text/html",
+      convertedFrom: "pptx",
+      size: 4096,
+      mtimeNs: "1",
+    }
+    : kind === "pdf"
+    ? {
+      file: "report.pdf",
+      sid: "artifact-preview-session",
+      requestId: "artifact-preview-request",
+      kind: "pdf" as const,
+      data: pdfFixtureBase64(),
+      mediaType: "application/pdf",
+      size: 4096,
+      mtimeNs: "1",
     }
     : kind === "svg"
     ? {
@@ -2577,6 +2642,10 @@ const rootParams = new URLSearchParams(window.location.search);
 createRoot(document.getElementById("root")!).render(
   rootParams.has("artifact-html")
     ? <ArtifactPreviewFixture kind="html" />
+    : rootParams.has("artifact-office-html")
+    ? <ArtifactPreviewFixture kind="office-html" />
+    : rootParams.has("artifact-pdf")
+    ? <ArtifactPreviewFixture kind="pdf" />
     : rootParams.has("artifact-svg")
     ? <ArtifactPreviewFixture kind="svg" />
     : rootParams.has("artifact-markdown-svg")
