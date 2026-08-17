@@ -124,6 +124,70 @@ def test_replacement_surface_message_does_not_erase_human_history():
     }, surfaceOp={"op": "replace", "start": 1, "end": 8})) == []
 
 
+def test_plugin_context_before_human_message_joins_the_real_turn():
+    translator = DshStreamTranslator()
+    translator.feed(event(444, "turn/start", {"turn": 2}))
+
+    context = translator.feed(event(448, "user/message", {
+        "id": "approval-context",
+        "role": "user",
+        "content": [{
+            "type": "text",
+            "text": "The approval policy changed from ask to never.",
+        }],
+        "source": {"kind": "plugin", "plugin": "user-approval"},
+    }, surfaceOp="append"))
+    human = translator.feed(event(449, "user/message", {
+        "id": "human-message",
+        "role": "user",
+        "content": [{"type": "text", "text": "install libreoffice"}],
+        "source": {"kind": "user", "rpcId": "remote-message"},
+    }, surfaceOp="append"))
+    terminal = translator.feed(event(1111, "turn/end", {
+        "turn": 2,
+        "reason": {"kind": "completed"},
+    }))
+
+    assert context == []
+    assert [row.type for row in human] == ["user_msg", "process"]
+    assert human[0].msg_id == "dsh-msg-449"
+    assert human[1].item_id == "dsh-context-448"
+    assert [row.type for row in terminal] == ["turn_end"]
+    assert terminal[0].presentation_id == "dsh-msg-449"
+    assert not any(
+        getattr(row, "msg_id", "").startswith("dsh-auto-")
+        for row in [*human, *terminal]
+    )
+
+
+def test_plugin_context_without_human_joins_one_synthetic_turn():
+    translator = DshStreamTranslator()
+    translator.feed(event(10, "turn/start", {"turn": 4}))
+    assert translator.feed(event(11, "user/message", {
+        "id": "plugin-context",
+        "role": "user",
+        "content": [{"type": "text", "text": "runtime context"}],
+        "source": {"kind": "plugin", "plugin": "runtime"},
+    }, surfaceOp="append")) == []
+
+    started = translator.feed(event(12, "assistant/chunk", {
+        "turn": 4,
+        "step": 1,
+        "chunk": {"type": "block-start", "index": 0, "blockType": "text"},
+    }))
+    terminal = translator.feed(event(13, "turn/end", {
+        "turn": 4,
+        "reason": {"kind": "completed"},
+    }))
+
+    assert [row.type for row in started] == [
+        "user_msg", "process", "assistant_msg_start",
+    ]
+    assert started[0].msg_id == "dsh-auto-10"
+    assert started[1].item_id == "dsh-context-11"
+    assert terminal[0].presentation_id == "dsh-auto-10"
+
+
 def test_streamed_text_is_promoted_to_final_by_assembled_message():
     translator = DshStreamTranslator()
     translator.feed(event(1, "turn/start", {"turn": 0}))

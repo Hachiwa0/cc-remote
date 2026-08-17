@@ -76,6 +76,63 @@ async def test_session_configuration_preamble_does_not_create_phantom_turn():
 
 
 @pytest.mark.asyncio
+async def test_plugin_context_before_human_does_not_create_phantom_turn():
+    client = FakeClient({
+        "events": [
+            event(444, "turn/start", {"turn": 2}),
+            event(448, "user/message", {
+                "id": "approval-context",
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "The approval policy changed from ask to never.",
+                }],
+                "source": {"kind": "plugin", "plugin": "user-approval"},
+            }, surfaceOp="append"),
+            event(449, "user/message", {
+                "id": "human-message",
+                "role": "user",
+                "content": [{"type": "text", "text": "install libreoffice"}],
+                "source": {"kind": "user", "rpcId": "remote-message"},
+            }, surfaceOp="append"),
+            event(450, "user/message", {
+                "id": "runtime-context",
+                "role": "user",
+                "content": [{"type": "text", "text": "runtime context"}],
+                "source": {
+                    "kind": "plugin",
+                    "plugin": "@deepseek-ai/dsh-system-prompt",
+                },
+            }, surfaceOp="append"),
+            event(1109, "assistant/message", {
+                "turn": 2,
+                "step": 2,
+                "message": {
+                    "content": [{"type": "text", "text": "installed"}],
+                },
+            }, surfaceOp="append"),
+            event(1111, "turn/end", {
+                "turn": 2,
+                "reason": {"kind": "completed"},
+            }),
+        ],
+        "hasMore": False,
+    })
+    history = DshHistory(client)  # type: ignore[arg-type]
+
+    page = await history.page("session-a", before=None, limit=4)
+
+    assert [turn.id for turn in page.turns] == ["dsh-msg-449"]
+    assert page.turns[0].done is True
+    assert page.turns[0].forkPointId == "dsh-seq-1111"
+    detail = history.detail("session-a", "dsh-msg-449")
+    assert detail is not None
+    assert [
+        row["item_id"] for row in detail if row["type"] == "process"
+    ][:2] == ["dsh-context-448", "dsh-context-450"]
+
+
+@pytest.mark.asyncio
 async def test_detail_cache_does_not_shift_after_metadata_only_group():
     client = FakeClient({
         "events": [

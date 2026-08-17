@@ -220,6 +220,13 @@ class DshStreamTranslator:
     turn_start_seq: int | None = None
     turn_has_visible_user: bool = False
     turn_presentation_id: str | None = None
+    # DSH emits plugin-authored ``user/message`` context before the direct
+    # human message in some turns.  Those rows are useful in the process
+    # timeline, but they cannot own a conversation turn.  Hold them until the
+    # exact human owner arrives (or until genuine autonomous output proves the
+    # turn has no human owner) so live delivery and history rebuild never
+    # synthesize an orphan ``dsh-auto-*`` row.
+    pending_contexts: list[ProcessEvent] = field(default_factory=list)
     blocks: dict[tuple[int, int, int], _AssistantBlock] = field(
         default_factory=dict
     )
@@ -234,6 +241,7 @@ class DshStreamTranslator:
     MAX_ACTIVE_BLOCKS = 4096
     MAX_INBOX_IDENTITIES = 4096
     MAX_ACTIVE_COMMANDS = 4096
+    MAX_PENDING_CONTEXTS = 128
 
     def feed(
         self,
@@ -289,6 +297,7 @@ class DshStreamTranslator:
             self.turn_start_seq = None
             self.turn_has_visible_user = False
             self.turn_presentation_id = None
+            self.pending_contexts.clear()
             return [*leading, TurnEnd(
                 ts=ts,
                 turn_id=dsh_fork_point(seq),
@@ -323,7 +332,7 @@ class DshStreamTranslator:
                     client_id = None
                 prompt = _content_text(message.get("content"))[:2 * 1024 * 1024]
                 if steered:
-                    return [TurnSteered(
+                    visible = TurnSteered(
                         ts=ts,
                         msg_id=presentation_id,
                         client_msg_id=client_id,
@@ -333,17 +342,19 @@ class DshStreamTranslator:
                             if self.active_turn is not None else seq,
                         ),
                         prompt=prompt,
-                    )]
-                return [UserMsg(
-                    ts=ts,
-                    msg_id=presentation_id,
-                    client_msg_id=client_id,
-                    prompt=prompt,
-                )]
+                    )
+                else:
+                    visible = UserMsg(
+                        ts=ts,
+                        msg_id=presentation_id,
+                        client_msg_id=client_id,
+                        prompt=prompt,
+                    )
+                return [visible, *self._drain_pending_contexts()]
             summary = _content_text(message.get("content"))
             if not summary:
                 return []
-            return [*self._ensure_visible_turn(ts), ProcessEvent(
+            context = ProcessEvent(
                 ts=ts,
                 item_id=_wire_id("dsh-context", seq),
                 kind="task",
@@ -351,7 +362,13 @@ class DshStreamTranslator:
                 status="succeeded",
                 title=self._context_title(source),
                 summary=summary[:64 * 1024],
-            )]
+            )
+            if not self.turn_has_visible_user:
+                if len(self.pending_contexts) >= self.MAX_PENDING_CONTEXTS:
+                    raise DshEventError("DSH pending context limit reached")
+                self.pending_contexts.append(context)
+                return []
+            return [context]
 
         if event_type == "agent/inbox/spliced":
             self._feed_inbox_splice(data)
@@ -737,7 +754,9 @@ class DshStreamTranslator:
         return events
 
     def _ensure_visible_turn(self, ts: float) -> list[Any]:
-        if self.turn_has_visible_user or self.turn_start_seq is None:
+        if self.turn_has_visible_user:
+            return self._drain_pending_contexts()
+        if self.turn_start_seq is None:
             return []
         self.turn_has_visible_user = True
         self.turn_presentation_id = f"dsh-auto-{self.turn_start_seq}"
@@ -745,7 +764,14 @@ class DshStreamTranslator:
             ts=ts,
             msg_id=self.turn_presentation_id,
             prompt="",
-        )]
+        ), *self._drain_pending_contexts()]
+
+    def _drain_pending_contexts(self) -> list[ProcessEvent]:
+        if not self.pending_contexts:
+            return []
+        contexts = self.pending_contexts
+        self.pending_contexts = []
+        return contexts
 
     def _feed_assistant_message(
         self, data: dict[str, Any], ts: float,
