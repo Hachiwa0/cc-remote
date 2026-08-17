@@ -41,7 +41,7 @@ interface CommonLightboxProps {
   closeLabel?: string;
 }
 
-type ImageLightboxProps = CommonLightboxProps & (
+export type ImageLightboxProps = CommonLightboxProps & (
   | { src: string; sanitizedSvg?: never }
   | { src?: never; sanitizedSvg: string }
 );

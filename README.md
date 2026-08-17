@@ -78,7 +78,7 @@ v3 把 cc-remote 从“能在网页控制 CLI”推进为一个本地优先、�
 | **Work 定时任务与隔离** | 支持一次、每日、每周任务；执行记录、租约、失败重试和防重叠状态均持久化。每个工作默认只能访问自己的私有目录，需要的资料通过会话附件或项目资料库显式加入。 |
 | **远程操作** | 手机、平板或桌面浏览器实时看流式回复并发送附件。Codex 忙碌时默认把新输入作为原生引导追加到当前任务，也可改为排队；Claude 保留打断并发送。停止始终是独立操作。 |
 | **完整过程** | 折叠展示引擎公开提供的 reasoning 摘要、计划、命令输出、文件 diff、MCP、协作代理、Hook 和终端交互事件。 |
-| **Artifacts 与文件预览** | Work 自动列出当前工作产生的文件；源码可定位行号，Markdown 可预览和冲突安全编辑，HTML 在隔离 iframe 中渲染，图片/PDF 可直接查看，DOCX/XLSX/PPTX 由 wrapper 本机沙箱临时转换后预览。 |
+| **Artifacts 与文件预览** | Work 自动列出当前工作产生的文件；源码可定位行号，Markdown 可预览和冲突安全编辑，HTML 在隔离 iframe 中渲染，图片/PDF 可直接查看，DOCX/XLSX/PPTX 由 wrapper 本机沙箱临时转换后预览。安装 Codex Desktop 工作区运行时后，新建的 Codex Code 会话也可使用其只读依赖定位器生成独立 Office 文件；官方文件引用会显示为可预览的文件卡片。 |
 | **人工确认** | 回传 Claude `can_use_tool`，以及 Codex 命令、文件修改、用户输入、通用权限和 MCP elicitation；终端占用时可只读镜像，也可由用户主动接管。 |
 | **会话管理** | 搜索、切换、重命名、归档、删除和消息级派生；Codex 支持主动 compact、原生 Review、派生到独立 worktree，以及把空闲对话迁移到另一工作目录。 |
 | **运行控制** | 切换模型、思考强度、服务档位、权限和 Plan 模式；Codex Code 的 `/permissions` 在同一紧凑面板中分别控制审批策略、官方执行环境 profile 和 Cached/Live 网页搜索；`/goal` 管理长目标，`/status` 只读展示 app-server 状态、用量与限额。 |
@@ -132,10 +132,19 @@ Code 会话按两家 CLI 的真实控制面协同，不替换官方命令：
   同一会话。它不终止终端 Shell、不使用 SIGKILL，也不会静默接管现有进程。
 - **Codex Code：**默认通过 Codex 官方共享 app-server daemon 接入，让原生 Codex
   客户端与 Remote 共享 thread 和控制状态。app-server 随 Codex CLI 提供，不需要
-  单独安装；但 CLI 必须同时支持 `app-server daemon` 和 `app-server proxy` 才能共享
-  这条控制面。如果本机版本或 daemon 不可用，cc-remote 会降级到私有 stdio
+  单独安装；但这条共享控制面要求主 `CODEX_HOME` 使用官方 standalone 托管布局
+  (`$CODEX_HOME/packages/standalone/current/codex`)。OpenAI 同时提供
+  [standalone 和 npm 两种官方安装方式](https://learn.chatgpt.com/docs/codex/cli)，
+  但仅安装 npm/NVM 版时，即使 `app-server daemon --help` 和
+  `app-server proxy --help` 都成功，官方 daemon bootstrap 仍可能因缺少托管路径而
+  拒绝启动。如果本机布局、版本或 daemon 不可用，cc-remote 会降级到私有 stdio
   app-server：Remote 仍可独立控制会话，但无法再与原生 Codex CLI/App 实时双向协同。
   `CC_REMOTE_CODEX_DAEMON=off` 会强制使用这个私有路径，仅建议用于故障排查。
+  如果本机已安装且可验证 Codex Desktop 工作区运行时，cc-remote 会在新建 Code
+  thread 时注册官方动态依赖定位工具，使模型能生成独立的 PPTX/DOCX/XLSX；它只读取
+  现有运行时，不安装或修改依赖。由 Codex App 创建且已经保存这项工具元数据的旧 thread
+  可直接恢复；早期由 Remote 创建且没有元数据的 thread 需要新建会话。生成的官方文件
+  引用复用既有的本机文件授权和预览链路，不会把文件内容经过 relay。
 - **同时使用多个 Codex 账号：**可通过 `CC_REMOTE_CODEX_PROFILES_JSON` 或
   `CC_REMOTE_CODEX_PROFILES_FILE` 注册最多 32 个完整、互相隔离的 `CODEX_HOME`。
   每个 Profile 使用自己的登录状态、配置、
@@ -285,14 +294,16 @@ Codex 会话把 app-server 提供的 reasoning 摘要、计划、命令、diff�
 
 ### 前置
 
-- 一台已完成 **Claude Code** 或新版 **Codex CLI** 登录、且 CLI **本身已经能正常对话**的机器。Codex app-server 已包含在 CLI 中，无需单独安装；Codex Code 要与原生 CLI/App 实时双向协同时，以下两个命令必须都能正常退出：
+- 一台已完成 **Claude Code** 或新版 **Codex CLI** 登录、且 CLI **本身已经能正常对话**的机器。Codex app-server 已包含在 CLI 中，无需单独安装。Codex Code 要与原生 CLI/App 实时双向协同时，主 `CODEX_HOME` 必须使用[官方 standalone 安装](https://learn.chatgpt.com/docs/codex/cli)，并完成以下初始化和验收：
 
   ```bash
-  codex app-server daemon --help
+  test -x "${CODEX_HOME:-$HOME/.codex}/packages/standalone/current/codex"
+  codex app-server daemon bootstrap --remote-control
+  codex app-server daemon version
   codex app-server proxy --help
   ```
 
-  只有 `codex app-server --stdio` 可用时，Remote 仍能独立使用 Codex，但无法共享原生客户端的实时控制状态。Claude wrapper 会显式启动日常使用的 `~/.local/bin/claude`，而不是 SDK 内置副本；Codex 每次新建 app-server 时会重新选择本机最新可用版本。两个引擎都可用即可在网页中切换。
+  `daemon version` 必须返回 `status: running` 和真实 `socketPath`；仅有两个 `--help` 成功不算通过。npm/NVM-only 安装或 daemon 不可用时，Remote 仍可通过私有 stdio 独立使用 Codex，但无法共享原生客户端的实时控制状态。Codex Work 始终使用私有 stdio，不属于降级。Claude wrapper 会显式启动日常使用的 `~/.local/bin/claude`，而不是 SDK 内置副本；Codex 每次新建 app-server 时会重新选择本机最新可用版本。两个引擎都可用即可在网页中切换。
 - **Python 3.10+**、**Node 20.19+**（用来构建网页）。
 - 可选：要预览 DOCX/XLSX/PPTX 等 Office 文件，Linux wrapper 主机需安装
   **LibreOffice + bubblewrap**（例如 `sudo apt install libreoffice bubblewrap`）；VPS 不需要。
@@ -721,7 +732,7 @@ cc-remote **不碰模型 API**——它只驱动你机器上已经配置好的 C
 
 - 用**官方 Anthropic API**：装好 `claude` 能对话即可，cc-remote 直接用。
 - 用**兼容端点（如 GLM / z.AI）**：照常在 `settings.json` 里设 `ANTHROPIC_BASE_URL`（指向官方兼容端点或你自建的代理），cc-remote 一样只做控制链路。
-- 用 **Codex**：先确保本机 `codex` 可正常对话；app-server 已随 CLI 提供。Codex Code 如需原生 CLI/App 与 Remote 实时双向协同，还要确保 `codex app-server daemon --help` 和 `codex app-server proxy --help` 都成功。cc-remote 不接触其 API key，也不会改写全局认证配置。
+- 用 **Codex**：先确保本机 `codex` 可正常对话；app-server 已随 CLI 提供。Codex Code 如需原生 CLI/App 与 Remote 实时双向协同，主 `CODEX_HOME` 还必须具有官方 standalone 托管路径，并且 `codex app-server daemon version` 返回 `status: running` 和真实 socket；仅检查 `daemon --help` / `proxy --help` 会漏掉 npm/NVM-only 布局导致的 bootstrap 失败。cc-remote 不接触其 API key，也不会改写全局认证配置。Codex Work 的私有 stdio 是正常设计。
 
 ## 开发
 

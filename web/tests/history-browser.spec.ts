@@ -428,6 +428,27 @@ test("local Markdown file link reveals its complete path without native title", 
   await expect(page.getByRole("tooltip")).toBeVisible();
 });
 
+test("official Codex file citation loads as a previewable local file card", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 720, height: 480 });
+  await page.goto("/tests/history-browser.html?codex-file-citation=1");
+  const card = page.getByRole("button", {
+    name: "在 Remote 中打开 /tmp/launch plan.pptx",
+  });
+  await expect(card).toBeVisible();
+  await expect(card).toContainText("launch plan.pptx");
+  await expect(card).toContainText("已生成 · 演示文稿");
+  await expect(page.locator("body")).not.toContainText(":codex-file-citation{");
+
+  await card.hover();
+  await expect(page.getByRole("tooltip"))
+    .toContainText("/tmp/launch plan.pptx");
+  await card.click();
+  await expect(page.getByTestId("opened-codex-file-citation"))
+    .toHaveText("/tmp/launch plan.pptx");
+});
+
 async function pinchThenPanPreview(
   page: import("@playwright/test").Page,
 ): Promise<{
@@ -1206,6 +1227,48 @@ test("reducer history paging and live refresh keep one stable projection", async
   await expect(page.locator('[data-turn-id="reducer-m40"]')).toBeVisible();
   await expect(page.getByTestId("reducer-turn-count")).toHaveText("20");
   await expect(page.getByTestId("reducer-unique-turn-count")).toHaveText("20");
+});
+
+test("same-revision completed history expansion keeps the latest tail pinned", async ({
+  page,
+}) => {
+  await page.goto(
+    "/tests/history-browser.html?reducer-pipeline=1&head-refresh-expansion=1",
+  );
+  const viewport = page.locator(".thread");
+  await expect(page.getByTestId("reducer-turn-count")).toHaveText("4");
+  await expect(page.locator('[data-turn-id="reducer-m52"]')).toBeVisible();
+  await viewport.evaluate((node) => { node.scrollTop = node.scrollHeight; });
+  await waitForScrollIdle(page);
+
+  const samples = await page.evaluate(async () => {
+    const thread = document.querySelector<HTMLElement>(".thread");
+    const refresh = document.querySelector<HTMLButtonElement>(
+      '[data-testid="reducer-live-refresh"]',
+    );
+    const count = document.querySelector<HTMLOutputElement>(
+      '[data-testid="reducer-turn-count"]',
+    );
+    if (!thread || !refresh || !count) throw new Error("fixture is incomplete");
+    const observed: Array<{ count: number; distance: number }> = [];
+    refresh.click();
+    for (let frame = 0; frame < 40; frame += 1) {
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      observed.push({
+        count: Number(count.textContent ?? "0"),
+        distance: thread.scrollHeight - thread.scrollTop - thread.clientHeight,
+      });
+    }
+    return observed;
+  });
+
+  await expect(page.getByTestId("reducer-turn-count")).toHaveText("52");
+  const expandedSamples = samples.filter((sample) => sample.count === 52);
+  expect(expandedSamples.length).toBeGreaterThan(0);
+  expect(Math.max(...expandedSamples.map((sample) => sample.distance)))
+    .toBeLessThan(2);
+  await expect(page.locator('[data-turn-id="reducer-m52"]')).toBeVisible();
+  await expect(page.locator('[data-turn-id="reducer-m1"]')).not.toBeVisible();
 });
 
 test("authoritative paging returns after an IndexedDB first paint", async ({
@@ -2482,6 +2545,46 @@ test("offscreen historical Mermaid does not load until its row is mounted", asyn
   await expect(diagramTurn.locator(".mermaid-svg")).toHaveCount(2);
 });
 
+test("Mermaid preview survives virtualization of its source row", async ({
+  page,
+}, testInfo) => {
+  await page.goto("/tests/history-browser.html?mermaid-history=1");
+  await scrollThreadToEdge(page, "start", testInfo.project.name);
+  const diagramTurn = page.locator('[data-turn-id="mermaid"]');
+  await expect(diagramTurn.locator(".mermaid-svg")).toHaveCount(2);
+  await diagramTurn.locator(".mermaid-zoom").first().click();
+  const preview = page.getByRole("dialog", { name: "Mermaid 图表预览" });
+  await expect(preview).toBeVisible();
+
+  await scrollThreadToEdge(page, "end", testInfo.project.name);
+  await expect(diagramTurn).toHaveCount(0);
+  await expect(preview).toBeVisible();
+
+  await page.getByRole("button", { name: "关闭 Mermaid 图表预览" }).click();
+  await expect(preview).toHaveCount(0);
+});
+
+test("Mermaid preview follows a live theme change without closing", async ({
+  page,
+}, testInfo) => {
+  await page.goto("/tests/history-browser.html?mermaid-history=1");
+  await scrollThreadToEdge(page, "start", testInfo.project.name);
+  const diagramTurn = page.locator('[data-turn-id="mermaid"]');
+  await expect(diagramTurn.locator(".mermaid-svg")).toHaveCount(2);
+  await diagramTurn.locator(".mermaid-zoom").first().click();
+  const preview = page.getByRole("dialog", { name: "Mermaid 图表预览" });
+  const vector = preview.locator(".image-lightbox-vector");
+  await expect(vector).toBeVisible();
+  const before = await vector.innerHTML();
+  await page.evaluate(() => {
+    const root = document.documentElement;
+    root.dataset.theme = root.dataset.theme === "dark" ? "light" : "dark";
+  });
+
+  await expect(preview).toBeVisible();
+  await expect.poll(() => vector.innerHTML()).not.toBe(before);
+});
+
 test("switching sessions discards an in-flight Mermaid render", async ({
   page,
 }) => {
@@ -2566,6 +2669,25 @@ test("a pending composer image previews without triggering removal", async ({
   await page.getByRole("button", { name: "移除待发送图片 1" }).click();
   await expect(preview).toHaveCount(0);
   await expect(page.locator(".image-lightbox")).toHaveCount(0);
+});
+
+test("a preview chunk failure stays local without replacing the app", async ({
+  page,
+}) => {
+  await page.route(/\/src\/components\/ImageLightbox\.tsx(?:\?|$)/, async (route) => {
+    await route.abort();
+  });
+  await page.goto("/tests/history-browser.html?composer-attachment=1");
+  const preview = page.getByRole("button", { name: "预览待发送图片 1" });
+  await preview.click();
+
+  const dialog = page.getByRole("dialog", { name: "图片预览" });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByRole("alert")).toContainText("预览资源加载失败");
+  await expect(page.getByText("页面需要重新载入")).toHaveCount(0);
+  await dialog.getByRole("button", { name: "关闭图片预览" }).click();
+  await expect(dialog).toHaveCount(0);
+  await expect(preview).toBeVisible();
 });
 
 test("a page waits through post-touch momentum and restores its final boundary", async ({

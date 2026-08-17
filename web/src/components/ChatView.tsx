@@ -33,7 +33,13 @@ import {
   type HistoryImageAsset,
   type HistoryImageVariant,
 } from "../history-image-assets";
-import { ImageLightbox } from "./ImageLightbox";
+import { LazyImageLightbox as ImageLightbox } from "./LazyImageLightbox";
+import {
+  activeMermaidTheme,
+  MermaidPreviewContext,
+  type MermaidPreviewPayload,
+} from "./mermaid-preview";
+import { mermaidPreviewSvg, renderMermaidSvg } from "../mermaid";
 import { presentHistoricalTurnProblem } from "../problem-presentation";
 import { queryImageDimensions } from "../img";
 import {
@@ -88,6 +94,7 @@ const HISTORY_PAGE_REQUEST_TIMEOUT_MS = HISTORY_REQUEST_TIMEOUT_MS + 1_000;
 // Markdown/image measurements settle, but never pin a huge virtual row
 // indefinitely after a successful detail response.
 const DETAIL_ANCHOR_QUIET_MS = 300;
+const COMPLETED_TAIL_REPLACEMENT_QUIET_MS = 300;
 const DETAIL_ANCHOR_MAX_SETTLE_MS = 2_000;
 
 type UserScrollDirection = "history" | "latest" | "unknown";
@@ -140,6 +147,12 @@ interface HistoryViewportScopeTransition {
   source: HistoryViewportPresentation;
   request: HistoryPageRequestTransaction;
   presentation: HistoryViewportPresentation;
+}
+
+interface CompletedTailReplacement {
+  scope: string;
+  turns: Turn[];
+  releaseTimer: number | null;
 }
 
 function sameHistoryViewportPresentation(
@@ -355,6 +368,13 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     | { kind: "history"; turnId: string; imageId: string; alt: string }
     | null
   >(null);
+  const [mermaidPreview, setMermaidPreview] = useState<(
+    MermaidPreviewPayload & {
+      scope: string;
+      interactionToken: number;
+    }
+  ) | null>(null);
+  const mermaidPreviewRef = useRef<typeof mermaidPreview>(null);
   const historyAnchorRef = useRef(new HistoryAnchorController());
   const historyPageActivityRef = useRef(new HistoryPageActivityController());
   const [historyPageActivity, setHistoryPageActivity] =
@@ -435,6 +455,8 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   const historyViewportLeaseRef = useRef(false);
   const historyViewportTransitionRef =
     useRef<HistoryViewportScopeTransition | null>(null);
+  const completedTailReplacementRef =
+    useRef<CompletedTailReplacement | null>(null);
   const [presentedHistory, setPresentedHistory] =
     useState<HistoryViewportPresentation>(incomingHistoryPresentation);
   const transitionPresentation = acceptedHistoryViewportTransition(
@@ -505,6 +527,36 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
       pendingHistoryPresentationRef.current = incoming;
       return;
     }
+    if (
+      !sameHistoryViewportPresentation(presentedHistory, incoming)
+      && presentedHistory.authorityScope === incoming.authorityScope
+      && !presentedHistory.browseMode
+      && !incoming.browseMode
+      && incoming.turns.length > 0
+    ) {
+      const el = scrollRef.current;
+      const controller = controllerRef.current;
+      if (
+        el
+        && controller?.isFollowing()
+        && measureBottom(readScrollMetrics(el)).atBottom
+        && !userScrollIntentRef.current
+        && touchYRef.current === null
+        && !wheelGestureActiveRef.current
+        && textSelectionRef.current === null
+        && !scrollCoordinatorRef.current.isInteractionLocked()
+      ) {
+        const previous = completedTailReplacementRef.current;
+        if (previous?.releaseTimer != null) {
+          window.clearTimeout(previous.releaseTimer);
+        }
+        completedTailReplacementRef.current = {
+          scope: incoming.scope,
+          turns: incoming.turns,
+          releaseTimer: null,
+        };
+      }
+    }
     setPresentedHistory((current) =>
       sameHistoryViewportPresentation(current, incoming) ? current : incoming);
   }, [
@@ -528,12 +580,40 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   }, []);
   const activeScrollScopeRef = useRef(scrollScope);
   activeScrollScopeRef.current = scrollScope;
+  useLayoutEffect(() => {
+    const replacement = completedTailReplacementRef.current;
+    if (!replacement || replacement.scope === scrollScope) return;
+    if (replacement.releaseTimer !== null) {
+      window.clearTimeout(replacement.releaseTimer);
+    }
+    completedTailReplacementRef.current = null;
+  }, [scrollScope]);
   const hasOpenTailRef = useRef(false);
   const newestTurn = turns.at(-1);
   const hasOpenTail = !!newestTurn && (
     !newestTurn.done || newestTurn.blocks.some((block) => !block.done)
   );
   hasOpenTailRef.current = hasOpenTail;
+  const completedTailReplacement = completedTailReplacementRef.current;
+  const hasCompletedTailReplacement = !!completedTailReplacement
+    && completedTailReplacement.scope === scrollScope
+    && completedTailReplacement.turns === turns;
+  const scheduleCompletedTailReplacementRelease = useCallback((
+    replacement: CompletedTailReplacement,
+  ): void => {
+    if (replacement.releaseTimer !== null) {
+      window.clearTimeout(replacement.releaseTimer);
+    }
+    replacement.releaseTimer = window.setTimeout(() => {
+      if (completedTailReplacementRef.current === replacement) {
+        completedTailReplacementRef.current = null;
+        // Remove the temporary MutationObserver as soon as its quiet window
+        // closes; a ref-only update would leave it attached until unrelated UI
+        // state happened to render again.
+        setScrollPolicyEpoch((value) => value + 1);
+      }
+    }, COMPLETED_TAIL_REPLACEMENT_QUIET_MS);
+  }, []);
   const turnKeySnapshot = updateTurnKeySnapshot(
     turnKeySnapshotRef.current,
     turns,
@@ -892,8 +972,15 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
       // pre-paint notification so the spacer update never becomes a visible
       // intermediate jump.
       restoreRetainedMeasurementBoundary();
-      if (!hasOpenTailRef.current) return;
+      const replacement = completedTailReplacementRef.current;
+      const followsCompletedReplacement = !!replacement
+        && replacement.scope === scrollScope
+        && replacement.turns === turns;
+      if (!hasOpenTailRef.current && !followsCompletedReplacement) return;
       maintainFollowedLiveTail();
+      if (followsCompletedReplacement) {
+        scheduleCompletedTailReplacementRelease(replacement);
+      }
     };
     const observer = new ResizeObserver(followMeasuredTail);
     observer.observe(content);
@@ -903,7 +990,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     // so observe the actual streamed text/tool/spacer commit as well. The same
     // strict follow/gesture/selection/transaction gates above still own whether
     // a bottom command is allowed.
-    const mutationObserver = !hasOpenTail
+    const mutationObserver = (!hasOpenTail && !hasCompletedTailReplacement)
         || typeof MutationObserver === "undefined"
       ? null
       : new MutationObserver(followMeasuredTail);
@@ -923,8 +1010,9 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
       mutationObserver?.disconnect();
     };
   }, [
-    hasOpenTail, maintainFollowedLiveTail,
-    restoreRetainedMeasurementBoundary, scrollScope,
+    hasCompletedTailReplacement, hasOpenTail, maintainFollowedLiveTail,
+    restoreRetainedMeasurementBoundary,
+    scheduleCompletedTailReplacementRelease, scrollScope, turns,
   ]);
 
   const pauseOutputFollow = useCallback(() => {
@@ -1613,8 +1701,15 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   // font/image/virtualizer measurements without introducing a frame-delayed
   // second writer.
   useLayoutEffect(() => {
-    if (!hasOpenTailRef.current) return;
+    const replacement = completedTailReplacementRef.current;
+    const followsCompletedReplacement = !!replacement
+      && replacement.scope === scrollScope
+      && replacement.turns === turns;
+    if (!hasOpenTailRef.current && !followsCompletedReplacement) return;
     maintainFollowedLiveTail();
+    if (followsCompletedReplacement) {
+      scheduleCompletedTailReplacementRelease(replacement);
+    }
   });
 
   useEffect(() => {
@@ -1627,14 +1722,17 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
       if (userScrollIntentTimerRef.current !== null) {
         window.clearTimeout(userScrollIntentTimerRef.current);
       }
+      const replacement = completedTailReplacementRef.current;
+      if (replacement?.releaseTimer != null) {
+        window.clearTimeout(replacement.releaseTimer);
+      }
+      completedTailReplacementRef.current = null;
       disposeTextSelection();
       cancelDetailAnchorFnRef.current?.(false);
     };
   }, [
     cancelHistoryAnchor, clearHistoryRequestTimeout, disposeTextSelection,
   ]);
-
-  useEffect(() => setZoom(null), [sid]);
 
   const settleUserScrollIntent = () => {
     if (touchYRef.current !== null || wheelGestureActiveRef.current) {
@@ -2068,6 +2166,104 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     }
   }, [applyScrollCommand]);
 
+  const closeMermaidPreview = useCallback((followOutput = true): void => {
+    const current = mermaidPreviewRef.current;
+    if (!current) return;
+    mermaidPreviewRef.current = null;
+    setMermaidPreview(null);
+    endProcessInteraction(current.interactionToken, followOutput);
+  }, [endProcessInteraction]);
+
+  const openMermaidPreview = useCallback((
+    preview: MermaidPreviewPayload,
+  ): void => {
+    const previous = mermaidPreviewRef.current;
+    if (previous) {
+      endProcessInteraction(previous.interactionToken, false);
+    }
+    const next = {
+      ...preview,
+      scope: scrollScope,
+      interactionToken: beginProcessInteraction(),
+    };
+    mermaidPreviewRef.current = next;
+    setMermaidPreview(next);
+    setZoom(null);
+  }, [beginProcessInteraction, endProcessInteraction, scrollScope]);
+
+  useEffect(() => setZoom(null), [sid]);
+
+  useEffect(() => {
+    const current = mermaidPreviewRef.current;
+    if (current && current.scope !== scrollScope) {
+      closeMermaidPreview(false);
+    }
+  }, [closeMermaidPreview, scrollScope]);
+
+  const mermaidPreviewInteractionToken =
+    mermaidPreview?.interactionToken ?? null;
+  useEffect(() => {
+    if (mermaidPreviewInteractionToken === null) return;
+    const root = document.documentElement;
+    let disposed = false;
+    let generation = 0;
+    let pendingTheme: MermaidPreviewPayload["theme"] | null = null;
+    const refreshTheme = () => {
+      const current = mermaidPreviewRef.current;
+      if (!current) return;
+      const theme = activeMermaidTheme();
+      if (current.theme === theme) {
+        if (pendingTheme !== null) {
+          generation += 1;
+          pendingTheme = null;
+        }
+        return;
+      }
+      if (pendingTheme === theme) return;
+      pendingTheme = theme;
+      const requestGeneration = ++generation;
+      const interactionToken = current.interactionToken;
+      void renderMermaidSvg(
+        current.source,
+        `cc-remote-mermaid-preview-${interactionToken}-${requestGeneration}`,
+        theme,
+      ).then((svg) => {
+        if (disposed || requestGeneration !== generation) return;
+        const latest = mermaidPreviewRef.current;
+        if (!latest || latest.interactionToken !== interactionToken) return;
+        const next = {
+          ...latest,
+          svg: mermaidPreviewSvg(svg),
+          theme,
+        };
+        pendingTheme = null;
+        mermaidPreviewRef.current = next;
+        setMermaidPreview(next);
+      }).catch(() => {
+        if (disposed || requestGeneration !== generation) return;
+        pendingTheme = null;
+        closeMermaidPreview(false);
+      });
+    };
+    const observer = new MutationObserver(refreshTheme);
+    observer.observe(root, { attributes: true, attributeFilter: ["data-theme"] });
+    refreshTheme();
+    return () => {
+      disposed = true;
+      observer.disconnect();
+    };
+  }, [closeMermaidPreview, mermaidPreviewInteractionToken]);
+
+  useEffect(() => () => {
+    const current = mermaidPreviewRef.current;
+    if (!current) return;
+    mermaidPreviewRef.current = null;
+    scrollCoordinatorRef.current.endInteraction(
+      current.interactionToken,
+      false,
+    );
+  }, []);
+
   const disposeDetailResources = useCallback((
     transaction: DetailAnchorTransaction,
   ): void => {
@@ -2391,6 +2587,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   }
 
   return (
+    <MermaidPreviewContext.Provider value={openMermaidPreview}>
     <div className={surface === "work" ? "thread-shell work-thread-shell" : "thread-shell"}>
       {visibleHistoryPageActivity && (
         <div className="history-page-activity"
@@ -2734,6 +2931,14 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
           onClose={() => setZoom(null)} />
         ) : null;
       })()}
+      {mermaidPreview && (
+        <ImageLightbox sanitizedSvg={mermaidPreview.svg}
+          alt="Mermaid 图表预览"
+          dialogLabel="Mermaid 图表预览"
+          closeLabel="关闭 Mermaid 图表预览"
+          onClose={closeMermaidPreview} />
+      )}
     </div>
+    </MermaidPreviewContext.Provider>
   );
 }

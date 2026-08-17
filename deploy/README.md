@@ -96,6 +96,16 @@ prefer a roll-forward fix unless that metadata rollback is explicitly accepted.
   shell, escalates to SIGKILL, or silently adopts a process.
 - **Codex Code:** `CC_REMOTE_CODEX_DAEMON=auto` prefers Codex's official shared
   app-server daemon. Set it to `off` only to force the legacy private stdio path.
+  The primary `CODEX_HOME` needs the official standalone managed layout at
+  `$CODEX_HOME/packages/standalone/current/codex`. Standalone and npm are both
+  official CLI install methods, but an npm/NVM-only binary can expose
+  `daemon --help` and `proxy --help` while official bootstrap still refuses the
+  missing managed path and `auto` falls back to stdio. Do not use those help
+  probes as deployment acceptance. Require `codex app-server daemon version`
+  to report `status=running`, verify its socket exists, and confirm an active
+  Code handle launches `app-server proxy` without fallback warnings. Codex Work
+  intentionally remains on private stdio and must not be diagnosed as a daemon
+  failure.
   Optional multi-account installs provide either inline
   `CC_REMOTE_CODEX_PROFILES_JSON` or a private
   `CC_REMOTE_CODEX_PROFILES_FILE`; the macOS LaunchAgent defaults the latter to

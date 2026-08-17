@@ -3041,6 +3041,7 @@ def codex_translate_history(
     end_offset: int | None = None,
     source_continuation: str | None = None,
     snapshot_in_progress: bool = False,
+    active_task_ids: set[str] | frozenset[str] | tuple[str, ...] = (),
     client_message_ids: dict[str, str] | None = None,
     segment_client_message_ids: dict[tuple[str, int], str] | None = None,
 ) -> tuple[list, str | None]:
@@ -3088,6 +3089,10 @@ def codex_translate_history(
     # native task/start marker. A window which begins mid-turn must not mistake
     # its first visible steer for segment zero.
     task_segment_index: int | None = None
+    known_active_task_ids = {
+        value for value in active_task_ids
+        if isinstance(value, str) and _SAFE_WIRE_ID.fullmatch(value)
+    }
     native_client_aliases = client_message_ids or {}
     segment_client_aliases = segment_client_message_ids or {}
     seen_tool_uses: set[str] = set()
@@ -3671,6 +3676,13 @@ def codex_translate_history(
                         # the Web projection stores one user prompt per turn,
                         # but it must be a neutral non-error boundary.
                         steered_same_task = task_has_user and turn_has_user
+                        active_mid_task_steer = bool(
+                            snapshot_in_progress
+                            and turn_open
+                            and not turn_has_user
+                            and isinstance(next_turn_id, str)
+                            and next_turn_id in known_active_task_ids
+                        )
                         # No terminal record proved where the previous visible
                         # reply ended. In particular, pending_turn_id now often
                         # belongs to this NEW user turn; never attach it to the
@@ -3685,7 +3697,7 @@ def codex_translate_history(
                                 "authoritative_page",
                             }
                         )
-                        if steered_same_task:
+                        if steered_same_task or active_mid_task_steer:
                             close_turn(
                                 "steered", 0, False,
                                 authoritative_boundary=False)

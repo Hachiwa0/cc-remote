@@ -11,6 +11,8 @@ _CODEX_PROFILE_ENV = (
     "CC_REMOTE_CODEX_PROFILES_FILE",
 )
 
+_MISSING_WORKSPACE_RUNTIME = "/__cc_remote_test_workspace_runtime_missing__"
+
 
 @pytest.fixture(autouse=True)
 def _isolate_codex_profile_environment(
@@ -25,3 +27,8 @@ def _isolate_codex_profile_environment(
     """
     for key in _CODEX_PROFILE_ENV:
         monkeypatch.delenv(key, raising=False)
+    # Tests must not change shape based on whether the developer has installed
+    # the Codex desktop app. Individual workspace-runtime tests opt in with a
+    # complete temporary bundle.
+    monkeypatch.setenv(
+        "CC_REMOTE_CODEX_WORKSPACE_RUNTIME", _MISSING_WORKSPACE_RUNTIME)

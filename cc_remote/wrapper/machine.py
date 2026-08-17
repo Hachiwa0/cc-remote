@@ -1133,19 +1133,44 @@ def _replace_history_control_rows(
     ]
 
 
+def _codex_active_continuation_ids(
+    ctx: Optional[SessionContext],
+) -> set[str]:
+    """Return every handle-proven active continuation id for translation."""
+    if ctx is None or ctx.engine != "codex":
+        return set()
+    values = getattr(ctx.sdk, "compaction_continuation_turn_ids", frozenset())
+    if not isinstance(values, (set, frozenset, tuple, list)):
+        return set()
+    return {
+        value for value in values
+        if isinstance(value, str) and value
+    }
+
+
 def _codex_compaction_continuation_ids(
     ctx: Optional[SessionContext],
 ) -> list[str]:
-    """Return only handle-proven compact continuation ids for History."""
-    if ctx is None or ctx.engine != "codex":
+    """Return the four most relevant handle-proven ids allowed on the wire."""
+    values = _codex_active_continuation_ids(ctx)
+    if not values or ctx is None:
         return []
-    values = getattr(ctx.sdk, "compaction_continuation_turn_ids", frozenset())
-    if not isinstance(values, (set, frozenset, tuple, list)):
-        return []
-    return sorted({
-        value for value in values
-        if isinstance(value, str) and value
-    })[:4]
+    if len(values) <= 4:
+        return sorted(values)
+    # The protocol intentionally keeps this lifecycle hint bounded to four
+    # ids.  Never let lexical truncation discard the resident control owners;
+    # the source translator receives the complete set separately.
+    priority: list[str] = []
+    for candidate in (
+        getattr(ctx.sdk, "turn_id", None),
+        ctx.codex_owned_turn_id,
+        ctx.codex_spontaneous_turn_id,
+    ):
+        if isinstance(candidate, str) and candidate in values \
+                and candidate not in priority:
+            priority.append(candidate)
+    priority.extend(sorted(values.difference(priority)))
+    return priority[:4]
 
 
 def _codex_list_state(status: Optional[str]) -> Optional[State]:
@@ -4082,7 +4107,7 @@ class WrapperMachine:
                 self._schedule_history_refresh(
                     sid,
                     before=None,
-                    limit=None,
+                    limit=self.MIRROR_LIMIT,
                     cwd=ctx.cwd,
                     detail="summary",
                 )
@@ -5019,52 +5044,82 @@ class WrapperMachine:
                             )
                         )
                     ), None)
-                    if witness is None:
-                        log.warning(
-                            "Codex active rollout lacks exact control-turn witness",
-                            session_id=session_id,
-                            turn_id=lease.turn_id,
-                        )
-                        return False
-                    native_message_id, active_stream_id = witness
-                    try:
-                        bound = await asyncio.to_thread(
-                            self._codex_turn_leases.bind_stream,
-                            session_id,
-                            lease.turn_id,
-                            active_stream_id,
-                            native_message_id,
-                            source_device=source.device,
-                            source_inode=source.inode,
-                            expected_msg_id=lease.msg_id,
-                            daemon_epoch=lease.daemon_epoch,
-                        )
-                    except Exception as exc:
-                        log.warning(
-                            "Codex recovered stream binding could not be persisted",
-                            session_id=session_id,
-                            turn_id=lease.turn_id,
-                            error_type=type(exc).__name__,
-                        )
-                        return False
-                    if not bound:
-                        return False
-                    rollout_matches = True
-                    # Only the newest official user item owns the lease's latest
-                    # browser message. An older item may prove task lineage but
-                    # must never be relabelled as the newest Remote steer.
+                    persisted_task_id = (
+                        next(iter(persisted_stream_ids))
+                        if len(persisted_stream_ids) == 1
+                        else None
+                    )
                     if (
-                        probe.native_user_message_ids
-                        and native_message_id
-                        == probe.native_user_message_ids[0]
+                        witness is None
+                        and persisted_task_id is not None
+                        and not active
+                        and last_marker is None
                     ):
-                        await self._remember_codex_client_message_id(
-                            ctx,
-                            active_stream_id,
-                            lease.msg_id,
-                            native_message_id=native_message_id,
-                            source_path=path,
+                        # Codex 0.147 may expose a different official user-item
+                        # id after a steer than the ``msg_...`` id written to
+                        # the rollout.  A prior live binding is still exact: it
+                        # is attached to this lease and this rollout inode. If
+                        # the bounded tail starts mid-task, the latest official
+                        # inProgress control turn plus that durable source
+                        # binding is the required three-way witness. Do not
+                        # relabel the newer official item; only recover the
+                        # already-proven stream task.
+                        active_stream_id = persisted_task_id
+                        rollout_matches = True
+                        log.info(
+                            "recovering Codex turn from durable stream witness",
+                            session_id=session_id,
+                            turn_id=lease.turn_id,
+                            stream_turn_id=active_stream_id,
                         )
+                    if witness is None:
+                        if not rollout_matches:
+                            log.warning(
+                                "Codex active rollout lacks exact control-turn witness",
+                                session_id=session_id,
+                                turn_id=lease.turn_id,
+                            )
+                            return False
+                    else:
+                        native_message_id, active_stream_id = witness
+                        try:
+                            bound = await asyncio.to_thread(
+                                self._codex_turn_leases.bind_stream,
+                                session_id,
+                                lease.turn_id,
+                                active_stream_id,
+                                native_message_id,
+                                source_device=source.device,
+                                source_inode=source.inode,
+                                expected_msg_id=lease.msg_id,
+                                daemon_epoch=lease.daemon_epoch,
+                            )
+                        except Exception as exc:
+                            log.warning(
+                                "Codex recovered stream binding could not be persisted",
+                                session_id=session_id,
+                                turn_id=lease.turn_id,
+                                error_type=type(exc).__name__,
+                            )
+                            return False
+                        if not bound:
+                            return False
+                        rollout_matches = True
+                        # Only the newest official user item owns the lease's latest
+                        # browser message. An older item may prove task lineage but
+                        # must never be relabelled as the newest Remote steer.
+                        if (
+                            probe.native_user_message_ids
+                            and native_message_id
+                            == probe.native_user_message_ids[0]
+                        ):
+                            await self._remember_codex_client_message_id(
+                                ctx,
+                                active_stream_id,
+                                lease.msg_id,
+                                native_message_id=native_message_id,
+                                source_path=path,
+                            )
                 else:
                     # The ordered official reads authoritatively show that the
                     # leased control turn is no longer the active turn.
@@ -10911,6 +10966,16 @@ class WrapperMachine:
             _codex_compaction_continuation_ids(ctx)
             if is_codex_hist and before is None else []
         )
+        active_codex_history_task_ids = _codex_active_continuation_ids(ctx)
+        if (
+            is_codex_hist
+            and before is None
+            and isinstance(active_external_turns, dict)
+        ):
+            active_codex_history_task_ids.update(
+                turn_id for turn_id in active_external_turns
+                if isinstance(turn_id, str) and turn_id
+            )
         source_path = None
         source_fingerprint = None
         source_snapshot_stable: bool | None = None
@@ -11014,6 +11079,33 @@ class WrapperMachine:
             # of the real lifecycle boundary. Old cache rows have no marker and
             # are rebuilt once rather than trusted in either state.
             indexed_page = None
+        if (
+            indexed_page is not None
+            and is_codex_hist
+            and before is None
+            and (
+                (
+                    in_progress
+                    and (
+                        indexed_page.in_progress is not True
+                        or set(indexed_page.active_task_ids)
+                        != active_codex_history_task_ids
+                    )
+                )
+                or (
+                    not in_progress
+                    and indexed_page.in_progress is True
+                )
+            )
+        ):
+            # A Codex app-server lifecycle can change without changing rollout
+            # bytes.  In particular, a restarted wrapper may recover the same
+            # in-progress task from a durable stream binding after the cached
+            # page was translated under a different active identity. Rebuild
+            # once with the current exact task set instead of replaying a stale
+            # interrupted/success terminal from an equal source fingerprint.
+            indexed_page = None
+            stale_indexed_page = False
         cached_full_events: list[dict] | None = None
         if (indexed_page is not None and detail == "full"
                 and source_fingerprint is not None
@@ -11245,6 +11337,10 @@ class WrapperMachine:
                         ),
                         snapshot_in_progress=(
                             in_progress and before is None
+                        ),
+                        active_task_ids=(
+                            tuple(sorted(active_codex_history_task_ids))
+                            if before is None else ()
                         ),
                         client_message_ids=(
                             codex_client_aliases.native_messages),
@@ -11553,96 +11649,202 @@ class WrapperMachine:
         history = make_history(selected, effective_start)
         margin = min(64 * 1024, max(1024, self.cfg.ws_max_size_bytes // 16))
         frame_budget = max(1024, self.cfg.ws_max_size_bytes - margin)
-        frame_size = len(history.model_dump_json().encode())
-        if frame_size > frame_budget and len(selected) > 1:
-            # Find the smallest number of oldest turns to drop. Re-serializing
-            # after every single removal is quadratic for a legal transcript
-            # containing many small turns; binary search bounds this to O(log n)
-            # complete serializations while retaining the largest fitting page.
-            low, high = 1, len(selected) - 1
-            best_drop = len(selected) - 1
-            best_history = make_history(selected[-1:], start + best_drop)
-            while low <= high:
-                drop = (low + high) // 2
-                candidate = make_history(selected[drop:], start + drop)
-                candidate_size = len(candidate.model_dump_json().encode())
-                if candidate_size <= frame_budget:
-                    best_drop = drop
-                    best_history = candidate
-                    high = drop - 1
-                else:
-                    low = drop + 1
-            selected = selected[best_drop:]
-            effective_start = start + best_drop
-            history = best_history
-            frame_size = len(history.model_dump_json().encode())
+        include_live_summary = bool(
+            is_codex_hist and in_progress and before is None)
 
-        # Keep the coherent source-complete projection before applying
-        # transport/cache-only image compaction. GetTurnDetail/GetHistoryImage
-        # read this independent row; the lightweight page stores only opaque
-        # image metadata and therefore never reparses base64 on every switch.
-        detail_source_events = tuple(
-            dict(row)
-            for row in history.events
-        )
-        detail_source_turns = materialize_history_turns(
-            detail_source_events,
-            include_live_detail=bool(
-                is_codex_hist and in_progress and before is None),
-        )
+        def make_summary_history(
+            groups: list[list],
+            group_start: int,
+        ) -> tuple[History, tuple[dict, ...], tuple[dict, ...]]:
+            # Size the payload the browser will actually receive.  The previous
+            # path measured source-complete tool/reasoning detail first and could
+            # discard an older turn from a 20 MiB intermediate even though its
+            # final summary page was only a few KiB.  That prevented History
+            # from delivering the authoritative terminal for a retained live
+            # row and resurrected a stale "processing" timer after pagination.
+            projected = make_history(groups, group_start)
+            source_events = tuple(dict(row) for row in projected.events)
+            summary_turns = materialize_history_turns(
+                source_events,
+                include_live_detail=include_live_summary,
+            )
+            projected.turns = [
+                ConversationTurn.model_validate(turn)
+                for turn in summary_turns
+            ]
+            projected.detail = "summary"
+            projected.events = [
+                row for row in projected.events
+                if row.get("type") in {"model", "effort"}
+            ]
+            return projected, source_events, summary_turns
 
-        if frame_size > frame_budget:
-            # A single legacy turn may predate today's attachment limits. First
-            # omit historical image bodies. If it is still too large, preserve a
-            # bounded prompt + terminal marker and surface an explicit error event
-            # instead of silently dropping the connection or pretending completeness.
-            for row in history.events:
-                if row.get("type") == "user_msg" and row.get("images"):
-                    row["images"] = None
+        if detail == "summary":
+            history, detail_source_events, detail_source_turns = (
+                make_summary_history(selected, effective_start)
+            )
             frame_size = len(history.model_dump_json().encode())
+            if frame_size > frame_budget and len(selected) > 1:
+                # Summary limits are normally tiny relative to the validated
+                # 12 MiB minimum frame, but a caller may request many turns.
+                # Retain the largest newest suffix using the final wire shape.
+                low, high = 1, len(selected) - 1
+                best_drop = len(selected) - 1
+                best_projection = make_summary_history(
+                    selected[-1:], start + best_drop)
+                while low <= high:
+                    drop = (low + high) // 2
+                    candidate = make_summary_history(
+                        selected[drop:], start + drop)
+                    candidate_size = len(
+                        candidate[0].model_dump_json().encode())
+                    if candidate_size <= frame_budget:
+                        best_drop = drop
+                        best_projection = candidate
+                        high = drop - 1
+                    else:
+                        low = drop + 1
+                selected = selected[best_drop:]
+                effective_start = start + best_drop
+                history, detail_source_events, detail_source_turns = (
+                    best_projection
+                )
+                frame_size = len(history.model_dump_json().encode())
+            if frame_size > frame_budget and detail_source_turns:
+                # Defensive fallback for a non-standard frame limit or a legacy
+                # single-turn summary. Preserve identity/lifecycle and make the
+                # source-complete TurnDetail expandable; only its large inline
+                # preview is omitted.
+                compact_turn = dict(detail_source_turns[-1])
+                compact_turn["prompt"] = str(
+                    compact_turn.get("prompt") or "")[:32 * 1024]
+                compact_turn["blocks"] = []
+                compact_turn["detailEventCount"] = max(
+                    1, int(compact_turn.get("detailEventCount") or 0))
+                compact_turn["detailLoaded"] = False
+                history.turns = [
+                    ConversationTurn.model_validate(compact_turn)
+                ]
+                history.oldest_id = compact_turn["id"]
+                history.newest_id = compact_turn["id"]
+                frame_size = len(history.model_dump_json().encode())
+                log.warning(
+                    "oversized history summary compacted",
+                    session_id=sid,
+                    frame_budget=frame_budget,
+                )
             if frame_size > frame_budget:
-                compact: list[dict] = [row.copy() for row in control_rows]
+                history.turns = []
+                history.events = []
+                history.oldest_id = None
+                history.newest_id = None
+                history.has_more = False
+                history.authoritative = False
+                history.error = "该历史摘要超过传输上限，请缩小历史页后重试"
+                detail_source_turns = ()
+        else:
+            frame_size = len(history.model_dump_json().encode())
+            if frame_size > frame_budget and len(selected) > 1:
+                # Find the smallest number of oldest turns to drop. Re-serializing
+                # after every single removal is quadratic for a legal transcript
+                # containing many small turns; binary search bounds this to O(log n)
+                # complete serializations while retaining the largest fitting page.
+                low, high = 1, len(selected) - 1
+                best_drop = len(selected) - 1
+                best_history = make_history(selected[-1:], start + best_drop)
+                while low <= high:
+                    drop = (low + high) // 2
+                    candidate = make_history(selected[drop:], start + drop)
+                    candidate_size = len(candidate.model_dump_json().encode())
+                    if candidate_size <= frame_budget:
+                        best_drop = drop
+                        best_history = candidate
+                        high = drop - 1
+                    else:
+                        low = drop + 1
+                selected = selected[best_drop:]
+                effective_start = start + best_drop
+                history = best_history
+                frame_size = len(history.model_dump_json().encode())
+
+            # Keep the coherent source-complete projection before applying
+            # transport/cache-only image compaction. GetTurnDetail/GetHistoryImage
+            # read this independent row; the lightweight page stores only opaque
+            # image metadata and therefore never reparses base64 on every switch.
+            detail_source_events = tuple(
+                dict(row)
+                for row in history.events
+            )
+            detail_source_turns = materialize_history_turns(
+                detail_source_events,
+                include_live_detail=include_live_summary,
+            )
+
+            if frame_size > frame_budget:
+                # A single legacy turn may predate today's attachment limits. First
+                # omit historical image bodies. If it is still too large, preserve a
+                # bounded prompt + terminal marker and surface an explicit error event
+                # instead of silently dropping the connection or pretending completeness.
                 for row in history.events:
-                    if row.get("type") == "user_msg":
-                        kept = row.copy()
-                        prompt_text = str(kept.get("prompt", ""))
-                        kept["prompt"] = prompt_text[:32 * 1024]
-                        kept["images"] = None
-                        compact.append(kept)
-                        break
+                    if row.get("type") == "user_msg" and row.get("images"):
+                        row["images"] = None
+                frame_size = len(history.model_dump_json().encode())
+                if frame_size > frame_budget:
+                    compact: list[dict] = [row.copy() for row in control_rows]
+                    for row in history.events:
+                        if row.get("type") == "user_msg":
+                            kept = row.copy()
+                            prompt_text = str(kept.get("prompt", ""))
+                            kept["prompt"] = prompt_text[:32 * 1024]
+                            kept["images"] = None
+                            compact.append(kept)
+                            break
+                    notice = Error(
+                        code=ERR_INTERNAL,
+                        message="该历史回合超过传输上限，已省略过大的回复或附件",
+                    )
+                    notice.sid = sid
+                    compact.append(notice.model_dump(mode="json"))
+                    terminal = next(
+                        (row for row in reversed(history.events)
+                         if row.get("type") == "turn_end"),
+                        None,
+                    )
+                    if terminal:
+                        compact.append(terminal)
+                    history.events = compact
+                    log.warning(
+                        "oversized history turn compacted",
+                        session_id=sid,
+                        frame_budget=frame_budget,
+                    )
+                    frame_size = len(history.model_dump_json().encode())
+            if frame_size > frame_budget:
                 notice = Error(
                     code=ERR_INTERNAL,
-                    message="该历史回合超过传输上限，已省略过大的回复或附件",
+                    message="该历史回合超过传输上限，无法在当前帧限制内显示",
                 )
                 notice.sid = sid
-                compact.append(notice.model_dump(mode="json"))
-                terminal = next(
-                    (row for row in reversed(history.events)
-                     if row.get("type") == "turn_end"),
-                    None,
-                )
-                if terminal:
-                    compact.append(terminal)
-                history.events = compact
-                log.warning("oversized history turn compacted", session_id=sid,
-                            frame_budget=frame_budget)
-                frame_size = len(history.model_dump_json().encode())
-        if frame_size > frame_budget:
-            notice = Error(
-                code=ERR_INTERNAL,
-                message="该历史回合超过传输上限，无法在当前帧限制内显示",
-            )
-            notice.sid = sid
-            history.events = [notice.model_dump(mode="json")]
-            history.oldest_id = None
-            history.newest_id = None
+                history.events = [notice.model_dump(mode="json")]
+                history.oldest_id = None
+                history.newest_id = None
+        # Keep the source-complete narrative in the private page cache even for
+        # a summary response. Turn details have an independent tighter LRU; a
+        # retained page must still be able to recover an evicted detail without
+        # reparsing the full transcript. Only ``history.events`` is reduced to
+        # control rows on the wire.
+        cached_page_rows = (
+            detail_source_events
+            if detail == "summary"
+            else tuple(history.events)
+        )
         page_events = tuple(
             {
                 **row,
                 **({"images": None} if row.get("type") == "user_msg"
                    and row.get("images") else {}),
             }
-            for row in history.events
+            for row in cached_page_rows
         )
         materialized = MaterializedHistoryPage(
             events=page_events,
@@ -11653,7 +11855,13 @@ class WrapperMachine:
             in_progress=(
                 claude_snapshot_in_progress
                 if not is_codex_hist and before is None
-                else None
+                else in_progress
+                    if is_codex_hist and before is None
+                    else None
+            ),
+            active_task_ids=(
+                tuple(sorted(active_codex_history_task_ids))
+                if is_codex_hist and before is None else ()
             ),
         )
         if source_fingerprint is not None:
@@ -11724,16 +11932,6 @@ class WrapperMachine:
                     cwd=cwd_hint,
                     detail=detail,
                 )
-        if detail == "summary":
-            history.turns = [
-                ConversationTurn.model_validate(turn)
-                for turn in materialized.turns
-            ]
-            history.detail = "summary"
-            history.events = [
-                row for row in history.events
-                if row.get("type") in {"model", "effort"}
-            ]
         if self._history_revision(sid) != revision:
             if allow_stale:
                 return await self._build_history(
@@ -11765,6 +11963,18 @@ class WrapperMachine:
         detail: str,
     ) -> None:
         """Refresh one provisional moving-source page off the first-paint path."""
+        # A newest-page background refresh is broadcast rather than correlated
+        # to one requester.  Never let an omitted/invalid limit turn it into a
+        # full-transcript replacement: inserting hundreds of older rows without
+        # a pagination anchor moves every connected reader's viewport.  Keep an
+        # explicit positive caller limit, otherwise refresh only the lightweight
+        # moving head used by normal history mirroring.
+        refresh_limit = (
+            limit
+            if before is not None
+            or (isinstance(limit, int) and limit > 0)
+            else self.MIRROR_LIMIT
+        )
         ctx = self._ctx_by_sid(sid)
         watch = self._watch.get(sid) or {}
         is_codex = bool(
@@ -11778,7 +11988,7 @@ class WrapperMachine:
         key = (
             sid,
             before or "",
-            limit or 0,
+            refresh_limit or 0,
             f"{refresh_cwd or ''}\0{detail}",
         )
         current = self._history_refresh_tasks.get(key)
@@ -11795,7 +12005,7 @@ class WrapperMachine:
                     history = await self._build_history(
                         sid,
                         before=before,
-                        limit=limit,
+                        limit=refresh_limit,
                         cwd_hint=refresh_cwd,
                         detail=detail,
                         allow_stale=False,

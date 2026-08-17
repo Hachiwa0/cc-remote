@@ -119,6 +119,28 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   A newer official private app-server is only a compatibility fallback before
   shared affinity has ever been established; it must never outrank a usable
   shared control plane.
+- **Codex shared daemon requires the managed standalone layout**: standalone
+  and `npm install -g @openai/codex` are both official CLI distributions, but
+  `daemon --help` / `proxy --help` only prove that the subcommands exist. An
+  npm/NVM-only primary `CODEX_HOME` may expose both commands while official
+  daemon bootstrap still refuses it because
+  `$CODEX_HOME/packages/standalone/current/codex` is absent; `auto` then falls
+  back to private stdio. Install the official standalone distribution for the
+  primary home; the wrapper may link that verified managed `current` into a
+  sibling profile home, but must never manufacture one from an npm binary.
+  Accept shared Code only when `codex app-server daemon version` reports
+  `status=running`, its socket exists, and the Wrapper launches `app-server
+  proxy` without fallback warnings. `app-server --stdio` for Codex Work is
+  intentional and is not a daemon failure.
+- **Codex Desktop workspace dependencies stay host-owned**: app-server accepts
+  `dynamicTools` only on `thread/start`; never rewrite old rollout metadata to
+  retrofit the dependency locator. Register it only for Code (not Work), only
+  after validating the existing Desktop runtime, and revalidate it on every
+  owned tool call. On the shared daemon, answer only the exact current thread,
+  namespace, and tool request—leave foreign requests for their owning client.
+  The locator may report paths but must never install, update, or mutate the
+  Desktop runtime. Official file citations still pass through the existing
+  local-file authorization and preview boundary.
 - **History = local projection + materialized summary pages; reconnect = live-tail replay**
   (protocol v24): IndexedDB paints the browser's last projection before network
   validation. `GetHistory(detail="summary")` returns a small canonical turn page

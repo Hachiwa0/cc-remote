@@ -33,6 +33,7 @@ from cc_remote.protocol import (
     HistoryImage,
     TurnDetail, HistoryInvalidated,
     UserMsg, TurnSteered, AssistantMsgStart, AssistantMsgEnd, Delta,
+    ToolUse, ToolResult,
     ProcessEvent, TurnPlan, TurnBinding, TurnEnd, TurnResult, Error,
     Model, Effort,
     is_downstream,
@@ -3519,6 +3520,7 @@ def test_codex_history_append_paints_cached_page_before_revalidation(
             oldest_id="old",
             newest_id="old",
             turns=materialize_history_turns(events),
+            in_progress=True,
         )
         machine._history_index.put_page(
             "codex-fast", "codex", old_source,
@@ -3549,6 +3551,70 @@ def test_codex_history_append_paints_cached_page_before_revalidation(
         assert history.in_progress is True
         assert history.has_more is True
         assert refreshes and refreshes[0][0] == "codex-fast"
+
+    asyncio.run(go())
+
+
+def test_active_codex_cache_is_bound_to_exact_continuation_tasks(
+        monkeypatch, tmp_path):
+    rollout = tmp_path / "active-cache.jsonl"
+    rollout.write_text(
+        '{"type":"session_meta","payload":{"id":"active-cache"}}\n')
+    monkeypatch.setattr(mm, "codex_rollout_path", lambda _sid: str(rollout))
+    translated = []
+
+    def translate(*_args, **kwargs):
+        translated.append(kwargs)
+        return [], None
+
+    monkeypatch.setattr(mm, "codex_translate_history", translate)
+
+    async def go():
+        machine, _ = _mk_machine()
+        machine._history_index = HistoryIndexStore(
+            tmp_path / "state-active-cache")
+        ctx = _mk_ctx("active-cache", "active-cache")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        ctx.sdk = SimpleNamespace(
+            turn_id="new-active-task",
+            compaction_continuation_turn_ids=frozenset({"new-active-task"}),
+        )
+        machine.sessions[ctx.key] = ctx
+        source = HistorySourceFingerprint.capture(rollout)
+        machine._history_index.put_page(
+            "active-cache",
+            "codex",
+            source,
+            before=None,
+            limit=4,
+            page=MaterializedHistoryPage(
+                events=(),
+                has_more=False,
+                oldest_id=None,
+                newest_id=None,
+                turns=(),
+                in_progress=True,
+                active_task_ids=("old-active-task",),
+            ),
+        )
+
+        history = await machine._build_history(
+            "active-cache",
+            before=None,
+            limit=4,
+            detail="summary",
+            allow_stale=True,
+        )
+
+        assert history.in_progress is True
+        assert translated
+        assert translated[0]["active_task_ids"] == ("new-active-task",)
+        rebuilt = machine._history_index.get_page(
+            "active-cache", "codex", source, before=None, limit=4)
+        assert rebuilt is not None
+        assert rebuilt.in_progress is True
+        assert rebuilt.active_task_ids == ("new-active-task",)
 
     asyncio.run(go())
 
@@ -4607,6 +4673,40 @@ def test_claude_history_refresh_coalesces_appends_during_full_scan(monkeypatch):
     asyncio.run(go())
 
 
+def test_newest_background_history_refresh_defaults_to_moving_head(monkeypatch):
+    async def go():
+        machine, transport = _mk_machine()
+        builds = []
+
+        async def build(sid, **kwargs):
+            builds.append((sid, kwargs))
+            return History(
+                session_id=sid,
+                revision="bounded-refresh",
+                events=[],
+                turns=[],
+                detail="summary",
+                has_more=True,
+            )
+
+        monkeypatch.setattr(machine, "_build_history", build)
+        machine._schedule_history_refresh(
+            "bounded-refresh",
+            before=None,
+            limit=None,
+            cwd=None,
+            detail="summary",
+        )
+        await asyncio.gather(*list(machine._history_refresh_tasks.values()))
+
+        assert len(builds) == 1
+        assert builds[0][1]["limit"] == machine.MIRROR_LIMIT
+        assert len([row for row in transport.sent
+                    if isinstance(row, History)]) == 1
+
+    asyncio.run(go())
+
+
 def test_codex_history_refresh_coalesces_cwd_hints_and_rate_limits_rescan(
         monkeypatch):
     async def go():
@@ -5001,6 +5101,13 @@ def test_active_external_codex_history_marks_growing_snapshot(monkeypatch, tmp_p
         ctx = _mk_ctx("external-codex", "external-codex")
         ctx.engine = "codex"
         ctx.state = "idle"
+        ctx.sdk = SimpleNamespace(
+            turn_id="continuation-6",
+            compaction_continuation_turn_ids=frozenset({
+                "continuation-1", "continuation-2", "continuation-3",
+                "continuation-4", "continuation-5", "continuation-6",
+            }),
+        )
         machine.sessions[ctx.key] = ctx
         machine._watch["external-codex"] = {
             "engine": "codex",
@@ -5009,10 +5116,19 @@ def test_active_external_codex_history_marks_growing_snapshot(monkeypatch, tmp_p
             "takeover_pending": None,
         }
 
-        await machine._build_history("external-codex", limit=20)
+        history = await machine._build_history("external-codex", limit=20)
 
         assert translate_kwargs
         assert translate_kwargs[0]["snapshot_in_progress"] is True
+        assert translate_kwargs[0]["active_task_ids"] == (
+            "continuation-1", "continuation-2", "continuation-3",
+            "continuation-4", "continuation-5", "continuation-6",
+            "native-turn",
+        )
+        assert history.compaction_continuation_turn_ids == [
+            "continuation-6", "continuation-1",
+            "continuation-2", "continuation-3",
+        ]
 
     asyncio.run(go())
 
@@ -5470,6 +5586,121 @@ def test_oversized_single_turn_wire_compaction_keeps_source_complete_detail(
         assert detail is not None
         delta = next(row for row in detail if row["type"] == "delta")
         assert delta["text"] == "x" * 200_000
+
+    asyncio.run(go())
+
+
+def test_codex_summary_sizes_final_projection_before_dropping_old_turns(
+        monkeypatch, tmp_path):
+    """Large deferred detail must not hide an older turn's terminal state."""
+    rollout = tmp_path / "oversized-summary-rollout.jsonl"
+    rollout.write_text(
+        '{"type":"session_meta","payload":{"id":"summary-session"}}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        mm,
+        "codex_history_window",
+        lambda path, **_kwargs: (
+            0, os.path.getsize(path), False, None, None,
+        ),
+    )
+
+    def completed_turn(index: int) -> list:
+        message_id = f"assistant-{index}"
+        tool_id = f"tool-{index}"
+        return [
+            UserMsg(msg_id=f"user-{index}", prompt=f"question-{index}"),
+            AssistantMsgStart(message_id=message_id, channel="commentary"),
+            ToolUse(
+                message_id=message_id,
+                tool_use_id=tool_id,
+                tool="exec_command",
+                input={"payload": str(index) * 160_000},
+            ),
+            ToolResult(
+                tool_use_id=tool_id,
+                content=str(index) * 160_000,
+                is_error=False,
+                status="succeeded",
+            ),
+            AssistantMsgEnd(message_id=message_id, channel="commentary"),
+            TurnEnd(
+                turn_id=f"native-{index}",
+                result=TurnResult(
+                    subtype="success", duration_ms=index, is_error=False,
+                ),
+            ),
+        ]
+
+    canned = [
+        *completed_turn(1),
+        *completed_turn(2),
+        UserMsg(msg_id="user-3", prompt="question-3"),
+        AssistantMsgStart(message_id="assistant-3", channel="commentary"),
+        Delta(
+            message_id="assistant-3",
+            text="still working",
+            channel="commentary",
+        ),
+    ]
+    monkeypatch.setattr(
+        mm,
+        "codex_translate_history",
+        lambda *_args, **_kwargs: (
+            [event.model_copy(deep=True) for event in canned], None,
+        ),
+    )
+
+    async def go():
+        machine, _ = _mk_machine()
+        machine.cfg.ws_max_size_bytes = 64 * 1024
+        machine._history_index = HistoryIndexStore(tmp_path / "state-summary")
+        machine._codex_rollout_for_wire = lambda _sid: str(rollout)
+        ctx = _mk_ctx("summary-session", "summary-session")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        machine.sessions[ctx.key] = ctx
+
+        history = await machine._build_history(
+            "summary-session", limit=4, detail="summary")
+
+        assert [turn.prompt for turn in history.turns] == [
+            "question-1", "question-2", "question-3",
+        ]
+        assert [turn.done for turn in history.turns] == [True, True, False]
+        assert len(history.model_dump_json().encode()) < 64 * 1024
+
+        source = HistorySourceFingerprint.capture(rollout)
+        cached = machine._history_index.get_page(
+            "summary-session", "codex", source, before=None, limit=4,
+        )
+        assert cached is not None
+        assert any(
+            row.get("type") == "tool_result" for row in cached.events)
+        detail = machine._history_index.get_turn_detail(
+            "summary-session", "codex", source, "user-1",
+        )
+        assert detail is not None
+        tool_result = next(
+            row for row in detail if row.get("type") == "tool_result")
+        assert tool_result["content"] == "1" * 160_000
+
+        # The standalone detail has a tighter LRU. A retained summary page
+        # remains a source-complete fallback after that row is evicted.
+        with machine._history_index._connect() as connection:
+            connection.execute(
+                "DELETE FROM history_turn_details "
+                "WHERE session_id=? AND turn_id=?",
+                ("summary-session", "user-1"),
+            )
+        recovered = machine._history_index.get_turn_detail(
+            "summary-session", "codex", source, "user-1",
+        )
+        assert recovered is not None
+        recovered_result = next(
+            row for row in recovered if row.get("type") == "tool_result")
+        assert recovered_result["content"] == "1" * 160_000
 
     asyncio.run(go())
 

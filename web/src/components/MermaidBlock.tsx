@@ -1,5 +1,6 @@
 import {
   useCallback,
+  useContext,
   useEffect,
   useId,
   useRef,
@@ -13,7 +14,12 @@ import {
   renderMermaidSvg,
   type MermaidTheme,
 } from "../mermaid";
-import { ImageLightbox } from "./ImageLightbox";
+import { LazyImageLightbox as ImageLightbox } from "./LazyImageLightbox";
+import {
+  activeMermaidTheme,
+  MermaidPreviewContext,
+  type MermaidPreviewPayload,
+} from "./mermaid-preview";
 
 interface RenderedMermaid {
   source: string;
@@ -23,31 +29,21 @@ interface RenderedMermaid {
   error?: string;
 }
 
-interface MermaidPreview {
-  svg: string;
-  source: string;
-  theme: MermaidTheme;
-}
-
-function activeTheme(): MermaidTheme {
-  if (typeof document === "undefined") return "light";
-  return document.documentElement.dataset.theme === "dark" ? "dark" : "light";
-}
-
 function safeRenderId(id: string): string {
   const safe = id.replace(/[^a-zA-Z0-9_-]/g, "");
   return `cc-remote-mermaid-${safe || "diagram"}`;
 }
 
 export function MermaidBlock({ source }: { source: string }) {
+  const onPreview = useContext(MermaidPreviewContext);
   const element = useRef<HTMLDivElement | null>(null);
   const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const renderGeneration = useRef(0);
   const renderId = safeRenderId(useId());
   const [nearViewport, setNearViewport] = useState(false);
-  const [theme, setTheme] = useState<MermaidTheme>(activeTheme);
+  const [theme, setTheme] = useState<MermaidTheme>(activeMermaidTheme);
   const [copied, setCopied] = useState(false);
-  const [preview, setPreview] = useState<MermaidPreview | null>(null);
+  const [preview, setPreview] = useState<MermaidPreviewPayload | null>(null);
   const [rendered, setRendered] = useState<RenderedMermaid>({
     source: "",
     theme: "light",
@@ -72,9 +68,9 @@ export function MermaidBlock({ source }: { source: string }) {
 
   useEffect(() => {
     const root = document.documentElement;
-    const observer = new MutationObserver(() => setTheme(activeTheme()));
+    const observer = new MutationObserver(() => setTheme(activeMermaidTheme()));
     observer.observe(root, { attributes: true, attributeFilter: ["data-theme"] });
-    setTheme(activeTheme());
+    setTheme(activeMermaidTheme());
     return () => observer.disconnect();
   }, []);
 
@@ -134,11 +130,16 @@ export function MermaidBlock({ source }: { source: string }) {
     : { source, theme, state: "idle" as const };
   const openPreview = () => {
     if (current.state !== "ready" || !current.svg) return;
-    setPreview({
+    const next = {
       svg: mermaidPreviewSvg(current.svg),
       source,
       theme,
-    });
+    };
+    if (onPreview) {
+      onPreview(next);
+    } else {
+      setPreview(next);
+    }
   };
 
   return (

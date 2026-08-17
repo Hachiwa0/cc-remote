@@ -8,6 +8,10 @@ import { createServer } from "vite";
 import { classifyPreviewTarget, isMarkdownPath } from "../src/preview-path.ts";
 import { parseLocalFileTarget } from "../src/file-link.ts";
 import {
+  parseCodexFileCitationDirective,
+  remarkCodexFileCitations,
+} from "../src/codex-file-citation.ts";
+import {
   InlineImageAssetCache,
   classifyMessageImageTarget,
 } from "../src/inline-image-assets.ts";
@@ -73,6 +77,39 @@ assert.deepEqual(parseLocalFileTarget("file:///tmp/a%20b.py:9"), {
 });
 assert.equal(parseLocalFileTarget("https://example.com/a.py:9"), null);
 assert.equal(parseLocalFileTarget("#L9"), null);
+assert.deepEqual(parseCodexFileCitationDirective(
+  ':codex-file-citation{path="/tmp/launch plan.pptx" purpose="output" '
+  + 'artifact_kind="presentation" label="Launch deck"}'), {
+  citation: {
+    path: "/tmp/launch plan.pptx",
+    purpose: "output",
+    artifactKind: "presentation",
+  },
+  end: 116,
+});
+assert.equal(parseCodexFileCitationDirective(
+  ':codex-file-citation{path="relative.pptx" purpose="output"}'), null);
+assert.equal(parseCodexFileCitationDirective(
+  ':codex-file-citation{path="/tmp/deck.pptx" purpose="unsafe"}'), null);
+const citationTree = {
+  type: "root",
+  children: [{
+    type: "paragraph",
+    children: [{
+      type: "text",
+      value: "Created :codex-file-citation{path=\"/tmp/deck.pptx\" "
+        + "purpose=\"output\" artifact_kind=\"presentation\"}.",
+    }],
+  }],
+};
+remarkCodexFileCitations()(citationTree);
+const citationLink = citationTree.children[0].children[1] as unknown as {
+  type: string;
+  title?: string;
+};
+assert.equal(citationLink.type, "link");
+assert.equal(citationLink.title,
+  "cc-remote-file-citation:output:presentation");
 assert.equal(isMermaidFenceClass("language-mermaid"), true);
 assert.equal(isMermaidFenceClass("foo language-mermaid bar"), true);
 assert.equal(isMermaidFenceClass("language-mermaid-extra"), false);
@@ -444,6 +481,8 @@ try {
     "/src/html-preview.ts");
   const { MessageBlock } = await harness.ssrLoadModule(
     "/src/components/MessageBlock.tsx");
+  const { CodexFileCitationCard } = await harness.ssrLoadModule(
+    "/src/components/CodexFileCitationCard.tsx");
   const codeCopyMarkup = renderToStaticMarkup(createElement(MessageBlock, {
     text: "请执行：\n\n```sh\necho ready\n```",
     done: true,
@@ -1141,6 +1180,30 @@ $$`,
   assert.match(messageMarkup, /message-file-link/);
   assert.match(messageMarkup, /在 Remote 中打开/);
   assert.doesNotMatch(messageMarkup, /href="\/home\/nancy/);
+
+  const citationMarkup = renderToStaticMarkup(createElement(CodexFileCitationCard, {
+    citation: {
+      path: "/tmp/launch plan.pptx",
+      purpose: "output",
+      artifactKind: "presentation",
+    },
+    onOpenFile: () => {},
+  }));
+  assert.match(citationMarkup, /message-file-citation/);
+  assert.match(citationMarkup, /launch plan\.pptx/);
+  assert.match(citationMarkup, /已生成/);
+  assert.match(citationMarkup, /演示文稿/);
+  assert.match(citationMarkup, /预览/);
+  assert.match(citationMarkup, /在 Remote 中打开 \/tmp\/launch plan\.pptx/);
+  assert.doesNotMatch(citationMarkup, /codex-file-citation/);
+
+  const codeCitationMarkup = renderToStaticMarkup(createElement(MessageBlock, {
+    text: "`:codex-file-citation{path=\"/tmp/not-a-card.pptx\" purpose=\"output\"}`",
+    done: true,
+    onOpenFile: () => {},
+  }));
+  assert.doesNotMatch(codeCitationMarkup, /message-file-citation/);
+  assert.match(codeCitationMarkup, /codex-file-citation/);
 
   const source = Array.from({ length: 740 }, (_, index) => `line ${index + 1}`).join("\n");
   const sourceMarkup = renderToStaticMarkup(createElement(ArtifactPanel, {

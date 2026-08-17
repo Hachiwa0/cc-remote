@@ -1,7 +1,7 @@
 import { useState } from "react";
 import type { QueryImg } from "../protocol";
 import { Icon } from "../icons";
-import { ImageLightbox } from "./ImageLightbox";
+import { LazyImageLightbox as ImageLightbox } from "./LazyImageLightbox";
 
 function imageSource(image: QueryImg): string {
   return `data:${image.media_type};base64,${image.data}`;

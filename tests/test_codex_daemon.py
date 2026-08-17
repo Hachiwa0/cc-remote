@@ -1293,6 +1293,42 @@ def test_shared_approval_without_callback_waits_for_resolved():
     asyncio.run(run())
 
 
+def test_shared_foreign_dynamic_tool_request_is_not_rejected():
+    async def run():
+        handle = CodexHandle(_Cfg(), daemon_mode="off")
+        handle._using_daemon_proxy = True
+        handle.thread_id = "current-thread"
+        sent = []
+        handle._send = lambda message: asyncio.sleep(  # type: ignore[method-assign]
+            0, result=sent.append(message))
+
+        await handle._dispatch({
+            "id": "dynamic-1",
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "foreign-thread",
+                "turnId": "foreign-turn",
+                "callId": "foreign-call",
+                "namespace": "codex_app",
+                "tool": "load_workspace_dependencies",
+                "arguments": {},
+            },
+        })
+
+        assert sent == []
+        assert handle._pending_server_request_ids == {"dynamic-1"}
+        await handle._dispatch({
+            "method": "serverRequest/resolved",
+            "params": {
+                "threadId": "foreign-thread",
+                "requestId": "dynamic-1",
+            },
+        })
+        assert handle._pending_server_request_ids == set()
+
+    asyncio.run(run())
+
+
 def test_shared_approval_first_response_wins_and_cancels_local_callback():
     async def run():
         started = asyncio.Event()

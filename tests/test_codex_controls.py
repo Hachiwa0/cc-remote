@@ -411,6 +411,18 @@ def test_codex_lightweight_resume_version_gate(version, expected):
     assert codex_handle_module._supports_lightweight_resume(version) is expected
 
 
+@pytest.mark.parametrize("version, expected", [
+    ("0.146.9", False),
+    ("0.147.0", True),
+    ("0.148.0-alpha.1", True),
+    (None, False),
+    ("invalid", False),
+])
+def test_codex_workspace_dynamic_tool_version_gate(version, expected):
+    supported = codex_handle_module._supports_workspace_dynamic_tools(version)
+    assert supported is expected
+
+
 _WORK_SKILLS_RESPONSE = {
     "data": [{
         "cwd": "/tmp",
@@ -4066,13 +4078,14 @@ def test_codex_legacy_resume_rejects_oversized_rollout_before_request(
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("work_mode,web_override", [
-    (False, None),
-    (False, "live"),
-    (True, None),
+@pytest.mark.parametrize("work_mode,web_override,workspace_runtime", [
+    (False, None, False),
+    (False, "live", False),
+    (False, None, True),
+    (True, None, False),
 ])
 def test_codex_fresh_thread_persists_all_first_turn_settings_before_return(
-        monkeypatch, work_mode, web_override):
+        monkeypatch, work_mode, web_override, workspace_runtime):
     class FakeProcess:
         pid = 424244
         returncode = None
@@ -4096,6 +4109,12 @@ def test_codex_fresh_thread_persists_all_first_turn_settings_before_return(
             codex_handle_module.asyncio, "create_subprocess_exec",
             lambda *_args, **_kwargs: asyncio.sleep(0, result=process))
         monkeypatch.setattr(codex_handle_module.os, "killpg", lambda *_args: None)
+        if workspace_runtime:
+            monkeypatch.setattr(
+                codex_handle_module,
+                "discover_workspace_dependencies",
+                lambda: object(),
+            )
 
         handle = CodexHandle(_Cfg(), work_mode=work_mode)
         handle.model = "first-model"
@@ -4117,7 +4136,8 @@ def test_codex_fresh_thread_persists_all_first_turn_settings_before_return(
         async def request(method, params=None):
             calls.append((method, params))
             if method == "initialize":
-                return {"userAgent": "codex_cli_rs/0.144.6 (test)"}
+                version = "0.147.0" if workspace_runtime else "0.144.6"
+                return {"userAgent": f"codex_cli_rs/{version} (test)"}
             if method == "skills/list":
                 return _WORK_SKILLS_RESPONSE
             if method == "config/read":
@@ -4180,6 +4200,9 @@ def test_codex_fresh_thread_persists_all_first_turn_settings_before_return(
             })
         elif web_override:
             expected_start["config"] = {"web_search": web_override}
+        if workspace_runtime:
+            expected_start["dynamicTools"] = (
+                codex_handle_module.WORKSPACE_DEPENDENCY_DYNAMIC_TOOLS)
         start_call = next(call for call in calls if call[0] == "thread/start")
         assert start_call == ("thread/start", expected_start)
         discovery_methods = [
@@ -4535,6 +4558,90 @@ def test_never_policy_and_unknown_requests_fail_closed():
         assert unknown["error"]["code"] == -32601
         assert "unsupported server request" in unknown["error"]["message"]
         assert called is False
+
+    asyncio.run(run())
+
+
+def test_workspace_dependency_dynamic_tool_returns_verified_runtime(monkeypatch):
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-1"
+        dependencies = SimpleNamespace(
+            tool_text=lambda: "verified workspace runtime")
+        monkeypatch.setattr(
+            codex_handle_module,
+            "discover_workspace_dependencies",
+            lambda: dependencies,
+        )
+
+        response = await _dispatch_request(
+            handle,
+            "item/tool/call",
+            {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "callId": "call-1",
+                "namespace": "codex_app",
+                "tool": "load_workspace_dependencies",
+                "arguments": {},
+            },
+        )
+
+        assert response == {
+            "jsonrpc": "2.0",
+            "id": 7,
+            "result": {
+                "success": True,
+                "contentItems": [{
+                    "type": "inputText",
+                    "text": "verified workspace runtime",
+                }],
+            },
+        }
+
+    asyncio.run(run())
+
+
+def test_workspace_dependency_dynamic_tool_rejects_arguments():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-1"
+        response = await _dispatch_request(
+            handle,
+            "item/tool/call",
+            {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "callId": "call-1",
+                "namespace": "codex_app",
+                "tool": "load_workspace_dependencies",
+                "arguments": {"path": "/tmp"},
+            },
+        )
+        assert response["error"]["code"] == -32602
+        assert "takes no arguments" in response["error"]["message"]
+
+    asyncio.run(run())
+
+
+def test_workspace_dependency_dynamic_tool_is_never_available_in_work():
+    async def run():
+        handle = CodexHandle(_Cfg(), work_mode=True)
+        handle.thread_id = "thread-1"
+        response = await _dispatch_request(
+            handle,
+            "item/tool/call",
+            {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "callId": "call-1",
+                "namespace": "codex_app",
+                "tool": "load_workspace_dependencies",
+                "arguments": {},
+            },
+        )
+        assert response["error"]["code"] == -32602
+        assert "invalid workspace dependency" in response["error"]["message"]
 
     asyncio.run(run())
 

@@ -1,8 +1,7 @@
-import { createContext, isValidElement, useContext, useEffect, useId,
-  useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore,
+import { createContext, isValidElement, useContext, useEffect,
+  useMemo, useRef, useState, useSyncExternalStore,
   type ComponentPropsWithoutRef,
   type ReactNode } from "react";
-import { createPortal } from "react-dom";
 import ReactMarkdown, { type Components } from "react-markdown";
 import { parseLocalFileTarget } from "../file-link";
 import { Icon } from "../icons";
@@ -22,6 +21,7 @@ import {
 } from "../markdown-math";
 import { useSanitizedSvgUrl } from "../use-sanitized-svg";
 import { MermaidBlock } from "./MermaidBlock";
+import { LocalFileLink } from "./LocalFileLink";
 import { PreviewAuthorizationPrompt } from "./PreviewAuthorizationPrompt";
 
 const CODEX_DIRECTIVE_LABELS: Record<string, string> = {
@@ -32,6 +32,17 @@ const CODEX_DIRECTIVE_LABELS: Record<string, string> = {
   "git-create-pr": "Pull Request 已创建",
   "created-thread": "Codex 任务已创建",
 };
+
+type FileCitationSupport = typeof import("../codex-file-citation-support");
+
+function useFileCitationSupport(source: string): FileCitationSupport | null {
+  const [support, setSupport] = useState<FileCitationSupport | null>(null);
+  useEffect(() => {
+    if (support || !source.includes(":codex-file-citation{")) return;
+    void import("../codex-file-citation-support").then(setSupport, () => {});
+  }, [source, support]);
+  return support;
+}
 
 type MessagePart =
   | { kind: "markdown"; text: string }
@@ -115,6 +126,7 @@ interface MessageMarkdownContextValue {
   ) => boolean;
   onOpenFile?: (path: string, line?: number) => void;
   onPreviewImage?: (src: string, alt: string) => void;
+  fileCitations?: FileCitationSupport | null;
 }
 
 const MessageMarkdownContext = createContext<MessageMarkdownContextValue>({});
@@ -371,8 +383,19 @@ function MarkdownImage({ src, alt, title }: ComponentPropsWithoutRef<"img">) {
 function MarkdownLink({
   href = "", children, title,
 }: ComponentPropsWithoutRef<"a">) {
-  const { onOpenFile } = useContext(MessageMarkdownContext);
+  const { fileCitations, onOpenFile } = useContext(MessageMarkdownContext);
   const file = parseLocalFileTarget(href);
+  const citationTitle = /^cc-remote-file-citation:(output|source):([A-Za-z0-9_-]*)$/
+    .exec(title ?? "");
+  const citation = file && citationTitle ? {
+    path: file.path,
+    purpose: citationTitle[1] === "output" ? "output" as const : "source" as const,
+    ...(citationTitle[2] ? { artifactKind: citationTitle[2] } : {}),
+  } : null;
+  if (citation && fileCitations) {
+    const Citation = fileCitations.CodexFileCitationCard;
+    return <Citation citation={citation} onOpenFile={onOpenFile} />;
+  }
   if (file && onOpenFile) {
     const location = file.line ? `${file.path}:${file.line}` : file.path;
     return <LocalFileLink location={location}
@@ -385,105 +408,6 @@ function MarkdownLink({
   if (href.startsWith("#")) return <a href={href} title={title}>{children}</a>;
   return <span className="message-link-disabled"
     title="该链接无法在当前会话中打开">{children}</span>;
-}
-
-function LocalFileLink({ location, children, onOpen }: {
-  location: string;
-  children: ReactNode;
-  onOpen: () => void;
-}) {
-  const tooltipId = useId();
-  const triggerRef = useRef<HTMLButtonElement>(null);
-  const tooltipRef = useRef<HTMLSpanElement>(null);
-  const pathRef = useRef<HTMLSpanElement>(null);
-  const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const [shown, setShown] = useState(false);
-  const [position, setPosition] = useState({ left: 0, top: 0 });
-
-  const cancelClose = () => {
-    if (!closeTimer.current) return;
-    clearTimeout(closeTimer.current);
-    closeTimer.current = null;
-  };
-  const open = () => {
-    cancelClose();
-    setShown(true);
-  };
-  const scheduleClose = () => {
-    cancelClose();
-    closeTimer.current = setTimeout(() => {
-      setShown(false);
-      closeTimer.current = null;
-    }, 220);
-  };
-
-  useEffect(() => () => {
-    if (closeTimer.current) clearTimeout(closeTimer.current);
-  }, []);
-
-  useLayoutEffect(() => {
-    if (!shown) return;
-    const update = () => {
-      const trigger = triggerRef.current;
-      const tooltip = tooltipRef.current;
-      if (!trigger || !tooltip) return;
-      const anchor = trigger.getBoundingClientRect();
-      const box = tooltip.getBoundingClientRect();
-      const margin = 10;
-      const gap = 8;
-      const idealLeft = anchor.left + anchor.width / 2 - box.width / 2;
-      const left = Math.min(
-        Math.max(margin, idealLeft),
-        Math.max(margin, window.innerWidth - box.width - margin),
-      );
-      const above = anchor.top - box.height - gap;
-      const top = above >= margin
-        ? above
-        : Math.min(window.innerHeight - box.height - margin, anchor.bottom + gap);
-      setPosition((current) => current.left === left && current.top === top
-        ? current : { left, top });
-    };
-    update();
-    window.addEventListener("resize", update);
-    window.addEventListener("scroll", update, true);
-    return () => {
-      window.removeEventListener("resize", update);
-      window.removeEventListener("scroll", update, true);
-    };
-  }, [shown, location]);
-
-  const selectPath = () => {
-    const path = pathRef.current;
-    const selection = window.getSelection();
-    if (!path || !selection) return;
-    const range = document.createRange();
-    range.selectNodeContents(path);
-    selection.removeAllRanges();
-    selection.addRange(range);
-  };
-
-  return <>
-    <button ref={triggerRef} type="button" className="message-file-link"
-      aria-label={`在 Remote 中打开 ${location}`}
-      aria-describedby={shown ? tooltipId : undefined}
-      onPointerEnter={open} onPointerLeave={scheduleClose}
-      onFocus={open} onBlur={scheduleClose}
-      onClick={onOpen}>{children}</button>
-    {shown && createPortal(
-      <span ref={tooltipRef} id={tooltipId} role="tooltip"
-        className="message-file-tooltip"
-        style={{ left: position.left, top: position.top }}
-        onPointerEnter={open} onPointerLeave={scheduleClose}
-        onFocus={open} onBlur={scheduleClose}>
-        <span ref={pathRef} className="message-file-tooltip-path"
-          onDoubleClick={(event) => {
-            event.preventDefault();
-            selectPath();
-          }}>{location}</span>
-      </span>,
-      document.body,
-    )}
-  </>;
 }
 
 function fenceClassName(children: ReactNode): string | undefined {
@@ -561,22 +485,28 @@ export function MessageBlock({ text, done, onOpenFile, imageAssets,
     if (timer.current) clearTimeout(timer.current);
   }, []);
 
+  const math = useMarkdownMathPlugins(shown, true);
+  const fileCitations = useFileCitationSupport(shown);
   const markdownContext = useMemo<MessageMarkdownContextValue>(() => ({
     done, imageAssets, onLoadImage, onAuthorizeImage,
-    onOpenFile, onPreviewImage,
+    onOpenFile, onPreviewImage, fileCitations,
   }), [
     done,
+    fileCitations,
     imageAssets,
     onAuthorizeImage,
     onLoadImage,
     onOpenFile,
     onPreviewImage,
   ]);
-  const math = useMarkdownMathPlugins(shown, true);
   const parts = useMemo(
     () => splitCodexDirectives(math.normalizedSource),
     [math.normalizedSource],
   );
+  const remarkPlugins = useMemo(() => [
+    ...(math.plugins?.remarkPlugins ?? STREAMING_REMARK_PLUGINS),
+    ...(fileCitations ? [fileCitations.remarkCodexFileCitations] : []),
+  ], [fileCitations, math.plugins]);
 
   if (!shown) return null;
   return (
@@ -584,8 +514,7 @@ export function MessageBlock({ text, done, onOpenFile, imageAssets,
       <div className="prose">
         {parts.map((part, index) => part.kind === "markdown"
           ? <ReactMarkdown key={`markdown-${index}`}
-              remarkPlugins={
-                math.plugins?.remarkPlugins ?? STREAMING_REMARK_PLUGINS}
+              remarkPlugins={remarkPlugins}
               rehypePlugins={math.plugins?.rehypePlugins}
               components={MESSAGE_MARKDOWN_COMPONENTS}>{part.text}</ReactMarkdown>
           : <div key={`directive-${index}`} className="codex-directive-status"

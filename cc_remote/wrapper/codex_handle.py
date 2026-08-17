@@ -67,6 +67,14 @@ from cc_remote.wrapper.codex_runtime import (
     codex_version as _runtime_codex_version,
     resolve_codex_bin as _runtime_resolve_codex_bin,
 )
+from cc_remote.wrapper.codex_workspace_dependencies import (
+    WORKSPACE_DEPENDENCY_DYNAMIC_TOOLS,
+    WORKSPACE_DEPENDENCY_NAMESPACE,
+    WORKSPACE_DEPENDENCY_REQUEST,
+    WORKSPACE_DEPENDENCY_TOOL,
+    discover_workspace_dependencies,
+    workspace_dependency_response,
+)
 from cc_remote.wrapper.codex_permissions import normalize_permission_profiles
 from cc_remote.wrapper.work_prompt import (
     WORK_BASE_INSTRUCTIONS,
@@ -109,6 +117,7 @@ _PROXY_HANDSHAKE_MAX = 16 * 1024
 _PROXY_HANDSHAKE_TIMEOUT = 5.0
 _PROXY_MESSAGE_MAX = 16 * 1024 * 1024
 _LIGHTWEIGHT_RESUME_MIN_VERSION = (0, 144, 6)
+_WORKSPACE_DYNAMIC_TOOLS_MIN_VERSION = (0, 147, 0)
 # The managed shared daemon intentionally follows Codex's standalone release
 # channel.  The desktop app can temporarily bundle a newer official app-server
 # core.  Only very large rollouts opt into that private core; normal Code
@@ -1160,6 +1169,11 @@ def _supports_lightweight_resume(value: Optional[str]) -> bool:
     return _semantic_version(value) >= _LIGHTWEIGHT_RESUME_MIN_VERSION
 
 
+def _supports_workspace_dynamic_tools(value: Optional[str]) -> bool:
+    """Whether thread/start accepts the experimental dynamicTools field."""
+    return _semantic_version(value) >= _WORKSPACE_DYNAMIC_TOOLS_MIN_VERSION
+
+
 def _resolve_codex_bin() -> str:
     """Compatibility seam for resident handle call sites."""
     return _runtime_resolve_codex_bin()
@@ -1367,6 +1381,10 @@ class CodexHandle:
         self._proxy_close_sent = False
         self._send_lock = asyncio.Lock()
         self._work_config: Optional[dict[str, Any]] = None
+        # Only a complete desktop-owned runtime is advertised on thread/start.
+        # Calls revalidate it so an app update/removal cannot leave stale paths
+        # trusted for the lifetime of a resident handle.
+        self._workspace_dependencies_registered = False
         self._id = 0
         self._pending: dict[int, asyncio.Future] = {}
         self._pending_response_boundaries: dict[
@@ -1918,6 +1936,15 @@ class CodexHandle:
         else:  # pragma: no cover - the attempt list is never empty
             raise RuntimeError("unable to start Codex app-server transport")
         try:
+            workspace_dependencies = None
+            if not self.work_mode:
+                workspace_dependencies = await asyncio.to_thread(
+                    discover_workspace_dependencies)
+                self._workspace_dependencies_registered = (
+                    workspace_dependencies is not None
+                    and _supports_workspace_dynamic_tools(
+                        self.app_server_version)
+                )
             if self.work_mode:
                 # Inspect the effective native runtime rather than guessing at
                 # user-configured skill and MCP names.  Failure is fatal: silently
@@ -2055,6 +2082,8 @@ class CodexHandle:
                     params["model"] = self.model
                 if self.permission_profile:
                     params["permissions"] = self.permission_profile
+                if self._workspace_dependencies_registered:
+                    params["dynamicTools"] = WORKSPACE_DEPENDENCY_DYNAMIC_TOOLS
                 if not self.work_mode and self.web_search_override:
                     params["config"] = {
                         "web_search": self.web_search_override,
@@ -5170,12 +5199,37 @@ class CodexHandle:
         if not isinstance(method, str):
             await self._respond_error(rid, -32600, "invalid server request")
             return
-        if method not in _NEW_APPROVAL_METHODS | _LEGACY_APPROVAL_METHODS | _INTERACTION_METHODS:
+        if method not in (
+            _NEW_APPROVAL_METHODS
+            | _LEGACY_APPROVAL_METHODS
+            | _INTERACTION_METHODS
+            | {WORKSPACE_DEPENDENCY_REQUEST}
+        ):
             log.warning("unsupported codex server request; rejecting", method=method)
             await self._respond_error(rid, -32601, f"unsupported server request: {method}")
             return
         if not isinstance(params, dict):
             await self._respond_error(rid, -32602, f"invalid params for {method}")
+            return
+
+        if method == WORKSPACE_DEPENDENCY_REQUEST:
+            if not self._workspace_dependency_request_is_current(params):
+                if self._using_daemon_proxy:
+                    return
+                await self._respond_error(
+                    rid, -32602, "invalid workspace dependency tool request")
+                return
+            arguments = params.get("arguments")
+            if not isinstance(arguments, dict) or arguments:
+                await self._respond_error(
+                    rid, -32602,
+                    "load_workspace_dependencies takes no arguments",
+                )
+                return
+            dependencies = await asyncio.to_thread(
+                discover_workspace_dependencies)
+            await self._respond(
+                rid, workspace_dependency_response(dependencies))
             return
 
         if method in _INTERACTION_METHODS:
@@ -5212,6 +5266,19 @@ class CodexHandle:
         if method in _LEGACY_APPROVAL_METHODS:
             decision = _LEGACY_DECISIONS[decision]
         await self._respond(rid, {"decision": decision})
+
+    def _workspace_dependency_request_is_current(self, params: Any) -> bool:
+        if not isinstance(params, dict):
+            return False
+        current_thread_id = (
+            self._shared_resume_binding_thread_id or self.thread_id)
+        return bool(
+            not self.work_mode
+            and isinstance(current_thread_id, str)
+            and params.get("threadId") == current_thread_id
+            and params.get("namespace") == WORKSPACE_DEPENDENCY_NAMESPACE
+            and params.get("tool") == WORKSPACE_DEPENDENCY_TOOL
+        )
 
     def _server_request_done(self, task: asyncio.Task) -> None:
         """Observe a detached server-request task and keep the set bounded."""
@@ -5710,6 +5777,28 @@ class CodexHandle:
         if has_id and has_method:                            # server -> client request
             method = m.get("method")
             request_id = _server_request_key(m.get("id"))
+            workspace_tool_request = bool(
+                method == WORKSPACE_DEPENDENCY_REQUEST
+                and self._workspace_dependency_request_is_current(
+                    m.get("params"))
+            )
+            if (
+                self._using_daemon_proxy
+                and method == WORKSPACE_DEPENDENCY_REQUEST
+                and not workspace_tool_request
+            ):
+                # Dynamic tools are restored per thread. Another shared client
+                # may own a sibling thread or another tool in the same namespace;
+                # never race it with a rejection from this handle.
+                if (request_id is not None
+                        and len(self._pending_server_request_ids)
+                        < _MAX_SERVER_REQUEST_TASKS):
+                    self._pending_server_request_ids.add(request_id)
+                log.warning(
+                    "foreign Codex dynamic tool request left pending",
+                    method=method,
+                )
+                return
             missing_callback = isinstance(method, str) and ((
                 method in _NEW_APPROVAL_METHODS | _LEGACY_APPROVAL_METHODS
                 and self.approval != "never"
@@ -5733,6 +5822,9 @@ class CodexHandle:
                 return
             if len(self._server_request_tasks) >= _MAX_SERVER_REQUEST_TASKS:
                 rid = m.get("id")
+                if workspace_tool_request:
+                    await self._respond(rid, workspace_dependency_response(None))
+                    return
                 supported = isinstance(method, str) and method in (
                     _NEW_APPROVAL_METHODS
                     | _LEGACY_APPROVAL_METHODS

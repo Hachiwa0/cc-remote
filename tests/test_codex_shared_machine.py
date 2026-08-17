@@ -634,6 +634,74 @@ def test_restarted_wrapper_recovers_split_turn_without_tail_lifecycle_marker(
     asyncio.run(go())
 
 
+def test_restarted_wrapper_recovers_large_steered_turn_from_durable_binding(
+    tmp_path, monkeypatch,
+):
+    """A new official steer id must not orphan its already-bound task."""
+    async def go() -> None:
+        machine, transport = _mk_machine()
+        rollout = tmp_path / "oversized-steered-tail.jsonl"
+        rollout.write_bytes(
+            _response_user_item("rollout-msg-id", "rollout-task")
+            + _event("task_started", "rollout-task")
+        )
+        monkeypatch.setattr(
+            "cc_remote.wrapper.machine.codex_rollout_path",
+            lambda _sid: str(rollout),
+        )
+        monkeypatch.setattr(type(machine), "CODEX_TAIL_READ_MAX", 256)
+        machine._codex_turn_leases.claim(
+            "sid", "control-turn", "latest-browser-message")
+        source = rollout.stat()
+        assert machine._codex_turn_leases.bind_stream(
+            "sid",
+            "control-turn",
+            "rollout-task",
+            "previous-official-user-item",
+            source_device=source.st_dev,
+            source_inode=source.st_ino,
+            expected_msg_id="latest-browser-message",
+        ) is True
+        with rollout.open("ab") as stream:
+            stream.write(b'{}\n' * 256)
+
+        class ShiftedOfficialIdentitySdk(_RecoveredSplitTurnSdk):
+            async def probe_owned_turn(self, turn_id: str):
+                assert turn_id == "control-turn"
+                return SimpleNamespace(
+                    turn_id=turn_id,
+                    native_user_message_ids=("new-official-user-item",),
+                )
+
+        ctx = _mk_ctx("sid", "sid")
+        ctx.engine = "codex"
+        ctx.space = "code"
+        ctx.sdk = ShiftedOfficialIdentitySdk()
+        ctx.sdk.machine = machine
+        ctx.sdk.ctx = ctx
+        machine.sessions[ctx.key] = ctx
+
+        assert await machine._recover_codex_owned_turn(ctx, "sid") is True
+        assert ctx.sdk.recovered_stream_turn_ids == ("rollout-task",)
+        lease = machine._codex_turn_leases.get("sid")
+        assert lease is not None
+        assert [(binding.task_id, binding.native_message_id)
+                for binding in lease.stream_bindings] == [
+            ("rollout-task", "previous-official-user-item"),
+        ]
+        assert not [
+            event for event in transport.sent
+            if isinstance(event, (Error, TurnEnd))
+        ]
+
+        await machine._handle_interrupt(SimpleNamespace(sid="sid"))
+        task = ctx.codex_spontaneous_task
+        assert task is not None
+        await asyncio.wait_for(task, timeout=1.0)
+
+    asyncio.run(go())
+
+
 def test_restarted_wrapper_keeps_lease_when_stream_witness_is_incomplete(
     tmp_path, monkeypatch,
 ):

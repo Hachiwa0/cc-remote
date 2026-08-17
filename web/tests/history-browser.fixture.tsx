@@ -147,7 +147,11 @@ const ROBOT_CORE_MERMAID_SOURCE = `flowchart TB
     SAFETY -.监控并可中断.-> OTHERCTRL
     SAFETY -.安全事件反馈.-> EXEC`;
 
-function finalTurn(id: string, paragraphs: number): Turn {
+function finalTurn(
+  id: string,
+  paragraphs: number,
+  timestamp = Date.now(),
+): Turn {
   const text = Array.from(
     { length: paragraphs },
     (_, index) => `${id} 的第 ${index + 1} 段动态高度内容，用于验证历史分页后的真实浏览器布局。`,
@@ -163,8 +167,8 @@ function finalTurn(id: string, paragraphs: number): Turn {
       done: true,
     }],
     done: true,
-    ts: Date.now(),
-    doneTs: Date.now(),
+    ts: timestamp,
+    doneTs: timestamp,
   };
 }
 
@@ -561,6 +565,20 @@ const REDUCER_SESSION_B = "reducer-history-session-b";
 const REDUCER_HISTORY_SCOPE = "fixture-reducer-history-scope";
 const REDUCER_HISTORY_REVISION = "reducer-revision-1";
 const REDUCER_HISTORY_GENERATION = "reducer-generation-1";
+const REDUCER_HISTORY_BASE_TS = 1_700_000_000_000;
+
+interface ReducerHistoryFixtureConfig {
+  cachedPagingRace: boolean;
+  headRefreshExpansion: boolean;
+}
+
+function reducerHistoryTurn(index: number, paragraphs = 3): Turn {
+  return finalTurn(
+    `reducer-m${index}`,
+    paragraphs,
+    REDUCER_HISTORY_BASE_TS + index * 1_000,
+  );
+}
 
 function reducerHistoryEvent(
   sid: string,
@@ -593,7 +611,9 @@ function reducerHistoryEvent(
   };
 }
 
-function reducerHistoryInitialState(cachedPagingRace = false): AppState {
+function reducerHistoryInitialState(
+  config: ReducerHistoryFixtureConfig,
+): AppState {
   let state: AppState = {
     ...initialState,
     focusedSid: REDUCER_SESSION_A,
@@ -602,7 +622,7 @@ function reducerHistoryInitialState(cachedPagingRace = false): AppState {
       [REDUCER_SESSION_B]: createRuntime(),
     },
   };
-  if (cachedPagingRace) {
+  if (config.cachedPagingRace) {
     return reduce(state, {
       type: "hydrate_cache",
       sid: REDUCER_SESSION_A,
@@ -611,17 +631,19 @@ function reducerHistoryInitialState(cachedPagingRace = false): AppState {
       turns: [finalTurn("reducer-cached-current", 3)],
     });
   }
+  const initialTurns = config.headRefreshExpansion
+    ? Array.from({ length: 4 }, (_, index) => reducerHistoryTurn(index + 49))
+    : Array.from({ length: 20 }, (_, index) => reducerHistoryTurn(index + 21));
   state = reduce(state, {
     type: "event",
     event: reducerHistoryEvent(
       REDUCER_SESSION_A,
-      Array.from({ length: 20 }, (_, index) =>
-        finalTurn(`reducer-m${index + 21}`, 3)),
+      initialTurns,
       {
         buildSeq: 1,
         hasMore: true,
-        oldestId: "reducer-m21",
-        newestId: "reducer-m40",
+        oldestId: initialTurns[0]?.id,
+        newestId: initialTurns.at(-1)?.id,
       },
     ),
   });
@@ -643,13 +665,17 @@ function reducerHistoryInitialState(cachedPagingRace = false): AppState {
 }
 
 function ReducerHistoryBrowserFixture() {
-  const cachedPagingRace = useMemo(
-    () => new URLSearchParams(window.location.search).has("cached-paging"),
-    [],
-  );
+  const config = useMemo<ReducerHistoryFixtureConfig>(() => {
+    const params = new URLSearchParams(window.location.search);
+    return {
+      cachedPagingRace: params.has("cached-paging"),
+      headRefreshExpansion: params.has("head-refresh-expansion"),
+    };
+  }, []);
+  const { cachedPagingRace, headRefreshExpansion } = config;
   const [state, dispatch] = useReducer(
     reduce,
-    cachedPagingRace,
+    config,
     reducerHistoryInitialState,
   );
   const stateRef = useRef(state);
@@ -740,23 +766,27 @@ function ReducerHistoryBrowserFixture() {
     const current = stateRef.current;
     const target = current.runtimes[REDUCER_SESSION_A];
     const nextBuildSeq = Math.max(2, (target?.historyBuildSeq ?? 0) + 1);
+    const refreshedTurns = headRefreshExpansion
+      ? Array.from({ length: 52 }, (_, index) =>
+          reducerHistoryTurn(index + 1, index === 51 ? 5 : 3))
+      : Array.from({ length: 16 }, (_, index) =>
+          reducerHistoryTurn(index + 25, index === 15 ? 5 : 3));
     dispatch({
       type: "event",
       event: reducerHistoryEvent(
         REDUCER_SESSION_A,
-        Array.from({ length: 16 }, (_, index) =>
-          finalTurn(`reducer-m${index + 25}`, index === 15 ? 5 : 3)),
+        refreshedTurns,
         {
           buildSeq: nextBuildSeq,
           hasMore: true,
-          oldestId: "reducer-m25",
-          newestId: "reducer-m40",
+          oldestId: refreshedTurns[0]?.id,
+          newestId: refreshedTurns.at(-1)?.id,
           liveSeq: target?.lastLiveSeq ?? 0,
         },
       ),
     });
     setRefreshes((value) => value + 1);
-  }, []);
+  }, [headRefreshExpansion]);
 
   const switchSession = useCallback(() => {
     const target = stateRef.current.focusedSid === REDUCER_SESSION_A
@@ -2638,6 +2668,18 @@ function LocalFileLinkFixture() {
   </main>;
 }
 
+function CodexFileCitationFixture() {
+  const [opened, setOpened] = useState("");
+  return <main style={{ minHeight: "100dvh", padding: 24 }}>
+    <MessageBlock text={[
+      "Generated",
+      ':codex-file-citation{path="/tmp/launch plan.pptx" purpose="output" '
+        + 'artifact_kind="presentation" label="Launch deck"}',
+    ].join(" ")} done onOpenFile={(path) => setOpened(path)} />
+    <output data-testid="opened-codex-file-citation">{opened}</output>
+  </main>;
+}
+
 const rootParams = new URLSearchParams(window.location.search);
 createRoot(document.getElementById("root")!).render(
   rootParams.has("artifact-html")
@@ -2657,6 +2699,8 @@ createRoot(document.getElementById("root")!).render(
         theme={rootParams.get("theme") === "light" ? "light" : "dark"} />
     : rootParams.has("local-file-link")
     ? <LocalFileLinkFixture />
+    : rootParams.has("codex-file-citation")
+    ? <CodexFileCitationFixture />
     : rootParams.has("inline-image-capacity")
     ? <InlineImageCapacityFixture />
     : rootParams.has("inline-image-eviction")

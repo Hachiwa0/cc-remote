@@ -84,7 +84,7 @@ requirements.
 | **Work schedules and isolation** | Run one-shot, daily, or weekly tasks with persisted run records, leases, retries, and overlap prevention. Each work item can access only its private directory; add required material explicitly through attachments or the project knowledge collection. |
 | **Remote operation** | Watch streaming replies and send attachments from a phone, tablet, or desktop browser. While Codex is busy, new input defaults to native steering of the active task, with queue still available; Claude retains interrupt-and-send. Stop remains a separate action. |
 | **Complete process** | Expand the reasoning summaries, plans, command output, file diffs, MCP calls, collaboration agents, Hooks, and terminal interaction events exposed by each engine. |
-| **Artifacts and file preview** | Work automatically lists files produced by the current task. Source opens at referenced lines, Markdown is previewable and conflict-safe to edit, HTML renders in an isolated iframe, images/PDF open directly, and DOCX/XLSX/PPTX are previewed after a temporary sandboxed conversion on the wrapper host. |
+| **Artifacts and file preview** | Work automatically lists files produced by the current task. Source opens at referenced lines, Markdown is previewable and conflict-safe to edit, HTML renders in an isolated iframe, images/PDF open directly, and DOCX/XLSX/PPTX are previewed after a temporary sandboxed conversion on the wrapper host. When the Codex Desktop workspace runtime is installed, new Codex Code sessions can also use its read-only dependency locator to generate standalone Office files; official file citations render as previewable file cards. |
 | **Human approval** | Return Claude `can_use_tool` decisions and Codex command, file-change, user-input, general-permission, and MCP elicitation responses. Mirror a terminal-owned session read-only or take it over explicitly. |
 | **Session management** | Search, switch, rename, archive, delete, and fork from individual messages. Codex supports explicit compact, native Review, isolated Git worktree forks, and moving an idle conversation to another working directory. |
 | **Runtime controls** | Change the model, reasoning effort, service tier, permissions, and Plan mode. Codex Code uses one compact `/permissions` sheet for approval policy, official execution-environment profiles, and Cached/Live Web Search. Use `/goal` for long-running goals and `/status` for read-only app-server status, usage, and rate limits. |
@@ -148,13 +148,26 @@ commands:
   or takes over a process silently.
 - **Codex Code:** prefers Codex's official shared app-server daemon, so native
   Codex clients and Remote share the thread and control state. App-server ships
-  with Codex CLI and does not need a separate installation, but the CLI must
-  support both `app-server daemon` and `app-server proxy` to share this control
-  plane. If the installed version or daemon is unavailable, cc-remote falls back
+  with Codex CLI and does not need a separate installation, but this shared
+  control plane requires the official standalone managed layout in the primary
+  `CODEX_HOME` (`$CODEX_HOME/packages/standalone/current/codex`). OpenAI offers
+  both [standalone and npm as official install methods](https://learn.chatgpt.com/docs/codex/cli),
+  but an npm/NVM-only install may expose both `app-server daemon --help` and
+  `app-server proxy --help` while official daemon bootstrap still refuses to
+  start without the managed path. If the layout, installed version, or daemon
+  is unavailable, cc-remote falls back
   to a private stdio app-server: Remote can still control the session on its own,
   but it no longer has live bidirectional coordination with native Codex CLI/App.
   `CC_REMOTE_CODEX_DAEMON=off` forces this private path and is intended only for
   troubleshooting.
+  When a verifiable Codex Desktop workspace runtime is already installed,
+  cc-remote registers the official dynamic dependency locator on newly created
+  Code threads so the model can generate standalone PPTX/DOCX/XLSX files. It
+  only reads that runtime and never installs or mutates dependencies. Existing
+  threads created by Codex App can resume when they already persist the tool
+  metadata; older Remote-created threads without it require a new conversation.
+  Official file citations reuse the existing host-local authorization and
+  preview path, so file contents do not pass through the relay.
 - **Concurrent Codex accounts:** `CC_REMOTE_CODEX_PROFILES_JSON` or
   `CC_REMOTE_CODEX_PROFILES_FILE` can register up to 32 fully isolated
   `CODEX_HOME` profiles. Each profile owns its login,
@@ -358,14 +371,16 @@ First get the relay + wrapper + web running on the **machine where the agent CLI
 
 ### Prerequisites
 
-- A machine signed in to **Claude Code** or to a recent **Codex CLI**, with the CLI itself already **able to chat**. Codex app-server ships with the CLI and does not need a separate installation. For live bidirectional coordination between Codex Code, native CLI/App, and Remote, both commands below must exit successfully:
+- A machine signed in to **Claude Code** or to a recent **Codex CLI**, with the CLI itself already **able to chat**. Codex app-server ships with the CLI and does not need a separate installation. Live bidirectional coordination between Codex Code, native CLI/App, and Remote requires the [official standalone install](https://learn.chatgpt.com/docs/codex/cli) in the primary `CODEX_HOME` plus the following bootstrap and acceptance checks:
 
   ```bash
-  codex app-server daemon --help
+  test -x "${CODEX_HOME:-$HOME/.codex}/packages/standalone/current/codex"
+  codex app-server daemon bootstrap --remote-control
+  codex app-server daemon version
   codex app-server proxy --help
   ```
 
-  If only `codex app-server --stdio` is available, Remote can still operate Codex independently but cannot share the native client's live control state. The Claude wrapper explicitly launches the daily `~/.local/bin/claude` rather than the SDK-bundled copy; each new Codex app-server reselects the newest usable local install. Make both engines available to switch between them in the web UI.
+  `daemon version` must report `status: running` and a real `socketPath`; two successful `--help` probes alone do not pass this check. With an npm/NVM-only install or an unavailable daemon, Remote can still operate Codex through private stdio but cannot share the native client's live control state. Codex Work always uses private stdio and is not a fallback. The Claude wrapper explicitly launches the daily `~/.local/bin/claude` rather than the SDK-bundled copy; each new Codex app-server reselects the newest usable local install. Make both engines available to switch between them in the web UI.
 - **Python 3.10+**, **Node 20.19+** (to build the web client).
 - Optional: Office artifact preview requires **LibreOffice + bubblewrap** on the
   Linux wrapper host (for example, `sudo apt install libreoffice bubblewrap`).
@@ -822,7 +837,7 @@ cc-remote **does not touch the model API** — it drives already-configured loca
 
 - **Official Anthropic API**: install `claude`, make sure it can chat, done.
 - **Compatible endpoint (e.g. GLM / z.AI)**: set `ANTHROPIC_BASE_URL` in `settings.json` as usual (pointing at an official-compatible endpoint or your own proxy); cc-remote still only does the control link.
-- **Codex**: first make sure local `codex` can chat; app-server ships with the CLI. For live bidirectional native CLI/App and Remote coordination in Codex Code, also verify that `codex app-server daemon --help` and `codex app-server proxy --help` both succeed. cc-remote neither reads its API key nor rewrites global authentication.
+- **Codex**: first make sure local `codex` can chat; app-server ships with the CLI. Live bidirectional native CLI/App and Remote coordination in Codex Code also requires the official standalone managed path in the primary `CODEX_HOME`, with `codex app-server daemon version` reporting `status: running` and a real socket. Checking only `daemon --help` / `proxy --help` misses bootstrap failures on npm/NVM-only layouts. cc-remote neither reads its API key nor rewrites global authentication. Codex Work's private stdio path is intentional.
 
 ## Development
 

@@ -1269,6 +1269,49 @@ def test_codex_history_preserves_steered_user_message_image_and_page_boundary(
     assert older_more is False
 
 
+def test_active_mid_task_window_never_marks_a_steer_as_failed(tmp_path):
+    """An oversized active task can begin before the bounded history window."""
+    rollout = tmp_path / "rollout-active-mid-task-steer.jsonl"
+    prefix = [
+        {"timestamp": "2026-01-01T00:00:00Z", "type": "session_meta",
+         "payload": {"id": "session-active-steer"}},
+        {"timestamp": "2026-01-01T00:00:01Z", "type": "event_msg",
+         "payload": {"type": "task_started", "turn_id": "active-task"}},
+        {"timestamp": "2026-01-01T00:00:02Z", "type": "event_msg",
+         "payload": {"type": "user_message", "message": "first",
+                     "turn_id": "active-task"}},
+    ]
+    window = [
+        {"timestamp": "2026-01-01T00:00:03Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "phase": "commentary",
+                     "message": "still working"}},
+        {"timestamp": "2026-01-01T00:00:04Z", "type": "event_msg",
+         "payload": {"type": "user_message", "message": "continue",
+                     "turn_id": "active-task"}},
+        {"timestamp": "2026-01-01T00:00:05Z", "type": "event_msg",
+         "payload": {"type": "agent_message", "phase": "commentary",
+                     "message": "continuing"}},
+    ]
+    encoded_prefix = "".join(json.dumps(row) + "\n" for row in prefix)
+    rollout.write_text(
+        encoded_prefix + "".join(json.dumps(row) + "\n" for row in window))
+
+    events, _ = codex_translate_history(
+        str(rollout),
+        8_000,
+        start_offset=len(encoded_prefix.encode()),
+        snapshot_in_progress=True,
+        active_task_ids={"active-task"},
+    )
+
+    terminals = [event for event in events if isinstance(event, TurnEnd)]
+    assert [(event.result.subtype, event.result.is_error)
+            for event in terminals] == [("steered", False)]
+    assert terminals[0].turn_id is None
+    users = [event for event in events if event.type == "user_msg"]
+    assert [event.prompt for event in users] == ["continue"]
+
+
 def test_codex_history_plan_only_turn_has_final_answer(tmp_path):
     rollout = tmp_path / "rollout-plan-only.jsonl"
     rows = [
