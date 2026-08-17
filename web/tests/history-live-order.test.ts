@@ -133,6 +133,175 @@ assert.deepEqual(
   "a duplicate History block identity fails closed instead of disappearing during live-order repair",
 );
 
+// A Wrapper generation can restart while the official Codex task keeps
+// running in the shared app-server. The browser then owns the user-bound
+// pre-restart row while the new generation briefly paints a prompt-less
+// suffix. An early idle History fallback can terminalize that suffix before
+// the final authoritative page arrives. Once every stable suffix block is
+// uniquely owned by one completed native History row, the fallback row is a
+// duplicate projection, not a second failed conversation turn.
+const restartedNativeTurn = "wrapper-restart-native-turn";
+const restartedSettledHistory: Turn = {
+  id: "wrapper-restart-history-user",
+  prompt: "部署一下",
+  forkPointId: restartedNativeTurn,
+  done: true,
+  blocks: [{
+    kind: "text",
+    message_id: "wrapper-restart-before-message",
+    channel: "commentary",
+    text: "开始部署",
+    done: true,
+  }, {
+    kind: "tool",
+    message_id: "wrapper-restart-after-envelope",
+    tool_use_id: "wrapper-restart-after-tool",
+    tool: "shell",
+    input: {},
+    done: true,
+    result: { content: "ok", is_error: false, status: "succeeded" },
+  }, {
+    kind: "text",
+    message_id: "wrapper-restart-final-message",
+    channel: "final",
+    text: "部署成功",
+    done: true,
+  }],
+};
+const restartedTerminalProjection = mergeInitialHistory(
+  [restartedSettledHistory],
+  [{
+    id: "wrapper-restart-history-user",
+    prompt: "部署一下",
+    forkPointId: restartedNativeTurn,
+    done: false,
+    blocks: [{
+      kind: "text",
+      message_id: "wrapper-restart-before-message",
+      channel: "commentary",
+      text: "开始部署",
+      done: true,
+    }],
+  }, {
+    id: "wrapper-restart-promptless-suffix",
+    prompt: "",
+    liveTaskId: restartedNativeTurn,
+    done: true,
+    interrupted: true,
+    error: "会话已结束，但未收到完整的终止状态。",
+    blocks: [{
+      kind: "tool",
+      message_id: "wrapper-restart-after-envelope",
+      tool_use_id: "wrapper-restart-after-tool",
+      tool: "shell",
+      input: {},
+      done: true,
+      result: { content: "ok", is_error: true, status: "interrupted" },
+    }],
+  }],
+  {
+    newestHistoryId: "wrapper-restart-history-user",
+    reconcileReplayOrphans: true,
+  },
+  true,
+);
+assert.deepEqual(
+  restartedTerminalProjection.map((turn) => ({
+    id: turn.id,
+    done: turn.done,
+    interrupted: turn.interrupted,
+    error: turn.error,
+    blockIds: turn.blocks.map(blockIdentity),
+  })),
+  [{
+    id: "wrapper-restart-history-user",
+    done: true,
+    interrupted: undefined,
+    error: undefined,
+    blockIds: [
+      "wrapper-restart-before-message",
+      "wrapper-restart-after-tool",
+      "wrapper-restart-final-message",
+    ],
+  }],
+  "settled Codex History must absorb a terminalized restart suffix",
+);
+
+const repairedPersistedRestartId = mergeInitialHistory(
+  [restartedSettledHistory],
+  [{
+    ...restartedSettledHistory,
+    id: "persisted-wrapper-restart-orphan",
+    historyTurnId: restartedSettledHistory.id,
+    clientMsgId: undefined,
+  }],
+  { reconcileReplayOrphans: true },
+  true,
+)[0];
+assert.deepEqual(
+  {
+    id: repairedPersistedRestartId.id,
+    historyTurnId: repairedPersistedRestartId.historyTurnId,
+  },
+  { id: restartedSettledHistory.id, historyTurnId: undefined },
+  "a previously cached unowned restart id self-heals to native History",
+);
+
+const preservedBrowserOwnedId = mergeInitialHistory(
+  [restartedSettledHistory],
+  [{
+    ...restartedSettledHistory,
+    id: "browser-owned-restart-row",
+    clientMsgId: "browser-owned-restart-row",
+    historyTurnId: restartedSettledHistory.id,
+  }],
+  { reconcileReplayOrphans: true },
+  true,
+)[0];
+assert.deepEqual(
+  {
+    id: preservedBrowserOwnedId.id,
+    clientMsgId: preservedBrowserOwnedId.clientMsgId,
+    historyTurnId: preservedBrowserOwnedId.historyTurnId,
+  },
+  {
+    id: "browser-owned-restart-row",
+    clientMsgId: "browser-owned-restart-row",
+    historyTurnId: restartedSettledHistory.id,
+  },
+  "a real browser-owned alias must keep its stable optimistic identity",
+);
+
+const uncertainRestartSuffix = mergeInitialHistory(
+  [restartedSettledHistory],
+  [{
+    id: "uncertain-wrapper-restart-suffix",
+    prompt: "",
+    liveTaskId: restartedNativeTurn,
+    done: true,
+    interrupted: true,
+    error: "会话已结束，但未收到完整的终止状态。",
+    blocks: [{
+      kind: "tool",
+      message_id: "unmatched-restart-envelope",
+      tool_use_id: "unmatched-restart-tool",
+      tool: "shell",
+      input: {},
+      done: true,
+    }],
+  }],
+  {
+    newestHistoryId: restartedSettledHistory.id,
+    reconcileReplayOrphans: true,
+  },
+  true,
+);
+assert.deepEqual(
+  uncertainRestartSuffix.map((turn) => turn.id),
+  [restartedSettledHistory.id, "uncertain-wrapper-restart-suffix"],
+  "a restart suffix without unique native block proof must remain visible",
+);
+
 const deferredPlan: Block = {
   kind: "process", item_id: "deferred-session-plan", processKind: "plan",
   phase: "snapshot", status: "succeeded", title: "计划", done: true,
@@ -432,6 +601,46 @@ try {
   ].find((block: Block) => block.kind === "process");
   assert.equal(racedProcess?.done, false,
     "an older idle History page cannot settle a newer live process event");
+
+  const lostTerminalSid = "codex-idle-history-recovery-source";
+  const lostTerminalState = reduce({
+    ...initialState,
+    focusedSid: lostTerminalSid,
+    sessions: [{ session_id: lostTerminalSid, engine: "codex" as const }],
+    runtimes: { [lostTerminalSid]: {
+      ...createRuntime(), state: "running" as const,
+      turns: [{
+        id: "promptless-wrapper-generation-tail", prompt: "", done: false,
+        blocks: [{
+          kind: "tool" as const,
+          message_id: "promptless-wrapper-generation-envelope",
+          tool_use_id: "promptless-wrapper-generation-tool",
+          tool: "shell", input: {}, done: true,
+          result: { content: "done", is_error: false },
+        }],
+      }],
+    } },
+  }, { type: "event", event: event({
+    type: "history", sid: lostTerminalSid, session_id: lostTerminalSid,
+    revision: "lost-terminal-r1", generation: "lost-terminal-g1",
+    build_seq: 1, live_seq: 0, authoritative: true,
+    detail: "summary", in_progress: false, has_more: false,
+    events: [], turns: [],
+  }) });
+  assert.deepEqual(
+    {
+      done: lostTerminalState.runtimes[lostTerminalSid].turns[0].done,
+      terminalSource:
+        lostTerminalState.runtimes[lostTerminalSid].turns[0].terminalSource,
+      error: lostTerminalState.runtimes[lostTerminalSid].turns[0].error,
+    },
+    {
+      done: true,
+      terminalSource: "idle_history_recovery",
+      error: "会话已结束，但未收到完整的终止状态。",
+    },
+    "a new idle-History fallback carries a machine-readable recovery source",
+  );
 
   const cachedInput = openObserved();
   const cachedState = reduce({
