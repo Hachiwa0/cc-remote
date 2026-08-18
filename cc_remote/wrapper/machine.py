@@ -6519,17 +6519,17 @@ class WrapperMachine:
             else:
                 current_turn_ids = frozenset()
             try:
-                # Completed Plan state belongs to the task which just ended.
+                # Settled Plan state belongs to the task which just ended.
                 # Retire it before broadcasting the next user boundary so a
-                # reconnect cannot recover the old green monitor.
+                # reconnect cannot recover the old task monitor as active.
                 await asyncio.to_thread(
-                    self._session_plans.retire_completed,
+                    self._session_plans.retire_settled,
                     msg.sid,
                     current_turn_ids=current_turn_ids,
                 )
             except SessionPlanStoreError:
                 log.warning(
-                    "Codex completed plan snapshot could not be retired",
+                    "Codex settled plan snapshot could not be retired",
                     session_id=msg.sid,
                 )
         if (
@@ -6548,6 +6548,38 @@ class WrapperMachine:
                 # plan notification or abort the model turn.
                 log.warning(
                     "Codex session plan snapshot could not be persisted",
+                    session_id=msg.sid,
+                )
+        if (
+            isinstance(msg, TurnEnd)
+            and ctx.engine == "codex"
+            and not ctx.btw
+            and self._session_plans is not None
+            and msg.sid
+            and msg.turn_id
+            and msg.result.subtype != "steered"
+        ):
+            terminal_status = (
+                "succeeded"
+                if not msg.result.is_error
+                else "interrupted"
+                if msg.result.subtype == "error_during_execution"
+                else "failed"
+            )
+            try:
+                # Persist the exact terminal separately from step progress.
+                # A successful turn does not prove that omitted Plan updates
+                # ran, but it does prove the old inProgress marker is no longer
+                # active and must not be rebound to a later user turn.
+                await asyncio.to_thread(
+                    self._session_plans.mark_terminal,
+                    msg.sid,
+                    turn_id=msg.turn_id,
+                    status=terminal_status,
+                )
+            except SessionPlanStoreError:
+                log.warning(
+                    "Codex plan terminal could not be persisted",
                     session_id=msg.sid,
                 )
         if isinstance(msg, TurnEnd):
@@ -10747,6 +10779,11 @@ class WrapperMachine:
         else:
             build_seq = self._history_build_sequences.get(sid, 0)
         ctx = self._ctx_by_sid(sid)
+        # Bind this page to the live-stream position observed before any
+        # rollout/app-server I/O. A cold newest-page read can overlap the first
+        # Query, so sampling after the await could let an old idle snapshot
+        # masquerade as newer than the intervening running StateEvent.
+        live_seq = ctx.seq if ctx is not None else None
         watch = self._watch.get(sid) or {}
         active_external_turns = watch.get("active_external_turns")
         active_turn_ids = (
@@ -10927,7 +10964,7 @@ class WrapperMachine:
             revision=revision,
             generation=self.instance_id,
             build_seq=build_seq,
-            live_seq=ctx.seq if ctx is not None else None,
+            live_seq=live_seq,
             authoritative=projection_outcome != "inconclusive",
             events=control_rows,
             turns=[
@@ -11206,21 +11243,51 @@ class WrapperMachine:
             if snapshot is not None:
                 turns = list(hist.turns)
                 target_index = None
-                if snapshot.turn_id:
+                owner_turn_ids = snapshot.owner_turn_ids
+                if owner_turn_ids:
                     for index in range(len(turns) - 1, -1, -1):
                         turn = turns[index]
-                        if snapshot.turn_id in {
+                        if owner_turn_ids.intersection({
                             turn.id,
                             turn.clientMsgId,
                             turn.forkPointId,
-                        }:
+                        }):
                             target_index = index
                             break
+                terminal_fence = next((
+                    fence
+                    for fence in hist.terminal_fences
+                    if fence.turn_id in owner_turn_ids
+                ), None)
+                if (
+                    terminal_fence is not None
+                    and snapshot.terminal_status is None
+                ):
+                    try:
+                        repaired = await asyncio.to_thread(
+                            self._session_plans.mark_terminal,
+                            sid,
+                            turn_id=terminal_fence.turn_id,
+                            status=(
+                                "interrupted"
+                                if terminal_fence.status == "interrupted"
+                                else "failed"
+                                if terminal_fence.status == "failed"
+                                else "succeeded"
+                            ),
+                        )
+                        if repaired is not None:
+                            snapshot = repaired
+                    except SessionPlanStoreError:
+                        log.warning(
+                            "Codex historical plan terminal could not be repaired",
+                            session_id=sid,
+                        )
                 # An unfinished Plan may legitimately span several steer turns
-                # after its owner fell off the newest page. A completed Plan
-                # must never be rebound to an unrelated newest turn: that would
+                # after its owner fell off the newest page. A settled Plan must
+                # never be rebound to an unrelated newest turn: that would
                 # resurrect it after the user already started another task.
-                if target_index is None and not snapshot.complete:
+                if target_index is None and not snapshot.settled:
                     target_index = len(turns) - 1
                 if target_index is not None:
                     target = turns[target_index]
