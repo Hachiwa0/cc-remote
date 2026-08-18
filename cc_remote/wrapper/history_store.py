@@ -30,8 +30,10 @@ from cc_remote.protocol import ConversationTurn
 
 
 # v17 also discards Codex pages whose legacy rollout user rows were materialized
-# without the adjacent native app-server item id used by the live stream.
-_SCHEMA_VERSION = 17
+# without the adjacent native app-server item id used by the live stream. v18
+# rebuilds page projections once: older summary pages could be truncated against
+# source-complete event size before lightweight turns were materialized.
+_SCHEMA_VERSION = 18
 _FINGERPRINT_SAMPLE_BYTES = 64 * 1024
 _DEFAULT_MAX_ENTRIES = 128
 _DEFAULT_MAX_BYTES = 64 * 1024 * 1024
@@ -206,6 +208,10 @@ class MaterializedHistoryPage:
     # fingerprint cached during a turn cannot close it (or remain open) after
     # ResultMessage changes state without adding another JSONL row.
     in_progress: bool | None = None
+    # Codex can resume one persisted rollout task under a different control
+    # user-item id without appending another source record first. Bind a newest-
+    # page projection to the complete source-proven active task set.
+    active_task_ids: tuple[str, ...] = ()
 
     def as_payload(self) -> dict[str, Any]:
         return {
@@ -215,6 +221,7 @@ class MaterializedHistoryPage:
             "newest_id": self.newest_id,
             "turns": list(self.turns),
             "in_progress": self.in_progress,
+            "active_task_ids": list(self.active_task_ids),
         }
 
     def semantic_token(self) -> str:
@@ -237,6 +244,7 @@ class MaterializedHistoryPage:
             "newest_id": self.newest_id,
             "turns": list(self.turns),
             "in_progress": self.in_progress,
+            "active_task_ids": list(self.active_task_ids),
         }
         encoded = json.dumps(
             payload, ensure_ascii=False, sort_keys=True,
@@ -262,6 +270,11 @@ class MaterializedHistoryPage:
         raw_in_progress = payload.get("in_progress")
         if raw_in_progress is not None and not isinstance(raw_in_progress, bool):
             raise ValueError("invalid materialized history lifecycle")
+        raw_active_task_ids = payload.get("active_task_ids", [])
+        if not isinstance(raw_active_task_ids, (list, tuple)) or not all(
+                isinstance(value, str) and value
+                for value in raw_active_task_ids):
+            raise ValueError("invalid materialized history active tasks")
         # The SQLite projection is rebuildable, but can outlive a wire-schema
         # change.  Validate its cached summary at this single boundary so an
         # obsolete field is never served to the client; callers invalidate the
@@ -283,6 +296,7 @@ class MaterializedHistoryPage:
                        if isinstance(payload.get("newest_id"), str) else None),
             turns=tuple(normalized_turns),
             in_progress=raw_in_progress,
+            active_task_ids=tuple(sorted(set(raw_active_task_ids))),
         )
 
 
@@ -912,6 +926,11 @@ class HistoryIndexStore:
                 ):
                     connection.execute(
                         f"DELETE FROM {table} WHERE engine='codex'")
+            elif current == 17:
+                # Page payloads are rebuildable and may contain the old
+                # pre-summary size truncation. Source-complete turn details and
+                # image assets are independently fingerprinted and remain valid.
+                connection.execute("DELETE FROM history_pages")
             elif current not in (0, _SCHEMA_VERSION):
                 # v9 changes the invariant of history_turn_details: those rows
                 # must contain the source-complete translated turn, never the

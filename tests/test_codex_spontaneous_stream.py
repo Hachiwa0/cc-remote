@@ -791,6 +791,9 @@ def test_machine_persists_cross_turn_steer_identity_and_refreshes_history(
         })
         assert machine._history_revision(ctx.session_id) != revision
         assert len(refreshes) == 1
+        assert refreshes[0][1]["before"] is None
+        assert refreshes[0][1]["limit"] == machine.MIRROR_LIMIT
+        assert refreshes[0][1]["detail"] == "summary"
         assert ctx.codex_published_steers == {
             "remote-client-message": "remote-expected-turn",
         }
