@@ -15393,8 +15393,12 @@ try {
     assert.equal(planProgressPresentation(
       livePlanAfterStaleDetail!.block).progressLabel, "2 / 3",
     `a late detail cannot roll back the Plan in ${location}`);
+    assert.equal(livePlanAfterStaleDetail!.block.plan?.find(
+      (entry) => entry.status === "inProgress")?.step, "完成验证",
+    "the newer raw step survives even though its owning turn is terminal");
     assert.equal(planProgressPresentation(
-      livePlanAfterStaleDetail!.block).currentStep, "完成验证");
+      livePlanAfterStaleDetail!.block).stateLabel,
+    "本轮已结束，计划未更新");
   }
   const completedDetailPlan: Block = {
     ...staleDetailPlan,
