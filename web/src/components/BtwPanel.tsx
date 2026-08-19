@@ -38,6 +38,7 @@ import {
   makeComposerPaste,
 } from "../composer-pastes";
 import { PasteCards } from "./PasteCards";
+import { uuid } from "../util";
 
 interface Props {
   sid?: string;
@@ -363,7 +364,7 @@ export function BtwPanel(p: Props) {
                 ...current,
                 pastes: [
                   ...current.pastes,
-                  makeComposerPaste(text, crypto.randomUUID()),
+                  makeComposerPaste(text, uuid()),
                 ],
               }));
             }}

@@ -17617,6 +17617,16 @@ assert.match(appSource, /space === "work" \? "never" : permissionMode/,
   "the atomic new-session wire must retain the authoritative Work policy");
 const composerSource = readFileSync(
   resolve(process.cwd(), "src/components/Composer.tsx"), "utf8");
+for (const [surface, source] of [
+  ["session composer", composerSource],
+  ["new chat", newChatSource],
+  ["BTW", btwPanelSource],
+] as const) {
+  assert.match(source, /\buuid\(\)/,
+    `${surface} long pastes must use the insecure-origin UUID fallback`);
+  assert.doesNotMatch(source, /crypto\.randomUUID\(/,
+    `${surface} must remain usable over supported private-IP HTTP origins`);
+}
 assert.match(composerSource, /<PendingImageAttachments/,
   "session drafts must expose the shared interactive image preview");
 assert.match(composerSource, /workSurface \? \(/);

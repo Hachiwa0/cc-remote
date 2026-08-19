@@ -21,6 +21,7 @@ import {
   type ComposerPaste,
 } from "../composer-pastes";
 import { PasteCards } from "./PasteCards";
+import { uuid } from "../util";
 
 type Engine = "claude" | "codex";
 
@@ -395,7 +396,7 @@ export function NewChatView({ cwd, controlScopeKey,
     e.preventDefault();
     setPastes((current) => [
       ...current,
-      makeComposerPaste(pastedText, crypto.randomUUID()),
+      makeComposerPaste(pastedText, uuid()),
     ]);
   };
 

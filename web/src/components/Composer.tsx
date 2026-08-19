@@ -44,6 +44,7 @@ import { PendingImageAttachments } from "./PendingImageAttachments";
 import { QueuedQueryChip } from "./QueuedQueryDialog";
 import { UsageMeter } from "./UsageMeter";
 import { PasteCards } from "./PasteCards";
+import { uuid } from "../util";
 
 interface Props {
   draftKey: string;
@@ -418,7 +419,7 @@ export function Composer(p: Props) {
     if (text.length <= LONG_PASTE_THRESHOLD) return;
     e.preventDefault();
     const textarea = e.currentTarget;
-    const id = crypto.randomUUID();
+    const id = uuid();
     updateDraft((current) => ({
       ...current,
       pastes: [...current.pastes, makeComposerPaste(text, id)],
