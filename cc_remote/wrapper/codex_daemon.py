@@ -35,6 +35,8 @@ _COMMAND_TIMEOUT = 30.0
 _OUTPUT_MAX = 64 * 1024
 _PID_RECORD_MAX = 4096
 _STALE_UPDATER_EXIT_TIMEOUT = 3.0
+_DAEMON_UPGRADE_SETTLE_TIMEOUT = 5.0
+_DAEMON_UPGRADE_POLL_INTERVAL = 0.1
 
 
 def codex_daemon_mode(value: Optional[str] = None) -> str:
@@ -155,7 +157,76 @@ def _prepare_profile_standalone(
             existing = (destination / "codex").resolve(strict=True)
         except OSError:
             return False
-        return existing == binary and os.access(existing, os.X_OK)
+        if existing == binary:
+            return os.access(existing, os.X_OK)
+        # A configured account may already own an older official standalone
+        # ``current`` symlink.  Merely restarting that daemon cannot upgrade it:
+        # the official lifecycle command launches the stale path again.  Only
+        # replace the pointer when every part of the old target is the same
+        # user's canonical standalone release layout.  Directories, ordinary
+        # files, broken links, and third-party layouts remain user-owned.
+        profile_standalone = profile_home / "packages" / "standalone"
+        try:
+            destination_stat = destination.lstat()
+            existing_stat = existing.stat()
+            existing_release = existing.parent.parent
+            safely_replaceable = bool(
+                stat.S_ISLNK(destination_stat.st_mode)
+                and destination_stat.st_uid == os.getuid()
+                and stat.S_ISREG(existing_stat.st_mode)
+                and existing_stat.st_uid == os.getuid()
+                and os.access(existing, os.X_OK)
+                and existing.parent.name == "bin"
+                and existing_release.parent.name == "releases"
+                and existing_release.parent.parent == profile_standalone
+            )
+        except OSError:
+            return False
+        if not safely_replaceable:
+            return False
+        replacement = destination.with_name(
+            f".{destination.name}.cc-remote-{os.getpid()}-"
+            f"{time.monotonic_ns()}"
+        )
+        try:
+            os.symlink(source_current, replacement, target_is_directory=True)
+            # The official updater may advance ``current`` concurrently.  A
+            # symlink's target is immutable, so the same inode proves the path
+            # still names the exact pointer validated above.  If it changed,
+            # preserve the updater's result instead of overwriting it.
+            if not os.path.samestat(destination_stat, destination.lstat()):
+                replacement.unlink()
+                try:
+                    concurrent = (destination / "codex").resolve(strict=True)
+                except OSError:
+                    return False
+                return concurrent == binary and os.access(concurrent, os.X_OK)
+            os.replace(replacement, destination)
+        except OSError:
+            try:
+                replacement.unlink()
+            except OSError:
+                pass
+            return False
+        try:
+            directory_fd = os.open(destination.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError as exc:
+            # The atomic replacement is already visible. A directory-fsync
+            # failure weakens crash durability but must not make callers retry
+            # or report that the old pointer is still active.
+            log.warning(
+                "Codex profile standalone directory fsync failed",
+                error_type=type(exc).__name__,
+            )
+        try:
+            prepared = (destination / "codex").resolve(strict=True)
+        except OSError:
+            return False
+        return prepared == binary and os.access(prepared, os.X_OK)
     # ``Path.exists`` is false for a broken symlink. Never replace one.
     if os.path.lexists(destination):
         return False
@@ -556,19 +627,37 @@ class CodexDaemonManager:
             app_server_version=_text(
                 lifecycle.get("appServerVersion"), 128),
         )
+        prepared = await asyncio.to_thread(
+            _prepare_profile_standalone, codex_bin, env,
+        )
+        if prepared is False:
+            log.warning(
+                "Codex profile managed standalone could not be aligned"
+            )
         if not await self.restart(codex_bin, env):
             self.invalidate()
             raise CodexDaemonUpgradeRequired(
                 "Codex shared daemon is older than the selected CLI and "
                 "could not be restarted"
             )
-        verified = await self.version(codex_bin, env)
-        if verified is None or _managed_daemon_lags_cli(verified):
-            self.invalidate()
-            raise CodexDaemonUpgradeRequired(
-                "Codex shared daemon did not upgrade to the selected CLI"
-            )
-        return verified
+        deadline = (
+            asyncio.get_running_loop().time()
+            + _DAEMON_UPGRADE_SETTLE_TIMEOUT
+        )
+        while True:
+            verified = await self.version(codex_bin, env)
+            if verified is not None and not _managed_daemon_lags_cli(verified):
+                return verified
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                self.invalidate()
+                raise CodexDaemonUpgradeRequired(
+                    "Codex shared daemon did not upgrade to the selected CLI"
+                )
+            await asyncio.sleep(min(
+                _DAEMON_UPGRADE_POLL_INTERVAL,
+                remaining,
+            ))
 
     async def enable_remote_control(
         self, codex_bin: str, env: Mapping[str, str],

@@ -410,6 +410,76 @@ def test_profile_bootstrap_never_replaces_existing_managed_path(tmp_path):
     assert not existing.is_symlink()
 
 
+def test_profile_bootstrap_atomically_advances_owned_official_current(
+    tmp_path,
+):
+    source_home = tmp_path / "source"
+    source_standalone = source_home / "packages" / "standalone"
+    source_release = source_standalone / "releases" / "0.148.0"
+    source_binary = source_release / "bin" / "codex"
+    source_binary.parent.mkdir(parents=True)
+    source_binary.write_bytes(b"#!/bin/sh\n")
+    source_binary.chmod(0o755)
+    (source_release / "codex").symlink_to("bin/codex")
+    (source_standalone / "current").symlink_to(
+        source_release,
+        target_is_directory=True,
+    )
+
+    profile_home = tmp_path / "profile"
+    profile_standalone = profile_home / "packages" / "standalone"
+    old_release = profile_standalone / "releases" / "0.147.0"
+    old_binary = old_release / "bin" / "codex"
+    old_binary.parent.mkdir(parents=True)
+    old_binary.write_bytes(b"#!/bin/sh\n")
+    old_binary.chmod(0o755)
+    (old_release / "codex").symlink_to("bin/codex")
+    current = profile_standalone / "current"
+    current.symlink_to(old_release, target_is_directory=True)
+
+    assert daemon_module._prepare_profile_standalone(
+        str(source_binary),
+        {"CODEX_HOME": str(profile_home)},
+    ) is True
+    assert current.is_symlink()
+    assert current.readlink() == source_standalone / "current"
+    assert (current / "codex").resolve() == source_binary
+    assert old_binary.exists()
+
+
+def test_profile_bootstrap_never_replaces_external_current_symlink(tmp_path):
+    source_home = tmp_path / "source"
+    source_standalone = source_home / "packages" / "standalone"
+    source_release = source_standalone / "releases" / "0.148.0"
+    source_binary = source_release / "bin" / "codex"
+    source_binary.parent.mkdir(parents=True)
+    source_binary.write_bytes(b"#!/bin/sh\n")
+    source_binary.chmod(0o755)
+    (source_release / "codex").symlink_to("bin/codex")
+    (source_standalone / "current").symlink_to(
+        source_release,
+        target_is_directory=True,
+    )
+
+    profile_home = tmp_path / "profile"
+    current = profile_home / "packages" / "standalone" / "current"
+    current.parent.mkdir(parents=True)
+    external_release = tmp_path / "external" / "releases" / "0.147.0"
+    external_binary = external_release / "bin" / "codex"
+    external_binary.parent.mkdir(parents=True)
+    external_binary.write_bytes(b"#!/bin/sh\n")
+    external_binary.chmod(0o755)
+    (external_release / "codex").symlink_to("bin/codex")
+    current.symlink_to(external_release, target_is_directory=True)
+
+    assert daemon_module._prepare_profile_standalone(
+        str(source_binary),
+        {"CODEX_HOME": str(profile_home)},
+    ) is False
+    assert current.readlink() == external_release
+    assert (current / "codex").resolve() == external_binary
+
+
 def test_required_profile_never_silently_falls_back_to_stdio(monkeypatch):
     async def run():
         monkeypatch.setattr(
@@ -634,6 +704,60 @@ def test_lagging_managed_daemon_restart_failure_never_uses_stdio(monkeypatch):
             await manager.proxy_args("/bin/codex", {})
         assert manager.info is None
         assert manager.strict_shared_affinity is False
+
+    asyncio.run(run())
+
+
+def test_lagging_managed_daemon_waits_for_async_replacement(monkeypatch):
+    async def run():
+        monkeypatch.setattr(
+            daemon_module, "_binary_identity", lambda _path: ("codex-v2",))
+        monkeypatch.setattr(
+            daemon_module,
+            "_prepare_profile_standalone",
+            lambda _bin, _env: True,
+        )
+        monkeypatch.setattr(
+            daemon_module,
+            "_DAEMON_UPGRADE_POLL_INTERVAL",
+            0.0,
+        )
+        manager = CodexDaemonManager("auto")
+        version_probes = 0
+        restarted = False
+
+        async def command(_bin, _env, *args):
+            nonlocal version_probes, restarted
+            if args[-1] == "--help":
+                return _result(0)
+            if args[-1] == "version":
+                version_probes += 1
+                upgraded = restarted and version_probes >= 5
+                version = "0.148.0" if upgraded else "0.147.0"
+                return _result(0, {
+                    "status": "running",
+                    "managedCodexPath": "/opt/codex/current/codex",
+                    "managedCodexVersion": version,
+                    "socketPath": "/tmp/codex.sock",
+                    "cliVersion": "0.148.0",
+                    "appServerVersion": version,
+                })
+            if args[-1] == "restart":
+                restarted = True
+                return _result(0, {"status": "restarted"})
+            assert args[-1] == "enable-remote-control"
+            return _result(0, {
+                "status": "enabled",
+                "remoteControlEnabled": True,
+                "socketPath": "/tmp/codex.sock",
+            })
+
+        manager._run = command  # type: ignore[method-assign]
+        assert await manager.proxy_args("/bin/codex", {}) == [
+            "/bin/codex", "app-server", "proxy",
+            "--sock", "/tmp/codex.sock",
+        ]
+        assert version_probes == 5
 
     asyncio.run(run())
 
@@ -1134,6 +1258,39 @@ def test_daemon_upgrade_error_is_not_converted_to_stdio(monkeypatch):
         with pytest.raises(CodexDaemonUpgradeRequired, match="upgrade required"):
             await CodexHandle(
                 _Cfg(), daemon_manager=_UpgradeManager()).connect(cwd="/tmp")
+        assert spawned == []
+
+    asyncio.run(run())
+
+
+def test_strict_daemon_preparation_failure_never_starts_private_stdio(
+        monkeypatch):
+    async def run():
+        class _StrictFailingManager(_Manager):
+            async def proxy_args(self, _bin, _env):
+                self.proxy_calls += 1
+                raise RuntimeError("strict daemon preparation failed")
+
+        manager = _StrictFailingManager(strict_shared=True)
+        spawned = []
+
+        async def spawn(*argv, **_kwargs):
+            spawned.append(list(argv))
+            raise AssertionError("private stdio must not be started")
+
+        monkeypatch.setattr(
+            handle_module, "_resolve_codex_bin", lambda: "/usr/bin/codex")
+        monkeypatch.setattr(
+            handle_module.asyncio, "create_subprocess_exec", spawn)
+
+        with pytest.raises(
+            RuntimeError,
+            match="strict daemon preparation failed",
+        ):
+            await CodexHandle(
+                _Cfg(), daemon_manager=manager).connect(cwd="/tmp")
+
+        assert manager.proxy_calls == 1
         assert spawned == []
 
     asyncio.run(run())

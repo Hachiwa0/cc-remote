@@ -1862,12 +1862,18 @@ class CodexHandle:
                 "-c", "permissions.cc_remote_work.network.enabled=false",
             ])
         proxy_argv: Optional[list[str]] = None
-        strict_shared = False
+        strict_shared = bool(
+            getattr(
+                self.daemon_manager,
+                "strict_shared_affinity",
+                False,
+            )
+        )
         if not self.work_mode and self.daemon_mode == "auto":
             try:
                 proxy_argv = await self.daemon_manager.proxy_args(
                     codex_bin, child_env)
-                strict_shared = bool(
+                strict_shared = strict_shared or bool(
                     getattr(
                         self.daemon_manager,
                         "strict_shared_affinity",
@@ -1879,6 +1885,15 @@ class CodexHandle:
                 # silently severing the terminal CLI <-> Remote live channel.
                 raise
             except Exception as exc:
+                strict_shared = strict_shared or bool(
+                    getattr(
+                        self.daemon_manager,
+                        "strict_shared_affinity",
+                        False,
+                    )
+                )
+                if strict_shared:
+                    raise
                 log.warning(
                     "Codex daemon preparation failed; using stdio",
                     error_type=type(exc).__name__,

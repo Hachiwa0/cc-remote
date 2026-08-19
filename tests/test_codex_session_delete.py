@@ -294,6 +294,9 @@ def test_unknown_loaded_delete_preserves_thread_when_exact_read_finds_it(
         handle = _DeleteHandle(ConnectionError("proxy closed"))
         ctx = _resident(machine, handle)
         _prepare(machine, monkeypatch)
+        machine._codex_forks.begin(
+            "fork-request", "parent-thread", "parent-turn", "/repo")
+        machine._codex_forks.complete("fork-request", "codex-thread")
 
         async def session_exists(_sid):
             return True
@@ -310,6 +313,8 @@ def test_unknown_loaded_delete_preserves_thread_when_exact_read_finds_it(
         assert result.code == ERR_INTERNAL
         assert handle.calls == [("delete", "codex-thread")]
         assert machine.sessions[ctx.key] is ctx
+        assert machine._codex_forks.child_entry(
+            "codex-thread")["status"] == "complete"
 
     asyncio.run(run())
 
@@ -363,6 +368,9 @@ def test_unknown_loaded_delete_preserves_unconfirmed_absence(
         handle = _DeleteHandle(ConnectionError("proxy closed"))
         ctx = _resident(machine, handle)
         _prepare(machine, monkeypatch)
+        machine._codex_forks.begin(
+            "fork-request", "parent-thread", "parent-turn", "/repo")
+        machine._codex_forks.complete("fork-request", "codex-thread")
         rollout = tmp_path / "rollout.jsonl"
         rollout.write_text("session\n", encoding="utf-8")
 
@@ -382,6 +390,8 @@ def test_unknown_loaded_delete_preserves_unconfirmed_absence(
         assert result.code == ERR_INTERNAL
         assert machine.sessions[ctx.key] is ctx
         assert rollout.exists()
+        assert machine._codex_forks.child_entry(
+            "codex-thread")["status"] == "delete_pending"
 
     asyncio.run(run())
 

@@ -58,7 +58,7 @@ from contextlib import AsyncExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
-from typing import Optional
+from typing import Literal, Optional
 
 from claude_agent_sdk import (
     PermissionResultAllow, PermissionResultDeny, delete_session,
@@ -325,6 +325,48 @@ _CLAUDE_OPUS_5_1M_ALIASES = frozenset({
     "claude-opus-5",
     "claude-opus-5[1m]",
 })
+
+
+def _quarantine_rebuildable_projection(
+    path: Path,
+    *,
+    projection: str,
+) -> bool:
+    """Move one unsafe display cache aside so it can rebuild from native state."""
+    quarantine = path.with_name(f"{path.name}.corrupt-{uuid4().hex}")
+    try:
+        os.replace(path, quarantine)
+    except FileNotFoundError:
+        # A concurrent cleanup already removed the rejected path. Retrying the
+        # constructor is equivalent to rebuilding an empty projection.
+        return True
+    except OSError as exc:
+        log.warning(
+            "rebuildable projection quarantine failed",
+            projection=projection,
+            error_type=type(exc).__name__,
+        )
+        return False
+    try:
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError as exc:
+        # The rename already made the unsafe projection unreachable. A failed
+        # directory fsync affects crash durability, not this process's safety.
+        log.warning(
+            "rebuildable projection quarantine fsync failed",
+            projection=projection,
+            error_type=type(exc).__name__,
+        )
+    log.warning(
+        "rebuildable projection quarantined",
+        projection=projection,
+        quarantine_path=str(quarantine),
+    )
+    return True
 
 
 def _normalize_claude_new_session_model(model: Optional[str]) -> Optional[str]:
@@ -1211,6 +1253,12 @@ class _CodexGoalRecoveryMiss:
     stable: bool
 
 
+@dataclass(frozen=True)
+class _CodexDeleteRejection:
+    error: Error
+    outcome: Literal["failed", "unknown"]
+
+
 class _CodexOfficialProjectionIncomplete(RuntimeError):
     """A stable rollout proves that the official newest page omitted turns."""
 
@@ -1780,6 +1828,15 @@ class WrapperMachine:
             # private cache must not prevent users from reaching their engine.
             self._session_plans = None
             log.exception("session plan store unavailable")
+            plan_path = Path(self.cfg.state_dir) / "session-plans.json"
+            if _quarantine_rebuildable_projection(
+                plan_path,
+                projection="session plans",
+            ):
+                try:
+                    self._session_plans = SessionPlanStore(self.cfg.state_dir)
+                except SessionPlanStoreError:
+                    log.exception("session plan store recovery failed")
         try:
             self._session_presentation: SessionPresentationStore | None = (
                 SessionPresentationStore(self.cfg.state_dir)
@@ -1790,6 +1847,21 @@ class WrapperMachine:
             # cache is damaged.
             self._session_presentation = None
             log.exception("session presentation store unavailable")
+            presentation_path = (
+                Path(self.cfg.state_dir) / "session-presentation.json"
+            )
+            if _quarantine_rebuildable_projection(
+                presentation_path,
+                projection="session presentation",
+            ):
+                try:
+                    self._session_presentation = SessionPresentationStore(
+                        self.cfg.state_dir
+                    )
+                except SessionPresentationStoreError:
+                    log.exception(
+                        "session presentation store recovery failed"
+                    )
         try:
             self._claude_controls: ClaudeControlStore | None = (
                 ClaudeControlStore(self.cfg.state_dir)
@@ -20333,8 +20405,8 @@ class WrapperMachine:
                     ctx,
                     rollout_path=codex_alias_path,
                 )
-                if isinstance(delete_result, Error):
-                    return delete_result
+                if isinstance(delete_result, _CodexDeleteRejection):
+                    return delete_result.error
                 codex_deleted = True
             else:
                 await ctx.sdk.disconnect()
@@ -20981,13 +21053,27 @@ class WrapperMachine:
         *,
         rollout_path: str | None,
         transient: bool = False,
-    ) -> Error | tuple[str, ...]:
+    ) -> _CodexDeleteRejection | tuple[str, ...]:
         """Delete a loaded Codex thread before releasing its writer."""
-        async with ctx.query_lock:
-            if self._session_delete_busy(ctx):
-                return await self._send_code_delete_error(
+        async def reject(
+            code: str,
+            message: str,
+            *,
+            outcome: Literal["failed", "unknown"] = "failed",
+        ) -> _CodexDeleteRejection:
+            return _CodexDeleteRejection(
+                error=await self._send_code_delete_error(
                     cmd,
                     sid,
+                    code,
+                    message,
+                ),
+                outcome=outcome,
+            )
+
+        async with ctx.query_lock:
+            if self._session_delete_busy(ctx):
+                return await reject(
                     ERR_BUSY,
                     "会话仍在运行或有排队消息，请先停止并取消排队后再删除",
                 )
@@ -20997,9 +21083,7 @@ class WrapperMachine:
                         ctx.sdk.daemon_mode == "auto"
                         and not self._codex_shared_live(ctx)
                     ):
-                        return await self._send_code_delete_error(
-                            cmd,
-                            sid,
+                        return await reject(
                             ERR_NOT_RUNNING,
                             "Codex 共享删除通道不可用，请重试",
                         )
@@ -21011,7 +21095,10 @@ class WrapperMachine:
                         client_id=getattr(cmd, "client_id", None),
                     )
                     if control_error is not None:
-                        return control_error
+                        return _CodexDeleteRejection(
+                            error=control_error,
+                            outcome="failed",
+                        )
                 if transient:
                     external_owner = await self._cold_codex_delete_blocked(
                         sid,
@@ -21023,16 +21110,12 @@ class WrapperMachine:
                         await self._codex_delete_external_owner(sid)
                     )
                 if external_owner:
-                    return await self._send_code_delete_error(
-                        cmd,
-                        sid,
+                    return await reject(
                         ERR_BUSY,
                         "会话正由 Codex App 使用，无法删除",
                     )
             if self._session_delete_busy(ctx):
-                return await self._send_code_delete_error(
-                    cmd,
-                    sid,
+                return await reject(
                     ERR_BUSY,
                     "会话状态已变化，请等待当前回合结束后再删除",
                 )
@@ -21065,9 +21148,7 @@ class WrapperMachine:
                     if self._is_resident_context(candidate)
                 ]
                 if self._session_delete_busy(ctx):
-                    return await self._send_code_delete_error(
-                        cmd,
-                        sid,
+                    return await reject(
                         ERR_BUSY,
                         "会话状态已变化，请等待当前回合结束后再删除",
                     )
@@ -21086,16 +21167,12 @@ class WrapperMachine:
                         session_id=sid,
                         error_type=type(exc).__name__,
                     )
-                    return await self._send_code_delete_error(
-                        cmd,
-                        sid,
+                    return await reject(
                         ERR_INTERNAL,
                         "无法确认派生会话状态，未执行删除",
                     )
                 if busy_descendant is not None:
-                    return await self._send_code_delete_error(
-                        cmd,
-                        sid,
+                    return await reject(
                         ERR_BUSY,
                         "派生会话仍在运行、排队或由其他 Codex 客户端使用",
                     )
@@ -21110,9 +21187,7 @@ class WrapperMachine:
                         session_id=sid,
                         error_code=exc.code,
                     )
-                    return await self._send_code_delete_error(
-                        cmd,
-                        sid,
+                    return await reject(
                         ERR_INTERNAL,
                         "会话删除失败，请刷新后重试",
                     )
@@ -21134,11 +21209,10 @@ class WrapperMachine:
                             session_id=sid,
                             error_type=type(reconcile_error).__name__,
                         )
-                        return await self._send_code_delete_error(
-                            cmd,
-                            sid,
+                        return await reject(
                             ERR_INTERNAL,
                             "会话删除结果暂时无法确认，请刷新后重试",
+                            outcome="unknown",
                         )
                     rollout_gone = bool(
                         rollout_path
@@ -21147,12 +21221,16 @@ class WrapperMachine:
                             rollout_path,
                         )
                     )
-                    if still_exists or not rollout_gone:
-                        return await self._send_code_delete_error(
-                            cmd,
-                            sid,
+                    if still_exists:
+                        return await reject(
                             ERR_INTERNAL,
                             "会话删除失败，请刷新后重试",
+                        )
+                    if not rollout_gone:
+                        return await reject(
+                            ERR_INTERNAL,
+                            "会话删除结果暂时无法确认，请刷新后重试",
+                            outcome="unknown",
                         )
                     deleted_native_ids = (native_sid,)
                 if not isinstance(deleted_native_ids, (tuple, list)):
@@ -21359,12 +21437,10 @@ class WrapperMachine:
                             session_id=sid,
                             error_type=type(exc).__name__,
                         )
-            if isinstance(delete_result, Error):
-                if delete_result.message != (
-                    "会话删除结果暂时无法确认，请刷新后重试"
-                ):
+            if isinstance(delete_result, _CodexDeleteRejection):
+                if delete_result.outcome == "failed":
                     await abort_fork_delete()
-                return delete_result
+                return delete_result.error
             deleted_sids = delete_result
             if transient_codex_ctx:
                 await self._cleanup_cold_deleted_codex_checkpoint(sid)

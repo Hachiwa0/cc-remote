@@ -2104,6 +2104,65 @@ def test_optional_presentation_migration_does_not_disable_codex_or_work(
     assert machine._codex_profiles.default.id == "primary"
 
 
+@pytest.mark.parametrize(
+    ("filename", "attribute"),
+    [
+        ("session-plans.json", "_session_plans"),
+        ("session-presentation.json", "_session_presentation"),
+    ],
+)
+def test_corrupt_rebuildable_projection_does_not_pin_profile_transition(
+    tmp_path: Path,
+    filename: str,
+    attribute: str,
+) -> None:
+    _machine(tmp_path)
+    state = tmp_path / "state"
+    previous = json.loads(
+        (state / "codex-profile-topology.json").read_text(encoding="utf-8")
+    )
+    renamed_profiles = {}
+    for profile in previous["profiles"]:
+        target = "renamed" if profile["id"] == "primary" else profile["id"]
+        renamed_profiles[target] = {
+            "label": target,
+            "home": profile["home"],
+            "default": profile["id"] == previous["default_id"],
+        }
+
+    projection = state / filename
+    projection.write_text("{not-json", encoding="utf-8")
+    cfg = WrapperConfig()
+    cfg.state_dir = state
+    cfg.claude_work_root = tmp_path / "work" / "claude"
+    cfg.codex_work_root = tmp_path / "work" / "codex"
+    cfg.codex_profiles_json = json.dumps(renamed_profiles)
+
+    migrated = WrapperMachine(cfg, _StubTransport())
+
+    assert migrated._codex_profile_migration_ok
+    assert migrated._codex_work_profile_migration_ok
+    assert migrated._codex_presentation_profile_migration_ok
+    assert getattr(migrated, attribute) is not None
+    assert not (state / "codex-profile-transition.json").exists()
+    quarantined = list(state.glob(f"{filename}.corrupt-*"))
+    assert len(quarantined) == 1
+    assert quarantined[0].read_text(encoding="utf-8") == "{not-json"
+
+    next_profiles = dict(renamed_profiles)
+    next_profiles["third"] = {
+        "label": "third",
+        "home": str(tmp_path / "third"),
+    }
+    cfg.codex_profiles_json = json.dumps(next_profiles)
+    advanced = WrapperMachine(cfg, _StubTransport())
+
+    assert advanced._codex_profile_migration_ok
+    assert advanced._codex_work_profile_migration_ok
+    assert advanced._codex_presentation_profile_migration_ok
+    assert not (state / "codex-profile-transition.json").exists()
+
+
 def test_work_profile_migration_failure_does_not_disable_codex_code(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
