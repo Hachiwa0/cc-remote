@@ -11538,12 +11538,10 @@ class WrapperMachine:
                             "Codex historical plan terminal could not be repaired",
                             session_id=sid,
                         )
-                # An unfinished Plan may legitimately span several steer turns
-                # after its owner fell off the newest page. A settled Plan must
-                # never be rebound to an unrelated newest turn: that would
-                # resurrect it after the user already started another task.
-                if target_index is None and not snapshot.settled:
-                    target_index = len(turns) - 1
+                # A durable Plan is only safe to project onto its exact native
+                # owner. If that turn is outside the newest summary page, keep
+                # the snapshot private instead of attaching it to unrelated
+                # work that happened later.
                 if target_index is not None:
                     target = turns[target_index]
                     block = snapshot.as_process_block()
@@ -21402,6 +21400,7 @@ class WrapperMachine:
             return error
         ctx = self._ctx_for(sid)
         transient_codex_ctx = False
+        transient_codex_ctx_closed = False
         if engine == "codex" and ctx is None:
             ctx_or_error = await self._cold_codex_delete_context(
                 cmd,
@@ -21412,7 +21411,27 @@ class WrapperMachine:
                 return ctx_or_error
             ctx = ctx_or_error
             transient_codex_ctx = True
+
+        async def cleanup_transient_codex_ctx() -> None:
+            nonlocal transient_codex_ctx_closed
+            if (
+                not transient_codex_ctx
+                or transient_codex_ctx_closed
+                or ctx is None
+            ):
+                return
+            transient_codex_ctx_closed = True
+            try:
+                await ctx.sdk.disconnect()
+            except Exception as exc:
+                log.warning(
+                    "cold Codex delete control cleanup failed",
+                    session_id=sid,
+                    error_type=type(exc).__name__,
+                )
+
         if ctx is not None and self._session_delete_busy(ctx):
+            await cleanup_transient_codex_ctx()
             return await self._send_code_delete_error(
                 cmd,
                 sid,
@@ -21472,6 +21491,7 @@ class WrapperMachine:
                 sid=sid,
                 to=getattr(cmd, "client_id", None),
             )
+            await cleanup_transient_codex_ctx()
             await self.transport.send(error)
             return error
 
@@ -21499,15 +21519,7 @@ class WrapperMachine:
                     transient=transient_codex_ctx,
                 )
             finally:
-                if transient_codex_ctx:
-                    try:
-                        await ctx.sdk.disconnect()
-                    except Exception as exc:
-                        log.warning(
-                            "cold Codex delete control cleanup failed",
-                            session_id=sid,
-                            error_type=type(exc).__name__,
-                        )
+                await cleanup_transient_codex_ctx()
             if isinstance(delete_result, _CodexDeleteRejection):
                 if delete_result.outcome == "failed":
                     await abort_fork_delete()

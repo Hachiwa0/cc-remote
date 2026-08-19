@@ -1701,6 +1701,60 @@ def test_completed_codex_plan_is_not_rebound_without_matching_owner(
     asyncio.run(run())
 
 
+def test_incomplete_codex_plan_is_not_rebound_without_matching_owner():
+    events = (
+        UserMsg(
+            sid="stale-active-plan", msg_id="user-2", prompt="next task",
+        ).model_dump(mode="json"),
+        TurnEnd(
+            sid="stale-active-plan",
+            turn_id="native-2",
+            result=TurnResult(
+                subtype="success", duration_ms=1000, is_error=False),
+        ).model_dump(mode="json"),
+    )
+
+    class Official:
+        async def summary_page(self, _sid, **_kwargs):
+            return CodexHistoryPage(
+                events=events,
+                turns=materialize_history_turns(events),
+                has_more=True,
+                oldest_id="user-2",
+                newest_id="user-2",
+            )
+
+    async def run():
+        machine, _transport = _mk_machine()
+        machine._codex_history = Official()
+        ctx = _mk_ctx("stale-active-plan", "stale-active-plan")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+        machine._session_plans.put("stale-active-plan", TurnPlan(
+            item_id="plan:native-1",
+            turn_id="native-1",
+            explanation="old unfinished task",
+            plan=[{"step": "old", "status": "inProgress"}],
+        ))
+
+        history = await machine._handle_get_history(SimpleNamespace(
+            session_id="stale-active-plan",
+            client_id="client-1",
+            before=None,
+            limit=4,
+            cwd=ctx.cwd,
+            detail="summary",
+        ))
+        assert all(
+            block.get("processKind") != "plan"
+            for turn in history.turns
+            for block in turn.blocks
+        )
+        assert machine._session_plans.get("stale-active-plan") is not None
+
+    asyncio.run(run())
+
+
 def test_requested_codex_summary_binds_exact_active_native_turn_ids(
     monkeypatch, tmp_path,
 ):

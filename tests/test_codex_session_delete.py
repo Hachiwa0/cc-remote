@@ -21,6 +21,7 @@ from cc_remote.protocol import (
     Query,
 )
 from cc_remote.wrapper import machine as machine_module
+from cc_remote.wrapper.codex_forks import ForkJournalError
 from cc_remote.wrapper.codex_handle import CodexAppServerError
 from cc_remote.wrapper.codex_external import HolderScan
 from cc_remote.wrapper.codex_rpc import CodexRpcRejected
@@ -1251,6 +1252,101 @@ def test_cold_codex_delete_bypasses_full_resident_pool(
                 },
             ),
             ("delete", "codex-thread"),
+            ("disconnect", None),
+        ]
+
+    asyncio.run(run())
+
+
+def test_cold_codex_delete_disconnects_when_fork_journal_fails(
+    monkeypatch,
+    tmp_path: Path,
+):
+    async def run():
+        machine, _ = _mk_machine()
+        machine.cfg.cc_cwd = str(tmp_path)
+        _prepare(machine, monkeypatch)
+        _ColdDeleteHandle.created = []
+        monkeypatch.setattr(
+            machine_module,
+            "CodexHandle",
+            _ColdDeleteHandle,
+        )
+        monkeypatch.setattr(
+            machine,
+            "_codex_cwd_for_wire",
+            lambda _sid: str(tmp_path),
+        )
+
+        def fail_begin_delete(_sid):
+            raise ForkJournalError("disk full")
+
+        monkeypatch.setattr(
+            machine._codex_forks,
+            "begin_delete",
+            fail_begin_delete,
+        )
+
+        result = await machine._handle_delete_session(_delete_command())
+
+        assert isinstance(result, Error)
+        assert result.code == ERR_INTERNAL
+        assert len(_ColdDeleteHandle.created) == 1
+        assert _ColdDeleteHandle.created[0].calls == [
+            (
+                "connect",
+                {
+                    "cwd": str(tmp_path),
+                    "control_only": True,
+                },
+            ),
+            ("disconnect", None),
+        ]
+
+    asyncio.run(run())
+
+
+def test_cold_codex_delete_disconnects_when_transient_context_is_busy(
+    monkeypatch,
+    tmp_path: Path,
+):
+    async def run():
+        machine, _ = _mk_machine()
+        machine.cfg.cc_cwd = str(tmp_path)
+        _prepare(machine, monkeypatch)
+        _ColdDeleteHandle.created = []
+        monkeypatch.setattr(
+            machine_module,
+            "CodexHandle",
+            _ColdDeleteHandle,
+        )
+        monkeypatch.setattr(
+            machine,
+            "_codex_cwd_for_wire",
+            lambda _sid: str(tmp_path),
+        )
+
+        original_connect = _ColdDeleteHandle.connect
+
+        async def connect_busy(handle, **kwargs):
+            await original_connect(handle, **kwargs)
+            handle.turn_active = True
+
+        monkeypatch.setattr(_ColdDeleteHandle, "connect", connect_busy)
+
+        result = await machine._handle_delete_session(_delete_command())
+
+        assert isinstance(result, Error)
+        assert result.code == ERR_BUSY
+        assert len(_ColdDeleteHandle.created) == 1
+        assert _ColdDeleteHandle.created[0].calls == [
+            (
+                "connect",
+                {
+                    "cwd": str(tmp_path),
+                    "control_only": True,
+                },
+            ),
             ("disconnect", None),
         ]
 
