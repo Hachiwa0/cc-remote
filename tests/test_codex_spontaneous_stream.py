@@ -2036,6 +2036,152 @@ def test_machine_uses_live_cli_user_item_as_spontaneous_turn_identity():
     asyncio.run(run())
 
 
+def test_machine_recovers_missed_cli_user_before_first_output(monkeypatch):
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("thread-spontaneous", "thread-spontaneous")
+        ctx.engine = "codex"
+        handle = CodexHandle(machine.cfg)
+        handle.thread_id = ctx.session_id
+        handle.proc = SimpleNamespace(returncode=None)
+        ctx.sdk = handle
+        machine.sessions[ctx.key] = ctx
+        handle.turn_lifecycle_callback = (
+            lambda phase, turn_id: machine._on_codex_turn_lifecycle(
+                ctx, phase, turn_id))
+        recoveries = []
+        refreshes = []
+
+        async def recover(sid, native_turn_id, visible_turn_id, user_index,
+                          **kwargs):
+            recoveries.append((
+                sid,
+                native_turn_id,
+                visible_turn_id,
+                user_index,
+                kwargs,
+            ))
+            return UserMsg(
+                msg_id="persisted-cli-user",
+                prompt="persisted CLI prompt",
+            )
+
+        monkeypatch.setattr(
+            machine, "_recover_official_codex_user", recover)
+        monkeypatch.setattr(
+            machine,
+            "_schedule_history_refresh",
+            lambda sid, **kwargs: refreshes.append((sid, kwargs)),
+        )
+
+        turn_id = "cli-user-notification-missed"
+        for message in [
+            _notification("turn/started", turn_id, turn={"id": turn_id}),
+            # The wrapper attached after app-server had already emitted the
+            # userMessage item. Persisted rollout state still has the exact row.
+            _notification("item/completed", turn_id, item={
+                "id": "cli-answer", "type": "agentMessage",
+                "text": "answer", "phase": "final_answer",
+            }),
+            _notification("turn/completed", turn_id, turn={
+                "id": turn_id, "status": "completed",
+            }),
+        ]:
+            await handle._dispatch(message)
+
+        task = ctx.codex_spontaneous_task
+        assert task is not None
+        await asyncio.wait_for(task, timeout=1)
+
+        users = [event for event in transport.sent
+                 if isinstance(event, UserMsg)]
+        assert [(event.msg_id, event.prompt) for event in users] == [
+            ("persisted-cli-user", "persisted CLI prompt"),
+        ]
+        assert not any(event.prompt == "" for event in users)
+        assert [
+            (event.msg_id, event.turn_id)
+            for event in transport.sent
+            if isinstance(event, TurnBinding)
+        ] == [("persisted-cli-user", turn_id)]
+        assert recoveries == [(
+            ctx.session_id,
+            turn_id,
+            turn_id,
+            0,
+            {
+                "max_reverse_scan_bytes": (
+                    machine.CODEX_LIVE_USER_RECOVERY_SCAN_BYTES
+                ),
+            },
+        )]
+        assert refreshes == [(
+            ctx.session_id,
+            {
+                "before": None,
+                "limit": machine.MIRROR_LIMIT,
+                "cwd": None,
+                "detail": "summary",
+            },
+        )]
+
+    asyncio.run(run())
+
+
+def test_machine_refreshes_history_after_missed_cli_user_recovery(monkeypatch):
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("thread-spontaneous", "thread-spontaneous")
+        ctx.engine = "codex"
+        turn_id = "cli-user-persisted-late"
+        ctx.codex_spontaneous_turn_id = turn_id
+        refreshes = []
+
+        class Sdk:
+            async def receive_spontaneous_response(self, requested_turn_id):
+                assert requested_turn_id == turn_id
+                yield _notification("item/completed", turn_id, item={
+                    "id": "cli-answer", "type": "agentMessage",
+                    "text": "answer", "phase": "final_answer",
+                })
+                yield _notification("turn/completed", turn_id, turn={
+                    "id": turn_id, "status": "completed",
+                })
+
+        async def recover(*_args, **_kwargs):
+            return None
+
+        ctx.sdk = Sdk()
+        machine.sessions[ctx.key] = ctx
+        monkeypatch.setattr(
+            machine, "_recover_official_codex_user", recover)
+        monkeypatch.setattr(
+            machine,
+            "_schedule_history_refresh",
+            lambda sid, **kwargs: refreshes.append((sid, kwargs)),
+        )
+
+        await machine._run_codex_spontaneous_turn(
+            ctx, turn_id, announce_running=False)
+
+        users = [event for event in transport.sent
+                 if isinstance(event, UserMsg)]
+        assert [(event.msg_id, event.prompt) for event in users] == [
+            (turn_id, ""),
+        ]
+        assert refreshes == [(
+            ctx.session_id,
+            {
+                "before": None,
+                "limit": machine.MIRROR_LIMIT,
+                "cwd": None,
+                "detail": "summary",
+            },
+        )]
+
+    asyncio.run(run())
+
+
 def test_machine_projects_later_cli_user_item_as_turn_steer():
     async def run():
         machine, transport = _mk_machine()

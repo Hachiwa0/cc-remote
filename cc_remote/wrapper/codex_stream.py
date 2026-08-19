@@ -1203,13 +1203,17 @@ def codex_history_turn_user(
     turn_id: str,
     cursor: str,
     user_index: int = 0,
+    *,
+    max_reverse_scan_bytes: int | None = None,
 ) -> UserMsg | None:
     """Recover one visible user row for one native Codex turn.
 
     Official summary items retain expired ``localImage`` paths rather than the
     inline image bytes persisted in the rollout. Locate only the requested
     native turn boundary, then reuse the bounded forward reader above so image
-    thumbnails remain available without translating the whole rollout.
+    thumbnails remain available without translating the whole rollout. Live
+    recovery may bound the reverse search to the recent tail; history detail
+    reads retain the existing unbounded exact-turn lookup by default.
     """
     if (
         not isinstance(turn_id, str)
@@ -1222,7 +1226,10 @@ def codex_history_turn_user(
     ):
         return None
     try:
-        for offset, line in _reverse_jsonl_records(path):
+        for offset, line in _reverse_jsonl_records(
+            path,
+            max_scan_bytes=max_reverse_scan_bytes,
+        ):
             if _history_turn_cursor(line) == turn_id:
                 return codex_history_boundary_user(
                     path, offset, cursor, user_index=user_index)

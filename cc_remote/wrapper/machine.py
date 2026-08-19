@@ -224,7 +224,8 @@ from cc_remote.wrapper.codex_client_messages import (
 )
 from cc_remote.wrapper.codex_permissions import codex_permission_profiles
 from cc_remote.wrapper.codex_stream import (
-    CodexHistoryImageView, CodexHistoryNativeWitness, CodexStreamTranslator,
+    CodexHistoryImageView, CodexHistoryNativeWitness, CodexLiveUserMessage,
+    CodexStreamTranslator,
     coalesce_codex_live_notifications,
     codex_live_user_message,
     codex_rollout_task_bindings,
@@ -1444,6 +1445,7 @@ class WrapperMachine:
     CODEX_HISTORY_IMAGE_VIEW_CACHE_ENTRIES = 256
     CODEX_GOAL_RECOVERY_MISS_CACHE_ENTRIES = 2048
     CODEX_GOAL_RECOVERY_MAX_SOURCE_SCANS = 3
+    CODEX_LIVE_USER_RECOVERY_SCAN_BYTES = 64 * 1024 * 1024
     CODEX_LIVE_USER_ITEM_IDS = 512
     CODEX_PUBLISHED_STEER_IDS = 512
     CODEX_THREAD_STARTED_HINTS = 1024
@@ -10923,8 +10925,10 @@ class WrapperMachine:
         native_turn_id: str,
         visible_turn_id: str,
         user_index: int,
+        *,
+        max_reverse_scan_bytes: int | None = None,
     ) -> UserMsg | None:
-        """Recover inline image bytes hidden behind expired localImage paths."""
+        """Recover one exact persisted user row, including inline image bytes."""
         path = await asyncio.to_thread(self._codex_rollout_for_wire, sid)
         if not path:
             return None
@@ -10934,6 +10938,7 @@ class WrapperMachine:
             native_turn_id,
             visible_turn_id,
             user_index,
+            max_reverse_scan_bytes=max_reverse_scan_bytes,
         )
 
     async def _recover_official_codex_users(
@@ -15186,6 +15191,7 @@ class WrapperMachine:
         stream_closed = False
         repair_history = False
         seen_user_item_ids: set[str] = set()
+        anchor_recovery_attempted = False
 
         def start_restart_watch() -> None:
             nonlocal restart_watch_task
@@ -15209,8 +15215,59 @@ class WrapperMachine:
             restart_watch_task = None
 
         async def ensure_automatic_anchor() -> None:
-            """Anchor only after output proves this turn has no earlier user item."""
+            """Recover a missed CLI user row or anchor true automatic output."""
+            nonlocal logical_msg_id, anchor_recovery_attempted
             if ctx.codex_spontaneous_anchor_id is not None:
+                return
+            anchor_recovery_attempted = True
+            sid = self._ctx_wire_sid(ctx)
+            recovered = None
+            if sid:
+                try:
+                    recovered = await self._recover_official_codex_user(
+                        sid,
+                        current_turn_id,
+                        logical_msg_id,
+                        0,
+                        max_reverse_scan_bytes=(
+                            self.CODEX_LIVE_USER_RECOVERY_SCAN_BYTES
+                        ),
+                    )
+                except Exception as exc:
+                    # The live stream remains authoritative. A bounded local
+                    # recovery failure may hide only the prompt until the final
+                    # newest-page refresh converges from persisted history.
+                    log.warning(
+                        "Codex live user recovery failed",
+                        session_id=sid,
+                        turn_id=current_turn_id,
+                        error_type=type(exc).__name__,
+                    )
+            if recovered is not None and recovered.prompt:
+                if recovered.client_msg_id is not None:
+                    await self._remember_codex_live_user_alias(
+                        ctx,
+                        CodexLiveUserMessage(
+                            message_id=recovered.msg_id,
+                            turn_id=current_turn_id,
+                            prompt=recovered.prompt,
+                            client_id=recovered.client_msg_id,
+                        ),
+                    )
+                seen_user_item_ids.add(recovered.msg_id)
+                ctx.codex_spontaneous_anchor_id = recovered.msg_id
+                logical_msg_id = recovered.msg_id
+                ctx.active_msg_id = recovered.msg_id
+                self._rebind_codex_turn(
+                    ctx,
+                    current_turn_id,
+                    recovered.msg_id,
+                )
+                await self._emit(ctx, recovered)
+                await self._emit(ctx, TurnBinding(
+                    msg_id=recovered.msg_id,
+                    turn_id=current_turn_id,
+                ))
                 return
             ctx.codex_spontaneous_anchor_id = logical_msg_id
             ctx.active_msg_id = logical_msg_id
@@ -15593,8 +15650,8 @@ class WrapperMachine:
                 )
 
             # A newly-set or modified Goal objective is the user's durable
-            # request. Ordinary automatic turns remain unanchored until the first
-            # output frame proves no official CLI user item preceded it.
+            # request. Other spontaneous turns remain unanchored until their
+            # first output lets us recover any missed official CLI user row.
             if recovered_msg_id is None and goal_prompt:
                 ctx.codex_spontaneous_anchor_id = turn_id
                 logical_msg_id = turn_id
@@ -15775,6 +15832,20 @@ class WrapperMachine:
             if repair_history:
                 await self._repair_codex_projection_after_overflow(
                     ctx, current_turn_id)
+            elif terminal_seen and anchor_recovery_attempted:
+                sid = self._ctx_wire_sid(ctx)
+                if sid:
+                    # The early bounded lookup can race rollout persistence.
+                    # Once the real terminal has unlocked the session, force a
+                    # small authoritative moving-head rebuild instead of waiting
+                    # for a later focus/history request to reveal the prompt.
+                    self._schedule_history_refresh(
+                        sid,
+                        before=None,
+                        limit=self.MIRROR_LIMIT,
+                        cwd=None,
+                        detail="summary",
+                    )
 
     async def _run_codex_review_turn(
         self, ctx: SessionContext, turn_id: str,

@@ -1272,6 +1272,57 @@ def test_rollout_user_recovery_is_bound_to_the_native_turn(tmp_path):
         str(rollout), "missing-turn", "user-image") is None
 
 
+def test_live_rollout_user_recovery_bounds_the_reverse_search(tmp_path):
+    rollout = tmp_path / "rollout-bounded-live-user.jsonl"
+    rows = [
+        {
+            "type": "event_msg",
+            "payload": {"type": "task_started", "turn_id": "native-old"},
+        },
+        {
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "old prompt"},
+        },
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "agent_message",
+                "message": "x" * 4096,
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {"type": "task_started", "turn_id": "native-current"},
+        },
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "message": "current prompt",
+            },
+        },
+    ]
+    rollout.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    current = codex_history_turn_user(
+        str(rollout),
+        "native-current",
+        "native-current",
+        max_reverse_scan_bytes=512,
+    )
+    assert current is not None
+    assert current.prompt == "current prompt"
+    assert codex_history_turn_user(
+        str(rollout),
+        "native-old",
+        "native-old",
+        max_reverse_scan_bytes=512,
+    ) is None
+
+
 def test_codex_0147_rollout_uses_official_user_item_identity(tmp_path):
     rollout = tmp_path / "rollout-modern-user.jsonl"
     rollout.write_text("".join(json.dumps(row) + "\n" for row in [
