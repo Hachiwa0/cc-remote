@@ -1411,6 +1411,119 @@ def test_hidden_resident_and_fork_catalog_rows_stay_profile_scoped(
     }
 
 
+def test_old_schema_catalog_fallback_is_batched_and_profile_scoped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    machine, _transport = _machine(tmp_path)
+    machine.sessions = {}
+    for profile_id in ("primary", "stack"):
+        profile_home = tmp_path / profile_id
+        profile_home.mkdir(parents=True, exist_ok=True)
+        (profile_home / "config.toml").write_text(
+            'model_provider = "openai"\n', encoding="utf-8")
+        request_id = f"fork-{profile_id}"
+        machine._codex_forks.begin(
+            request_id,
+            f"{profile_id}@parent-native",
+            f"turn-{profile_id}",
+            f"/repo/{profile_id}",
+        )
+        machine._codex_forks.complete(
+            request_id, f"{profile_id}@same-native-id")
+
+    async def empty_list(_limit, *, codex_home=None):
+        assert codex_home is not None
+        return []
+
+    def uncertain_exact_rows(session_ids, *, codex_home=None):
+        assert tuple(session_ids) == ("same-native-id",)
+        assert codex_home is not None
+        return None
+
+    calls: list[tuple[str, list[tuple[str, object]], float]] = []
+
+    async def batch(requests, cwd=None, *, timeout, codex_home=None):
+        assert cwd is None
+        assert codex_home is not None
+        profile_id = Path(codex_home).name
+        calls.append((profile_id, requests, timeout))
+        return [{"thread": {
+            "id": request[1]["threadId"],
+            "cwd": f"/repo/{profile_id}",
+            "preview": f"{profile_id} hidden fork",
+            "updatedAt": 42,
+            "modelProvider": "openai",
+        }} for request in requests]
+
+    monkeypatch.setattr(machine_module, "list_codex_sessions", empty_list)
+    monkeypatch.setattr(
+        machine_module, "codex_exact_catalog_rows", uncertain_exact_rows)
+    monkeypatch.setattr(machine_module, "codex_rpc_batch", batch)
+
+    rows = asyncio.run(machine._read_all_codex_profile_sessions())
+
+    by_wire = {row["session_id"]: row for row in rows}
+    assert set(by_wire) == {
+        "primary@same-native-id", "stack@same-native-id",
+    }
+    assert by_wire["primary@same-native-id"]["cwd"] == "/repo/primary"
+    assert by_wire["stack@same-native-id"]["cwd"] == "/repo/stack"
+    assert by_wire["primary@same-native-id"]["forked_from_id"] == (
+        "primary@parent-native")
+    assert by_wire["stack@same-native-id"]["forked_from_id"] == (
+        "stack@parent-native")
+    assert {profile_id for profile_id, _requests, _timeout in calls} == {
+        "primary", "stack",
+    }
+    assert all(requests == [(
+        "thread/read",
+        {"threadId": "same-native-id", "includeTurns": False},
+    )] for _profile_id, requests, _timeout in calls)
+    assert all(0 < timeout <= machine.CODEX_EXACT_CATALOG_RPC_TIMEOUT_SECONDS
+               for _profile_id, _requests, timeout in calls)
+
+
+def test_exact_catalog_rpc_fallback_is_bounded_and_provider_filtered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    machine, _transport = _machine(tmp_path)
+    primary_home = tmp_path / "primary"
+    primary_home.mkdir(parents=True, exist_ok=True)
+    (primary_home / "config.toml").write_text(
+        'model_provider = "openai"\n', encoding="utf-8")
+    captured: list[tuple[str, object]] = []
+    batch_sizes: list[int] = []
+    timeouts: list[float] = []
+
+    async def batch(requests, cwd=None, *, timeout, codex_home=None):
+        del cwd
+        assert Path(codex_home) == primary_home
+        batch_sizes.append(len(requests))
+        timeouts.append(timeout)
+        captured.extend(requests)
+        return [{"thread": {
+            "id": params["threadId"],
+            "modelProvider": "different-provider",
+        }} for _method, params in requests]
+
+    monkeypatch.setattr(machine_module, "codex_rpc_batch", batch)
+    rows = asyncio.run(machine._codex_exact_catalog_rpc_rows(
+        machine._codex_profile("primary"),
+        [f"thread-{index}" for index in range(600)],
+    ))
+
+    assert rows == []
+    assert len(captured) == machine_module.CODEX_EXACT_CATALOG_MAX_IDS
+    assert batch_sizes == [
+        machine.CODEX_EXACT_CATALOG_RPC_BATCH_IDS,
+    ] * (
+        machine_module.CODEX_EXACT_CATALOG_MAX_IDS
+        // machine.CODEX_EXACT_CATALOG_RPC_BATCH_IDS
+    )
+    assert all(0 < timeout <= machine.CODEX_EXACT_CATALOG_RPC_TIMEOUT_SECONDS
+               for timeout in timeouts)
+
+
 def test_resident_catalog_repair_survives_the_global_row_bound(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1475,6 +1588,11 @@ def test_profile_list_failure_still_returns_resident_exact_rows(
         machine_module,
         "codex_exact_catalog_rows",
         lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        machine_module,
+        "codex_rpc_batch",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=[]),
     )
 
     rows, errors = asyncio.run(machine._read_codex_profile_catalog())

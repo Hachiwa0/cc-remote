@@ -134,12 +134,23 @@ export function reconcileProvenCompactionOrphans(
     const nativeId = nativeTaskId(owner);
     const candidates = nativeId ? orphans.get(nativeId) : undefined;
     if (!nativeId || !owner.prompt || owners.get(nativeId)?.length !== 1
-        || candidates?.length !== 1 || !owner.blocks.some((block) =>
-          block.kind === "process" && block.processKind === "compaction"
-          && block.turn_id === nativeId)) return;
+        || candidates?.length !== 1) return;
+    const ownerItemIds = new Set(owner.blocks.flatMap((block) =>
+      block.kind === "process" && block.processKind === "compaction"
+        && block.turn_id === nativeId ? [block.item_id] : []));
+    const orphan = next[candidates[0]];
+    const orphanItemIds = orphan.blocks.flatMap((block) =>
+      block.kind === "process" && block.processKind === "compaction"
+        && block.turn_id === nativeId ? [block.item_id] : []);
+    // A native task may compact repeatedly. The native turn id proves only the
+    // owner task, not the occurrence, so remove a row only when every marker it
+    // contains is already represented by the exact source-backed item id.
+    if (orphanItemIds.length !== orphan.blocks.length
+        || orphanItemIds.length === 0
+        || !orphanItemIds.every((itemId) => ownerItemIds.has(itemId))) return;
     // The source-backed History owner is canonical. The cache/live orphan is
-    // useful only as proof that its standalone row is disposable; copying any
-    // of its payload back would resurrect stale or duplicated compactions.
+    // now proven to contain only exact duplicate occurrences; copying any of
+    // its payload back would resurrect stale or duplicated compactions.
     removed.add(candidates[0]);
   });
   return next.filter((_, index) => !removed.has(index));

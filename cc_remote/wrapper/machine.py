@@ -244,9 +244,11 @@ from cc_remote.wrapper.codex_history import (
     CodexOfficialHistory,
 )
 from cc_remote.wrapper.codex_sessions import (
+    CODEX_EXACT_CATALOG_MAX_IDS,
     list_codex_sessions, codex_exact_catalog_rows, codex_session_cwd,
     codex_rollout_path, codex_model, codex_effort, codex_session_settings,
     codex_session_presence, codex_current_provider,
+    codex_thread_catalog_row,
 )
 from cc_remote.wrapper.codex_models import (
     MODEL_DEFAULT_EFFORT,
@@ -255,7 +257,7 @@ from cc_remote.wrapper.codex_models import (
     default_effort_for,
 )
 from cc_remote.wrapper.codex_rpc import (
-    CodexRpcOutcomeUnknown, CodexRpcRejected, codex_rpc,
+    CodexRpcOutcomeUnknown, CodexRpcRejected, codex_rpc, codex_rpc_batch,
 )
 from cc_remote.wrapper.engine_capabilities import (
     engine_capabilities, manage_engine_plugin, manage_engine_skill,
@@ -1450,6 +1452,8 @@ class WrapperMachine:
     CODEX_PUBLISHED_STEER_IDS = 512
     CODEX_THREAD_STARTED_HINTS = 1024
     CODEX_THREAD_STARTED_HINT_TTL_SECONDS = 30.0
+    CODEX_EXACT_CATALOG_RPC_TIMEOUT_SECONDS = 10.0
+    CODEX_EXACT_CATALOG_RPC_BATCH_IDS = 128
     NOTIFICATION_TITLE_CAP = 512
     NOTIFICATION_TITLE_LENGTH = 120
     PREVIEW_WRITE_TOOLS = frozenset({
@@ -6680,6 +6684,7 @@ class WrapperMachine:
             and self._session_plans is not None
             and msg.sid
             and msg.turn_id
+            and msg._codex_authoritative_terminal
             and msg.result.subtype != "steered"
         ):
             terminal_status = (
@@ -19060,6 +19065,75 @@ class WrapperMachine:
             )
         return candidates
 
+    async def _codex_exact_catalog_rpc_rows(
+        self,
+        profile: CodexProfile,
+        native_session_ids: list[str],
+    ) -> list[dict]:
+        """Resolve uncertain exact rows through one account-scoped app-server.
+
+        This is a compatibility fallback for state DB schemas which cannot
+        prove provider ownership. It is intentionally exact-id-only and bounded
+        by both the SQLite candidate cap and a small per-process request batch.
+        The batches share one deadline so a broken app-server cannot multiply
+        the sidebar delay.
+        """
+        bounded_ids = native_session_ids[:CODEX_EXACT_CATALOG_MAX_IDS]
+        if not bounded_ids:
+            return []
+        home = self._codex_home(profile)
+        deadline = (
+            asyncio.get_running_loop().time()
+            + self.CODEX_EXACT_CATALOG_RPC_TIMEOUT_SECONDS
+        )
+        results: list[object] = []
+        for offset in range(
+            0, len(bounded_ids), self.CODEX_EXACT_CATALOG_RPC_BATCH_IDS,
+        ):
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                break
+            chunk_ids = bounded_ids[
+                offset:offset + self.CODEX_EXACT_CATALOG_RPC_BATCH_IDS]
+            requests = [(
+                "thread/read",
+                {"threadId": native_sid, "includeTurns": False},
+            ) for native_sid in chunk_ids]
+            try:
+                chunk = (
+                    await codex_rpc_batch(requests, timeout=remaining)
+                    if home is None
+                    else await codex_rpc_batch(
+                        requests, timeout=remaining, codex_home=home)
+                )
+            except Exception as exc:
+                log.warning(
+                    "Codex exact catalog RPC repair unavailable",
+                    profile_id=profile.id,
+                    error_type=type(exc).__name__,
+                )
+                break
+            results.extend(chunk)
+
+        provider = await asyncio.to_thread(
+            codex_current_provider,
+            **({} if home is None else {"codex_home": home}),
+        )
+        provider = provider.strip()
+        rows: list[dict] = []
+        for native_sid, result in zip(bounded_ids, results):
+            if isinstance(result, Exception) or not isinstance(result, dict):
+                continue
+            thread = result.get("thread")
+            if not isinstance(thread, dict) or thread.get("id") != native_sid:
+                continue
+            if provider and thread.get("modelProvider") != provider:
+                continue
+            row = codex_thread_catalog_row(thread)
+            if row is not None:
+                rows.append(row)
+        return rows
+
     def _bounded_codex_profile_catalog(
         self, candidates: list[dict],
     ) -> list[dict]:
@@ -19230,38 +19304,39 @@ class WrapperMachine:
                 )
                 if exact_rows is None:
                     log.warning(
-                        "Codex exact catalog repair unavailable",
+                        "Codex exact SQLite catalog repair uncertain",
                         profile_id=profile.id,
                     )
-                else:
-                    for row in exact_rows:
-                        native_sid = row.get("session_id")
-                        if not isinstance(native_sid, str):
-                            continue
-                        try:
-                            wire_sid = self._codex_wire_sid(
-                                profile, native_sid)
-                        except ValueError:
-                            continue
-                        item = dict(row)
-                        item.update({
-                            "session_id": wire_sid,
-                            "native_session_id": native_sid,
-                            "codex_profile_id": profile.id,
-                            "codex_profile_label": profile.label,
-                        })
-                        candidate_info = profile_candidates.get(native_sid, {})
-                        priority = int(candidate_info.get("priority") or 0)
-                        if priority:
-                            item[_CODEX_CATALOG_PRIORITY] = priority
-                        parent_wire = candidate_info.get("forked_from_id")
-                        if isinstance(parent_wire, str):
-                            item["forked_from_id"] = parent_wire
-                            if not item.get("summary") and not item.get(
-                                "first_prompt"
-                            ):
-                                item["summary"] = "派生会话"
-                        normalized.append(item)
+                    exact_rows = await self._codex_exact_catalog_rpc_rows(
+                        profile, missing_native_ids)
+                for row in exact_rows:
+                    native_sid = row.get("session_id")
+                    if not isinstance(native_sid, str):
+                        continue
+                    try:
+                        wire_sid = self._codex_wire_sid(
+                            profile, native_sid)
+                    except ValueError:
+                        continue
+                    item = dict(row)
+                    item.update({
+                        "session_id": wire_sid,
+                        "native_session_id": native_sid,
+                        "codex_profile_id": profile.id,
+                        "codex_profile_label": profile.label,
+                    })
+                    candidate_info = profile_candidates.get(native_sid, {})
+                    priority = int(candidate_info.get("priority") or 0)
+                    if priority:
+                        item[_CODEX_CATALOG_PRIORITY] = priority
+                    parent_wire = candidate_info.get("forked_from_id")
+                    if isinstance(parent_wire, str):
+                        item["forked_from_id"] = parent_wire
+                        if not item.get("summary") and not item.get(
+                            "first_prompt"
+                        ):
+                            item["summary"] = "派生会话"
+                    normalized.append(item)
 
             materialized_native_ids = {
                 row.get("native_session_id")

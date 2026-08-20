@@ -1577,11 +1577,13 @@ def test_codex_next_user_boundary_retires_only_settled_plan_snapshot():
             msg_id="turn-4", turn_id="turn-3", prompt="clarification"))
         assert machine._session_plans.get("plan-lifecycle") is not None
 
-        await machine._emit_locked(ctx, TurnEnd(
+        authoritative_terminal = TurnEnd(
             turn_id="turn-3",
             result=TurnResult(
                 subtype="success", duration_ms=1000, is_error=False),
-        ))
+        )
+        authoritative_terminal._codex_authoritative_terminal = True
+        await machine._emit_locked(ctx, authoritative_terminal)
         terminal = machine._session_plans.get("plan-lifecycle")
         assert terminal is not None
         assert terminal.terminal_status == "succeeded"
@@ -1599,6 +1601,50 @@ def test_codex_next_user_boundary_retires_only_settled_plan_snapshot():
         await machine._emit_locked(ctx, TurnSteered(
             msg_id="steer-1", turn_id="turn-5", prompt="next request"))
         assert machine._session_plans.get("plan-lifecycle") is None
+
+    asyncio.run(run())
+
+
+def test_codex_synthetic_terminal_cannot_poison_durable_plan_status():
+    async def run():
+        machine, _transport = _mk_machine()
+        ctx = _mk_ctx("plan-terminal-authority", "plan-terminal-authority")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+
+        await machine._emit_locked(ctx, TurnPlan(
+            item_id="plan:native-turn",
+            turn_id="native-turn",
+            explanation="still working",
+            plan=[
+                {"step": "inspect", "status": "completed"},
+                {"step": "finish", "status": "inProgress"},
+            ],
+        ))
+
+        synthetic = TurnEnd(
+            turn_id="native-turn",
+            result=TurnResult(
+                subtype="error", duration_ms=0, is_error=True),
+        )
+        assert synthetic._codex_authoritative_terminal is False
+        await machine._emit_locked(ctx, synthetic)
+        after_synthetic = machine._session_plans.get(
+            "plan-terminal-authority")
+        assert after_synthetic is not None
+        assert after_synthetic.terminal_status is None
+
+        authoritative = TurnEnd(
+            turn_id="native-turn",
+            result=TurnResult(
+                subtype="success", duration_ms=1000, is_error=False),
+        )
+        authoritative._codex_authoritative_terminal = True
+        await machine._emit_locked(ctx, authoritative)
+        after_authoritative = machine._session_plans.get(
+            "plan-terminal-authority")
+        assert after_authoritative is not None
+        assert after_authoritative.terminal_status == "succeeded"
 
     asyncio.run(run())
 

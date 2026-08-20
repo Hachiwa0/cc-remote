@@ -113,6 +113,29 @@ def test_work_cold_resume_recovers_context_until_live_notification(monkeypatch):
     assert len(recovered_calls) == 1
 
 
+def test_code_cold_resume_recovers_profile_scoped_context(monkeypatch):
+    recovered_calls = []
+
+    def recover(session_id, *, codex_home=None):
+        recovered_calls.append((session_id, codex_home))
+        return {
+            "last": {"totalTokens": 88_765},
+            "modelContextWindow": 258_400,
+        }
+
+    monkeypatch.setattr(
+        codex_handle_module, "recover_codex_context_usage", recover)
+    handle = CodexHandle(_Cfg(), codex_home="/tmp/code-profile")
+    handle.thread_id = "code-native-session"
+
+    usage = asyncio.run(handle.get_context_usage())
+
+    assert usage["used_tokens"] == 88_765
+    assert usage["context_window"] == 258_400
+    assert recovered_calls == [(
+        "code-native-session", os.path.realpath("/tmp/code-profile"))]
+
+
 def test_work_context_recovery_discards_old_thread_race(monkeypatch):
     async def run():
         started = asyncio.Event()

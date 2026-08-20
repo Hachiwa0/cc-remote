@@ -11,6 +11,10 @@ export interface ChatDialogGeometry {
   maxHeight: number;
 }
 
+export interface AnchoredPopoverGeometry extends ChatDialogGeometry {
+  placement: "above" | "below";
+}
+
 interface DialogGeometryOptions {
   open: boolean;
   maxWidth: number;
@@ -27,6 +31,7 @@ interface AnchoredPopoverGeometryOptions {
   maxHeight: number;
   gap?: number;
   gutter?: number;
+  minimumHeight?: number;
 }
 
 interface Bounds {
@@ -151,6 +156,14 @@ function sameGeometry(
     && Math.abs(first.maxHeight - second.maxHeight) < 0.25;
 }
 
+function sameAnchoredGeometry(
+  first: AnchoredPopoverGeometry | null,
+  second: AnchoredPopoverGeometry,
+): boolean {
+  return sameGeometry(first, second)
+    && first?.placement === second.placement;
+}
+
 function clamp(value: number, minimum: number, maximum: number): number {
   return Math.min(Math.max(value, minimum), maximum);
 }
@@ -227,7 +240,7 @@ export function useChatDialogGeometry({
   return open ? geometry : null;
 }
 
-/** Place a floating card immediately above its trigger without leaving view. */
+/** Place a floating card beside its trigger without leaving the chat view. */
 export function useAnchoredPopoverGeometry({
   open,
   anchorRef,
@@ -235,8 +248,9 @@ export function useAnchoredPopoverGeometry({
   maxHeight,
   gap = 8,
   gutter = 16,
-}: AnchoredPopoverGeometryOptions): ChatDialogGeometry | null {
-  const [geometry, setGeometry] = useState<ChatDialogGeometry | null>(null);
+  minimumHeight = 64,
+}: AnchoredPopoverGeometryOptions): AnchoredPopoverGeometry | null {
+  const [geometry, setGeometry] = useState<AnchoredPopoverGeometry | null>(null);
 
   useLayoutEffect(() => {
     if (!open) {
@@ -277,18 +291,38 @@ export function useAnchoredPopoverGeometry({
       const left = minimumCenter <= maximumCenter
         ? clamp(anchorCenter, minimumCenter, maximumCenter)
         : (bounds.left + bounds.right) / 2;
-      const top = anchorBounds.top - gap;
-      const safeTop = bounds.top + Math.min(
+      const verticalGutter = Math.min(
         gutter,
-        Math.max(0, bounds.bottom - bounds.top - 1),
+        Math.max(0, (bounds.bottom - bounds.top - 1) / 2),
       );
+      const safeTop = bounds.top + verticalGutter;
+      const safeBottom = bounds.bottom - verticalGutter;
+      const aboveTop = anchorBounds.top - gap;
+      const belowTop = anchorBounds.bottom + gap;
+      const aboveHeight = Math.max(0, aboveTop - safeTop);
+      const belowHeight = Math.max(0, safeBottom - belowTop);
+      const usableHeight = Math.min(
+        maxHeight,
+        Math.max(1, minimumHeight),
+      );
+      // Preserve the preferred above-anchor layout whenever it has enough room
+      // for a useful card. Near the top edge, flip below instead of collapsing
+      // a fully populated Plan to a one-pixel scrolling viewport.
+      const placement = aboveHeight >= usableHeight || aboveHeight >= belowHeight
+        ? "above" as const
+        : "below" as const;
+      const top = placement === "above" ? aboveTop : belowTop;
+      const availableHeight = placement === "above"
+        ? aboveHeight : belowHeight;
       const next = {
         left,
         top,
         width,
-        maxHeight: Math.min(maxHeight, Math.max(1, top - safeTop)),
+        maxHeight: Math.min(maxHeight, Math.max(1, availableHeight)),
+        placement,
       };
-      setGeometry((current) => sameGeometry(current, next) ? current : next);
+      setGeometry((current) => sameAnchoredGeometry(current, next)
+        ? current : next);
     };
     function schedule() {
       if (frame !== null) window.cancelAnimationFrame(frame);
@@ -312,7 +346,7 @@ export function useAnchoredPopoverGeometry({
       document.removeEventListener("scroll", schedule, true);
       resizeObserver?.disconnect();
     };
-  }, [anchorRef, gap, gutter, maxHeight, maxWidth, open]);
+  }, [anchorRef, gap, gutter, maxHeight, maxWidth, minimumHeight, open]);
 
   return open ? geometry : null;
 }

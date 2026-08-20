@@ -150,10 +150,11 @@ assert.deepEqual(
   ]),
   [
     ["shared-display", "canonical-older", "older legitimate row"],
+    ["compaction-orphan", undefined, ""],
     ["shared-display", "canonical-newer", "newer legitimate row"],
     ["compaction-owner", undefined, "canonical compaction owner"],
   ],
-  "cross-page compaction repair preserves rows which share only a display id",
+  "cross-page reconciliation preserves display collisions and distinct compactions",
 );
 assert.deepEqual(nextAutoLoadDetailTurn([
   turn("complete", {

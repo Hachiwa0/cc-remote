@@ -4772,7 +4772,7 @@ class CodexHandle:
         # recent turn's full token count ≈ current context depth (what the codex TUI
         # gauges); `total` is the cumulative session sum (over-counts context). Use
         # `last` for the "context full?" reading, falling back to `total`.
-        if (self.work_mode and self.thread_id and self.last_token_usage is None
+        if (self.thread_id and self.last_token_usage is None
                 and not self._rollout_context_recovery_attempted):
             recovery_thread_id = self.thread_id
             recovery_generation = self._generation

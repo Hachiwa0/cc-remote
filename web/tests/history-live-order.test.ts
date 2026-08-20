@@ -10,6 +10,8 @@ import {
   restoreObservedLiveTurnDetails,
 } from "../src/history-merge.ts";
 import type { Block, Turn } from "../src/reducer.ts";
+import { reconcileProvenCompactionOrphans } from
+  "../src/compaction-orphans.ts";
 
 const blockIdentity = (block: Block): string => block.kind === "text"
   ? block.message_id
@@ -34,6 +36,65 @@ assert.equal(
   "succeeded",
   "a stale cached child cannot restart the working spark after refresh",
 );
+
+const cachedNeutralSteerPlan = restoreCachedTurnDetails([{
+  id: "cached-neutral-steer", prompt: "continue", done: true,
+  detailEventCount: 1, detailLoaded: false, blocks: [],
+}], [{
+  id: "cached-neutral-steer", prompt: "continue", done: true,
+  blocks: [{
+    kind: "process", item_id: "cached-neutral-plan",
+    processKind: "plan", phase: "update", status: "running",
+    title: "计划", plan: [
+      { step: "inspect", status: "completed" },
+      { step: "finish", status: "inProgress" },
+    ], done: false,
+  }],
+}])[0];
+const restoredNeutralPlan = cachedNeutralSteerPlan.detailProjection
+  ?.blocks[0];
+assert.equal(restoredNeutralPlan?.done, false,
+  "IndexedDB reconciliation preserves a neutral-steer Plan until an exact terminal");
+assert.equal(
+  restoredNeutralPlan?.kind === "process" ? restoredNeutralPlan.status : null,
+  "running",
+  "cache paint cannot fabricate a terminal Plan status",
+);
+
+const compactionNativeId = "repeated-compaction-native-turn";
+const compaction = (item_id: string): Block => ({
+  kind: "process", item_id, processKind: "compaction", phase: "end",
+  status: "succeeded", turn_id: compactionNativeId,
+  title: "压缩上下文", done: true,
+});
+const compactionOwner: Turn = {
+  id: "source-compaction-owner", forkPointId: compactionNativeId,
+  prompt: "long task", done: true,
+  blocks: [compaction("source-occurrence")],
+};
+const compactionOrphan = (
+  id: string, itemIds: string[],
+): Turn => ({
+  id, prompt: "", done: true,
+  blocks: itemIds.map(compaction),
+});
+assert.equal(reconcileProvenCompactionOrphans([
+  compactionOwner,
+  compactionOrphan("different-occurrence-row", ["different-occurrence"]),
+]).length, 2,
+"the same native task cannot prove two compactions are the same occurrence");
+assert.equal(reconcileProvenCompactionOrphans([
+  compactionOwner,
+  compactionOrphan("exact-occurrence-row", ["source-occurrence"]),
+]).length, 1,
+"an exact compaction item duplicate remains safely removable");
+assert.equal(reconcileProvenCompactionOrphans([
+  compactionOwner,
+  compactionOrphan("partially-matched-row", [
+    "source-occurrence", "bounded-out-occurrence",
+  ]),
+]).length, 2,
+"one item omitted by a bounded summary preserves the complete orphan row");
 
 const staleObservedTurn: Turn = {
   id: "completed-cli-observed", prompt: "inspect", done: true,

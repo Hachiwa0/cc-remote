@@ -17,6 +17,17 @@ export interface GoalEventOwnership {
   space: "code" | "work";
 }
 
+/** Drop both halves of legacy Goal-dismiss migration tracking as one action.
+ * A reconnect replays the old reliable command before requesting fresh Goal
+ * state; the fresh state must be free to enqueue a new idempotent migration. */
+export function resetGoalDismissMigrationTracking(
+  migrations: Set<string>,
+  migrationByRequest: Map<string, string>,
+): void {
+  migrations.clear();
+  migrationByRequest.clear();
+}
+
 export function goalUiScopeKey(
   machineId: string,
   space: "code" | "work",

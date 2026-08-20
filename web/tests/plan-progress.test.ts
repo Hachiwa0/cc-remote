@@ -132,6 +132,102 @@ try {
   );
   assert.equal(reducerPlan?.done, false,
     "a live neutral steer boundary must not settle the Plan block");
+
+  const detailSid = "expanded-neutral-steer-plan";
+  let detailState = {
+    ...initialState,
+    focusedSid: detailSid,
+    runtimes: {
+      [detailSid]: {
+        ...createRuntime(),
+        historyRevision: "expanded-plan-revision",
+        historyGeneration: "expanded-plan-generation",
+        turns: [{
+          id: "expanded-plan-turn", prompt: "execute", done: true,
+          detailEventCount: 2, detailLoaded: true,
+          blocks: [],
+          detailProjection: {
+            segments: [], capped: false, hasMore: false,
+            oldestCursor: null, hasNewer: false, newerCursor: null,
+            blocks: [{ ...activePlanBlock, item_id: "expanded-plan" }, {
+              kind: "process", item_id: "expanded-command",
+              processKind: "command", phase: "start", status: "running",
+              title: "command", done: false,
+            }],
+          },
+        }],
+      },
+    },
+  };
+  detailState = reduce(detailState, { type: "event", event: event({
+    type: "history", sid: detailSid, session_id: detailSid,
+    revision: "expanded-plan-revision",
+    generation: "expanded-plan-generation", build_seq: 1,
+    detail: "summary", in_progress: true, has_more: false, events: [],
+    turns: [{
+      id: "expanded-plan-turn", prompt: "execute", done: true,
+      detailEventCount: 2, detailLoaded: false, blocks: [],
+    }],
+  }) });
+  const reconciledDetail = detailState.runtimes[detailSid].turns[0]
+    .detailProjection?.blocks ?? [];
+  const reconciledPlan = reconciledDetail.find((block: ProcessBlock) =>
+    block.kind === "process" && block.processKind === "plan");
+  const reconciledCommand = reconciledDetail.find((block: ProcessBlock) =>
+    block.kind === "process" && block.processKind === "command");
+  assert.equal(reconciledPlan?.done, false,
+    "summary refresh preserves an expanded neutral-steer Plan");
+  assert.equal(reconciledCommand?.done, true,
+    "summary refresh still settles ordinary expanded-detail children");
+
+  let idleDetailState = {
+    ...initialState,
+    focusedSid: detailSid,
+    runtimes: {
+      [detailSid]: {
+        ...createRuntime(),
+        historyRevision: "expanded-plan-revision",
+        historyGeneration: "expanded-plan-generation",
+        turns: [{
+          id: "expanded-plan-turn", prompt: "execute", done: true,
+          detailEventCount: 1, detailLoaded: true,
+          blocks: [],
+          detailProjection: {
+            segments: [], capped: false, hasMore: false,
+            oldestCursor: null, hasNewer: false, newerCursor: null,
+            blocks: [{ ...activePlanBlock, item_id: "idle-expanded-plan" }],
+          },
+        }],
+      },
+    },
+  };
+  idleDetailState = reduce(idleDetailState, {
+    type: "event", event: event({
+      type: "history", sid: detailSid, session_id: detailSid,
+      revision: "expanded-plan-revision",
+      generation: "expanded-plan-generation", build_seq: 1,
+      detail: "summary", in_progress: false, has_more: false, events: [],
+      turns: [{
+        id: "expanded-plan-turn", prompt: "execute", done: true,
+        detailEventCount: 1, detailLoaded: false, blocks: [],
+      }],
+    }),
+  });
+  const idleTurn = idleDetailState.runtimes[detailSid].turns[0];
+  const idlePlan = idleTurn.detailProjection?.blocks.find(
+    (block: ProcessBlock) => block.kind === "process"
+      && block.processKind === "plan",
+  );
+  assert.equal(idlePlan?.done, true,
+    "an authoritative idle History settles an old cached Plan");
+  assert.equal(
+    latestPlanProgress([idleTurn, {
+      id: "after-idle-plan", prompt: "next task", done: true, blocks: [],
+    }]),
+    null,
+    "a settled stale Plan retires at the next user boundary",
+  );
+
   reducerState = reduce(reducerState, { type: "event", event: event({
     type: "turn_end",
     sid: reducerSid,

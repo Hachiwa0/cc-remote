@@ -92,11 +92,13 @@ export function PlanProgressFloatingCard({ anchorRef, block, open,
   }, [anchorRef, onOpenChange, open]);
 
   if (!open || !position) return null;
+  const { placement, ...style } = position;
   return createPortal(
     <section ref={cardRef} id={id}
-      className={`plan-progress-popover${compact ? " compact" : ""}`}
+      className={`plan-progress-popover place-${placement}${compact ? " compact" : ""}`}
+      data-placement={placement}
       role="dialog" aria-modal="false" aria-label="计划进度"
-      style={position}>
+      style={style}>
       <PlanProgressContent block={block} detailLoading={detailLoading} />
     </section>,
     document.body,

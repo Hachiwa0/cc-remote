@@ -482,7 +482,8 @@ function cloneSettledCachedDetailBlock(block: Block, summary: Turn): Block {
   const cloned = cloneDetailBlock(block);
   if (cloned.kind === "text") {
     cloned.done = true;
-  } else if (cloned.kind === "process" && !cloned.done) {
+  } else if (cloned.kind === "process" && !cloned.done
+      && cloned.processKind !== "plan") {
     cloned.done = true;
     if (!cloned.status || cloned.status === "running") {
       cloned.status = summary.interrupted

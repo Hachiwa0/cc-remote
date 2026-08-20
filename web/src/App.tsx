@@ -65,6 +65,7 @@ import {
   reconcileGoalUiPreference,
   rekeyGoalUiPreference,
   rememberGoalUi,
+  resetGoalDismissMigrationTracking,
   writeGoalUiPreferences,
   type GoalUiPreferences,
 } from "./scoped-goal-ui";
@@ -645,8 +646,10 @@ export default function App() {
     setQueuedQueryEditor(null);
     btwDraftsRef.current.clear();
     setCompletionReceipts({});
-    goalDismissMigrationsRef.current.clear();
-    goalDismissMigrationByRequestRef.current.clear();
+    resetGoalDismissMigrationTracking(
+      goalDismissMigrationsRef.current,
+      goalDismissMigrationByRequestRef.current,
+    );
     planProgressCacheRef.current.reset();
     sessionListsBySurfaceRef.current = {};
     historySessionListsRef.current = {};
@@ -2913,7 +2916,15 @@ export default function App() {
           if (s === "connected") {
             goalRecoveryRequestsRef.current.clear();
             goalRequestScopeByIdRef.current.clear();
-            goalDismissMigrationByRequestRef.current.clear();
+            // Recovery preamble replay happens before this callback. Forget
+            // both halves of the old-socket correlation together, then let
+            // the focused Goal's fresh GetGoal response deliberately enqueue
+            // a new idempotent migration. Keeping only the in-flight key would
+            // suppress that retry forever when the replay returns an Error.
+            resetGoalDismissMigrationTracking(
+              goalDismissMigrationsRef.current,
+              goalDismissMigrationByRequestRef.current,
+            );
             recoverableReads.clear();
             settleCancelledHistoryBrowse(
               historyRequestsRef.current.beginConnection());

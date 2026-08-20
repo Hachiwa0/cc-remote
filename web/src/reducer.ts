@@ -1462,14 +1462,15 @@ function finishOpenBlocks(
 }
 
 /** Settle stale children only at a projection boundary with no active task. */
-function finishCompletedTurnChildren(turn: Turn): void {
+function finishCompletedTurnChildren(
+  turn: Turn,
+  preserveOpenPlans = false,
+): void {
   if (!turn.done) return;
   const status = turn.interrupted
     ? "interrupted" : turn.error ? "failed" : "succeeded";
-  // A summary/cache row can be a neutral Codex steer segment. Its open Plan
-  // deliberately spans the following user clarification; only an exact live
-  // terminal or lifecycle fence may settle that Plan.
-  finishOpenBlocks(turn, status, status !== "succeeded", true);
+  finishOpenBlocks(
+    turn, status, status !== "succeeded", preserveOpenPlans);
 }
 
 /** Close only one newly-installed detail projection. A completed turn may have
@@ -2724,7 +2725,10 @@ export function reduce(state: AppState, action: Action): AppState {
           if (control) applySessionControl(rt, control);
           if (action.turns.length) {
             replaceWithBoundedTurns(rt, cloneTurns(action.turns).map((turn) => (
-              finishCompletedTurnChildren(turn),
+              // Cache paint has no current lifecycle authority. Keep a Plan
+              // provisionally open until the first accepted History page says
+              // whether the enclosing native task is still running.
+              finishCompletedTurnChildren(turn, true),
               !turn.forkPointId && turn.codexTurnId
                 ? { ...turn, forkPointId: turn.codexTurnId }
                 : turn
@@ -3634,6 +3638,9 @@ function reduceEvent(
       }
       const racedLiveEvent = !e.before && e.live_seq != null
         && base.lastLiveSeq > e.live_seq;
+      const preserveProjectionOpenPlans = racedLiveEvent
+        || e.in_progress === true
+        || (e.in_progress == null && base.state !== "idle");
       const settledHistory = !e.before && !racedLiveEvent
         && e.in_progress === false;
       const settledCodexHistory = settledHistory && state.sessions.some(
@@ -3699,8 +3706,7 @@ function reduceEvent(
           // contain ResultMessage. A newer live event always wins; otherwise an
           // explicit in_progress value is authoritative, and only an older
           // wrapper without that field falls back to the local runtime state.
-          preserveLiveTailOpen: racedLiveEvent || e.in_progress === true
-            || (e.in_progress == null && base.state !== "idle"),
+          preserveLiveTailOpen: preserveProjectionOpenPlans,
           // Codex app-server History reports the native turn's persisted
           // completed/failed status. Once an idle, unraced page arrives it
           // repairs a provisional live terminal (notably after compaction)
@@ -3752,11 +3758,12 @@ function reduceEvent(
             .find((candidate): candidate is Turn => !!candidate);
           if (!detail) return turn;
           const merged = mergeAuthoritativeTurnDetail(turn, detail);
-          if (turn.done) {
-            const status = turn.interrupted
-              ? "interrupted" : turn.error ? "failed" : "succeeded";
-            finishOpenBlocks(merged, status, status !== "succeeded");
-          }
+          // A completed row may be the neutral-steer segment whose Plan spans
+          // the following clarification, but only a current running History
+          // (or a newer live frame which raced this page) may keep it open. An
+          // exact idle page must settle stale cache/detail Plan state too.
+          finishCompletedTurnChildren(
+            merged, preserveProjectionOpenPlans);
           return merged;
         });
         const cachedScopeMatches = e.generation != null
@@ -3876,7 +3883,7 @@ function reduceEvent(
         // process projections. Preserve every payload/disclosure, but never let
         // an old item/started replay animate the session again.
         turns = cloneTurns(turns);
-        turns.forEach(finishCompletedTurnChildren);
+        turns.forEach((turn) => finishCompletedTurnChildren(turn));
       }
       turns = turns.map(withLimitedTurnBlocks);
       const boundedTurns = boundRuntimeTurns(turns);
@@ -4481,7 +4488,7 @@ function reduceEvent(
             // A direct idle frame is the exact shared-daemon boundary between
             // native tasks. Close only stale display children of already-done
             // turns; a later real background event can still reopen its item.
-            turns.forEach(finishCompletedTurnChildren);
+            turns.forEach((turn) => finishCompletedTurnChildren(turn));
           }
         }
         rt.turns = turns;

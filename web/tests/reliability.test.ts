@@ -2248,21 +2248,16 @@ const completedCachedOrphan: Turn = {
     summary: "stale cached summary",
   }],
 };
-const completedCachedMultiCompactionOrphan: Turn = {
-  ...completedCachedOrphan,
-  id: "completed-cached-multi-compaction-orphan",
-  blocks: [
-    ...completedCachedOrphan.blocks,
-    { ...orphanCompactionBlock, item_id: "second-stale-cached-compaction",
-      summary: "second stale cached summary" },
-  ],
-};
 const canonicalOrphanRepaired = reconcileProvenCompactionOrphans([
   canonicalCompactionOwner,
-  completedCachedMultiCompactionOrphan,
+  {
+    ...completedCachedOrphan,
+    blocks: [{ ...orphanCompactionBlock,
+      item_id: "canonical-compaction" }],
+  },
 ]);
 assert.equal(canonicalOrphanRepaired.length, 1,
-  "canonical History repairs a completed cache orphan after the binding left replay");
+  "canonical History removes an exact completed cache occurrence duplicate");
 assert.deepEqual({
   doneTs: canonicalOrphanRepaired[0].doneTs,
   durationMs: canonicalOrphanRepaired[0].durationMs,
@@ -7979,8 +7974,8 @@ try {
     }),
   });
   assert.deepEqual(cachedCompactionState.runtimes[cachedCompactionSid].turns.map(
-    (turn: Turn) => turn.id), ["cached-history-owner"],
-  "the real first-page reducer repairs a completed IndexedDB compact orphan");
+    (turn: Turn) => turn.id), ["cached-history-owner", "cached-history-orphan"],
+  "the first-page reducer preserves a different bounded-out compaction occurrence");
   assert.equal(cachedCompactionState.runtimes[cachedCompactionSid].hasMore, true,
     "cache self-heal preserves authoritative moving-head pagination");
   assert.equal(cachedCompactionState.runtimes[cachedCompactionSid].oldestId,
@@ -8003,8 +7998,8 @@ try {
       turns: [cachedCompactionOwner],
     }),
   });
-  assert.equal(cachedCompactionState.runtimes[cachedCompactionSid].turns.length, 1,
-    "repeated first-page History remains idempotent after cache self-heal");
+  assert.equal(cachedCompactionState.runtimes[cachedCompactionSid].turns.length, 2,
+    "repeated first-page History keeps the unmatched occurrence stable");
 
   const orphanRaceProcess = (sid: string, nativeTurnId: string) => event({
     type: "process", sid, item_id: `${sid}-compaction`,
@@ -8508,9 +8503,9 @@ try {
 
   const testCrossPageCompactionRepair = () => {
   // A polluted completed projection can span the byte boundary between the
-  // newest page and one older page. The canonical owner in one segment proves
-  // exactly one compact-only orphan in the other segment, while page keys and
-  // cursors must remain usable after the visible row is absorbed.
+  // newest page and one older page. A shared native task does not prove that
+  // the compact-only row is the same occurrence, so preserve both rows while
+  // keeping page keys and cursors usable.
   const compactBrowseSid = "compact-orphan-across-browse-pages";
   const compactBrowseNative = "compact-browse-native";
   const compactBrowseOwner: Turn = {
@@ -8566,11 +8561,13 @@ try {
     },
   });
   assert.deepEqual(compactBrowse.historyBrowse?.turns.map(
-    (turn: Turn) => turn.id), ["compact-browse-owner"],
-  "older-page materialization repairs a proven cross-page compact orphan");
+    (turn: Turn) => turn.id), [
+      "compact-browse-orphan", "compact-browse-owner",
+    ],
+  "older-page materialization preserves a distinct compaction occurrence");
   assert.deepEqual(compactBrowse.historyBrowse?.loadedPageKeys,
     ["compact-browse-older", "compact-browse-head"],
-  "absorbing the only row does not erase page-link authority");
+  "preserving the row does not erase page-link authority");
   assert.equal(compactBrowse.historyBrowse?.hasOlder, false);
   assert.equal(compactBrowse.historyBrowse?.olderCursor,
     "compact-browse-floor");

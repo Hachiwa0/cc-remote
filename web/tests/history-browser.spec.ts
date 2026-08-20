@@ -3128,6 +3128,56 @@ test("plan progress uses a compact popover that closes outside", async ({
   await expect(popover).toHaveCount(0);
 });
 
+test("historical Plan flips below a trigger near the top edge", async ({
+  page,
+}) => {
+  await page.goto("/tests/history-browser.html?timeline=1");
+  const thread = page.locator(".thread");
+  await thread.evaluate((node) => {
+    node.scrollTop = 0;
+    node.dispatchEvent(new Event("scroll"));
+  });
+  const trigger = page.locator('[data-turn-id="timeline"]')
+    .getByRole("button", { name: /查看计划进度/ });
+  await expect(trigger).toBeVisible();
+  const [initialThreadBox, initialAnchorBox] = await Promise.all([
+    thread.boundingBox(),
+    trigger.boundingBox(),
+  ]);
+  if (!initialThreadBox || !initialAnchorBox) {
+    throw new Error("historical Plan has no initial geometry");
+  }
+  await thread.evaluate((node, delta) => {
+    node.scrollTop += delta;
+    node.dispatchEvent(new Event("scroll"));
+  }, initialAnchorBox.y - (initialThreadBox.y + 20));
+  await expect.poll(async () => {
+    const [threadBox, anchorBox] = await Promise.all([
+      thread.boundingBox(),
+      trigger.boundingBox(),
+    ]);
+    return threadBox && anchorBox ? anchorBox.y - threadBox.y : null;
+  }).toBeLessThan(24);
+
+  await trigger.click();
+  const popover = page.getByRole("dialog", { name: "计划进度" });
+  await expect(popover).toBeVisible();
+  await expect(popover).toHaveAttribute("data-placement", "below");
+  const [threadBox, anchorBox, popoverBox] = await Promise.all([
+    thread.boundingBox(),
+    trigger.boundingBox(),
+    popover.boundingBox(),
+  ]);
+  if (!threadBox || !anchorBox || !popoverBox) {
+    throw new Error("near-top Plan has no geometry");
+  }
+  expect(Math.abs(popoverBox.y - (anchorBox.y + anchorBox.height + 8)))
+    .toBeLessThan(2);
+  expect(popoverBox.height).toBeGreaterThan(64);
+  expect(popoverBox.y + popoverBox.height)
+    .toBeLessThanOrEqual(threadBox.y + threadBox.height - 15);
+});
+
 test("a long active turn keeps its plan beside the composer", async ({ page }) => {
   await page.goto("/tests/history-browser.html?persistent-plan=1");
   const thread = page.locator(".thread");

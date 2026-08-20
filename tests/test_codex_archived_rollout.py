@@ -142,3 +142,22 @@ def test_exact_catalog_rows_bound_optional_text_on_minimal_schema(tmp_path):
     assert rows[0]["session_id"] == "bounded-preview"
     assert rows[0]["first_prompt"] == "x" * 2000
     assert rows[0]["cwd"] is None
+
+
+def test_exact_catalog_old_schema_with_provider_preserves_uncertainty(tmp_path):
+    home = tmp_path / ".codex"
+    home.mkdir()
+    (home / "config.toml").write_text(
+        'model_provider = "openai"\n', encoding="utf-8")
+    db = home / "state_5.sqlite"
+    with sqlite3.connect(db) as connection:
+        connection.execute(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, preview TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO threads(id, preview) VALUES (?, ?)",
+            ("old-schema-child", "hidden fork"),
+        )
+
+    assert codex_sessions.codex_exact_catalog_rows(
+        ["old-schema-child"], codex_home=home) is None

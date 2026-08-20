@@ -44,7 +44,7 @@ _LIST_MAX_PER_ARCHIVE_STATE = 200
 _LIST_MAX_PAGES = 20
 _THREAD_STATUSES = frozenset({"notLoaded", "idle", "systemError", "active"})
 _STATE_DB = re.compile(r"^state_(\d+)\.sqlite$")
-_EXACT_CATALOG_MAX_IDS = 512
+CODEX_EXACT_CATALOG_MAX_IDS = 512
 _EXACT_CATALOG_COLUMNS = (
     "id",
     "cwd",
@@ -199,6 +199,17 @@ def _normalize_thread(thread: Any, *, archived: bool) -> Optional[dict[str, Any]
     }
 
 
+def codex_thread_catalog_row(thread: Any) -> Optional[dict[str, Any]]:
+    """Normalize one profile-scoped ``thread/read`` result for the sidebar.
+
+    The caller is responsible for selecting the matching ``CODEX_HOME`` before
+    obtaining ``thread``. This helper deliberately performs no cross-account
+    lookup and accepts only the same bounded fields as ``thread/list``.
+    """
+    archived = isinstance(thread, dict) and thread.get("archived") is True
+    return _normalize_thread(thread, archived=archived)
+
+
 def _bounded_text(value: Any, limit: int) -> Optional[str]:
     if not isinstance(value, str):
         return None
@@ -339,7 +350,7 @@ def codex_exact_catalog_rows(
             continue
         seen.add(value)
         unique_ids.append(value)
-        if len(unique_ids) >= _EXACT_CATALOG_MAX_IDS:
+        if len(unique_ids) >= CODEX_EXACT_CATALOG_MAX_IDS:
             break
     if not unique_ids:
         return []
@@ -360,7 +371,10 @@ def codex_exact_catalog_rows(
             if "id" not in schema:
                 return None
             if provider and "model_provider" not in schema:
-                return []
+                # Older Codex schemas predate provider ownership metadata. The
+                # id may exist, but this SQLite snapshot cannot prove it belongs
+                # to the configured provider, so absence is not authoritative.
+                return None
             projections = []
             for name in _EXACT_CATALOG_COLUMNS:
                 if name not in schema:
