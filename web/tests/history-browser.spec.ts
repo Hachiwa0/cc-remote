@@ -3130,47 +3130,62 @@ test("plan progress uses a compact popover that closes outside", async ({
 
 test("historical Plan flips below a trigger near the top edge", async ({
   page,
-}) => {
+}, testInfo) => {
   await page.goto("/tests/history-browser.html?timeline=1");
-  const thread = page.locator(".thread");
-  await thread.evaluate((node) => {
-    node.scrollTop = 0;
-    node.dispatchEvent(new Event("scroll"));
-  });
+  await scrollThreadToEdge(page, "start", testInfo.project.name);
   const trigger = page.locator('[data-turn-id="timeline"]')
     .getByRole("button", { name: /查看计划进度/ });
   await expect(trigger).toBeVisible();
-  const [initialThreadBox, initialAnchorBox] = await Promise.all([
-    thread.boundingBox(),
-    trigger.boundingBox(),
-  ]);
-  if (!initialThreadBox || !initialAnchorBox) {
-    throw new Error("historical Plan has no initial geometry");
+  if (isMobileWebKitProject(testInfo.project.name)) {
+    await dispatchTouchGesture(page, -60);
+  } else {
+    await page.locator(".thread").dispatchEvent("wheel", { deltaY: 80 });
   }
-  await thread.evaluate((node, delta) => {
-    node.scrollTop += delta;
-    node.dispatchEvent(new Event("scroll"));
-  }, initialAnchorBox.y - (initialThreadBox.y + 20));
-  await expect.poll(async () => {
-    const [threadBox, anchorBox] = await Promise.all([
-      thread.boundingBox(),
-      trigger.boundingBox(),
-    ]);
-    return threadBox && anchorBox ? anchorBox.y - threadBox.y : null;
-  }).toBeLessThan(24);
+  await trigger.evaluate((node) => {
+    const viewport = node.closest<HTMLElement>(".thread");
+    if (!viewport) throw new Error("historical Plan has no thread viewport");
+    const viewportBox = viewport.getBoundingClientRect();
+    const triggerBox = node.getBoundingClientRect();
+    viewport.scrollTop += triggerBox.y - (viewportBox.y + 20);
+  });
+  await expect.poll(() => trigger.evaluate((node) => {
+    const viewport = node.closest<HTMLElement>(".thread");
+    if (!viewport) return false;
+    const viewportBox = viewport.getBoundingClientRect();
+    const triggerBox = node.getBoundingClientRect();
+    const relativeTop = triggerBox.y - viewportBox.y;
+    const settled = relativeTop >= 16 && relativeTop < 24;
+    if (!settled) {
+      viewport.scrollTop += relativeTop - 20;
+    }
+    return settled && triggerBox.bottom <= viewportBox.bottom;
+  })).toBe(true);
 
   await trigger.click();
   const popover = page.getByRole("dialog", { name: "计划进度" });
   await expect(popover).toBeVisible();
   await expect(popover).toHaveAttribute("data-placement", "below");
-  const [threadBox, anchorBox, popoverBox] = await Promise.all([
-    thread.boundingBox(),
-    trigger.boundingBox(),
-    popover.boundingBox(),
-  ]);
-  if (!threadBox || !anchorBox || !popoverBox) {
-    throw new Error("near-top Plan has no geometry");
-  }
+  const { threadBox, anchorBox, popoverBox } = await trigger.evaluate((node) => {
+    const viewport = node.closest<HTMLElement>(".thread");
+    const dialog = document.querySelector<HTMLElement>(
+      '[role="dialog"][aria-label="计划进度"]',
+    );
+    if (!viewport || !dialog) throw new Error("near-top Plan has no geometry");
+    const bounds = (element: Element) => {
+      const box = element.getBoundingClientRect();
+      return {
+        x: box.x,
+        y: box.y,
+        width: box.width,
+        height: box.height,
+      };
+    };
+    return {
+      threadBox: bounds(viewport),
+      anchorBox: bounds(node),
+      popoverBox: bounds(dialog),
+    };
+  });
   expect(Math.abs(popoverBox.y - (anchorBox.y + anchorBox.height + 8)))
     .toBeLessThan(2);
   expect(popoverBox.height).toBeGreaterThan(64);
