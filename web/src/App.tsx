@@ -224,6 +224,7 @@ import {
   readEngineSpaces,
   rememberEngineSpace,
 } from "./surface-preferences";
+import { exactActiveTurnId } from "./process-blocks";
 
 const THEME_KEY = "cc_remote_theme";
 const ENGINE_KEY = "cc_remote_engine";  // which backend the NEXT new session uses
@@ -4458,6 +4459,15 @@ export default function App() {
   const effectiveState = mergeSessionActivityState(
     focusedSessionState, rt.state, rt.mirroredRunning,
   ) ?? rt.state;
+  // Fail closed when a migrated cache contains colliding display aliases. A
+  // session-level running bit alone must never animate the wrong historical
+  // row, another account, or a read-only browse projection.
+  const activeTurnId = exactActiveTurnId(
+    historyView.turns,
+    rt.liveOwner?.turnId,
+    !historyView.browsing && !historyView.recovering
+      && (rt.state !== "idle" || rt.mirroredRunning),
+  );
 
   return (
     <div className={"shell" + (sidebarOpen ? " sidebar-open" : "") + ((state.artifact || activeBtw || btwOpening) ? " panel-open" : "")} onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}>
@@ -4708,6 +4718,7 @@ export default function App() {
                 turnId: planProgress.turnId,
                 itemId: planProgress.block.item_id,
               } : null}
+              activeTurnId={activeTurnId}
               onFork={!historyView.recovering && space === "code"
                 ? forkFromTurn : undefined} />
 

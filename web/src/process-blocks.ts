@@ -1,4 +1,19 @@
-import type { Block, TextBlock } from "./domain/conversation";
+import type { Block, TextBlock, Turn } from "./domain/conversation";
+
+/** Resolve runtime activity onto exactly one displayed narrative row. Session
+ * state alone is deliberately insufficient: aliases can collide in migrated
+ * caches, and a stale owner must not animate an unrelated historical turn. */
+export function exactActiveTurnId(
+  turns: readonly Pick<Turn, "id" | "clientMsgId" | "historyTurnId">[],
+  ownerTurnId: string | null | undefined,
+  active: boolean,
+): string | null {
+  if (!active || !ownerTurnId) return null;
+  const matches = turns.filter((turn) => [
+    turn.id, turn.clientMsgId, turn.historyTurnId,
+  ].includes(ownerTurnId));
+  return matches.length === 1 ? matches[0].id : null;
+}
 
 export function processBlocks(blocks: Block[]): Block[] {
   const dedicatedAgents = new Set(blocks.flatMap((block) => (

@@ -1,5 +1,7 @@
 export const MAX_PROMPT_CHARS = 2 * 1024 * 1024;
 export const LONG_PASTE_THRESHOLD = 1000;
+export const PASTE_PREVIEW_CHARS = 180;
+const PASTE_PREVIEW_SOURCE_CHARS = 1024;
 
 export interface ComposerPaste {
   id: string;
@@ -10,8 +12,28 @@ export interface ComposerPaste {
 
 export type PasteText = Pick<ComposerPaste, "text">;
 
+/** Count lines in one pass without allocating an array proportional to a
+ * potentially 2 MiB paste. Keep the empty-string result compatible with
+ * String.split(), which reports one editable line. */
+export function countTextLines(text: string): number {
+  let lines = 1;
+  for (let index = 0; index < text.length; index += 1) {
+    if (text.charCodeAt(index) === 10) lines += 1;
+  }
+  return lines;
+}
+
+/** Build a bounded card preview without normalizing or retaining the complete
+ * paste as a second render-time string. */
+export function composerPastePreview(text: string): string {
+  return text.slice(0, PASTE_PREVIEW_SOURCE_CHARS)
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, PASTE_PREVIEW_CHARS);
+}
+
 export function makeComposerPaste(text: string, id: string): ComposerPaste {
-  return { id, text, chars: text.length, lines: text.split("\n").length };
+  return { id, text, chars: text.length, lines: countTextLines(text) };
 }
 
 export type ComposedPastePrompt =

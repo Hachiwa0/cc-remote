@@ -4385,9 +4385,13 @@ test("oversized edited paste stays in the draft instead of being cleared", async
     '[data-testid="live-composer-shell"] .paste-card',
   );
   await card.locator(".paste-open").click();
-  await page.getByRole("dialog", { name: "编辑粘贴内容" })
-    .getByRole("textbox").fill("x".repeat(2 * 1024 * 1024));
+  const pasteEditor = page.getByRole("dialog", { name: "编辑粘贴内容" });
+  await pasteEditor.getByRole("textbox")
+    .fill("x".repeat(2 * 1024 * 1024));
+  await expect(pasteEditor.locator("small"))
+    .toContainText("2097152 字符 · 1 行");
   await page.getByRole("button", { name: "保存" }).click();
+  await expect(card.locator(".paste-card-preview")).toHaveText(/^x{180}$/);
   await input.fill("tail");
   await page.locator(
     '[data-testid="live-composer-shell"] .sendbtn',

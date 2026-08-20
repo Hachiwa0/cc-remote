@@ -39,6 +39,7 @@ import {
 } from "../composer-pastes";
 import { PasteCards } from "./PasteCards";
 import { uuid } from "../util";
+import { exactActiveTurnId } from "../process-blocks";
 
 interface Props {
   sid?: string;
@@ -98,6 +99,11 @@ export function BtwPanel(p: Props) {
   const input = draft.input;
   const turns = p.rt?.turns ?? [];
   const runtimeState = p.rt?.state ?? "idle";
+  const activeTurnId = exactActiveTurnId(
+    turns,
+    p.rt?.liveOwner?.turnId,
+    runtimeState !== "idle" || p.rt?.mirroredRunning === true,
+  );
   // The query outbox can be awaiting its first authoritative echo while the
   // last lifecycle frame still says idle. Treat that short acceptance window
   // as settling-busy so a second submit becomes pending/queued instead of
@@ -286,6 +292,7 @@ export function BtwPanel(p: Props) {
                 问一个基于当前会话的侧边问题 —— 回答不会写进主线,关闭即丢弃。
               </div>
             : <ChatView sid={p.sid ?? null} turns={turns}
+                activeTurnId={activeTurnId}
                 onEdit={() => {}} onGetDiff={() => {}}
                 onOpenFile={p.onOpenFile}
                 imageAssets={p.imageAssets}

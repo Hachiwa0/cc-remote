@@ -2750,7 +2750,15 @@ export function reduce(state: AppState, action: Action): AppState {
             switchControlGeneration(rt, cacheGeneration);
             applySessionControl(rt, control);
           }
-          rt.turns = restoreCachedTurnDetails(rt.turns, action.turns);
+          const newerUnsettledLiveFrame = rt.lastLiveSeq
+            > Math.max(rt.historyLiveSeq, rt.lastLifecycleSeq);
+          const cacheRestoreAuthority = rt.state !== "idle"
+              || rt.mirroredRunning
+              || newerUnsettledLiveFrame
+            ? "running" as const
+            : "idle" as const;
+          rt.turns = restoreCachedTurnDetails(
+            rt.turns, action.turns, cacheRestoreAuthority);
         }
         applyPendingCodexTerminalFences(rt);
         rt.loading = false;
@@ -3774,6 +3782,7 @@ function reduceEvent(
           turns = restoreCachedTurnDetails(
             turns,
             base.turns.filter((turn) => cachedIds.has(turn.id)),
+            preserveProjectionOpenPlans ? "running" : "idle",
           );
         }
       }

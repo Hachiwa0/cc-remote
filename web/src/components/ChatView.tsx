@@ -290,6 +290,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   historyImageAssets, onLoadHistoryImage,
   onTextSelectionGuardChange,
   externalPlanProgress,
+  activeTurnId = null,
   surface = "code" }: {
   sid: string | null;
   turns: Turn[];
@@ -341,6 +342,9 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     turnId: string;
     itemId: string;
   } | null;
+  /** Exact displayed row owned by the still-running native task. Runtime-only:
+   * never infer this from array position, final text, or historical activity. */
+  activeTurnId?: string | null;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentSizerRef = useRef<HTMLDivElement>(null);
@@ -2467,18 +2471,21 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
             const activeTimeline = activeProcess
               || processItems.some((block) => !block.done);
             const finalBlocks = finalTextBlocks(t.blocks);
+            const enclosingTaskActive = activeTurnId === t.id;
             // A failed/interrupted enclosing terminal is authoritative. A
             // successful answer may still own genuine background agent work,
             // but a stale child flag must never animate beside "已打断".
             const terminalProblem = t.done && (!!t.interrupted || !!t.error);
-            const working = !terminalProblem && (!t.done || activeTimeline);
+            const working = !terminalProblem && (
+              enclosingTaskActive || !t.done || activeTimeline);
             const hasProcessTimeline = processItems.length > 0
               || (!!t.detailEventCount && !t.detailLoaded)
               || !!t.detailError;
             const activePhase = !working
               ? "complete"
               : hasProcessTimeline
-                  && (activeTimeline || finalBlocks.length === 0)
+                  && (enclosingTaskActive
+                    || activeTimeline || finalBlocks.length === 0)
                 ? "process"
                 : finalBlocks.length > 0 ? "answering" : "waiting";
             const showProcessTimeline = hasProcessTimeline;

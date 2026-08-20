@@ -478,12 +478,18 @@ function cloneDetailBlock(block: Block): Block {
  * detail restored from IndexedDB.  The cache may have been written between a
  * child start and its final update; replaying that open bit after refresh makes
  * an hour-old answer show a permanently animated "处理中" spark. */
-function cloneSettledCachedDetailBlock(block: Block, summary: Turn): Block {
+export type CachedDetailAuthority = "provisional" | "running" | "idle";
+
+function cloneSettledCachedDetailBlock(
+  block: Block,
+  summary: Turn,
+  preserveOpenPlans: boolean,
+): Block {
   const cloned = cloneDetailBlock(block);
   if (cloned.kind === "text") {
     cloned.done = true;
   } else if (cloned.kind === "process" && !cloned.done
-      && cloned.processKind !== "plan") {
+      && !(preserveOpenPlans && cloned.processKind === "plan")) {
     cloned.done = true;
     if (!cloned.status || cloned.status === "running") {
       cloned.status = summary.interrupted
@@ -512,13 +518,15 @@ function cloneSettledCachedDetailBlock(block: Block, summary: Turn): Block {
 function installCachedDetailRestore(
   summary: Turn,
   cached: Turn,
+  authority: CachedDetailAuthority,
 ): Turn {
   if (!summary.done || !cached.done || summary.detailLoaded
       || summary.detailProjection
       || (summary.detailEventCount ?? 0) <= 0) return summary;
   const source = cached.detailProjection?.blocks ?? cached.blocks;
   const blocks = source.filter((block) => !isFinalTextBlock(block))
-    .map((block) => cloneSettledCachedDetailBlock(block, summary));
+    .map((block) => cloneSettledCachedDetailBlock(
+      block, summary, authority !== "idle"));
   if (blocks.length === 0) return summary;
   return {
     ...summary,
@@ -644,10 +652,13 @@ export function restoreObservedLiveTurnDetails(
 }
 
 /** Reconcile cached process with canonical summary identities without
- * resurrecting a completed row which authoritative History removed. */
+ * resurrecting a completed row which authoritative History removed. The
+ * authority describes the enclosing native task, not the summary row's own
+ * completed bit: a neutral steer row may be done while its Plan remains live. */
 export function restoreCachedTurnDetails(
   summaries: Turn[],
   cachedTurns: readonly Turn[],
+  authority: CachedDetailAuthority,
 ): Turn[] {
   const matches = new Array<number>(summaries.length).fill(-1);
   const usedCached = new Set<number>();
@@ -707,7 +718,7 @@ export function restoreCachedTurnDetails(
     if (cachedIndex < 0) continue;
     const summary = restored[summaryIndex];
     const installed = installCachedDetailRestore(
-      summary, cachedTurns[cachedIndex]);
+      summary, cachedTurns[cachedIndex], authority);
     restored[summaryIndex] = installed;
   }
   return restored;

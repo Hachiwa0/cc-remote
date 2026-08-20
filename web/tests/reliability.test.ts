@@ -6917,6 +6917,7 @@ try {
       },
       cachedSixStepTurn,
     ],
+    "idle",
   );
   assert.deepEqual(
     twoCachedRestores.map((turn) => !!turn.detailRestorePending),
@@ -6950,7 +6951,7 @@ try {
     }, ...turn.blocks],
   }));
   const repeatedPromptRestores = restoreCachedTurnDetails(
-    repeatedPromptSummaries, repeatedPromptCaches);
+    repeatedPromptSummaries, repeatedPromptCaches, "idle");
   assert.deepEqual(
     repeatedPromptRestores.map(processFingerprint),
     [["process-0"], ["process-1"]],
@@ -6976,7 +6977,8 @@ try {
       done: true,
     }, ...repeatedPromptSummaries[index].blocks],
   }));
-  const aliasRestores = restoreCachedTurnDetails(aliasSummaries, aliasCaches);
+  const aliasRestores = restoreCachedTurnDetails(
+    aliasSummaries, aliasCaches, "idle");
   assert.deepEqual(
     aliasRestores.map(processFingerprint),
     [["native-process-a"], ["native-process-b"]],
@@ -14458,6 +14460,7 @@ try {
       },
     ],
     restoredSteerSegments.slice(0, 2),
+    "idle",
   );
   assert.deepEqual(
     restoredCachedSteerSegments[0].detailProjection?.blocks.flatMap((block) =>

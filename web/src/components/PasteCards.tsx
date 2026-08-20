@@ -1,7 +1,11 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import type { ComposerPaste } from "../composer-pastes";
-import { makeComposerPaste } from "../composer-pastes";
+import {
+  composerPastePreview,
+  countTextLines,
+  makeComposerPaste,
+} from "../composer-pastes";
 import { Icon } from "../icons";
 
 interface Props {
@@ -12,24 +16,46 @@ interface Props {
 
 export function PasteCards({ pastes, onChange, disabled = false }: Props) {
   const [editingId, setEditingId] = useState<string | null>(null);
-  const [editingText, setEditingText] = useState("");
+  const [editingChars, setEditingChars] = useState(0);
+  const [editingLines, setEditingLines] = useState(1);
+  const editorRef = useRef<HTMLTextAreaElement>(null);
+  const lineCountTimerRef = useRef<number | null>(null);
   const editingPaste = editingId
     ? pastes.find((paste) => paste.id === editingId) ?? null
     : null;
 
+  const cancelLineCount = () => {
+    if (lineCountTimerRef.current === null) return;
+    window.clearTimeout(lineCountTimerRef.current);
+    lineCountTimerRef.current = null;
+  };
+
+  const closeEditor = () => {
+    cancelLineCount();
+    setEditingId(null);
+    setEditingChars(0);
+    setEditingLines(1);
+  };
+
   useEffect(() => {
     if (editingId && !pastes.some((paste) => paste.id === editingId)) {
+      if (lineCountTimerRef.current !== null) {
+        window.clearTimeout(lineCountTimerRef.current);
+        lineCountTimerRef.current = null;
+      }
       setEditingId(null);
-      setEditingText("");
+      setEditingChars(0);
+      setEditingLines(1);
     }
   }, [editingId, pastes]);
 
-  if (pastes.length === 0) return null;
+  useEffect(() => () => {
+    if (lineCountTimerRef.current !== null) {
+      window.clearTimeout(lineCountTimerRef.current);
+    }
+  }, []);
 
-  const closeEditor = () => {
-    setEditingId(null);
-    setEditingText("");
-  };
+  if (pastes.length === 0) return null;
 
   return <>
     {pastes.map((paste) => (
@@ -37,12 +63,13 @@ export function PasteCards({ pastes, onChange, disabled = false }: Props) {
         <button className="paste-open" type="button" disabled={disabled}
           onClick={() => {
             setEditingId(paste.id);
-            setEditingText(paste.text);
+            setEditingChars(paste.chars);
+            setEditingLines(paste.lines);
           }}>
           <span className="paste-card-icon"><Icon name="read" size={15} /></span>
           <span className="paste-card-body">
             <span className="paste-card-preview">
-              {paste.text.replace(/\s+/g, " ").trim()}
+              {composerPastePreview(paste.text)}
             </span>
             <span className="paste-card-meta">
               粘贴内容 · {paste.chars} 字符 · {paste.lines} 行
@@ -70,18 +97,29 @@ export function PasteCards({ pastes, onChange, disabled = false }: Props) {
           <header>
             <span>
               <b>编辑粘贴内容</b>
-              <small>{editingText.length} 字符 · {editingText.split("\n").length} 行</small>
+              <small>{editingChars} 字符 · {editingLines} 行</small>
             </span>
             <button type="button" aria-label="关闭" onClick={closeEditor}>
               <Icon name="close" size={16} />
             </button>
           </header>
-          <textarea value={editingText} autoFocus
-            onChange={(event) => setEditingText(event.target.value)} />
+          <textarea key={editingPaste.id} ref={editorRef}
+            defaultValue={editingPaste.text} autoFocus
+            onInput={(event) => {
+              setEditingChars(event.currentTarget.value.length);
+              cancelLineCount();
+              lineCountTimerRef.current = window.setTimeout(() => {
+                lineCountTimerRef.current = null;
+                const editor = editorRef.current;
+                if (editor) setEditingLines(countTextLines(editor.value));
+              }, 120);
+            }} />
           <footer>
             <button type="button" onClick={closeEditor}>取消</button>
-            <button type="button" className="primary" disabled={!editingText}
+            <button type="button" className="primary" disabled={!editingChars}
               onClick={() => {
+                const editingText = editorRef.current?.value
+                  ?? editingPaste.text;
                 onChange(pastes.map((paste) => paste.id === editingPaste.id
                   ? makeComposerPaste(editingText, paste.id)
                   : paste));

@@ -12,10 +12,42 @@ import {
 import type { Block, Turn } from "../src/reducer.ts";
 import { reconcileProvenCompactionOrphans } from
   "../src/compaction-orphans.ts";
+import {
+  composerPastePreview,
+  countTextLines,
+  MAX_PROMPT_CHARS,
+  PASTE_PREVIEW_CHARS,
+} from "../src/composer-pastes.ts";
+import { exactActiveTurnId } from "../src/process-blocks.ts";
 
 const blockIdentity = (block: Block): string => block.kind === "text"
   ? block.message_id
   : block.kind === "tool" ? block.tool_use_id : block.item_id;
+
+const maximumPaste = `first line\n${"x".repeat(MAX_PROMPT_CHARS - 20)}\nlast`;
+assert.equal(countTextLines(maximumPaste), 3,
+  "line metadata is computed without changing the complete paste payload");
+const maximumPastePreview = composerPastePreview(maximumPaste);
+assert.equal(maximumPastePreview.startsWith("first line x"), true);
+assert.equal(maximumPastePreview.length <= PASTE_PREVIEW_CHARS, true,
+  "a 2 MiB paste contributes only a bounded preview string to the card DOM");
+assert.equal(maximumPastePreview.includes("last"), false,
+  "preview generation never scans forward to the tail of a huge paste");
+assert.equal(exactActiveTurnId([{
+  id: "display-owner", clientMsgId: "client-owner",
+  historyTurnId: "history-owner",
+}], "history-owner", true), "display-owner",
+"an exact runtime owner resolves through the displayed History alias");
+assert.equal(exactActiveTurnId([{
+  id: "collision-a", historyTurnId: "shared-owner",
+}, {
+  id: "collision-b", historyTurnId: "shared-owner",
+}], "shared-owner", true), null,
+"colliding aliases fail closed instead of animating either row");
+assert.equal(exactActiveTurnId([{
+  id: "stale-owner",
+}], "stale-owner", false), null,
+"an idle lifecycle never revives a stale runtime owner");
 
 const settledCachedProcess = restoreCachedTurnDetails([{
   id: "settled-cache-summary", prompt: "done already", done: true,
@@ -27,7 +59,7 @@ const settledCachedProcess = restoreCachedTurnDetails([{
     processKind: "command", phase: "start", status: "running",
     title: "old command", done: false,
   }],
-}])[0];
+}], "idle")[0];
 assert.equal(settledCachedProcess.detailProjection?.blocks[0]?.done, true,
   "a completed summary closes a stale open process restored from IndexedDB");
 assert.equal(
@@ -50,7 +82,7 @@ const cachedNeutralSteerPlan = restoreCachedTurnDetails([{
       { step: "finish", status: "inProgress" },
     ], done: false,
   }],
-}])[0];
+}], "provisional")[0];
 const restoredNeutralPlan = cachedNeutralSteerPlan.detailProjection
   ?.blocks[0];
 assert.equal(restoredNeutralPlan?.done, false,
@@ -59,6 +91,27 @@ assert.equal(
   restoredNeutralPlan?.kind === "process" ? restoredNeutralPlan.status : null,
   "running",
   "cache paint cannot fabricate a terminal Plan status",
+);
+
+const settledCachedPlan = restoreCachedTurnDetails([{
+  id: "settled-cached-plan", prompt: "finished", done: true,
+  detailEventCount: 1, detailLoaded: false, blocks: [],
+}], [{
+  id: "settled-cached-plan", prompt: "finished", done: true,
+  blocks: [{
+    kind: "process", item_id: "stale-open-cache-plan",
+    processKind: "plan", phase: "update", status: "running",
+    title: "计划", plan: [{ step: "finish", status: "inProgress" }],
+    done: false,
+  }],
+}], "idle")[0];
+const restoredSettledPlan = settledCachedPlan.detailProjection?.blocks[0];
+assert.equal(restoredSettledPlan?.done, true,
+  "an authoritative idle boundary settles a delayed cached Plan");
+assert.equal(
+  restoredSettledPlan?.kind === "process" ? restoredSettledPlan.status : null,
+  "succeeded",
+  "a delayed same-revision cache cannot restart a settled Plan",
 );
 
 const compactionNativeId = "repeated-compaction-native-turn";
@@ -624,6 +677,40 @@ try {
   assert.doesNotMatch(directAnswerMarkup, /已处理/,
     "a direct answer with no process remains free of a synthetic disclosure");
 
+  const compactToolGapTurn: Turn = {
+    id: "compact-tool-gap", clientMsgId: "compact-client",
+    historyTurnId: "compact-history", prompt: "继续长任务", done: true,
+    blocks: [{
+      kind: "process", item_id: "completed-before-compact",
+      processKind: "command", phase: "end", status: "succeeded",
+      title: "压缩前工具已完成", done: true,
+    }, {
+      kind: "text", message_id: "internal-compact-summary",
+      channel: "final", text: "内部压缩摘要", done: true,
+    }],
+  };
+  const compactToolGapMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: idleSid, turns: [compactToolGapTurn], engine: "codex",
+    activeTurnId: compactToolGapTurn.id,
+    onEdit: () => {}, onGetDiff: () => {},
+  }));
+  assert.match(compactToolGapMarkup, /turn-process-state running/,
+    "an exact active task keeps its process disclosure running across a compact tool gap");
+  assert.match(compactToolGapMarkup,
+    /class="turn-working"[\s\S]*处理中/,
+    "an internal final answer cannot settle the exact enclosing native task");
+  assert.match(compactToolGapMarkup, /class="turn-process open"/,
+    "running History refreshes do not repeatedly collapse the active process");
+  const unrelatedOwnerMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: idleSid, turns: [compactToolGapTurn], engine: "codex",
+    activeTurnId: "another-turn",
+    onEdit: () => {}, onGetDiff: () => {},
+  }));
+  assert.doesNotMatch(unrelatedOwnerMarkup, /class="turn-working"/,
+    "session activity cannot leak onto a turn which does not own it");
+  assert.match(unrelatedOwnerMarkup, /turn-process-state done/,
+    "removing the exact owner settles the process exactly once");
+
   const currentRunningState = reduce({
     ...initialState,
     focusedSid: idleSid,
@@ -717,6 +804,54 @@ try {
     "an IndexedDB paint cannot animate stale completed child activity");
   assert.equal(cachedInput.blocks[0].done, false,
     "cache hydration cannot mutate its action payload");
+
+  const delayedPlanCache: Turn = {
+    id: summaryTurn.id, prompt: summaryTurn.prompt, done: true,
+    blocks: [{
+      kind: "process", item_id: "delayed-cached-plan",
+      processKind: "plan", phase: "update", status: "running",
+      title: "计划", plan: [{ step: "done", status: "inProgress" }],
+      done: false,
+    }],
+  };
+  const historyBeforeCache = reduce({
+    ...initialState,
+    focusedSid: idleSid,
+    sessions: [{ session_id: idleSid, engine: "codex" as const }],
+    runtimes: { [idleSid]: createRuntime() },
+  }, { type: "event", event: idleHistory });
+  const delayedIdleCacheState = reduce(historyBeforeCache, {
+    type: "hydrate_cache", sid: idleSid, turns: [delayedPlanCache],
+    revision: idleRevision, generation: idleGeneration,
+  });
+  const delayedIdlePlan = delayedIdleCacheState.runtimes[idleSid].turns[0]
+    .detailProjection?.blocks.find((block: Block) =>
+      block.kind === "process" && block.processKind === "plan");
+  assert.equal(delayedIdleCacheState.runtimes[idleSid].state, "idle");
+  assert.equal(delayedIdlePlan?.done, true,
+    "History(idle) followed by same-scope cache hydration stays settled");
+
+  const cacheAfterAuthority = (
+    lastLiveSeq: number,
+    lastLifecycleSeq: number,
+  ) => reduce({
+    ...historyBeforeCache,
+    runtimes: { [idleSid]: {
+      ...historyBeforeCache.runtimes[idleSid],
+      state: "idle" as const,
+      lastLiveSeq,
+      lastLifecycleSeq,
+    } },
+  }, {
+    type: "hydrate_cache", sid: idleSid, turns: [delayedPlanCache],
+    revision: idleRevision, generation: idleGeneration,
+  }).runtimes[idleSid].turns[0].detailProjection?.blocks.find(
+    (block: Block) => block.kind === "process"
+      && block.processKind === "plan");
+  assert.equal(cacheAfterAuthority(41, 40)?.done, false,
+    "a live frame newer than History provisionally preserves its open Plan");
+  assert.equal(cacheAfterAuthority(41, 42)?.done, true,
+    "a lifecycle terminal newer than that live frame settles delayed cache");
 
   const idleBoundaryState = reduce({
     ...initialState,
