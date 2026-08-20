@@ -2494,6 +2494,10 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
             // tool stream grows, so it must not be the only place which tells
             // the reader that the turn is still active.
             const showWorking = working;
+            // Compact can close a display segment before the enclosing native
+            // task reaches its terminal boundary. Completion time, copy and
+            // fork belong to that real boundary, never to the segment bit.
+            const showCompletionFooter = t.done && !working;
             const workingLabel = t.progress
               ?? (activePhase === "answering"
                 ? "回答中"
@@ -2671,7 +2675,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
                     onAuthorizeImage={onAuthorizeImage}
                     onPreviewImage={(src, alt) => setZoom({ kind: "data", src, alt })} />
                 ))}
-                {t.done && (
+                {showCompletionFooter && (
                   <>
                     <div className="ubub-meta ai-meta">
                       {t.doneTs && <span className="ubub-time">{formatTime(t.doneTs)}</span>}
@@ -2691,7 +2695,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
                         </button>
                       )}
                     </div>
-                    {ti === turns.length - 1 && !working
+                    {ti === turns.length - 1
                       && <div className="turn-done-mark"><ClaudeSpark size={22} /></div>}
                   </>
                 )}

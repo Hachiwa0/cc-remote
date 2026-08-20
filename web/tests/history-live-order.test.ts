@@ -680,6 +680,9 @@ try {
   const compactToolGapTurn: Turn = {
     id: "compact-tool-gap", clientMsgId: "compact-client",
     historyTurnId: "compact-history", prompt: "继续长任务", done: true,
+    forkPointId: "compact-fork-point",
+    ts: Date.UTC(2026, 7, 20, 9, 10),
+    doneTs: Date.UTC(2026, 7, 20, 9, 11),
     blocks: [{
       kind: "process", item_id: "completed-before-compact",
       processKind: "command", phase: "end", status: "succeeded",
@@ -692,7 +695,7 @@ try {
   const compactToolGapMarkup = renderToStaticMarkup(createElement(ChatView, {
     sid: idleSid, turns: [compactToolGapTurn], engine: "codex",
     activeTurnId: compactToolGapTurn.id,
-    onEdit: () => {}, onGetDiff: () => {},
+    onEdit: () => {}, onGetDiff: () => {}, onFork: () => {},
   }));
   assert.match(compactToolGapMarkup, /turn-process-state running/,
     "an exact active task keeps its process disclosure running across a compact tool gap");
@@ -701,15 +704,33 @@ try {
     "an internal final answer cannot settle the exact enclosing native task");
   assert.match(compactToolGapMarkup, /class="turn-process open"/,
     "running History refreshes do not repeatedly collapse the active process");
+  assert.doesNotMatch(compactToolGapMarkup, /class="ubub-meta ai-meta"/,
+    "a compact continuation cannot expose completion metadata while working");
+  assert.doesNotMatch(compactToolGapMarkup, /aria-label="派生"/,
+    "a compact continuation cannot expose fork while working");
+  assert.equal(
+    compactToolGapMarkup.match(/class="ubub-time"/g)?.length ?? 0,
+    1,
+    "the user prompt keeps its timestamp without an early completion time",
+  );
   const unrelatedOwnerMarkup = renderToStaticMarkup(createElement(ChatView, {
     sid: idleSid, turns: [compactToolGapTurn], engine: "codex",
     activeTurnId: "another-turn",
-    onEdit: () => {}, onGetDiff: () => {},
+    onEdit: () => {}, onGetDiff: () => {}, onFork: () => {},
   }));
   assert.doesNotMatch(unrelatedOwnerMarkup, /class="turn-working"/,
     "session activity cannot leak onto a turn which does not own it");
   assert.match(unrelatedOwnerMarkup, /turn-process-state done/,
     "removing the exact owner settles the process exactly once");
+  assert.match(unrelatedOwnerMarkup, /class="ubub-meta ai-meta"/,
+    "the real terminal reveals completion metadata");
+  assert.match(unrelatedOwnerMarkup, /aria-label="派生"/,
+    "the real terminal reveals fork");
+  assert.equal(
+    unrelatedOwnerMarkup.match(/class="ubub-time"/g)?.length ?? 0,
+    2,
+    "the real terminal adds one completion time beside the prompt time",
+  );
 
   const currentRunningState = reduce({
     ...initialState,
