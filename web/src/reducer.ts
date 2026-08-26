@@ -2757,8 +2757,14 @@ export function reduce(state: AppState, action: Action): AppState {
               || newerUnsettledLiveFrame
             ? "running" as const
             : "idle" as const;
+          const activeCacheOwnerId = cacheRestoreAuthority === "running"
+            ? rt.acceptanceKind === "query" && rt.acceptancePending
+              ? rt.acceptancePending
+              : (rt.liveOwner?.turnId ?? null)
+            : null;
           rt.turns = restoreCachedTurnDetails(
-            rt.turns, action.turns, cacheRestoreAuthority);
+            rt.turns, action.turns, cacheRestoreAuthority,
+            activeCacheOwnerId);
         }
         applyPendingCodexTerminalFences(rt);
         rt.loading = false;
@@ -3779,10 +3785,18 @@ function reduceEvent(
           : base.historyGeneration == null;
         if (cachedScopeMatches && base.hydratedCacheTurnIds.length > 0) {
           const cachedIds = new Set(base.hydratedCacheTurnIds);
+          const activeCacheOwnerId = preserveProjectionOpenPlans
+            ? (!racedLiveEvent && e.in_progress === true
+                ? (e.newest_id ?? null)
+                : base.acceptanceKind === "query" && base.acceptancePending
+                  ? base.acceptancePending
+                  : (base.liveOwner?.turnId ?? null))
+            : null;
           turns = restoreCachedTurnDetails(
             turns,
             base.turns.filter((turn) => cachedIds.has(turn.id)),
             preserveProjectionOpenPlans ? "running" : "idle",
+            activeCacheOwnerId,
           );
         }
       }
@@ -3927,8 +3941,13 @@ function reduceEvent(
       const nextOrderingGeneration = base.controlGeneration
         ?? nextHistoryGeneration;
       let pendingLiveBinding = base.pendingLiveBinding;
-      let liveOwner = boundHistoryOwner
-        ?? remapExplicitLiveTaskOwner(base.liveOwner, turns);
+      // An exact idle History page is also a lifecycle boundary when the
+      // browser missed State(idle). Do not carry task A's owner into a later
+      // task B which can become running before its binding reaches this client.
+      let liveOwner = settledHistory
+        ? null
+        : boundHistoryOwner
+          ?? remapExplicitLiveTaskOwner(base.liveOwner, turns);
       const liveDetailTurnIds = remapTurnProvenanceIds(
         base.liveDetailTurnIds, base.turns, turns);
       if (pendingLiveBinding
@@ -4474,6 +4493,10 @@ function reduceEvent(
           turn.progress = undefined;
         }
         if (e.state === "idle") {
+          // State(idle) is the exact boundary between resident turns. Keeping
+          // the completed owner here lets the next State(running) animate the
+          // old row before its own UserMsg/TurnBinding establishes ownership.
+          rt.liveOwner = null;
           rt.pendingLiveBinding = null;
           rt.pendingQuestion = null;
           const doneTs = eventTimestampMs(e.ts) ?? Date.now();

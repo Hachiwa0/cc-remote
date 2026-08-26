@@ -519,14 +519,23 @@ function installCachedDetailRestore(
   summary: Turn,
   cached: Turn,
   authority: CachedDetailAuthority,
+  activeOwnerId: string | null,
 ): Turn {
   if (!summary.done || !cached.done || summary.detailLoaded
       || summary.detailProjection
       || (summary.detailEventCount ?? 0) <= 0) return summary;
   const source = cached.detailProjection?.blocks ?? cached.blocks;
+  // A session-wide running bit is not turn ownership. The next task may have
+  // started before its UserMsg/TurnBinding while a same-revision cache row from
+  // the completed predecessor is still arriving. Preserve a cached open Plan
+  // only when both sides of this exact restore name the current live owner.
+  const preserveOpenPlans = authority === "provisional"
+    || (authority === "running" && !!activeOwnerId
+      && exactTurnAliases(summary).has(activeOwnerId)
+      && exactTurnAliases(cached).has(activeOwnerId));
   const blocks = source.filter((block) => !isFinalTextBlock(block))
     .map((block) => cloneSettledCachedDetailBlock(
-      block, summary, authority !== "idle"));
+      block, summary, preserveOpenPlans));
   if (blocks.length === 0) return summary;
   return {
     ...summary,
@@ -659,6 +668,7 @@ export function restoreCachedTurnDetails(
   summaries: Turn[],
   cachedTurns: readonly Turn[],
   authority: CachedDetailAuthority,
+  activeOwnerId: string | null = null,
 ): Turn[] {
   const matches = new Array<number>(summaries.length).fill(-1);
   const usedCached = new Set<number>();
@@ -718,7 +728,7 @@ export function restoreCachedTurnDetails(
     if (cachedIndex < 0) continue;
     const summary = restored[summaryIndex];
     const installed = installCachedDetailRestore(
-      summary, cachedTurns[cachedIndex], authority);
+      summary, cachedTurns[cachedIndex], authority, activeOwnerId);
     restored[summaryIndex] = installed;
   }
   return restored;

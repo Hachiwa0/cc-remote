@@ -93,6 +93,36 @@ assert.equal(
   "cache paint cannot fabricate a terminal Plan status",
 );
 
+const runningExactPlan = restoreCachedTurnDetails([{
+  id: "running-exact-owner", prompt: "continue", done: true,
+  detailEventCount: 1, detailLoaded: false, blocks: [],
+}], [{
+  id: "running-exact-owner", prompt: "continue", done: true,
+  blocks: [{
+    kind: "process", item_id: "running-exact-plan",
+    processKind: "plan", phase: "update", status: "running",
+    title: "计划", plan: [{ step: "finish", status: "inProgress" }],
+    done: false,
+  }],
+}], "running", "running-exact-owner")[0].detailProjection?.blocks[0];
+assert.equal(runningExactPlan?.done, false,
+  "only the exact active owner may preserve its cached open Plan");
+
+const runningOtherPlan = restoreCachedTurnDetails([{
+  id: "completed-predecessor", prompt: "old task", done: true,
+  detailEventCount: 1, detailLoaded: false, blocks: [],
+}], [{
+  id: "completed-predecessor", prompt: "old task", done: true,
+  blocks: [{
+    kind: "process", item_id: "completed-predecessor-plan",
+    processKind: "plan", phase: "update", status: "running",
+    title: "旧计划", plan: [{ step: "old", status: "inProgress" }],
+    done: false,
+  }],
+}], "running", "new-active-owner")[0].detailProjection?.blocks[0];
+assert.equal(runningOtherPlan?.done, true,
+  "another running task cannot revive its predecessor's cached Plan");
+
 const settledCachedPlan = restoreCachedTurnDetails([{
   id: "settled-cached-plan", prompt: "finished", done: true,
   detailEventCount: 1, detailLoaded: false, blocks: [],
@@ -839,8 +869,14 @@ try {
     ...initialState,
     focusedSid: idleSid,
     sessions: [{ session_id: idleSid, engine: "codex" as const }],
-    runtimes: { [idleSid]: createRuntime() },
+    runtimes: { [idleSid]: {
+      ...createRuntime(), state: "running" as const,
+      liveOwner: { turnId: summaryTurn.id, seq: 39 },
+      turns: [summaryTurn],
+    } },
   }, { type: "event", event: idleHistory });
+  assert.equal(historyBeforeCache.runtimes[idleSid].liveOwner, null,
+    "an authoritative idle History page retires its completed owner");
   const delayedIdleCacheState = reduce(historyBeforeCache, {
     type: "hydrate_cache", sid: idleSid, turns: [delayedPlanCache],
     revision: idleRevision, generation: idleGeneration,
@@ -852,6 +888,27 @@ try {
   assert.equal(delayedIdlePlan?.done, true,
     "History(idle) followed by same-scope cache hydration stays settled");
 
+  let nextTaskBeforeBinding = reduce(historyBeforeCache, {
+    type: "query_sent", sid: idleSid, prompt: "next task",
+    msg_id: "next-task-client-id", ts: 50_000,
+  });
+  nextTaskBeforeBinding = reduce(nextTaskBeforeBinding, {
+    type: "event", event: event({
+      type: "state", sid: idleSid, state: "running", seq: 41,
+    }),
+  });
+  assert.equal(nextTaskBeforeBinding.runtimes[idleSid].liveOwner, null,
+    "the next running state cannot reclaim the completed owner before binding");
+  const nextTaskAfterDelayedCache = reduce(nextTaskBeforeBinding, {
+    type: "hydrate_cache", sid: idleSid, turns: [delayedPlanCache],
+    revision: idleRevision, generation: idleGeneration,
+  });
+  const predecessorPlan = nextTaskAfterDelayedCache.runtimes[idleSid]
+    .turns[0].detailProjection?.blocks.find((block: Block) =>
+      block.kind === "process" && block.processKind === "plan");
+  assert.equal(predecessorPlan?.done, true,
+    "task B cannot revive task A's cached Plan before its own binding");
+
   const cacheAfterAuthority = (
     lastLiveSeq: number,
     lastLifecycleSeq: number,
@@ -862,6 +919,9 @@ try {
       state: "idle" as const,
       lastLiveSeq,
       lastLifecycleSeq,
+      liveOwner: lastLiveSeq > lastLifecycleSeq
+        ? { turnId: summaryTurn.id, seq: lastLiveSeq }
+        : null,
     } },
   }, {
     type: "hydrate_cache", sid: idleSid, turns: [delayedPlanCache],
@@ -880,6 +940,7 @@ try {
     sessions: [{ session_id: idleSid, engine: "codex" as const }],
     runtimes: { [idleSid]: {
       ...createRuntime(), state: "running" as const,
+      liveOwner: { turnId: summaryTurn.id, seq: 41 },
       turns: [openObserved()],
     } },
   }, { type: "event", event: event({
@@ -891,6 +952,8 @@ try {
     === "process"
     ? idleBoundaryState.runtimes[idleSid].turns[0].blocks[0].output : null,
   "keep this output", "the idle boundary preserves process payloads");
+  assert.equal(idleBoundaryState.runtimes[idleSid].liveOwner, null,
+    "State(idle) retires the completed turn's runtime owner");
 
   const resumedBackgroundState = reduce(idleBoundaryState, {
     type: "event", event: event({
