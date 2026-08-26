@@ -88,6 +88,74 @@ assert.equal(canonicalTurnId(turn("optimistic", {
   historyTurnId: "native-user-message",
 })), "native-user-message");
 assert.equal(canonicalTurnId(turn("plain")), "plain");
+
+const sharedDisplayIdOlder = turn("shared-display", {
+  historyTurnId: "canonical-older",
+  prompt: "older legitimate row",
+});
+const sharedDisplayIdNewer = turn("shared-display", {
+  historyTurnId: "canonical-newer",
+  prompt: "newer legitimate row",
+});
+const compactionNativeId = "cross-page-compaction-native";
+const compactionOwner = turn("compaction-owner", {
+  forkPointId: compactionNativeId,
+  prompt: "canonical compaction owner",
+  blocks: [{
+    kind: "process",
+    item_id: "canonical-compaction",
+    processKind: "compaction",
+    phase: "end",
+    status: "succeeded",
+    turn_id: compactionNativeId,
+    title: "压缩上下文",
+    done: true,
+  }],
+});
+const compactionOrphan = turn("compaction-orphan", {
+  prompt: "",
+  blocks: [{
+    kind: "process",
+    item_id: "stale-compaction",
+    processKind: "compaction",
+    phase: "end",
+    status: "succeeded",
+    turn_id: compactionNativeId,
+    title: "压缩上下文",
+    done: true,
+  }],
+});
+const displayAliasRepair = createHistoryBrowse({
+  scopeKey,
+  sid: "display-alias-repair",
+  revision: "display-alias-revision",
+  generation: "display-alias-generation",
+  viewId: "display-alias-view",
+  baseTurns: [sharedDisplayIdNewer, compactionOwner],
+  basePageKey: "display-alias-head",
+  hasOlder: true,
+  olderCursor: "display-alias-cursor",
+  olderPage: {
+    pageKey: "display-alias-older",
+    turns: [sharedDisplayIdOlder, compactionOrphan],
+    hasOlder: false,
+    olderCursor: null,
+    newerPageKey: "display-alias-head",
+  },
+  limits: limits(10),
+});
+assert.deepEqual(
+  displayAliasRepair.projection.turns.map((item) => [
+    item.id, item.historyTurnId, item.prompt,
+  ]),
+  [
+    ["shared-display", "canonical-older", "older legitimate row"],
+    ["compaction-orphan", undefined, ""],
+    ["shared-display", "canonical-newer", "newer legitimate row"],
+    ["compaction-owner", undefined, "canonical compaction owner"],
+  ],
+  "cross-page reconciliation preserves display collisions and distinct compactions",
+);
 assert.deepEqual(nextAutoLoadDetailTurn([
   turn("complete", {
     detailAutoLoad: true,

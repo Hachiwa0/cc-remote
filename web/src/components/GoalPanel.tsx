@@ -1,4 +1,5 @@
 import { useEffect, useId, useRef, useState, type CSSProperties } from "react";
+import { useChatDialogGeometry } from "../chat-dialog-geometry";
 import type { GoalStatus, ThreadGoal } from "../protocol";
 import { Icon } from "../icons";
 import type { TurnPlanProgress } from "../plan-progress";
@@ -46,8 +47,16 @@ export function GoalPanel(p: Props) {
   const [status, setStatus] = useState<GoalStatus>("active");
   const [budget, setBudget] = useState("");
   const [planOpen, setPlanOpen] = useState(false);
+  const closeGoal = p.onClose;
+  const goalScopeRef = useRef<HTMLDivElement>(null);
   const planChipRef = useRef<HTMLButtonElement>(null);
   const planPopoverId = useId();
+  const dialogGeometry = useChatDialogGeometry({
+    open: p.open,
+    maxWidth: 560,
+    maxHeight: 740,
+    scopeRef: goalScopeRef,
+  });
   useEffect(() => {
     setObjective(p.goal?.objective ?? "");
     setStatus(p.goal?.status ?? "active");
@@ -67,6 +76,14 @@ export function GoalPanel(p: Props) {
   useEffect(() => {
     if (planMergedIntoGoal && !p.open) setPlanOpen(false);
   }, [planMergedIntoGoal, p.open]);
+  useEffect(() => {
+    if (!p.open) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") closeGoal();
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [closeGoal, p.open]);
   if (!goalRevealed && !p.open && !standalonePlan) return null;
   const goal = p.goal;
   const used = goal?.tokensUsed ?? 0;
@@ -76,11 +93,15 @@ export function GoalPanel(p: Props) {
   const engineName = p.engine === "codex" ? "Codex" : "Claude";
   const planPresentation = p.plan
     ? planProgressPresentation(p.plan.block, p.plan.detailLoading) : null;
+  const planHeadline = planPresentation?.stale
+    ? planPresentation.stateLabel
+    : planPresentation?.currentStep ?? planPresentation?.description
+      ?? planPresentation?.stateLabel;
   const openGoal = () => p.onOpen();
 
   return <>
     {standalonePlan && planPresentation && (
-      <div className="goal-chip-wrap plan-chip-wrap">
+      <div ref={goalScopeRef} className="goal-chip-wrap plan-chip-wrap">
         <button ref={planChipRef} type="button" className="goal-chip plan-chip"
           aria-expanded={planOpen} aria-controls={planPopoverId}
           onClick={() => {
@@ -88,15 +109,14 @@ export function GoalPanel(p: Props) {
             if (next) p.onLoadPlanDetail?.();
             setPlanOpen(next);
           }} aria-label={`查看计划进度，${planPresentation.progressLabel}`}>
-          <span className={`goal-chip-ring plan-chip-ring${planPresentation.complete ? " complete" : ""}${planPresentation.failed ? " failed" : ""}`}
+          <span className={`goal-chip-ring plan-chip-ring${planPresentation.complete ? " complete" : ""}${planPresentation.failed ? " failed" : ""}${planPresentation.stale ? " stale" : ""}`}
             aria-hidden="true"
             style={{ "--goal-progress": `${planPresentation.progress * 3.6}deg` } as CSSProperties}>
             <Icon name={planPresentation.complete ? "verify" : "plan"} size={11} />
           </span>
           <span className="goal-chip-label">计划</span>
           <span className="goal-chip-objective">
-            {planPresentation.currentStep ?? planPresentation.description
-              ?? planPresentation.stateLabel}
+            {planHeadline}
           </span>
           <span className="goal-chip-status">{planPresentation.progressLabel}</span>
         </button>
@@ -107,7 +127,7 @@ export function GoalPanel(p: Props) {
       </div>
     )}
     {goalRevealed && !goal &&
-      <div className="goal-chip-wrap goal-loading" role="status"
+      <div ref={goalScopeRef} className="goal-chip-wrap goal-loading" role="status"
         aria-label={p.loading ? "正在恢复 Goal" : "Goal 暂时不可用，可重试"}>
         <button className="goal-chip goal-chip-loading" onClick={openGoal}>
           <span className="goal-chip-dot goal-chip-dot-active" aria-hidden="true" />
@@ -117,7 +137,8 @@ export function GoalPanel(p: Props) {
           </span>
         </button>
       </div>}
-    {goalRevealed && goal && <div className={`goal-chip-wrap goal-${goal.status}`}>
+    {goalRevealed && goal && <div ref={goalScopeRef}
+      className={`goal-chip-wrap goal-${goal.status}`}>
       <button className="goal-chip" onClick={openGoal}
         aria-label={`查看 Goal，${statusName[goal.status]}`}>
         {visualProgress != null
@@ -138,9 +159,10 @@ export function GoalPanel(p: Props) {
       </button>
     </div>}
 
-    {p.open && <>
+    {p.open && dialogGeometry && <>
       <div className="scrim show" onClick={p.onClose} />
-      <section className="sheet show goal-sheet" role="dialog" aria-modal="true" aria-label={`${engineName} Goal`}>
+      <section className="sheet show goal-sheet" role="dialog" aria-modal="true"
+        aria-label={`${engineName} Goal`} style={dialogGeometry}>
         <div className="sheet-grip" />
         <header className="goal-sheet-head">
           <span className="goal-sheet-icon"><Icon name="plan" size={18} /></span>
@@ -158,16 +180,14 @@ export function GoalPanel(p: Props) {
                 if (next) p.onLoadPlanDetail?.();
                 setPlanOpen(next);
               }}>
-              <span className={`goal-chip-ring plan-chip-ring${planPresentation.complete ? " complete" : ""}${planPresentation.failed ? " failed" : ""}`}
+              <span className={`goal-chip-ring plan-chip-ring${planPresentation.complete ? " complete" : ""}${planPresentation.failed ? " failed" : ""}${planPresentation.stale ? " stale" : ""}`}
                 aria-hidden="true"
                 style={{ "--goal-progress": `${planPresentation.progress * 3.6}deg` } as CSSProperties}>
                 <Icon name={planPresentation.complete ? "verify" : "plan"} size={11} />
               </span>
               <span className="goal-plan-entry-copy">
                 <b>计划</b>
-                <small>{planPresentation.currentStep
-                  ?? planPresentation.description
-                  ?? planPresentation.stateLabel}</small>
+                <small>{planHeadline}</small>
               </span>
               <strong>{planPresentation.progressLabel}</strong>
               <span className={`goal-plan-entry-chev${planOpen ? " open" : ""}`}

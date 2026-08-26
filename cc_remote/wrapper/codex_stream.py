@@ -1203,13 +1203,17 @@ def codex_history_turn_user(
     turn_id: str,
     cursor: str,
     user_index: int = 0,
+    *,
+    max_reverse_scan_bytes: int | None = None,
 ) -> UserMsg | None:
     """Recover one visible user row for one native Codex turn.
 
     Official summary items retain expired ``localImage`` paths rather than the
     inline image bytes persisted in the rollout. Locate only the requested
     native turn boundary, then reuse the bounded forward reader above so image
-    thumbnails remain available without translating the whole rollout.
+    thumbnails remain available without translating the whole rollout. Live
+    recovery may bound the reverse search to the recent tail; history detail
+    reads retain the existing unbounded exact-turn lookup by default.
     """
     if (
         not isinstance(turn_id, str)
@@ -1222,7 +1226,10 @@ def codex_history_turn_user(
     ):
         return None
     try:
-        for offset, line in _reverse_jsonl_records(path):
+        for offset, line in _reverse_jsonl_records(
+            path,
+            max_scan_bytes=max_reverse_scan_bytes,
+        ):
             if _history_turn_cursor(line) == turn_id:
                 return codex_history_boundary_user(
                     path, offset, cursor, user_index=user_index)
@@ -1513,7 +1520,19 @@ class CodexStreamTranslator:
         self._live_items_truncated = False
         self._turn_closed = False
 
-    def feed(self, msg: dict) -> list:
+    def feed(
+        self,
+        msg: dict,
+        *,
+        authoritative_terminal: bool = True,
+    ) -> list:
+        """Translate one app-server notification.
+
+        ``authoritative_terminal=False`` is reserved for the few callers which
+        feed a locally synthesized ``turn/completed`` only to close translator
+        blocks.  Its TurnEnd remains useful on the live wire, but cannot be
+        persisted as an engine-owned lifecycle fact.
+        """
         method = msg.get("method")
         p = msg.get("params") if isinstance(msg.get("params"), dict) else {}
         out: list = []
@@ -2032,12 +2051,14 @@ class CodexStreamTranslator:
                        else "error_during_execution" if st == "interrupted"
                        else "error")
             completed_turn_id = turn.get("id")
-            out.append(TurnEnd(result=TurnResult(
+            terminal = TurnEnd(result=TurnResult(
                 subtype=subtype,
                 duration_ms=int(turn.get("durationMs") or 0),
                 is_error=(st != "completed"),
             ), turn_id=(completed_turn_id
-                        if isinstance(completed_turn_id, str) else None)))
+                        if isinstance(completed_turn_id, str) else None))
+            terminal._codex_authoritative_terminal = authoritative_terminal
+            out.append(terminal)
             self._clear_all_delta_budgets()
             self._completed_plan = None
             self._turn_closed = True
@@ -3027,6 +3048,7 @@ def codex_translate_history(
     end_offset: int | None = None,
     source_continuation: str | None = None,
     snapshot_in_progress: bool = False,
+    active_task_ids: set[str] | frozenset[str] | tuple[str, ...] = (),
     client_message_ids: dict[str, str] | None = None,
     segment_client_message_ids: dict[tuple[str, int], str] | None = None,
 ) -> tuple[list, str | None]:
@@ -3074,6 +3096,10 @@ def codex_translate_history(
     # native task/start marker. A window which begins mid-turn must not mistake
     # its first visible steer for segment zero.
     task_segment_index: int | None = None
+    known_active_task_ids = {
+        value for value in active_task_ids
+        if isinstance(value, str) and _SAFE_WIRE_ID.fullmatch(value)
+    }
     native_client_aliases = client_message_ids or {}
     segment_client_aliases = segment_client_message_ids or {}
     seen_tool_uses: set[str] = set()
@@ -3657,6 +3683,13 @@ def codex_translate_history(
                         # the Web projection stores one user prompt per turn,
                         # but it must be a neutral non-error boundary.
                         steered_same_task = task_has_user and turn_has_user
+                        active_mid_task_steer = bool(
+                            snapshot_in_progress
+                            and turn_open
+                            and not turn_has_user
+                            and isinstance(next_turn_id, str)
+                            and next_turn_id in known_active_task_ids
+                        )
                         # No terminal record proved where the previous visible
                         # reply ended. In particular, pending_turn_id now often
                         # belongs to this NEW user turn; never attach it to the
@@ -3671,7 +3704,7 @@ def codex_translate_history(
                                 "authoritative_page",
                             }
                         )
-                        if steered_same_task:
+                        if steered_same_task or active_mid_task_steer:
                             close_turn(
                                 "steered", 0, False,
                                 authoritative_boundary=False)

@@ -256,6 +256,24 @@ export const effortsFor = (engine?: string, model?: string | null, catalog?: Cat
   return engine === "codex" ? CODEX_EFFORTS : EFFORTS;
 };
 
+/** A null app-server thread effort is a real model-default state, not loading.
+ * Ordinary effort labels intentionally remain their raw CLI/config ids. */
+export function effortNameForDisplay(
+  id: string | null | undefined,
+): string | null {
+  const normalized = id?.trim();
+  return normalized
+    ? (normalized === "model-default" ? "模型默认" : normalized)
+    : null;
+}
+
+export function effortIsSelectable(
+  id: string | null | undefined,
+): id is string {
+  const normalized = id?.trim();
+  return !!normalized && normalized !== "model-default";
+}
+
 /** Default effort = the HIGHEST level the selected model supports (product decision:
  *  always think as hard as the model allows — we deliberately ignore the server's
  *  own `default_effort`, which is `low` for sol). Also what we clamp to when the user

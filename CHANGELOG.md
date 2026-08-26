@@ -4,6 +4,12 @@
 
 ## Unreleased
 
+- Upgrade the coordinated Wrapper/Relay/Web gate to protocol v35. Exact Codex
+  app-server and source-validated rollout terminals now travel independently of
+  the narrative History projection, so a multi-hundred-MiB rollout cannot keep
+  a completed turn spinning while its content index catches up. Terminal facts
+  remain profile-, revision-, and source-bound; they never guess the newest open
+  row or create a second completion receipt.
 - Upgrade the coordinated Wrapper/Relay/Web gate to protocol v34. Main-session
   completion acknowledgements and exact Goal-generation dismissals now live in
   bounded wrapper-owned state, so reading or hiding them in one browser updates

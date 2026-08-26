@@ -2,7 +2,7 @@ import {
   canonicalTurnId,
   type HistoryBrowsePage,
 } from "./history-browse.ts";
-import type { Turn } from "./domain/conversation.ts";
+import type { Block, Turn } from "./domain/conversation.ts";
 
 /** Deliberately independent from cache.ts. Deep-history browsing is best-effort
  * page storage and must never make an upgrade/failure of the replay/session
@@ -14,8 +14,10 @@ const HISTORY_PAGE_CACHE_SCOPE_INDEX = "scope";
 const HISTORY_PAGE_CACHE_SESSION_INDEX = "session";
 const HISTORY_PAGE_CACHE_LRU_INDEX = "lru";
 const DEFAULT_HISTORY_PAGE_CACHE_BYTES = 64 * 1024 * 1024;
-const LEGACY_RECORD_VERSIONS = new Set([1, 2] as const);
-const RECORD_VERSION = 3;
+// v4 preserves a payload-free context-compaction identity shell. Older page
+// records can otherwise turn a repaired compact orphan into an unprovable
+// empty row after a hard refresh, so they must be rebuilt from History.
+const RECORD_VERSION = 4;
 
 export interface HistoryPageCacheSessionScope {
   machineId: string;
@@ -29,7 +31,7 @@ export interface HistoryPageCacheScope extends HistoryPageCacheSessionScope {
 }
 
 export interface HistoryPageCacheStoredRecord {
-  version: 1 | 2 | typeof RECORD_VERSION;
+  version: 1 | 2 | 3 | typeof RECORD_VERSION;
   key: string;
   scopeKey: string;
   sessionKey: string;
@@ -108,15 +110,39 @@ export function historyPageCachePageKey(
 }
 
 function sanitizeTurn(turn: Turn): Turn {
-  const summaryBlocks = turn.blocks.filter((block) =>
-    block.kind === "text" && block.channel === "final");
+  const summaryBlocks = turn.blocks.flatMap((block): Block[] => {
+    if (block.kind === "text" && block.channel === "final") {
+      return [{ ...block }];
+    }
+    // Context compaction is lightweight narrative metadata, and its native
+    // turn id is the proof used to repair the historical standalone-row bug.
+    // Preserve a payload-free shell across page eviction/cache reload; ordinary
+    // command/tool/reasoning bodies still remain detail-only.
+    if (block.kind === "process" && block.processKind === "compaction") {
+      return [{
+        kind: "process" as const,
+        item_id: block.item_id,
+        processKind: block.processKind,
+        phase: block.phase,
+        status: block.status,
+        turn_id: block.turn_id,
+        parent_id: block.parent_id,
+        title: block.title,
+        summary: block.summary,
+        duration_ms: block.duration_ms,
+        truncated: block.truncated,
+        done: block.done,
+      }];
+    }
+    return [];
+  });
   const deferredBlocks = turn.blocks.length - summaryBlocks.length;
   return {
     ...turn,
     // Tool/process/thinking bodies are intentionally deferred to
     // GetTurnDetail. Keeping their stripped shells produced dozens of
     // expandable "运行命令" rows with empty bodies after an IndexedDB paint.
-    blocks: summaryBlocks.map((block) => ({ ...block })),
+    blocks: summaryBlocks,
     // Summary pages keep canonical metadata only. Attachment bytes are fetched
     // lazily through GetHistoryImage when this row re-enters the viewport.
     images: undefined,
@@ -197,10 +223,7 @@ function validRecord(
 ): value is HistoryPageCacheStoredRecord {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const record = value as Partial<HistoryPageCacheStoredRecord>;
-  const compatibleVersion = record.version === RECORD_VERSION
-    || (LEGACY_RECORD_VERSIONS.has(record.version as 1 | 2)
-      && expected.engine === "codex");
-  return compatibleVersion
+  return record.version === RECORD_VERSION
     && record.key === expected.key
     && record.scopeKey === expected.scopeKey
     && record.sessionKey === expected.sessionKey
@@ -403,8 +426,8 @@ class IndexedDbHistoryPageStorage implements HistoryPageCacheStorage {
         }
         if (!store.indexNames.contains(HISTORY_PAGE_CACHE_LRU_INDEX)) {
           // The compound index exposes ordering and byte sizes through a key
-          // cursor. A v1 upgrade keeps existing page records and indexes them
-          // from the metadata already stored with each page.
+          // cursor. Schema upgrades index legacy records for bounded accounting;
+          // semantic record-version validation removes them lazily on read.
           store.createIndex(
             HISTORY_PAGE_CACHE_LRU_INDEX,
             ["savedAt", "byteSize", "key"],

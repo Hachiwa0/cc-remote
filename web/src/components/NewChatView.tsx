@@ -14,6 +14,14 @@ import { PendingImageAttachments } from "./PendingImageAttachments";
 import { CommandSheet } from "./CommandSheet";
 import { permissionProfileLabel } from "../data";
 import { codexProfilePresentation } from "../codex-profile-presentation";
+import {
+  composePastePrompt,
+  LONG_PASTE_THRESHOLD,
+  makeComposerPaste,
+  type ComposerPaste,
+} from "../composer-pastes";
+import { PasteCards } from "./PasteCards";
+import { uuid } from "../util";
 
 type Engine = "claude" | "codex";
 
@@ -241,6 +249,7 @@ export function NewChatView({ cwd, controlScopeKey,
   const [text, setText] = useState("");
   const [images, setImages] = useState<QueryImg[]>([]);
   const [files, setFiles] = useState<QueryFile[]>([]);
+  const [pastes, setPastes] = useState<ComposerPaste[]>([]);
   const [importing, setImporting] = useState(false);
   const [creating, setCreating] = useState(false);
   const [sheetKind, setSheetKind] =
@@ -318,7 +327,7 @@ export function NewChatView({ cwd, controlScopeKey,
   const selectedProfileWarning = selectedProfileMissing
     ? "所选 Codex 账号已移除，请重新选择。"
     : selectedCodexProfile?.error ?? null;
-  const canSend = (text.trim().length > 0 || hasAttachments)
+  const canSend = (text.trim().length > 0 || hasAttachments || pastes.length > 0)
     && !creating && !importing && !selectedProfileMissing;
   const modelList = modelsFor(engine, catalog);
   const effectiveModel = model ?? defaultModel;
@@ -381,11 +390,23 @@ export function NewChatView({ cwd, controlScopeKey,
       const it = items[i];
       if (it.kind === "file") { const f = it.getAsFile(); if (f) fs.push(f); }
     }
-    if (fs.length) { e.preventDefault(); void onPick(fs); }
+    if (fs.length) { e.preventDefault(); void onPick(fs); return; }
+    const pastedText = e.clipboardData.getData("text/plain");
+    if (pastedText.length <= LONG_PASTE_THRESHOLD) return;
+    e.preventDefault();
+    setPastes((current) => [
+      ...current,
+      makeComposerPaste(pastedText, uuid()),
+    ]);
   };
 
   const send = (value = taRef.current?.value ?? text) => {
-    const prompt = value.trim();
+    const composed = composePastePrompt(pastes, value.trim());
+    if (!composed.ok) {
+      window.alert(`消息内容超过上限（最多 ${composed.maxChars.toLocaleString()} 个字符）`);
+      return;
+    }
+    const prompt = composed.prompt;
     if ((!prompt && !hasAttachments) || creating || importing
         || selectedProfileMissing) return;
     setCreating(true);
@@ -503,7 +524,7 @@ export function NewChatView({ cwd, controlScopeKey,
           </>
         )}
 
-        {space === "work" && !text && !hasAttachments && (
+        {space === "work" && !text && !hasAttachments && pastes.length === 0 && (
           <div className="work-starters" aria-label="常用工作类型">
             {[
               ["read", "整理文档", "帮我整理这份资料，输出一份结构清晰的文档。"],
@@ -518,7 +539,7 @@ export function NewChatView({ cwd, controlScopeKey,
           </div>
         )}
 
-        {hasAttachments && (
+        {(hasAttachments || pastes.length > 0) && (
           <div className="attach show newchat-attach">
             <PendingImageAttachments images={images}
               onRemove={(index) => setImages((previous) =>
@@ -530,6 +551,8 @@ export function NewChatView({ cwd, controlScopeKey,
                 <button className="attach-x" onClick={() => setFiles(files.filter((_, j) => j !== i))} aria-label="移除"><Icon name="close" size={12} /></button>
               </span>
             ))}
+            <PasteCards pastes={pastes} onChange={setPastes}
+              disabled={creating || importing} />
           </div>
         )}
 

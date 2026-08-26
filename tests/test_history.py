@@ -27,11 +27,15 @@ from claude_agent_sdk.types import (
 )
 
 from cc_remote.protocol import (
+    MAX_SAFE_WIRE_INTEGER,
     serialize, deserialize,
-    GetHistory, GetHistoryImage, GetTurnDetail, History, HistoryImage,
+    CodexTerminalFence, GetHistory, GetHistoryImage, GetTurnDetail, History,
+    HistoryImage,
     TurnDetail, HistoryInvalidated,
     UserMsg, TurnSteered, AssistantMsgStart, AssistantMsgEnd, Delta,
+    ToolUse, ToolResult,
     ProcessEvent, TurnPlan, TurnBinding, TurnEnd, TurnResult, Error,
+    Model, Effort,
     is_downstream,
 )
 from cc_remote.wrapper import machine as mm
@@ -64,6 +68,220 @@ from cc_remote.wrapper.stream import (
     translate_history,
 )
 from tests.test_multisession import _mk_machine, _mk_ctx
+
+
+def test_live_codex_terminal_is_available_to_stale_history_immediately(
+    tmp_path,
+):
+    rollout = tmp_path / "terminal-rollout.jsonl"
+    rollout.write_text(
+        '{"type":"session_meta","payload":{"id":"terminal-session"}}\n')
+
+    async def run():
+        machine, transport = _mk_machine()
+        sid = "terminal-session"
+        ctx = _mk_ctx(sid, sid)
+        ctx.engine = "codex"
+        ctx.sdk = SimpleNamespace(
+            compaction_continuation_turn_ids=frozenset())
+        machine.sessions[sid] = ctx
+        source_stat = rollout.stat()
+        machine._watch[sid] = {
+            "path": str(rollout),
+            "file_id": (source_stat.st_dev, source_stat.st_ino),
+            "size": source_stat.st_size,
+            "engine": "codex",
+        }
+        machine._codex_rollout_for_wire = lambda _sid: str(rollout)
+
+        terminal = TurnEnd(
+            result=TurnResult(
+                subtype="success", duration_ms=1200, is_error=False),
+            turn_id="native-terminal-turn",
+        )
+        terminal._codex_authoritative_terminal = True
+        await machine._emit_locked(ctx, terminal)
+        immediate = machine._codex_terminal_ledger.snapshot(
+            sid,
+            rollout,
+            revision=machine._history_revision(sid),
+        )
+        assert immediate == (CodexTerminalFence(
+            turn_id="native-terminal-turn",
+            status="completed",
+            duration_ms=1200,
+            completed_at=transport.sent[-1].ts,
+        ),)
+
+        async def stale_official_history(_sid, *, before, limit):
+            assert before is None and limit == 4
+            return History(
+                session_id=sid,
+                revision=machine._history_revision(sid),
+                generation=machine.instance_id,
+                build_seq=1,
+                live_seq=0,
+                authoritative=False,
+                error="stale projection",
+                events=[],
+                turns=[],
+                detail="summary",
+                has_more=False,
+                in_progress=True,
+            )
+
+        machine._build_official_codex_history = stale_official_history
+        history = await machine._build_requested_history(
+            sid,
+            before=None,
+            limit=4,
+            cwd=ctx.cwd,
+            detail="summary",
+        )
+        assert history.authoritative is False
+        assert history.terminal_fences == list(immediate)
+
+        # A local transport/drain failure still closes the live UI, but is not
+        # an engine-owned fact and must not poison a later History response.
+        await machine._emit_locked(ctx, TurnEnd(
+            result=TurnResult(
+                subtype="error", duration_ms=0, is_error=True),
+            turn_id="synthetic-local-failure",
+        ))
+        assert machine._codex_terminal_ledger.snapshot(
+            sid,
+            rollout,
+            revision=machine._history_revision(sid),
+        ) == immediate
+
+        unsafe_terminal = TurnEnd(
+            result=TurnResult(
+                subtype="success",
+                duration_ms=MAX_SAFE_WIRE_INTEGER + 1,
+                is_error=False,
+            ),
+            turn_id="unsafe-duration-terminal",
+        )
+        unsafe_terminal._codex_authoritative_terminal = True
+        await machine._emit_locked(ctx, unsafe_terminal)
+        assert transport.sent[-1].turn_id == "unsafe-duration-terminal"
+        assert machine._codex_terminal_ledger.snapshot(
+            sid,
+            rollout,
+            revision=machine._history_revision(sid),
+        ) == immediate
+
+        def fail_recovery(*_args):
+            raise RuntimeError("optional ledger failure")
+
+        machine._remember_codex_terminal_event = fail_recovery
+        fallback_terminal = TurnEnd(
+            result=TurnResult(
+                subtype="success", duration_ms=1, is_error=False),
+            turn_id="live-terminal-survives-ledger-failure",
+        )
+        fallback_terminal._codex_authoritative_terminal = True
+        await machine._emit_locked(ctx, fallback_terminal)
+        assert transport.sent[-1].turn_id == fallback_terminal.turn_id
+
+        tasks = list(machine._codex_terminal_persist_tasks)
+        if tasks:
+            await asyncio.gather(*tasks)
+
+    asyncio.run(run())
+
+
+def test_codex_terminal_provenance_never_crosses_the_wire():
+    terminal = TurnEnd(
+        result=TurnResult(
+            subtype="success", duration_ms=1, is_error=False),
+        turn_id="native-turn",
+    )
+    terminal._codex_authoritative_terminal = True
+
+    encoded = serialize(terminal)
+    restored = deserialize(encoded)
+
+    assert "_codex_authoritative_terminal" not in encoded
+    assert isinstance(restored, TurnEnd)
+    assert restored._codex_authoritative_terminal is False
+
+
+def test_unbound_live_codex_terminal_is_visible_in_same_revision():
+    async def run():
+        machine, _transport = _mk_machine()
+        sid = "unbound-terminal-session"
+        ctx = _mk_ctx(sid, sid)
+        ctx.engine = "codex"
+        ctx.sdk = SimpleNamespace(
+            compaction_continuation_turn_ids=frozenset())
+        machine.sessions[sid] = ctx
+        machine._codex_rollout_for_wire = lambda _sid: None
+
+        terminal = TurnEnd(
+            result=TurnResult(
+                subtype="success", duration_ms=15, is_error=False),
+            turn_id="unbound-native-turn",
+        )
+        terminal._codex_authoritative_terminal = True
+        await machine._emit_locked(ctx, terminal)
+
+        assert await machine._codex_terminal_snapshot(
+            sid, machine._history_revision(sid),
+        ) == [CodexTerminalFence(
+            turn_id="unbound-native-turn",
+            status="completed",
+            duration_ms=15,
+            completed_at=terminal.ts,
+        )]
+        assert not machine._codex_terminal_persist_tasks
+
+    asyncio.run(run())
+
+
+def test_compaction_interrupted_terminal_is_not_persisted_as_completion(
+    tmp_path,
+):
+    rollout = tmp_path / "compact-rollout.jsonl"
+    rollout.write_text(
+        '{"type":"session_meta","payload":{"id":"compact-session"}}\n')
+
+    async def run():
+        machine, _transport = _mk_machine()
+        sid = "compact-session"
+        ctx = _mk_ctx(sid, sid)
+        ctx.engine = "codex"
+        ctx.sdk = SimpleNamespace(
+            compaction_continuation_turn_ids=frozenset({"compact-turn"}))
+        machine.sessions[sid] = ctx
+        source_stat = rollout.stat()
+        machine._watch[sid] = {
+            "path": str(rollout),
+            "file_id": (source_stat.st_dev, source_stat.st_ino),
+            "size": source_stat.st_size,
+            "engine": "codex",
+        }
+        machine._codex_rollout_for_wire = lambda _sid: str(rollout)
+
+        terminal = TurnEnd(
+            result=TurnResult(
+                subtype="error_during_execution",
+                duration_ms=0,
+                is_error=True,
+            ),
+            turn_id="compact-turn",
+        )
+        terminal._codex_authoritative_terminal = True
+        await machine._emit_locked(ctx, terminal)
+
+        assert machine._codex_terminal_ledger.snapshot(
+            sid,
+            rollout,
+            revision=machine._history_revision(sid),
+        ) == ()
+        assert not machine._codex_terminal_persist_tasks
+
+    asyncio.run(run())
 
 
 def _write_projection_rollout(path, native_turn_ids: list[str]) -> None:
@@ -1224,8 +1442,8 @@ def test_requested_codex_summary_uses_official_turns_without_rollout_parse(
     asyncio.run(run())
 
 
-def test_codex_plan_snapshot_survives_native_summary_omission():
-    """A fresh browser recovers a live plan absent from app-server history."""
+def test_codex_plan_snapshot_recovers_as_settled_after_native_terminal():
+    """A stale Plan remains auditable without impersonating active work."""
     events = (
         UserMsg(
             sid="plan-summary", msg_id="user-1", prompt="implement",
@@ -1254,6 +1472,15 @@ def test_codex_plan_snapshot_survives_native_summary_omission():
         ctx = _mk_ctx("plan-summary", "plan-summary")
         ctx.engine = "codex"
         machine.sessions[ctx.key] = ctx
+
+        async def terminal_snapshot(_sid, _revision):
+            return (CodexTerminalFence(
+                turn_id="native-1",
+                status="completed",
+                duration_ms=1000,
+            ),)
+
+        machine._codex_terminal_snapshot = terminal_snapshot
 
         await machine._emit_locked(ctx, TurnPlan(
             item_id="plan:native-1",
@@ -1288,13 +1515,18 @@ def test_codex_plan_snapshot_survives_native_summary_omission():
         assert plans[0]["item_id"] == "plan:native-1"
         assert plans[0]["plan"][1] == {
             "step": "implement", "status": "inProgress"}
+        assert plans[0]["done"] is True
+        assert plans[0]["status"] == "succeeded"
+        repaired = machine._session_plans.get("plan-summary")
+        assert repaired is not None
+        assert repaired.terminal_status == "succeeded"
         assert history.to == "client-1"
         assert transport.sent[-1] is history
 
     asyncio.run(run())
 
 
-def test_codex_next_user_boundary_retires_only_completed_plan_snapshot():
+def test_codex_next_user_boundary_retires_only_settled_plan_snapshot():
     async def run():
         machine, _transport = _mk_machine()
         ctx = _mk_ctx("plan-lifecycle", "plan-lifecycle")
@@ -1333,9 +1565,32 @@ def test_codex_next_user_boundary_retires_only_completed_plan_snapshot():
                 {"step": "fix", "status": "inProgress"},
             ],
         ))
-        await machine._emit_locked(ctx, UserMsg(
-            msg_id="turn-4", prompt="clarification"))
+        await machine._emit_locked(ctx, TurnEnd(
+            turn_id="turn-3",
+            result=TurnResult(
+                subtype="steered", duration_ms=0, is_error=False),
+        ))
+        steered = machine._session_plans.get("plan-lifecycle")
+        assert steered is not None
+        assert steered.terminal_status is None
+        await machine._emit_locked(ctx, TurnSteered(
+            msg_id="turn-4", turn_id="turn-3", prompt="clarification"))
         assert machine._session_plans.get("plan-lifecycle") is not None
+
+        authoritative_terminal = TurnEnd(
+            turn_id="turn-3",
+            result=TurnResult(
+                subtype="success", duration_ms=1000, is_error=False),
+        )
+        authoritative_terminal._codex_authoritative_terminal = True
+        await machine._emit_locked(ctx, authoritative_terminal)
+        terminal = machine._session_plans.get("plan-lifecycle")
+        assert terminal is not None
+        assert terminal.terminal_status == "succeeded"
+        assert terminal.complete is False
+        await machine._emit_locked(ctx, UserMsg(
+            msg_id="turn-4b", prompt="new task after terminal"))
+        assert machine._session_plans.get("plan-lifecycle") is None
 
         await machine._emit_locked(ctx, TurnPlan(
             item_id="plan:turn-5",
@@ -1348,6 +1603,92 @@ def test_codex_next_user_boundary_retires_only_completed_plan_snapshot():
         assert machine._session_plans.get("plan-lifecycle") is None
 
     asyncio.run(run())
+
+
+def test_codex_synthetic_terminal_cannot_poison_durable_plan_status():
+    async def run():
+        machine, _transport = _mk_machine()
+        ctx = _mk_ctx("plan-terminal-authority", "plan-terminal-authority")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+
+        await machine._emit_locked(ctx, TurnPlan(
+            item_id="plan:native-turn",
+            turn_id="native-turn",
+            explanation="still working",
+            plan=[
+                {"step": "inspect", "status": "completed"},
+                {"step": "finish", "status": "inProgress"},
+            ],
+        ))
+
+        synthetic = TurnEnd(
+            turn_id="native-turn",
+            result=TurnResult(
+                subtype="error", duration_ms=0, is_error=True),
+        )
+        assert synthetic._codex_authoritative_terminal is False
+        await machine._emit_locked(ctx, synthetic)
+        after_synthetic = machine._session_plans.get(
+            "plan-terminal-authority")
+        assert after_synthetic is not None
+        assert after_synthetic.terminal_status is None
+
+        authoritative = TurnEnd(
+            turn_id="native-turn",
+            result=TurnResult(
+                subtype="success", duration_ms=1000, is_error=False),
+        )
+        authoritative._codex_authoritative_terminal = True
+        await machine._emit_locked(ctx, authoritative)
+        after_authoritative = machine._session_plans.get(
+            "plan-terminal-authority")
+        assert after_authoritative is not None
+        assert after_authoritative.terminal_status == "succeeded"
+
+    asyncio.run(run())
+
+
+def test_materialized_steer_keeps_plan_open_until_exact_terminal():
+    def projection(subtype: str):
+        return materialize_history_turns([
+            {"type": "user_msg", "msg_id": "user-1", "prompt": "work"},
+            {
+                "type": "turn_plan",
+                "item_id": "plan:turn-1",
+                "turn_id": "turn-1",
+                "plan": [
+                    {"step": "inspect", "status": "completed"},
+                    {"step": "fix", "status": "inProgress"},
+                ],
+            },
+            {
+                "type": "turn_end",
+                "turn_id": "turn-1",
+                "result": {
+                    "subtype": subtype,
+                    "duration_ms": 0,
+                    "is_error": False,
+                },
+            },
+        ], include_live_detail=True)
+
+    steered = projection("steered")[0]
+    steered_plan = next(
+        block for block in steered["blocks"]
+        if block.get("processKind") == "plan"
+    )
+    assert steered["done"] is True
+    assert steered_plan["done"] is False
+    assert steered_plan["status"] == "running"
+
+    completed = projection("success")[0]
+    completed_plan = next(
+        block for block in completed["blocks"]
+        if block.get("processKind") == "plan"
+    )
+    assert completed_plan["done"] is True
+    assert completed_plan["status"] == "succeeded"
 
 
 @pytest.mark.parametrize("plan_turn_id", ["native-1", None])
@@ -1402,6 +1743,60 @@ def test_completed_codex_plan_is_not_rebound_without_matching_owner(
             for turn in history.turns
             for block in turn.blocks
         )
+
+    asyncio.run(run())
+
+
+def test_incomplete_codex_plan_is_not_rebound_without_matching_owner():
+    events = (
+        UserMsg(
+            sid="stale-active-plan", msg_id="user-2", prompt="next task",
+        ).model_dump(mode="json"),
+        TurnEnd(
+            sid="stale-active-plan",
+            turn_id="native-2",
+            result=TurnResult(
+                subtype="success", duration_ms=1000, is_error=False),
+        ).model_dump(mode="json"),
+    )
+
+    class Official:
+        async def summary_page(self, _sid, **_kwargs):
+            return CodexHistoryPage(
+                events=events,
+                turns=materialize_history_turns(events),
+                has_more=True,
+                oldest_id="user-2",
+                newest_id="user-2",
+            )
+
+    async def run():
+        machine, _transport = _mk_machine()
+        machine._codex_history = Official()
+        ctx = _mk_ctx("stale-active-plan", "stale-active-plan")
+        ctx.engine = "codex"
+        machine.sessions[ctx.key] = ctx
+        machine._session_plans.put("stale-active-plan", TurnPlan(
+            item_id="plan:native-1",
+            turn_id="native-1",
+            explanation="old unfinished task",
+            plan=[{"step": "old", "status": "inProgress"}],
+        ))
+
+        history = await machine._handle_get_history(SimpleNamespace(
+            session_id="stale-active-plan",
+            client_id="client-1",
+            before=None,
+            limit=4,
+            cwd=ctx.cwd,
+            detail="summary",
+        ))
+        assert all(
+            block.get("processKind") != "plan"
+            for turn in history.turns
+            for block in turn.blocks
+        )
+        assert machine._session_plans.get("stale-active-plan") is not None
 
     asyncio.run(run())
 
@@ -1556,12 +1951,20 @@ def test_requested_codex_summary_falls_back_only_for_unsupported_capability(
         mm, "codex_rollout_path", lambda _sid: str(rollout))
 
     class Unsupported:
+        def __init__(self):
+            self.calls = 0
+
         async def summary_page(self, *_args, **_kwargs):
+            self.calls += 1
             raise CodexHistoryUnsupported("old app-server")
+
+        def invalidate_thread(self, _sid):
+            return None
 
     async def run():
         machine, _transport = _mk_machine()
-        machine._codex_history = Unsupported()
+        official = Unsupported()
+        machine._codex_history = official
         ctx = _mk_ctx("unsupported-summary", "unsupported-summary")
         ctx.engine = "codex"
         machine.sessions[ctx.key] = ctx
@@ -1585,6 +1988,23 @@ def test_requested_codex_summary_falls_back_only_for_unsupported_capability(
         )
         assert history.error is None
         assert len(fallback_calls) == 1
+        assert official.calls == 1
+        assert machine._codex_rollout_history_active(
+            "unsupported-summary") is True
+
+        # The first rollout page owns its stable turn-id cursor. Every older
+        # summary page in the same revision must remain on rollout instead of
+        # handing that id to the official reader's opaque cursor table.
+        await machine._build_requested_history(
+            "unsupported-summary",
+            before="rollout-turn-id",
+            limit=12,
+            cwd=None,
+            detail="summary",
+        )
+        assert len(fallback_calls) == 2
+        assert fallback_calls[-1][1]["before"] == "rollout-turn-id"
+        assert official.calls == 1
 
     asyncio.run(run())
 
@@ -3199,6 +3619,7 @@ def test_codex_history_append_paints_cached_page_before_revalidation(
             oldest_id="old",
             newest_id="old",
             turns=materialize_history_turns(events),
+            in_progress=True,
         )
         machine._history_index.put_page(
             "codex-fast", "codex", old_source,
@@ -3229,6 +3650,70 @@ def test_codex_history_append_paints_cached_page_before_revalidation(
         assert history.in_progress is True
         assert history.has_more is True
         assert refreshes and refreshes[0][0] == "codex-fast"
+
+    asyncio.run(go())
+
+
+def test_active_codex_cache_is_bound_to_exact_continuation_tasks(
+        monkeypatch, tmp_path):
+    rollout = tmp_path / "active-cache.jsonl"
+    rollout.write_text(
+        '{"type":"session_meta","payload":{"id":"active-cache"}}\n')
+    monkeypatch.setattr(mm, "codex_rollout_path", lambda _sid: str(rollout))
+    translated = []
+
+    def translate(*_args, **kwargs):
+        translated.append(kwargs)
+        return [], None
+
+    monkeypatch.setattr(mm, "codex_translate_history", translate)
+
+    async def go():
+        machine, _ = _mk_machine()
+        machine._history_index = HistoryIndexStore(
+            tmp_path / "state-active-cache")
+        ctx = _mk_ctx("active-cache", "active-cache")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        ctx.sdk = SimpleNamespace(
+            turn_id="new-active-task",
+            compaction_continuation_turn_ids=frozenset({"new-active-task"}),
+        )
+        machine.sessions[ctx.key] = ctx
+        source = HistorySourceFingerprint.capture(rollout)
+        machine._history_index.put_page(
+            "active-cache",
+            "codex",
+            source,
+            before=None,
+            limit=4,
+            page=MaterializedHistoryPage(
+                events=(),
+                has_more=False,
+                oldest_id=None,
+                newest_id=None,
+                turns=(),
+                in_progress=True,
+                active_task_ids=("old-active-task",),
+            ),
+        )
+
+        history = await machine._build_history(
+            "active-cache",
+            before=None,
+            limit=4,
+            detail="summary",
+            allow_stale=True,
+        )
+
+        assert history.in_progress is True
+        assert translated
+        assert translated[0]["active_task_ids"] == ("new-active-task",)
+        rebuilt = machine._history_index.get_page(
+            "active-cache", "codex", source, before=None, limit=4)
+        assert rebuilt is not None
+        assert rebuilt.in_progress is True
+        assert rebuilt.active_task_ids == ("new-active-task",)
 
     asyncio.run(go())
 
@@ -4287,6 +4772,41 @@ def test_claude_history_refresh_coalesces_appends_during_full_scan(monkeypatch):
     asyncio.run(go())
 
 
+def test_newest_background_history_refresh_defaults_to_moving_head(monkeypatch):
+    async def go():
+        machine, transport = _mk_machine()
+        builds = []
+
+        async def build(sid, **kwargs):
+            builds.append((sid, kwargs))
+            return History(
+                session_id=sid,
+                revision="bounded-refresh",
+                events=[],
+                turns=[],
+                detail="summary",
+                has_more=True,
+            )
+
+        monkeypatch.setattr(machine, "_build_history", build)
+        machine._schedule_history_refresh(
+            "bounded-refresh",
+            before=None,
+            limit=None,
+            cwd=None,
+            detail="summary",
+        )
+        await asyncio.gather(*list(machine._history_refresh_tasks.values()))
+
+        assert len(builds) == 1
+        assert builds[0][1]["limit"] == machine.MIRROR_LIMIT
+        assert len([
+            row for row in transport.sent if isinstance(row, History)
+        ]) == 1
+
+    asyncio.run(go())
+
+
 def test_codex_history_refresh_coalesces_cwd_hints_and_rate_limits_rescan(
         monkeypatch):
     async def go():
@@ -4681,6 +5201,13 @@ def test_active_external_codex_history_marks_growing_snapshot(monkeypatch, tmp_p
         ctx = _mk_ctx("external-codex", "external-codex")
         ctx.engine = "codex"
         ctx.state = "idle"
+        ctx.sdk = SimpleNamespace(
+            turn_id="continuation-6",
+            compaction_continuation_turn_ids=frozenset({
+                "continuation-1", "continuation-2", "continuation-3",
+                "continuation-4", "continuation-5", "continuation-6",
+            }),
+        )
         machine.sessions[ctx.key] = ctx
         machine._watch["external-codex"] = {
             "engine": "codex",
@@ -4689,10 +5216,19 @@ def test_active_external_codex_history_marks_growing_snapshot(monkeypatch, tmp_p
             "takeover_pending": None,
         }
 
-        await machine._build_history("external-codex", limit=20)
+        history = await machine._build_history("external-codex", limit=20)
 
         assert translate_kwargs
         assert translate_kwargs[0]["snapshot_in_progress"] is True
+        assert translate_kwargs[0]["active_task_ids"] == (
+            "continuation-1", "continuation-2", "continuation-3",
+            "continuation-4", "continuation-5", "continuation-6",
+            "native-turn",
+        )
+        assert history.compaction_continuation_turn_ids == [
+            "continuation-6", "continuation-1",
+            "continuation-2", "continuation-3",
+        ]
 
     asyncio.run(go())
 
@@ -4766,6 +5302,61 @@ def test_newest_history_builds_are_monotonic_and_capture_live_seq(monkeypatch):
         assert older.live_seq == 7
         assert newer.live_seq == 8
         assert page.build_seq == newer.build_seq
+
+    asyncio.run(go())
+
+
+def test_official_codex_history_captures_live_seq_before_async_read():
+    """An old idle page must not outrank a first-turn running event."""
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    class Official:
+        async def summary_page(self, _sid, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                entered.set()
+                await release.wait()
+            return CodexHistoryPage(
+                events=(),
+                turns=(),
+                has_more=False,
+                oldest_id=None,
+                newest_id=None,
+            )
+
+    async def go():
+        machine, _ = _mk_machine()
+        machine._codex_history = Official()
+        machine._codex_rollout_for_wire = lambda _sid: None
+        ctx = _mk_ctx("official-seq-race", "official-seq-race")
+        ctx.engine = "codex"
+        ctx.state = "idle"
+        ctx.seq = 7
+        machine.sessions[ctx.key] = ctx
+
+        older_task = asyncio.create_task(
+            machine._build_official_codex_history(
+                "official-seq-race", before=None, limit=4,
+            )
+        )
+        await asyncio.wait_for(entered.wait(), timeout=2)
+
+        ctx.state = "running"
+        ctx.seq = 8
+        newer = await machine._build_official_codex_history(
+            "official-seq-race", before=None, limit=4,
+        )
+        release.set()
+        older = await older_task
+
+        assert older.build_seq < newer.build_seq
+        assert older.in_progress is False
+        assert older.live_seq == 7
+        assert newer.in_progress is True
+        assert newer.live_seq == 8
 
     asyncio.run(go())
 
@@ -4848,6 +5439,8 @@ def test_fresh_hello_replays_only_current_inflight_turn_after_snapshot():
 def test_get_history_returns_one_bulk_frame(monkeypatch):
     canned = [
         UserMsg(msg_id="u1", prompt="hi"),
+        Model(model="claude-old-model"),
+        Effort(effort="low"),
         AssistantMsgStart(message_id="a1"),
         Delta(message_id="a1", text="hello"),
         TurnEnd(result=TurnResult(subtype="success", duration_ms=0, is_error=False)),
@@ -4872,14 +5465,180 @@ def test_get_history_returns_one_bulk_frame(monkeypatch):
         assert hist.has_more is False
         assert hist.in_progress is True
         assert hist.oldest_id == "u1" and hist.newest_id == "u1"
-        # Current model + effort precede the translated transcript narrative.
-        assert [(event["type"], event.get("model") or event.get("effort"))
-                for event in hist.events[:2]] == [
+        # The newest page exposes one authoritative control pair. Older
+        # transcript control rows cannot override the current resident values.
+        controls = [
+            (event["type"], event.get("model") or event.get("effort"))
+            for event in hist.events
+            if event["type"] in {"model", "effort"}
+        ]
+        assert controls == [
                     ("model", "claude-opus-4-8"), ("effort", "max")]
         assert [e["type"] for e in hist.events[2:]] == [
             "user_msg", "assistant_msg_start", "delta", "turn_end"]
         # every event is stamped with the session id so the client routes them right
         assert all(e["sid"] == "sX" for e in hist.events)
+    asyncio.run(go())
+
+
+def test_history_current_controls_match_cache_and_non_cache_paths(
+        monkeypatch, tmp_path):
+    transcript = tmp_path / "current-controls.jsonl"
+    transcript.write_text("{}\n", encoding="utf-8")
+    canned = [
+        UserMsg(msg_id="u-current", prompt="hi"),
+        Model(model="claude-old-model"),
+        Effort(effort="low"),
+        Delta(message_id="a-current", text="hello"),
+        TurnEnd(result=TurnResult(
+            subtype="success", duration_ms=0, is_error=False)),
+    ]
+    monkeypatch.setattr(mm, "transcript_path", lambda _sid: str(transcript))
+    monkeypatch.setattr(
+        mm, "get_session_messages", lambda *_args, **_kwargs: ["message"])
+    monkeypatch.setattr(
+        mm, "translate_history",
+        lambda *_args, **_kwargs: [event.model_copy() for event in canned],
+    )
+    monkeypatch.setattr(mm, "last_assistant_model", lambda _msgs: None)
+
+    async def go():
+        machine, _ = _mk_machine()
+        machine._history_index = HistoryIndexStore(tmp_path / "state")
+        ctx = _mk_ctx("controls", "controls")
+        ctx.engine = "claude"
+        ctx.sdk = SimpleNamespace(model="claude-current", effort="max")
+        machine.sessions[ctx.key] = ctx
+
+        first = await machine._build_history(
+            "controls", limit=4, detail="full")
+        cached = await machine._build_history(
+            "controls", limit=4, detail="full")
+
+        def controls(history):
+            return [
+                (row["type"], row.get("model") or row.get("effort"))
+                for row in history.events
+                if row["type"] in {"model", "effort"}
+            ]
+
+        assert controls(first) == [
+            ("model", "claude-current"), ("effort", "max")]
+        assert controls(cached) == controls(first)
+        assert [row["type"] for row in cached.events[2:]] == [
+            "user_msg", "delta", "turn_end"]
+
+    asyncio.run(go())
+
+
+def test_codex_nullable_and_btw_history_controls_are_session_scoped():
+    def controls(history):
+        return [
+            (row["type"], row.get("model") or row.get("effort"))
+            for row in history.events
+            if row["type"] in {"model", "effort"}
+        ]
+
+    async def go():
+        machine, _ = _mk_machine()
+        main = _mk_ctx("main", "main")
+        main.engine = "codex"
+        main.sdk = SimpleNamespace(
+            model="gpt-main",
+            effort=None,
+            display_effort=None,
+            display_effort_model=None,
+            display_effort_cwd=None,
+            display_effort_generation=None,
+            _cwd=main.cwd,
+            _generation=1,
+        )
+        machine.sessions[main.key] = main
+        main_history = History(
+            session_id="main",
+            revision="main-r1",
+            events=mm._history_control_rows("main", main),
+        )
+        assert controls(main_history) == [
+            ("model", "gpt-main"),
+            ("effort", mm.MODEL_DEFAULT_EFFORT),
+        ]
+
+        btw = _mk_ctx("btw-main", "btw-main")
+        btw.engine = "codex"
+        btw.btw = True
+        btw.parent_sid = "main"
+        btw.sdk = SimpleNamespace(model="gpt-main", effort="low")
+        machine.sessions[btw.key] = btw
+        btw_history = History(
+            session_id="btw-main",
+            revision="btw-r1",
+            events=mm._history_control_rows("btw-main", btw),
+        )
+        assert controls(btw_history) == [
+            ("model", "gpt-main"), ("effort", "low")]
+
+        machine.sessions.pop(btw.key)
+        main_after_close = History(
+            session_id="main",
+            revision="main-r1",
+            events=mm._history_control_rows("main", main),
+        )
+        assert controls(main_after_close) == controls(main_history)
+
+    asyncio.run(go())
+
+
+def test_history_control_overlay_keeps_only_newest_missing_source_kind():
+    rows = [
+        {"type": "model", "model": "gpt-old", "sid": "cold"},
+        {"type": "effort", "effort": "low", "sid": "cold"},
+        {"type": "model", "model": "gpt-new", "sid": "cold"},
+        {"type": "effort", "effort": "high", "sid": "cold"},
+        {"type": "user_msg", "msg_id": "u1", "prompt": "hi"},
+    ]
+    normalized = mm._replace_history_control_rows(rows, [])
+    assert [
+        (row["type"], row.get("model") or row.get("effort"))
+        for row in normalized[:2]
+    ] == [("model", "gpt-new"), ("effort", "high")]
+    assert [row["type"] for row in normalized[2:]] == ["user_msg"]
+
+
+def test_cached_pagination_strips_legacy_control_rows(monkeypatch, tmp_path):
+    transcript = tmp_path / "legacy-controls.jsonl"
+    transcript.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(mm, "transcript_path", lambda _sid: str(transcript))
+
+    async def go():
+        machine, _ = _mk_machine()
+        machine._history_index = HistoryIndexStore(tmp_path / "state")
+        source = HistorySourceFingerprint.capture(transcript)
+        rows = (
+            {"type": "model", "model": "claude-old", "sid": "legacy"},
+            {"type": "effort", "effort": "low", "sid": "legacy"},
+            {"type": "user_msg", "msg_id": "u-old", "prompt": "old"},
+            {"type": "turn_end", "result": {
+                "subtype": "success", "duration_ms": 0, "is_error": False,
+            }},
+        )
+        machine._history_index.put_page(
+            "legacy", "claude", source,
+            before="u-new", limit=4,
+            page=MaterializedHistoryPage(
+                events=rows,
+                has_more=False,
+                oldest_id="u-old",
+                newest_id="u-old",
+                turns=materialize_history_turns(rows),
+            ),
+        )
+
+        history = await machine._build_history(
+            "legacy", before="u-new", limit=4, detail="full")
+        assert [row["type"] for row in history.events] == [
+            "user_msg", "turn_end"]
+
     asyncio.run(go())
 
 
@@ -4918,6 +5677,121 @@ def test_oversized_single_turn_wire_compaction_keeps_source_complete_detail(
         assert detail is not None
         delta = next(row for row in detail if row["type"] == "delta")
         assert delta["text"] == "x" * 200_000
+
+    asyncio.run(go())
+
+
+def test_codex_summary_sizes_final_projection_before_dropping_old_turns(
+        monkeypatch, tmp_path):
+    """Large deferred detail must not hide an older turn's terminal state."""
+    rollout = tmp_path / "oversized-summary-rollout.jsonl"
+    rollout.write_text(
+        '{"type":"session_meta","payload":{"id":"summary-session"}}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        mm,
+        "codex_history_window",
+        lambda path, **_kwargs: (
+            0, os.path.getsize(path), False, None, None,
+        ),
+    )
+
+    def completed_turn(index: int) -> list:
+        message_id = f"assistant-{index}"
+        tool_id = f"tool-{index}"
+        return [
+            UserMsg(msg_id=f"user-{index}", prompt=f"question-{index}"),
+            AssistantMsgStart(message_id=message_id, channel="commentary"),
+            ToolUse(
+                message_id=message_id,
+                tool_use_id=tool_id,
+                tool="exec_command",
+                input={"payload": str(index) * 160_000},
+            ),
+            ToolResult(
+                tool_use_id=tool_id,
+                content=str(index) * 160_000,
+                is_error=False,
+                status="succeeded",
+            ),
+            AssistantMsgEnd(message_id=message_id, channel="commentary"),
+            TurnEnd(
+                turn_id=f"native-{index}",
+                result=TurnResult(
+                    subtype="success", duration_ms=index, is_error=False,
+                ),
+            ),
+        ]
+
+    canned = [
+        *completed_turn(1),
+        *completed_turn(2),
+        UserMsg(msg_id="user-3", prompt="question-3"),
+        AssistantMsgStart(message_id="assistant-3", channel="commentary"),
+        Delta(
+            message_id="assistant-3",
+            text="still working",
+            channel="commentary",
+        ),
+    ]
+    monkeypatch.setattr(
+        mm,
+        "codex_translate_history",
+        lambda *_args, **_kwargs: (
+            [event.model_copy(deep=True) for event in canned], None,
+        ),
+    )
+
+    async def go():
+        machine, _ = _mk_machine()
+        machine.cfg.ws_max_size_bytes = 64 * 1024
+        machine._history_index = HistoryIndexStore(tmp_path / "state-summary")
+        machine._codex_rollout_for_wire = lambda _sid: str(rollout)
+        ctx = _mk_ctx("summary-session", "summary-session")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        machine.sessions[ctx.key] = ctx
+
+        history = await machine._build_history(
+            "summary-session", limit=4, detail="summary")
+
+        assert [turn.prompt for turn in history.turns] == [
+            "question-1", "question-2", "question-3",
+        ]
+        assert [turn.done for turn in history.turns] == [True, True, False]
+        assert len(history.model_dump_json().encode()) < 64 * 1024
+
+        source = HistorySourceFingerprint.capture(rollout)
+        cached = machine._history_index.get_page(
+            "summary-session", "codex", source, before=None, limit=4,
+        )
+        assert cached is not None
+        assert any(
+            row.get("type") == "tool_result" for row in cached.events)
+        detail = machine._history_index.get_turn_detail(
+            "summary-session", "codex", source, "user-1",
+        )
+        assert detail is not None
+        tool_result = next(
+            row for row in detail if row.get("type") == "tool_result")
+        assert tool_result["content"] == "1" * 160_000
+
+        # A retained source-complete page remains a fallback after the
+        # standalone detail row is evicted from its tighter LRU.
+        with machine._history_index._connect() as connection:
+            connection.execute(
+                "DELETE FROM history_turn_details "
+                "WHERE session_id=? AND turn_id=?",
+                ("summary-session", "user-1"),
+            )
+        recovered = machine._history_index.get_turn_detail(
+            "summary-session", "codex", source, "user-1",
+        )
+        assert recovered is not None
+        recovered_result = next(
+            row for row in recovered if row.get("type") == "tool_result")
+        assert recovered_result["content"] == "1" * 160_000
 
     asyncio.run(go())
 

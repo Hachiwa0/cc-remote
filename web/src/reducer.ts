@@ -16,6 +16,7 @@ import type {
   CollaborationModeName, Notice, RateLimitUpdate,
   StatusRateLimit, StatusRateWindow, SessionControl, PermissionProfileInfo,
   PreviewAuthorizationOperation, CodexProfileInfo,
+  CodexTerminalFence,
 } from "./protocol";
 import type { SendMode } from "./composer-submit";
 import {
@@ -39,6 +40,7 @@ import {
   mergeAuthoritativeTurnDetail, mergeDetailWithLiveTail, mergeInitialHistory,
   restoreCachedTurnDetails, restoreObservedLiveTurnDetails,
 } from "./history-merge";
+import { reconcileBoundCompactionOrphanDetailed } from "./compaction-orphans.ts";
 import {
   installTurnDetailProjectionPage,
 } from "./history-detail-projection";
@@ -77,13 +79,17 @@ import {
   queryAcceptanceDescriptor,
   type QueryAcceptanceHistoryHead,
 } from "./outbox";
-import type {
-  Block,
-  ProcessBlock,
-  TextBlock,
-  ToolBlock,
-  Turn,
-} from "./domain/conversation";
+import {
+  UNKNOWN_TERMINAL_ERROR,
+  type Block,
+  type ProcessBlock,
+  type TextBlock,
+  type ToolBlock,
+  type Turn,
+} from "./domain/conversation.ts";
+
+const DETAIL_PARSE_ERROR = "过程解析失败";
+
 export type {
   Block,
   ProcessBlock,
@@ -246,6 +252,14 @@ export interface SessionRuntime {
     turnId: string;
     seq: number;
     generation: string | null;
+  } | null;
+  // Source/revision-bound Codex terminals which arrived before their exact
+  // native turn identity was present in the current narrative projection.
+  // These never use array position or the generic "last open turn" fallback.
+  pendingTerminalFences: {
+    revision: string;
+    generation: string | null;
+    fences: CodexTerminalFence[];
   } | null;
   // A wrapper restart invalidated every unscoped liveTaskId fallback still
   // present in the visible projection. New-generation events establish an
@@ -414,6 +428,7 @@ export function createRuntime(): SessionRuntime {
     pendingHistoryCandidateBuildSeq: null,
     historyBuildSeq: 0, historyLiveSeq: 0,
     historyFence: null, liveOwner: null, pendingLiveBinding: null,
+    pendingTerminalFences: null,
     legacyLiveFallbackBlocked: false,
     lastLiveSeq: 0, lastLifecycleSeq: 0,
     hasLoadedOlderHistory: false,
@@ -469,6 +484,7 @@ export type Action =
   | { type: "clear_all_btw" }
   | { type: "clear_session_list" }
   | { type: "restore_session_list"; sessions: SessionInfo[] }
+  | { type: "drop_fork_placeholder"; sid: string; parentSid: string }
   | { type: "set_session_pinned"; sid: string; pinned: boolean }
   | { type: "focus_session"; sid: string }
   | { type: "turn_detail_requested"; sid: string; turnId: string; before?: string | null; autoLoad?: boolean }
@@ -589,6 +605,12 @@ function cloneTurns(turns: Turn[]): Turn[] {
     ...t,
     blocks: t.blocks.map((b) => ({ ...b })),
     liveSpillBlocks: t.liveSpillBlocks?.map((b) => ({ ...b })),
+    detailProjection: t.detailProjection
+      ? {
+          ...t.detailProjection,
+          blocks: t.detailProjection.blocks.map((block) => ({ ...block })),
+        }
+      : undefined,
   }));
 }
 
@@ -658,6 +680,55 @@ function turnsShareIdentityAlias(
     firstAliases.has(alias));
 }
 
+function reconcileBoundCompactionOrphan(
+  runtime: SessionRuntime,
+  turns: Turn[],
+  msgIds: readonly (string | null | undefined)[],
+  nativeTurnId: string | null | undefined,
+): Turn[] {
+  if (!nativeTurnId) return turns;
+  const aliases = msgIds.filter((value): value is string => !!value);
+  const reconciliation = reconcileBoundCompactionOrphanDetailed(
+    turns, aliases, nativeTurnId);
+  const repaired = reconciliation.turns;
+  if (repaired.length === turns.length) return turns;
+  const owner = reconciliation.owner;
+  const orphan = reconciliation.orphan;
+  if (!owner || !orphan) return turns;
+  const orphanAliases = new Set(turnIdentityAliases(orphan));
+  // liveOwner stores an identity, not an object reference. If a distinct
+  // retained row shares the orphan's display id, that id is still a valid
+  // owner and must not be moved merely because the removed object used it too.
+  // A later ordered binding can supersede it normally. Transfer only when the
+  // identity disappeared with the exact orphan object.
+  if (runtime.liveOwner && !repaired.some((turn) =>
+    turnHasIdentityAlias(turn, runtime.liveOwner!.turnId))) {
+    runtime.liveOwner = { ...runtime.liveOwner, turnId: owner.id };
+  }
+  const hydratedIds = runtime.hydratedCacheTurnIds.flatMap((id) => {
+    const retained = repaired.some((turn) => turnHasIdentityAlias(turn, id));
+    // Hydrated ids gate provisional detail restoration just like live-detail
+    // ids below. Transfer the exact removed orphan's cache provenance to its
+    // surviving owner, while preserving a distinct row whose display id only
+    // happens to collide with that orphan.
+    if (!orphanAliases.has(id)) return retained ? [id] : [];
+    return retained ? [id, owner.id] : [owner.id];
+  });
+  runtime.hydratedCacheTurnIds = [...new Set(hydratedIds)].filter((id) =>
+    repaired.some((turn) => turnHasIdentityAlias(turn, id)));
+  const detailIds = runtime.liveDetailTurnIds.flatMap((id) => {
+    const retained = repaired.some((turn) => turnHasIdentityAlias(turn, id));
+    // Display ids can collide across cache migrations. Preserve a still-valid
+    // colliding id, but also transfer the removed live orphan's observation to
+    // its exact surviving owner instead of trying to infer deletion by id.
+    if (!orphanAliases.has(id)) return retained ? [id] : [];
+    return retained ? [id, owner.id] : [owner.id];
+  });
+  runtime.liveDetailTurnIds = [...new Set(detailIds)].filter((id) =>
+    repaired.some((turn) => turnHasIdentityAlias(turn, id)));
+  return repaired;
+}
+
 function pendingOptimisticSteerIndex(
   runtime: SessionRuntime, turns: Turn[],
 ): number {
@@ -690,6 +761,180 @@ function findTurnByEngineId(turns: Turn[], id: string | null | undefined): Turn 
     || turn.forkPointId === id || turn.codexTurnId === id
     || mutableTurnBlocks(turn).some((block) => block.kind === "process"
       && block.turn_id === id));
+}
+
+function boundedTerminalFences(
+  values: readonly CodexTerminalFence[],
+): CodexTerminalFence[] {
+  const byTurn = new Map<string, CodexTerminalFence>();
+  for (const fence of values) {
+    byTurn.delete(fence.turn_id);
+    byTurn.set(fence.turn_id, fence);
+    if (byTurn.size > 16) {
+      const oldest = byTurn.keys().next().value;
+      if (oldest !== undefined) byTurn.delete(oldest);
+    }
+  }
+  return [...byTurn.values()];
+}
+
+function turnHasExactNativeTerminalId(turn: Turn, turnId: string): boolean {
+  return turn.id === turnId
+    || turn.forkPointId === turnId
+    || turn.liveTaskId === turnId
+    || turn.codexTurnId === turnId
+    || mutableTurnBlocks(turn).some((block) =>
+      block.kind === "process" && block.turn_id === turnId);
+}
+
+function applyTerminalFence(turn: Turn, fence: CodexTerminalFence): Turn {
+  const next: Turn = {
+    ...turn,
+    blocks: turn.blocks.map((block) => ({ ...block })),
+    liveSpillBlocks: turn.liveSpillBlocks?.map((block) => ({ ...block })),
+    detailProjection: turn.detailProjection
+      ? {
+          ...turn.detailProjection,
+          blocks: turn.detailProjection.blocks.map((block) => ({ ...block })),
+        }
+      : undefined,
+    done: true,
+    progress: undefined,
+  };
+  if (typeof fence.duration_ms === "number" && fence.duration_ms > 0) {
+    next.durationMs = fence.duration_ms;
+  }
+  if (typeof fence.completed_at === "number"
+      && Number.isFinite(fence.completed_at)
+      && fence.completed_at >= 0
+      && fence.completed_at <= Math.floor(Number.MAX_SAFE_INTEGER / 1000)) {
+    next.doneTs = Math.round(fence.completed_at * 1000);
+  }
+  if (fence.status === "completed") {
+    next.interrupted = undefined;
+    next.error = undefined;
+    delete next.terminalSource;
+    finishOpenBlocks(next, "succeeded", false);
+  } else if (fence.status === "interrupted") {
+    next.interrupted = true;
+    next.error = undefined;
+    next.terminalSource = "unexpected_interrupt";
+    finishOpenBlocks(next, "interrupted", true);
+  } else {
+    next.interrupted = undefined;
+    next.error ??= "本次回复未完成，请重试。";
+    next.terminalSource = "failed";
+    finishOpenBlocks(next, "failed", true);
+  }
+  return next;
+}
+
+function installCodexTerminalFences(
+  runtime: SessionRuntime,
+  incoming: readonly CodexTerminalFence[] | undefined,
+  options: {
+    revision: string;
+    generation: string | null;
+    continuationTurnIds?: readonly string[];
+    // A current newest-page History carries a complete bounded snapshot. A
+    // stale build may add an exact terminal which the browser has not seen, but
+    // must not erase a newer pending fence merely because its older snapshot
+    // omitted it.
+    replaceSnapshot?: boolean;
+    // A complete current History can prove that a completed matching row is
+    // the final narrative segment for this native turn. Live/stale paths cannot:
+    // Codex steer segments may share the same native turn id and arrive later.
+    consumeSettledMatches?: boolean;
+  },
+): void {
+  const { revision, generation } = options;
+  const continuationTurnIds = options.continuationTurnIds ?? [];
+  const previous = runtime.pendingTerminalFences;
+  const sameScope = !!previous
+    && previous.revision === revision
+    && previous.generation === generation;
+  if (incoming === undefined && !sameScope) return;
+  const candidates = boundedTerminalFences(
+    incoming === undefined
+      ? (sameScope ? previous!.fences : [])
+      : options.replaceSnapshot === false && sameScope
+        ? [...previous!.fences, ...incoming]
+        : incoming,
+  );
+  const continuations = new Set(continuationTurnIds);
+  const unresolved: CodexTerminalFence[] = [];
+  let turns = runtime.turns;
+  let copied = false;
+  for (const fence of candidates) {
+    if (fence.status === "interrupted"
+        && continuations.has(fence.turn_id)) {
+      continue;
+    }
+    const matches = turns.flatMap((turn, index) =>
+      turnHasExactNativeTerminalId(turn, fence.turn_id) ? [index] : []);
+    const openMatches = matches.filter((index) => !turns[index].done);
+    const targetIndex = openMatches.length === 1 ? openMatches[0] : -1;
+    if (targetIndex < 0) {
+      if (matches.length === 0 || !options.consumeSettledMatches) {
+        unresolved.push(fence);
+      }
+      continue;
+    }
+    // A fence only repairs an unfinished narrative row. If the exact turn is
+    // already terminal, its richer live/history outcome wins; never let an
+    // older recovery hint rewrite a completed error or interruption.
+    if (!copied) {
+      turns = [...turns];
+      copied = true;
+    }
+    turns[targetIndex] = applyTerminalFence(turns[targetIndex], fence);
+    if (!options.consumeSettledMatches) {
+      // A stale/running page can arrive before an ordered TurnSteered frame.
+      // Close the only exact row we can currently see, but retain the fence so
+      // a later segment sharing this native turn id cannot reopen forever.
+      unresolved.push(fence);
+    }
+  }
+  if (copied) runtime.turns = turns;
+  runtime.pendingTerminalFences = unresolved.length > 0
+    ? { revision, generation, fences: unresolved }
+    : null;
+}
+
+function mergePendingTerminalFences(
+  source: SessionRuntime["pendingTerminalFences"],
+  target: SessionRuntime["pendingTerminalFences"],
+): SessionRuntime["pendingTerminalFences"] {
+  if (!source) return target;
+  if (!target) return source;
+  if (source.revision !== target.revision
+      || source.generation !== target.generation) return source;
+  return {
+    revision: source.revision,
+    generation: source.generation,
+    fences: boundedTerminalFences([...target.fences, ...source.fences]),
+  };
+}
+
+function applyPendingCodexTerminalFences(runtime: SessionRuntime): void {
+  const pending = runtime.pendingTerminalFences;
+  if (!pending) return;
+  installCodexTerminalFences(runtime, undefined, {
+    revision: pending.revision,
+    generation: pending.generation,
+  });
+}
+
+function discardPendingCodexTerminalFence(
+  runtime: SessionRuntime,
+  turnId: string | null | undefined,
+): void {
+  const pending = runtime.pendingTerminalFences;
+  if (!pending || !turnId) return;
+  const fences = pending.fences.filter((fence) => fence.turn_id !== turnId);
+  runtime.pendingTerminalFences = fences.length > 0
+    ? { ...pending, fences }
+    : null;
 }
 
 function findExplicitLiveTaskOwner(
@@ -864,6 +1109,36 @@ function remapExplicitLiveTaskOwner(
   return aliases.length === 1
     ? { ...owner, turnId: aliases[0].id }
     : null;
+}
+
+function remapTurnProvenanceIds(
+  ids: readonly string[],
+  previousTurns: readonly Turn[],
+  turns: readonly Turn[],
+): string[] {
+  return [...new Set(ids.flatMap((id) => {
+    const directOwners = turns.filter((turn) =>
+      turnHasIdentityAlias(turn, id));
+    if (directOwners.length === 1) return [directOwners[0].id];
+    // Legacy cache migrations can leave a colliding display id on two real
+    // rows. Preserve that still-valid provenance exactly as before; only an id
+    // which disappeared with a collapsed projection needs block-id remapping.
+    if (directOwners.length > 1) return [id];
+    const source = previousTurns.filter((turn) =>
+      turnHasIdentityAlias(turn, id));
+    if (source.length !== 1) return [];
+    const stableBlockIds = new Set(source[0].blocks.map((block) =>
+      block.kind === "text" ? `message:${block.message_id}`
+        : block.kind === "tool" ? `tool:${block.tool_use_id}`
+          : `process:${block.item_id}`));
+    if (stableBlockIds.size === 0) return [];
+    const blockOwners = turns.filter((turn) => turn.blocks.some(
+      (block) => stableBlockIds.has(
+        block.kind === "text" ? `message:${block.message_id}`
+          : block.kind === "tool" ? `tool:${block.tool_use_id}`
+            : `process:${block.item_id}`)));
+    return blockOwners.length === 1 ? [blockOwners[0].id] : [];
+  }))].slice(-MAX_LIVE_DETAIL_TURN_IDS);
 }
 
 function findCurrentUnownedLiveOwner(
@@ -1176,11 +1451,55 @@ function finishOpenBlocks(
   turn: Turn,
   status: "succeeded" | "failed" | "interrupted",
   isError: boolean,
+  preserveOpenPlans = false,
 ): void {
-  for (const block of mutableTurnBlocks(turn)) {
+  finishOpenBlockList(
+    mutableTurnBlocks(turn), status, isError, preserveOpenPlans);
+  if (turn.detailProjection) {
+    finishOpenBlockList(
+      turn.detailProjection.blocks, status, isError, preserveOpenPlans);
+  }
+}
+
+/** Settle stale children only at a projection boundary with no active task. */
+function finishCompletedTurnChildren(
+  turn: Turn,
+  preserveOpenPlans = false,
+): void {
+  if (!turn.done) return;
+  const status = turn.interrupted
+    ? "interrupted" : turn.error ? "failed" : "succeeded";
+  finishOpenBlocks(
+    turn, status, status !== "succeeded", preserveOpenPlans);
+}
+
+/** Close only one newly-installed detail projection. A completed turn may have
+ * acquired real background process events after TurnEnd; a late old
+ * TurnDetail response must not close those live blocks again. */
+function finishOpenDetailBlocks(
+  turn: Turn,
+  status: "succeeded" | "failed" | "interrupted",
+  isError: boolean,
+): void {
+  if (turn.detailProjection) {
+    // Exact terminal translations already close their Plan. Preserve an open
+    // one because it identifies a neutral Codex steer segment.
+    finishOpenBlockList(
+      turn.detailProjection.blocks, status, isError, true);
+  }
+}
+
+function finishOpenBlockList(
+  blocks: Block[],
+  status: "succeeded" | "failed" | "interrupted",
+  isError: boolean,
+  preserveOpenPlans = false,
+): void {
+  for (const block of blocks) {
     if (block.kind === "text") {
       block.done = true;
     } else if (block.kind === "process" && !block.done) {
+      if (preserveOpenPlans && block.processKind === "plan") continue;
       block.done = true;
       if (!terminalProcessStatus(block.status)) block.status = status;
     } else if (block.kind === "tool" && !block.done) {
@@ -1194,8 +1513,6 @@ function finishOpenBlocks(
   }
 }
 
-const UNKNOWN_TERMINAL_ERROR =
-  "会话已结束，但未收到完整的终止状态。";
 const UNKNOWN_STEER_TERMINAL_ERROR =
   "任务已结束，但本次引导是否生效未得到确认。";
 
@@ -1228,6 +1545,7 @@ function finishTurnFromIdleHistory(turn: Turn, doneTs: number): void {
   const allBlocksClosed = turn.blocks.every((block) => block.done);
   if (!turn.error && (!completedFinal || !allBlocksClosed)) {
     finishTurnWithoutTerminal(turn, doneTs);
+    turn.terminalSource = "idle_history_recovery";
     return;
   }
   turn.done = true;
@@ -1536,6 +1854,7 @@ function switchControlGeneration(
     runtime.historyFence = null;
     runtime.liveOwner = null;
     runtime.pendingLiveBinding = null;
+    runtime.pendingTerminalFences = null;
     runtime.legacyLiveFallbackBlocked = true;
   }
   if (runtime.historyGeneration !== null
@@ -2027,6 +2346,23 @@ export function reduce(state: AppState, action: Action): AppState {
         historyRecovery: null, historyBrowse: null,
         retainedHistoryBrowse: null,
       };
+    case "drop_fork_placeholder": {
+      const sessions = state.sessions.filter((session) => !(
+        session.provisional_fork
+        && session.session_id === action.sid
+        && session.forked_from_id === action.parentSid
+      ));
+      if (sessions.length === state.sessions.length) return state;
+      const focused = state.focusedSid === action.sid;
+      return {
+        ...state,
+        sessions,
+        focusedSid: focused ? null : state.focusedSid,
+        historyRecovery: focused ? null : state.historyRecovery,
+        historyBrowse: focused ? null : state.historyBrowse,
+        retainedHistoryBrowse: focused ? null : state.retainedHistoryBrowse,
+      };
+    }
     case "set_session_pinned": {
       const sessions = setSessionPinned(state.sessions, action.sid, action.pinned);
       return sessions === state.sessions ? state : { ...state, sessions };
@@ -2307,7 +2643,7 @@ export function reduce(state: AppState, action: Action): AppState {
           browse, action.turnId, false, {
             expectedScopeKey: action.scopeKey,
             expectedViewId: action.viewId,
-          }, false, "详细过程无法解析，请重试", {
+          }, false, DETAIL_PARSE_ERROR, {
             before: target.detailRetryBefore ?? action.before ?? null,
             direction: target.detailRetryDirection
               ?? (action.before == null
@@ -2388,7 +2724,11 @@ export function reduce(state: AppState, action: Action): AppState {
             rt, cacheGeneration);
           if (control) applySessionControl(rt, control);
           if (action.turns.length) {
-            replaceWithBoundedTurns(rt, action.turns.map((turn) => (
+            replaceWithBoundedTurns(rt, cloneTurns(action.turns).map((turn) => (
+              // Cache paint has no current lifecycle authority. Keep a Plan
+              // provisionally open until the first accepted History page says
+              // whether the enclosing native task is still running.
+              finishCompletedTurnChildren(turn, true),
               !turn.forkPointId && turn.codexTurnId
                 ? { ...turn, forkPointId: turn.codexTurnId }
                 : turn
@@ -2410,8 +2750,23 @@ export function reduce(state: AppState, action: Action): AppState {
             switchControlGeneration(rt, cacheGeneration);
             applySessionControl(rt, control);
           }
-          rt.turns = restoreCachedTurnDetails(rt.turns, action.turns);
+          const newerUnsettledLiveFrame = rt.lastLiveSeq
+            > Math.max(rt.historyLiveSeq, rt.lastLifecycleSeq);
+          const cacheRestoreAuthority = rt.state !== "idle"
+              || rt.mirroredRunning
+              || newerUnsettledLiveFrame
+            ? "running" as const
+            : "idle" as const;
+          const activeCacheOwnerId = cacheRestoreAuthority === "running"
+            ? rt.acceptanceKind === "query" && rt.acceptancePending
+              ? rt.acceptancePending
+              : (rt.liveOwner?.turnId ?? null)
+            : null;
+          rt.turns = restoreCachedTurnDetails(
+            rt.turns, action.turns, cacheRestoreAuthority,
+            activeCacheOwnerId);
         }
+        applyPendingCodexTerminalFences(rt);
         rt.loading = false;
       }, true);
     case "prune_runtimes": {
@@ -2725,6 +3080,12 @@ function reduceEvent(
                 : source.historyFence,
             liveOwner: mergedLiveTaskOwner,
             pendingLiveBinding: mergedPendingBinding,
+            pendingTerminalFences: orderingGenerationConflict
+              ? source.pendingTerminalFences
+              : mergePendingTerminalFences(
+                  source.pendingTerminalFences,
+                  mergeTarget.pendingTerminalFences,
+                ),
             historyGeneration: source.historyRevision == null
               ? mergeTarget.historyGeneration : source.historyGeneration,
             pendingHistoryGeneration:
@@ -2777,6 +3138,17 @@ function reduceEvent(
           // bounded merge.
           mergedRuntime.liveOwner = remapExplicitLiveTaskOwner(
             mergedLiveTaskOwner, mergedRuntime.turns);
+          if (mergedRuntime.pendingTerminalFences) {
+            const pending = mergedRuntime.pendingTerminalFences;
+            installCodexTerminalFences(
+              mergedRuntime,
+              undefined,
+              {
+                revision: pending.revision,
+                generation: pending.generation,
+              },
+            );
+          }
           runtimes[session_id] = mergedRuntime;
         } else {
           runtimes[session_id] = { ...source, ccSessionId: session_id };
@@ -3014,6 +3386,7 @@ function reduceEvent(
         rt.historyFence = null;
         rt.liveOwner = null;
         rt.pendingLiveBinding = null;
+        rt.pendingTerminalFences = null;
         rt.hasLoadedOlderHistory = false;
         rt.hydratedCacheTurnIds = [];
         rt.liveDetailTurnIds = [];
@@ -3120,6 +3493,29 @@ function reduceEvent(
           switchControlGeneration(rt, e.generation);
         }, true);
       }
+      if (!e.before && e.terminal_fences !== undefined
+          && (!preControlBase.pendingHistoryRevision
+            || e.revision === preControlBase.pendingHistoryRevision)
+          && (!staleHistoryBuild
+            || preControlBase.historyRevision === e.revision)) {
+        // Terminal authority is independent from narrative freshness. Even a
+        // sampled/stale content page may close an exact already-painted native
+        // turn; unmatched fences remain revision-scoped until that identity
+        // arrives. No lifecycle/state or notification receipt is changed here.
+        state = patch(state, sid, (rt) => {
+          installCodexTerminalFences(
+            rt,
+            e.terminal_fences,
+            {
+              revision: e.revision,
+              generation: e.generation ?? rt.historyGeneration,
+              continuationTurnIds:
+                e.compaction_continuation_turn_ids ?? [],
+              replaceSnapshot: !staleHistoryBuild,
+            },
+          );
+        }, true);
+      }
       if (staleHistoryBuild) return state;
       const base = state.runtimes[sid] ?? createRuntime();
       // build_seq orders newest-page reads only within the same boot-scoped
@@ -3179,6 +3575,7 @@ function reduceEvent(
             oldestId: e.oldest_id ?? null,
             historyRevision: e.revision,
           };
+          applyPendingCodexTerminalFences(previewRuntime);
           next = {
             ...next,
             historyRecovery: pendingRecovery
@@ -3255,8 +3652,13 @@ function reduceEvent(
       }
       const racedLiveEvent = !e.before && e.live_seq != null
         && base.lastLiveSeq > e.live_seq;
+      const preserveProjectionOpenPlans = racedLiveEvent
+        || e.in_progress === true
+        || (e.in_progress == null && base.state !== "idle");
       const settledHistory = !e.before && !racedLiveEvent
         && e.in_progress === false;
+      const settledCodexHistory = settledHistory && state.sessions.some(
+        (session) => session.session_id === sid && session.engine === "codex");
       const resolveUnknownSteerFromIdle = settledHistory
         && base.acceptanceKind === "steer_unknown"
         && !!base.acceptancePending
@@ -3318,17 +3720,15 @@ function reduceEvent(
           // contain ResultMessage. A newer live event always wins; otherwise an
           // explicit in_progress value is authoritative, and only an older
           // wrapper without that field falls back to the local runtime state.
-          preserveLiveTailOpen: racedLiveEvent || e.in_progress === true
-            || (e.in_progress == null && base.state !== "idle"),
+          preserveLiveTailOpen: preserveProjectionOpenPlans,
           // Codex app-server History reports the native turn's persisted
           // completed/failed status. Once an idle, unraced page arrives it
           // repairs a provisional live terminal (notably after compaction)
           // while leaving Claude's transcript-only lifecycle untouched.
           newestHistoryId: e.newest_id ?? null,
+          activeOwnerId: base.liveOwner?.turnId ?? null,
           reconcileReplayOrphans: true,
-        }, settledHistory
-          && state.sessions.find((session) =>
-            session.session_id === sid)?.engine === "codex");
+        }, settledCodexHistory);
         if (acceptanceConfirmed && base.acceptancePending
             && (base.acceptanceKind === "steer"
               || base.acceptanceKind === "steer_unknown")
@@ -3372,11 +3772,12 @@ function reduceEvent(
             .find((candidate): candidate is Turn => !!candidate);
           if (!detail) return turn;
           const merged = mergeAuthoritativeTurnDetail(turn, detail);
-          if (turn.done) {
-            const status = turn.interrupted
-              ? "interrupted" : turn.error ? "failed" : "succeeded";
-            finishOpenBlocks(merged, status, status !== "succeeded");
-          }
+          // A completed row may be the neutral-steer segment whose Plan spans
+          // the following clarification, but only a current running History
+          // (or a newer live frame which raced this page) may keep it open. An
+          // exact idle page must settle stale cache/detail Plan state too.
+          finishCompletedTurnChildren(
+            merged, preserveProjectionOpenPlans);
           return merged;
         });
         const cachedScopeMatches = e.generation != null
@@ -3384,9 +3785,18 @@ function reduceEvent(
           : base.historyGeneration == null;
         if (cachedScopeMatches && base.hydratedCacheTurnIds.length > 0) {
           const cachedIds = new Set(base.hydratedCacheTurnIds);
+          const activeCacheOwnerId = preserveProjectionOpenPlans
+            ? (!racedLiveEvent && e.in_progress === true
+                ? (e.newest_id ?? null)
+                : base.acceptanceKind === "query" && base.acceptancePending
+                  ? base.acceptancePending
+                  : (base.liveOwner?.turnId ?? null))
+            : null;
           turns = restoreCachedTurnDetails(
             turns,
             base.turns.filter((turn) => cachedIds.has(turn.id)),
+            preserveProjectionOpenPlans ? "running" : "idle",
+            activeCacheOwnerId,
           );
         }
       }
@@ -3468,6 +3878,36 @@ function reduceEvent(
         }
         return settled;
       });
+      const terminalRuntime: SessionRuntime = {
+        ...base,
+        turns,
+        pendingTerminalFences: base.pendingTerminalFences,
+      };
+      installCodexTerminalFences(
+        terminalRuntime,
+        e.terminal_fences,
+        {
+          revision: e.revision,
+          generation: e.generation ?? base.historyGeneration,
+          continuationTurnIds:
+            e.compaction_continuation_turn_ids ?? [],
+          // Only an idle, unraced newest page proves that an already-completed
+          // row is the final narrative segment for this native turn. A running
+          // or live-raced page can still be followed by a steer segment which
+          // shares the same native turn id, so keep its fence pending.
+          consumeSettledMatches: settledHistory,
+        },
+      );
+      turns = terminalRuntime.turns;
+      if (settledCodexHistory) {
+        // A passive CLI holder shares the daemon but owns no active task. Once
+        // the newest exact Codex History page is idle and no newer live frame
+        // raced it, its completed rows are the terminal fence for browser-only
+        // process projections. Preserve every payload/disclosure, but never let
+        // an old item/started replay animate the session again.
+        turns = cloneTurns(turns);
+        turns.forEach((turn) => finishCompletedTurnChildren(turn));
+      }
       turns = turns.map(withLimitedTurnBlocks);
       const boundedTurns = boundRuntimeTurns(turns);
       const historyTrimmed = boundedTurns.length < turns.length;
@@ -3501,8 +3941,15 @@ function reduceEvent(
       const nextOrderingGeneration = base.controlGeneration
         ?? nextHistoryGeneration;
       let pendingLiveBinding = base.pendingLiveBinding;
-      let liveOwner = boundHistoryOwner
-        ?? remapExplicitLiveTaskOwner(base.liveOwner, turns);
+      // An exact idle History page is also a lifecycle boundary when the
+      // browser missed State(idle). Do not carry task A's owner into a later
+      // task B which can become running before its binding reaches this client.
+      let liveOwner = settledHistory
+        ? null
+        : boundHistoryOwner
+          ?? remapExplicitLiveTaskOwner(base.liveOwner, turns);
+      const liveDetailTurnIds = remapTurnProvenanceIds(
+        base.liveDetailTurnIds, base.turns, turns);
       if (pendingLiveBinding
           && pendingLiveBinding.generation !== nextOrderingGeneration) {
         pendingLiveBinding = null;
@@ -3596,6 +4043,8 @@ function reduceEvent(
               : base.historyFence,
             liveOwner,
             pendingLiveBinding,
+            pendingTerminalFences:
+              terminalRuntime.pendingTerminalFences,
             historyNewestId: acceptsControlState
               ? (Object.prototype.hasOwnProperty.call(e, "newest_id")
                   ? (e.newest_id ?? null)
@@ -3608,6 +4057,7 @@ function reduceEvent(
                 : false,
             hydratedCacheTurnIds: acceptsControlState
               ? [] : base.hydratedCacheTurnIds,
+            liveDetailTurnIds,
             // A first-page History can finish after a live thread-settings
             // notification.  Its transcript snapshot then contains the old
             // model/effort even though its narrative rows are still useful.
@@ -3711,7 +4161,7 @@ function reduceEvent(
                 ...turn,
                 detailLoading: false,
                 detailAutoLoad: false,
-                detailError: "详细过程无法解析，请重试",
+                detailError: DETAIL_PARSE_ERROR,
                 detailRetryBefore:
                   turn.detailRetryBefore ?? e.before ?? null,
                 detailRetryDirection: turn.detailRetryDirection
@@ -3740,6 +4190,12 @@ function reduceEvent(
             },
             installed.projection,
           );
+          if (next.done) {
+            const status = next.interrupted
+              ? "interrupted" : next.error ? "failed" : "succeeded";
+            finishOpenDetailBlocks(
+              next, status, status !== "succeeded");
+          }
           if (continuedLiveSpillRefreshDue(next)
               && next.detailLoading !== true) {
             next.detailRestorePending = true;
@@ -4037,6 +4493,10 @@ function reduceEvent(
           turn.progress = undefined;
         }
         if (e.state === "idle") {
+          // State(idle) is the exact boundary between resident turns. Keeping
+          // the completed owner here lets the next State(running) animate the
+          // old row before its own UserMsg/TurnBinding establishes ownership.
+          rt.liveOwner = null;
           rt.pendingLiveBinding = null;
           rt.pendingQuestion = null;
           const doneTs = eventTimestampMs(e.ts) ?? Date.now();
@@ -4055,6 +4515,13 @@ function reduceEvent(
           }
           resolveUnknownPendingSteer(
             rt, turns, doneTs);
+          if (state.sessions.some((session) =>
+            session.session_id === e.sid && session.engine === "codex")) {
+            // A direct idle frame is the exact shared-daemon boundary between
+            // native tasks. Close only stale display children of already-done
+            // turns; a later real background event can still reopen its item.
+            turns.forEach((turn) => finishCompletedTurnChildren(turn));
+          }
         }
         rt.turns = turns;
       });
@@ -4298,6 +4765,7 @@ function reduceEvent(
             rt.historyFence = null;
             rt.liveOwner = null;
             rt.pendingLiveBinding = null;
+            rt.pendingTerminalFences = null;
             rt.historyGeneration = null;
             rt.historyNewestId = null;
             rt.lastLiveSeq = 0;
@@ -4532,7 +5000,16 @@ function reduceEvent(
             ts: stamp,
           });
         }
-        rt.turns = turns;
+        const binding = rt.pendingLiveBinding;
+        const boundNativeTurnId = binding
+          && acceptedIds.has(binding.msgId) ? binding.turnId : undefined;
+        rt.turns = reconcileBoundCompactionOrphan(
+          rt,
+          turns,
+          [e.msg_id, e.client_msg_id],
+          boundNativeTurnId,
+        );
+        applyPendingCodexTerminalFences(rt);
       });
       const sessions = e.sid
         ? bumpSessionActivity(next.sessions, e.sid, Math.round(e.ts * 1000))
@@ -4599,6 +5076,7 @@ function reduceEvent(
           }
           markTurnAsLive(rt, existing.id, boundCompletedTurns, e.seq);
           rt.turns = turns;
+          applyPendingCodexTerminalFences(rt);
           return;
         }
 
@@ -4635,6 +5113,7 @@ function reduceEvent(
         markTurnAsLive(rt, existing.id, boundCompletedTurns, e.seq);
         if (boundCompletedTurns) replaceWithBoundedTurns(rt, turns);
         else rt.turns = turns;
+        applyPendingCodexTerminalFences(rt);
       }, true);
       const sessions = e.sid
         ? bumpSessionActivity(next.sessions, e.sid, Math.round(e.ts * 1000))
@@ -4855,6 +5334,7 @@ function reduceEvent(
         owner.progress = undefined;
         if (boundCompletedTurns) limitTurnBlocks(owner);
         rt.turns = turns;
+        applyPendingCodexTerminalFences(rt);
       });
     case "turn_plan":
       return patch(state, e.sid, (rt) => {
@@ -4916,7 +5396,7 @@ function reduceEvent(
         if (rt.acceptancePending === e.msg_id) {
           clearAcceptance(rt);
         }
-        const turns = cloneTurns(rt.turns);
+        let turns = cloneTurns(rt.turns);
         const seq = typeof e.seq === "number" ? e.seq : 0;
         const binding = {
           msgId: e.msg_id,
@@ -4943,6 +5423,14 @@ function reduceEvent(
           bindAuthoritativeActiveHistoryHead(
             rt, turns, e.msg_id, e.turn_id, seq);
         }
+        // A native Codex task may contain multiple visible steer rows. Once a
+        // newer row owns that task, an older delayed binding cannot prove which
+        // row a standalone compaction belongs to; leave it for canonical
+        // History instead of moving it into the completed predecessor.
+        if (bindingCanSupersedeOwner) {
+          turns = reconcileBoundCompactionOrphan(
+            rt, turns, [e.msg_id], e.turn_id);
+        }
         const exact = turns.filter((turn) =>
           turnHasIdentityAlias(turn, e.msg_id));
         if (exact.length === 1) {
@@ -4968,18 +5456,22 @@ function reduceEvent(
               && authoritativeCandidates.length === 1) {
             const authoritative = authoritativeCandidates[0];
             const authoritativeIndex = turns.indexOf(authoritative);
-            const merged = mergeInitialHistory(
-              [authoritative], [owner])[0] ?? owner;
-            merged.forkPointId = e.turn_id;
-            const first = Math.min(ownerIndex, authoritativeIndex);
-            const second = Math.max(ownerIndex, authoritativeIndex);
-            turns.splice(second, 1);
-            turns.splice(first, 1, merged);
-            rt.liveOwner = { turnId: merged.id, seq };
+            const mergedTurns = mergeInitialHistory(
+              [authoritative], [owner]);
+            if (mergedTurns.length === 1) {
+              const merged = mergedTurns[0];
+              merged.forkPointId = e.turn_id;
+              const first = Math.min(ownerIndex, authoritativeIndex);
+              const second = Math.max(ownerIndex, authoritativeIndex);
+              turns.splice(second, 1);
+              turns.splice(first, 1, merged);
+              rt.liveOwner = { turnId: merged.id, seq };
+            }
           }
         }
         if (boundCompletedTurns) replaceWithBoundedTurns(rt, turns);
         else rt.turns = turns;
+        applyPendingCodexTerminalFences(rt);
       });
     case "turn_end":
       return patch(state, e.sid, (rt) => {
@@ -5012,6 +5504,7 @@ function reduceEvent(
             t = openTurns[0];
           }
         }
+        const terminalClosedOpenTurn = !!t && !t.done;
         if (t) {
           markTurnAsLive(rt, t.id, boundCompletedTurns, e.seq);
           if (rt.acceptancePending === t.id) {
@@ -5044,8 +5537,12 @@ function reduceEvent(
           // without a client-side start time (i.e. everything after a refresh,
           // where turns come from history replay). Fall back to start time, then now.
           t.doneTs = e.ts ? Math.round(e.ts * 1000) : (t.ts || Date.now());
-          finishOpenBlocks(t, e.result.is_error ? "interrupted" : "succeeded",
-            e.result.is_error);
+          finishOpenBlocks(
+            t,
+            e.result.is_error ? "interrupted" : "succeeded",
+            e.result.is_error,
+            e.result.subtype === "steered",
+          );
           if (t.liveBlocksSpilled) {
             // Refresh the newest source-backed page at the terminal boundary.
             // If a running snapshot is already in flight, keep this pending
@@ -5069,6 +5566,10 @@ function reduceEvent(
         }
         if (boundCompletedTurns) replaceWithBoundedTurns(rt, turns);
         else rt.turns = turns;
+        applyPendingCodexTerminalFences(rt);
+        if (terminalClosedOpenTurn) {
+          discardPendingCodexTerminalFence(rt, e.turn_id);
+        }
         // TurnEnd closes the visible turn, but the wrapper may still be
         // draining an interrupt, finishing a checkpoint, or releasing its
         // app-server consumer. Only the following authoritative State(idle)

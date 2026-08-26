@@ -2,13 +2,13 @@ import {
   useCallback,
   useEffect,
   useId,
-  useLayoutEffect,
   useRef,
   useState,
   type CSSProperties,
   type RefObject,
 } from "react";
 import { createPortal } from "react-dom";
+import { useAnchoredPopoverGeometry } from "../chat-dialog-geometry";
 import type { ProcessBlock } from "../domain/conversation";
 import { Icon } from "../icons";
 import { planProgressPresentation } from "../plan-progress";
@@ -18,23 +18,15 @@ import {
   releaseDraggedPointer,
 } from "../pointer-tap";
 
-interface PlanPopoverPosition {
-  left: number;
-  width: number;
-  maxHeight: number;
-  top?: number;
-  bottom?: number;
-}
-
 export function PlanProgressContent({ block, detailLoading = false }: {
   block: ProcessBlock;
   detailLoading?: boolean;
 }) {
   const presentation = planProgressPresentation(block, detailLoading);
   const steps = block.plan ?? [];
-  return <div className="plan-progress-content">
+  return <div className={`plan-progress-content${presentation.stale ? " stale" : ""}`}>
     <header>
-      <span className={`plan-progress-mark${presentation.complete ? " complete" : ""}${presentation.failed ? " failed" : ""}`}>
+      <span className={`plan-progress-mark${presentation.complete ? " complete" : ""}${presentation.failed ? " failed" : ""}${presentation.stale ? " stale" : ""}`}>
         <Icon name={presentation.complete ? "verify" : "plan"} size={15} />
       </span>
       <span>
@@ -71,51 +63,13 @@ export function PlanProgressFloatingCard({ anchorRef, block, open,
   detailLoading?: boolean;
   compact?: boolean;
 }) {
-  const [position, setPosition] = useState<PlanPopoverPosition | null>(null);
   const cardRef = useRef<HTMLElement>(null);
-
-  useLayoutEffect(() => {
-    if (!open) {
-      setPosition(null);
-      return;
-    }
-    const place = () => {
-      const trigger = anchorRef.current?.getBoundingClientRect();
-      if (!trigger) return;
-      // WebKit's fixed-position layout viewport can differ from innerWidth by
-      // a few CSS pixels around the safe-area. Use the document viewport and a
-      // wider gutter so the card never grazes an iPhone edge.
-      const gutter = 20;
-      const viewportWidth = Math.min(
-        window.innerWidth,
-        document.documentElement.clientWidth,
-      );
-      const width = Math.min(compact ? 320 : 360, viewportWidth - gutter * 2);
-      const left = Math.min(
-        Math.max(gutter, trigger.right - width),
-        viewportWidth - width - gutter,
-      );
-      const below = window.innerHeight - trigger.bottom - gutter;
-      const above = trigger.top - gutter;
-      const openUp = below < 240 && above > below;
-      const available = Math.max(96, (openUp ? above : below) - 6);
-      setPosition({
-        left,
-        width,
-        maxHeight: Math.min(compact ? 360 : 420, available),
-        ...(openUp
-          ? { bottom: window.innerHeight - trigger.top + 6 }
-          : { top: trigger.bottom + 6 }),
-      });
-    };
-    place();
-    window.addEventListener("resize", place);
-    document.addEventListener("scroll", place, true);
-    return () => {
-      window.removeEventListener("resize", place);
-      document.removeEventListener("scroll", place, true);
-    };
-  }, [anchorRef, compact, open]);
+  const position = useAnchoredPopoverGeometry({
+    open,
+    anchorRef,
+    maxWidth: compact ? 360 : 400,
+    maxHeight: compact ? 440 : 500,
+  });
 
   useEffect(() => {
     if (!open) return;
@@ -138,10 +92,13 @@ export function PlanProgressFloatingCard({ anchorRef, block, open,
   }, [anchorRef, onOpenChange, open]);
 
   if (!open || !position) return null;
+  const { placement, ...style } = position;
   return createPortal(
     <section ref={cardRef} id={id}
-      className={`plan-progress-popover${compact ? " compact" : ""}`}
-      role="dialog" aria-label="计划进度" style={position}>
+      className={`plan-progress-popover place-${placement}${compact ? " compact" : ""}`}
+      data-placement={placement}
+      role="dialog" aria-modal="false" aria-label="计划进度"
+      style={style}>
       <PlanProgressContent block={block} detailLoading={detailLoading} />
     </section>,
     document.body,
@@ -170,7 +127,7 @@ export function PlanProgressPopover({ block, openOverride, onOpenChange,
 
   return <div ref={rootRef} className="plan-progress-control">
     <button type="button"
-      className={`plan-progress-trigger${presentation.complete ? " complete" : ""}${presentation.failed ? " failed" : ""}`}
+      className={`plan-progress-trigger${presentation.complete ? " complete" : ""}${presentation.failed ? " failed" : ""}${presentation.stale ? " stale" : ""}`}
       aria-expanded={open} aria-controls={labelId}
       aria-label={`查看计划进度，${presentation.progressLabel}`}
       title={`计划进度 · ${presentation.progressLabel}`}

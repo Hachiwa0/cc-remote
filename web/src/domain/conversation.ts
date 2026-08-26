@@ -10,6 +10,13 @@ import type {
   ToolCategory,
 } from "../protocol";
 
+/** Browser-only fallback used when an authoritative idle History snapshot
+ * proves that a locally painted turn stopped, but no exact terminal frame was
+ * observed. Kept beside Turn so reconnect repair can recognize legacy cached
+ * projections without comparing arbitrary user-visible errors. */
+export const UNKNOWN_TERMINAL_ERROR =
+  "会话已结束，但未收到完整的终止状态。";
+
 export interface TextBlock {
   kind: "text";
   message_id: string;
@@ -119,10 +126,11 @@ export interface Turn {
   done: boolean;
   interrupted?: boolean;
   error?: string;
-  /** Connection-local terminal classification used only to reconcile a false
-   * compact boundary with a newer authoritative running History snapshot. */
+  /** Browser-side provisional terminal classification. It lets a later
+   * authoritative History snapshot repair reconnect/compaction boundaries;
+   * it is never native terminal proof by itself. */
   terminalSource?: "unexpected_interrupt" | "remote_interrupt" | "failed"
-    | "compact_continuation";
+    | "compact_continuation" | "idle_history_recovery";
   progress?: string;
   images?: QueryImg[];
   imageRefs?: ConversationImageRef[];

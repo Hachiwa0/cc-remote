@@ -8,6 +8,7 @@ import pytest
 
 from cc_remote.protocol import ForkSession, SessionForked
 from cc_remote.wrapper import machine as machine_module
+from cc_remote.wrapper import claude_forks as claude_forks_module
 from cc_remote.wrapper.claude_forks import (
     ClaudeForkJournalError,
     claude_fork_marker,
@@ -539,6 +540,48 @@ def test_ack_loss_retry_never_overwrites_user_renamed_child(monkeypatch):
         assert "request-1" not in machine._claude_fork_locks
 
     asyncio.run(run())
+
+
+def test_claude_fork_child_delete_lifecycle_survives_restart(tmp_path):
+    from cc_remote.wrapper.claude_forks import ClaudeForkJournal
+
+    journal = ClaudeForkJournal(tmp_path)
+    journal.begin("request-1", PARENT, CUTOFF, CWD)
+    journal.claim_submission("request-1")
+    journal.complete("request-1", CHILD)
+
+    assert journal.begin_delete(CHILD) == "delete_pending"
+    assert ClaudeForkJournal(tmp_path).child_entry(CHILD)["status"] == (
+        "delete_pending")
+    assert journal.abort_delete(CHILD) is True
+    assert journal.begin_delete(CHILD) == "delete_pending"
+    assert journal.finish_delete(CHILD) is True
+    reloaded = ClaudeForkJournal(tmp_path)
+    assert reloaded.child_entry(CHILD)["status"] == "deleted"
+    assert reloaded.complete("request-1", CHILD)["status"] == "deleted"
+
+
+def test_claude_fork_journal_never_compacts_deleted_replay_tombstone(
+    tmp_path, monkeypatch,
+):
+    from cc_remote.wrapper.claude_forks import ClaudeForkJournal
+
+    monkeypatch.setattr(claude_forks_module, "_MAX_ENTRIES", 1)
+    journal = ClaudeForkJournal(tmp_path)
+    journal.begin("request-deleted", PARENT, CUTOFF, CWD)
+    journal.claim_submission("request-deleted")
+    journal.complete("request-deleted", CHILD)
+    journal.begin_delete(CHILD)
+    journal.finish_delete(CHILD)
+
+    with pytest.raises(ClaudeForkJournalError, match="capacity exhausted"):
+        journal.begin(
+            "request-new", PARENT,
+            "dddddddd-dddd-4ddd-8ddd-dddddddddddd", CWD,
+        )
+
+    assert ClaudeForkJournal(tmp_path).get(
+        "request-deleted")["status"] == "deleted"
 
 
 def test_cold_claude_source_uses_session_info_cwd_without_spawning(monkeypatch):

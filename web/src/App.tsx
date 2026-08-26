@@ -51,7 +51,10 @@ import { CapabilitiesSheet, type HookDraft, type SkillDraft } from "./components
 import { TerminalControl } from "./components/TerminalControl";
 import { DeviceSheet, type PairingState, type RemoteDevice } from "./components/DeviceSheet";
 import { HeaderMenu } from "./components/HeaderMenu";
-import { codexProfilePresentation } from "./codex-profile-presentation";
+import {
+  codexProfileIdForSession,
+  codexProfilePresentation,
+} from "./codex-profile-presentation";
 import { parseGoalCommand } from "./goal-command";
 import {
   dismissGoalUi,
@@ -62,6 +65,7 @@ import {
   reconcileGoalUiPreference,
   rekeyGoalUiPreference,
   rememberGoalUi,
+  resetGoalDismissMigrationTracking,
   writeGoalUiPreferences,
   type GoalUiPreferences,
 } from "./scoped-goal-ui";
@@ -81,6 +85,8 @@ import {
 import type { SendMode } from "./composer-submit";
 import { MAX_RUNTIME_SESSIONS } from "./runtime-bounds";
 import {
+  FORK_FOCUS_REFRESH_MS,
+  forkFocusLeaseSession,
   isTerminalSessionMigrationError,
   isTerminalWorktreeForkError,
   matchesSessionForkRequest,
@@ -88,8 +94,10 @@ import {
   matchesWorktreeForkRequest,
   reconcileOpenMigrationSession,
   type PendingSessionFork,
+  type ForkFocusLease,
   type PendingSessionMigration,
   type PendingWorktreeFork,
+  withoutForkFocusPlaceholder,
 } from "./session-worktree";
 import { classifyBtwOpened, consumeDiscardedBtwSnapshot, matchesBtwRequest,
   normalizeDiffTheme, normalizeEngine, type Snapshot, type QueryImg,
@@ -145,6 +153,7 @@ import {
   HistoryRequestCoordinator,
   HistoryDetailRequestCoordinator,
   resolveHistoryCwdHint,
+  type CancelledHistoryBrowseRequest,
   type HistoryBrowseRequestContext,
   type HistoryDetailRequestContext,
 } from "./history-requests";
@@ -209,10 +218,16 @@ import {
   planFollowsCompletedGoal,
   SessionPlanProgressCache,
 } from "./plan-progress";
+import {
+  ENGINE_SPACES_KEY,
+  LEGACY_SPACE_KEY,
+  readEngineSpaces,
+  rememberEngineSpace,
+} from "./surface-preferences";
+import { exactActiveTurnId } from "./process-blocks";
 
 const THEME_KEY = "cc_remote_theme";
 const ENGINE_KEY = "cc_remote_engine";  // which backend the NEXT new session uses
-const SPACE_KEY = "cc_remote_space";
 const MACHINE_KEY = "cc_remote_machine";
 const GoalPanel = lazy(() => import("./components/GoalPanel").then(
   ({ GoalPanel: Panel }) => ({ default: Panel }),
@@ -254,10 +269,11 @@ function catalogForEngineProfile(
 export default function App() {
   const [theme, setTheme] = useState<DiffTheme>(
     () => normalizeDiffTheme(localStorage.getItem(THEME_KEY)));
-  const [engine, setEngine] = useState<Engine>(
-    () => normalizeEngine(localStorage.getItem(ENGINE_KEY)));
-  const [space, setSpace] = useState<Space>(
-    () => localStorage.getItem(SPACE_KEY) === "work" ? "work" : "code");
+  const initialEngineRef = useRef(normalizeEngine(localStorage.getItem(ENGINE_KEY)));
+  const initialSpacesRef = useRef(readEngineSpaces(localStorage, initialEngineRef.current));
+  const [engine, setEngine] = useState<Engine>(initialEngineRef.current);
+  const [space, setSpace] = useState<Space>(initialSpacesRef.current[initialEngineRef.current]);
+  const spacesByEngineRef = useRef<Record<Engine, Space>>(initialSpacesRef.current);
   const [authed, setAuthed] = useState(false);
   const [authReady, setAuthReady] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -375,6 +391,8 @@ export default function App() {
     readGoalUiPreferences(localStorage));
   const goalRecoveryRequestsRef = useRef<Set<string>>(new Set());
   const goalDismissMigrationsRef = useRef<Set<string>>(new Set());
+  const goalDismissMigrationByRequestRef = useRef<Map<string, string>>(
+    new Map());
   const planProgressCacheRef = useRef(new SessionPlanProgressCache());
   const goalRequestScopeByIdRef = useRef<Map<
     string, { scopeKey: string; sid: string }
@@ -416,6 +434,23 @@ export default function App() {
       dispatch({ type: "history_detail_cancelled", context });
     }
   }, []);
+  const settleCancelledHistoryBrowse = useCallback((
+    cancelled: readonly CancelledHistoryBrowseRequest[],
+  ) => {
+    for (const request of cancelled) {
+      const browse = request.browse;
+      dispatch({
+        type: "history_browse_page_failed",
+        sid: request.sid,
+        scopeKey: browse.scopeKey,
+        revision: request.revision,
+        generation: request.generation,
+        viewId: browse.viewId,
+        windowEpoch: browse.windowEpoch,
+        before: browse.pendingBefore,
+      });
+    }
+  }, []);
   const historyPageCacheRef = useRef(new HistoryPageCache());
   const historyPageScopesRef =
     useRef(new Map<string, HistoryPageCacheScope>());
@@ -433,6 +468,8 @@ export default function App() {
   }>>(new Map());
   const pendingBtwByParentRef = useRef<Map<string, string>>(new Map());
   const pendingSessionForkRef = useRef<PendingSessionFork | null>(null);
+  const forkFocusLeaseRef = useRef<ForkFocusLease | null>(null);
+  const forkFocusLeaseTimerRef = useRef<number | null>(null);
   const pendingWorktreeForkRef = useRef<PendingWorktreeFork | null>(null);
   const pendingSessionMigrationRef =
     useRef<PendingSessionMigration | null>(null);
@@ -491,6 +528,52 @@ export default function App() {
       return next;
     });
   }, []);
+  const clearForkFocusLease = useCallback((
+    refresh = false,
+    dropPlaceholder = true,
+  ) => {
+    const lease = forkFocusLeaseRef.current;
+    if (forkFocusLeaseTimerRef.current !== null) {
+      window.clearTimeout(forkFocusLeaseTimerRef.current);
+      forkFocusLeaseTimerRef.current = null;
+    }
+    if (!lease) return;
+    forkFocusLeaseRef.current = null;
+    if (!dropPlaceholder) return;
+    const surfaceKey = `${lease.space}:${lease.engine}`;
+    const current = sessionListsBySurfaceRef.current[surfaceKey] ?? [];
+    const sessions = withoutForkFocusPlaceholder(current, lease);
+    sessionListsBySurfaceRef.current[surfaceKey] = sessions;
+    historySessionListsRef.current[surfaceKey] = sessions;
+    dispatch({
+      type: "drop_fork_placeholder",
+      sid: lease.childSessionId,
+      parentSid: lease.parentSessionId,
+    });
+    if (refresh) wsRef.current?.sendListSessions(lease.engine, lease.space);
+  }, []);
+  const startForkFocusLease = useCallback((lease: ForkFocusLease) => {
+    // Replacing one successful fork with another is explicit navigation. The
+    // old synthetic row no longer has a lease and must not linger undeletable.
+    clearForkFocusLease(false, true);
+    forkFocusLeaseRef.current = lease;
+    const refresh = () => {
+      const current = forkFocusLeaseRef.current;
+      if (current?.requestId !== lease.requestId
+          || current.childSessionId !== lease.childSessionId) return;
+      wsRef.current?.sendListSessions(current.engine, current.space);
+      current.refreshAt = Date.now() + FORK_FOCUS_REFRESH_MS;
+      forkFocusLeaseTimerRef.current = window.setTimeout(
+        refresh, FORK_FOCUS_REFRESH_MS);
+    };
+    forkFocusLeaseTimerRef.current = window.setTimeout(
+      refresh, Math.max(0, lease.refreshAt - Date.now()));
+  }, [clearForkFocusLease]);
+  useEffect(() => () => {
+    if (forkFocusLeaseTimerRef.current !== null) {
+      window.clearTimeout(forkFocusLeaseTimerRef.current);
+    }
+  }, []);
   const requestHistory = useCallback((
     sid: string,
     before: string | null | undefined,
@@ -511,8 +594,8 @@ export default function App() {
       before,
       limit,
       resolveHistoryCwdHint(historySessionListsRef.current, sid),
-    ));
-  }, []);
+    ), settleCancelledHistoryBrowse);
+  }, [settleCancelledHistoryBrowse]);
   const cancelPendingNotificationTarget = useCallback(() => {
     setPendingNotificationTarget(null);
     notificationListRequestRef.current = null;
@@ -551,6 +634,7 @@ export default function App() {
     pendingCreateRef.current = null;
     createRequestsRef.current.clear();
     pendingSessionMigrationRef.current = null;
+    clearForkFocusLease(false);
     setMigrateSession(null);
     setMigrateCreating(false);
     setMigrateError(null);
@@ -563,7 +647,11 @@ export default function App() {
     setQueuedQueryEditor(null);
     btwDraftsRef.current.clear();
     setCompletionReceipts({});
-    goalDismissMigrationsRef.current.clear();
+    resetGoalDismissMigrationTracking(
+      goalDismissMigrationsRef.current,
+      goalDismissMigrationByRequestRef.current,
+    );
+    planProgressCacheRef.current.reset();
     sessionListsBySurfaceRef.current = {};
     historySessionListsRef.current = {};
     preferredSurfaceFocusRef.current = null;
@@ -609,7 +697,7 @@ export default function App() {
     }
     void import("./cache").then((module) => module.clearCache());
     void historyPageCacheRef.current.clear();
-  }, [clearHistoryDetailRequests, machineId]);
+  }, [clearForkFocusLease, clearHistoryDetailRequests, machineId]);
 
   // The focused session's runtime (turns/state/model/perm/queue/...). Falls back
   // to an empty runtime before any session is focused.
@@ -701,7 +789,8 @@ export default function App() {
     (session) => session.session_id === focusedSid);
   const focusedEngine = (focusedSession?.engine ?? engine) as "claude" | "codex";
   const focusedCodexProfileId = focusedEngine === "codex"
-    ? focusedSession?.codex_profile_id ?? state.defaultCodexProfileId
+    ? focusedSession?.codex_profile_id
+      ?? codexProfileIdForSession(focusedSid, state.defaultCodexProfileId)
     : null;
   const focusedWorkProfile = space === "work" && !state.newChat
     && focusedEngine === "codex" && focusedSession?.codex_profile_id
@@ -727,7 +816,10 @@ export default function App() {
   const historyPlanProgress = historyView.browsing || historyView.recovering
     ? latestPlanProgress(historyView.turns) : null;
   let planProgress = focusedSid
-    ? planProgressCacheRef.current.resolve({
+      ? planProgressCacheRef.current.resolve({
+        machineId,
+        engine: focusedEngine,
+        space,
         sid: focusedSid,
         runtime: runtimePlanProgress,
         history: historyPlanProgress,
@@ -742,7 +834,9 @@ export default function App() {
   // turn starts after the authoritative Goal completion boundary.
   if (completedGoalRetired && planProgress
       && !planFollowsCompletedGoal(rt.goal, planProgress)) {
-    planProgressCacheRef.current.clear(focusedSid!);
+    planProgressCacheRef.current.clear({
+      machineId, engine: focusedEngine, space, sid: focusedSid!,
+    });
     planProgress = null;
   }
   const planProgressSource = planProgress?.source ?? null;
@@ -1315,8 +1409,11 @@ export default function App() {
   }, [engine, space]);
   useEffect(() => {
     document.documentElement.setAttribute("data-space", space);
-    localStorage.setItem(SPACE_KEY, space);
-  }, [space]);
+    localStorage.setItem(LEGACY_SPACE_KEY, space);
+    spacesByEngineRef.current = rememberEngineSpace(
+      spacesByEngineRef.current, engine, space);
+    localStorage.setItem(ENGINE_SPACES_KEY, JSON.stringify(spacesByEngineRef.current));
+  }, [engine, space]);
   useEffect(() => {
     if (newChatCwd === null || state.connState !== "connected"
         || !state.wrapperOnline || newChatCodexProfileMissing) return;
@@ -1389,6 +1486,7 @@ export default function App() {
     nextSpace: Space,
     preserveAuthority = false,
   ) => {
+    clearForkFocusLease(false);
     rememberSurfaceFocus(engine, space);
     const surfaceKey = `${nextSpace}:${nextEngine}`;
     const focusScopeKey = sessionScopeKey(
@@ -1421,7 +1519,7 @@ export default function App() {
         : null,
     });
     setNewChatAutoFocus(false);
-  }, [engine, machineId, rememberSurfaceFocus, space]);
+  }, [clearForkFocusLease, engine, machineId, rememberSurfaceFocus, space]);
 
   const focusListedSession = useCallback((selected: SessionInfo) => {
     const selectedEngine: Engine = selected.engine === "codex"
@@ -1431,6 +1529,9 @@ export default function App() {
       || selected.space === "code"
       ? selected.space : spaceRef.current;
     const id = selected.session_id;
+    if (forkFocusLeaseRef.current?.childSessionId !== id) {
+      clearForkFocusLease(false);
+    }
     pendingCreateRef.current = null;
     setCreateError(null);
     setStatusOpenSid(null);
@@ -1445,7 +1546,7 @@ export default function App() {
       wsRef.current?.sendGetWorkArtifacts(selectedEngine, id);
     }
     if (isMobile()) setSidebarOpen(false);
-  }, [requestHistory]);
+  }, [clearForkFocusLease, requestHistory]);
 
   useEffect(() => {
     const target = pendingNotificationTarget;
@@ -1554,14 +1655,18 @@ export default function App() {
   const toggleEngine = () => {
     cancelPendingNotificationTarget();
     const nextEngine: Engine = engine === "codex" ? "claude" : "codex";
+    const nextSpace = spacesByEngineRef.current[nextEngine];
     pendingCreateRef.current = null;
     setCreateError(null);
     setStatusOpenSid(null);
     setUsageActivityOpen(false);
     setWorkArtifactsOpen(false);
     setWorkProjectId(null);
-    prepareSurfaceSwitch(nextEngine, space);
+    prepareSurfaceSwitch(nextEngine, nextSpace);
+    engineRef.current = nextEngine;
+    spaceRef.current = nextSpace;
     setEngine(nextEngine);
+    setSpace(nextSpace);
     if (isMobile()) setSidebarOpen(false);
   };
 
@@ -1575,6 +1680,7 @@ export default function App() {
     setForkWorktreeError(null);
     setWorkArtifactsOpen(false);
     prepareSurfaceSwitch(engine, next);
+    spaceRef.current = next;
     setSpace(next);
   };
 
@@ -1614,9 +1720,33 @@ export default function App() {
         onEvent: (msg, ownership) => {
           if (!acceptsLifecycle()) return;
           if (msg.type === "history_invalidated") {
-            planProgressCacheRef.current.clear(msg.session_id);
+            const session = stateRef.current.sessions.find(
+              (candidate) => candidate.session_id === msg.session_id);
+            const scoped = ownership ?? {
+              machineId,
+              engine: session?.engine ?? engineRef.current,
+              space: session?.space ?? spaceRef.current,
+            };
+            planProgressCacheRef.current.clear({
+              machineId: scoped.machineId,
+              engine: scoped.engine,
+              space: scoped.space,
+              sid: msg.session_id,
+            });
           } else if (msg.type === "session_rekey") {
-            planProgressCacheRef.current.rekey(msg.old_key, msg.session_id);
+            const session = stateRef.current.sessions.find(
+              (candidate) => candidate.session_id === msg.old_key
+                || candidate.session_id === msg.session_id);
+            const scoped = ownership ?? {
+              machineId,
+              engine: session?.engine ?? engineRef.current,
+              space: session?.space ?? spaceRef.current,
+            };
+            planProgressCacheRef.current.rekey({
+              machineId: scoped.machineId,
+              engine: scoped.engine,
+              space: scoped.space,
+            }, msg.old_key, msg.session_id);
           }
           // SessionList is a scoped response, not a broadcast catalog. Without
           // the exact request ownership it may belong to an older surface or
@@ -1644,12 +1774,20 @@ export default function App() {
                 ? `${machineId}\0${msg.sid}\0${msg.goal_id}` : null;
               if (migrationKey && authoritativeDismissed) {
                 goalDismissMigrationsRef.current.delete(migrationKey);
+                for (const [requestId, pendingKey] of
+                  goalDismissMigrationByRequestRef.current) {
+                  if (pendingKey === migrationKey) {
+                    goalDismissMigrationByRequestRef.current.delete(requestId);
+                  }
+                }
               } else if (migrationKey && legacyDismissed
                   && !goalDismissMigrationsRef.current.has(migrationKey)) {
                 const requestId = ws.sendDismissGoalTo(
                   msg.sid, msg.goal_id!);
                 if (requestId) {
                   goalDismissMigrationsRef.current.add(migrationKey);
+                  goalDismissMigrationByRequestRef.current.set(
+                    requestId, migrationKey);
                 }
               }
               const reconciled = reconcileGoalUiPreference(
@@ -1724,6 +1862,12 @@ export default function App() {
               return next;
             });
           } else if (msg.type === "error" && msg.request_id) {
+            const failedMigration =
+              goalDismissMigrationByRequestRef.current.get(msg.request_id);
+            if (failedMigration && msg.code !== "wrapper_offline") {
+              goalDismissMigrationByRequestRef.current.delete(msg.request_id);
+              goalDismissMigrationsRef.current.delete(failedMigration);
+            }
             const request = goalRequestScopeByIdRef.current.get(msg.request_id);
             if (request) {
               goalRequestScopeByIdRef.current.delete(msg.request_id);
@@ -2025,8 +2169,22 @@ export default function App() {
             }
           }
           if (msg.type === "history") {
-            const browseWaiters =
+            const completedHistory =
               historyRequestsRef.current.complete(msg);
+            const browseWaiters = completedHistory.matched;
+            for (const browse of completedHistory.stale) {
+              dispatch({
+                type: "history_browse_page_failed",
+                sid: msg.session_id,
+                scopeKey: browse.scopeKey,
+                revision: stateRef.current.historyBrowse?.revision
+                  ?? msg.revision,
+                generation: stateRef.current.historyBrowse?.generation,
+                viewId: browse.viewId,
+                windowEpoch: browse.windowEpoch,
+                before: browse.pendingBefore,
+              });
+            }
             const retryKey = ["history", msg.session_id, msg.before ?? "",
               msg.revision ?? ""].join("\u0000");
             let retryScheduled = false;
@@ -2053,6 +2211,24 @@ export default function App() {
               recoverableReads.complete(retryKey);
             }
             if (msg.before) {
+              if (completedHistory.stale.length > 0
+                  && stateRef.current.focusedSid === msg.session_id) {
+                // The cursor came from an obsolete revision/generation. Exit
+                // that read-only browse lifetime and refresh the canonical head
+                // rather than leaving mobile paging in a permanent spinner.
+                dispatch({ type: "return_to_latest", sid: msg.session_id });
+                const currentRuntime =
+                  stateRef.current.runtimes[msg.session_id];
+                const currentGeneration = ws.generationFor(msg.session_id)
+                  ?? currentRuntime?.pendingHistoryGeneration
+                  ?? currentRuntime?.historyGeneration;
+                const currentRevision = currentRuntime?.pendingHistoryRevision
+                  ?? (currentRuntime?.historyInvalidated
+                    ? undefined : currentRuntime?.historyRevision);
+                requestHistory(
+                  msg.session_id, undefined, HISTORY_INITIAL_PAGE,
+                  currentGeneration, currentRevision);
+              }
               if (msg.authoritative !== false) {
                 void installBrowseHistoryPage(msg, browseWaiters);
               } else if (!retryScheduled) {
@@ -2299,7 +2475,23 @@ export default function App() {
               ? stateRef.current.sessions.find(
                 (session) => session.session_id === msg.parent_session_id,
               )?.codex_profile_id
+                ?? codexProfileIdForSession(
+                  msg.parent_session_id,
+                  stateRef.current.defaultCodexProfileId,
+                )
               : undefined;
+            startForkFocusLease({
+              requestId: msg.request_id,
+              parentSessionId: msg.parent_session_id,
+              childSessionId: msg.session_id,
+              engine: targetEngine,
+              space: "code",
+              machineId,
+              cwd: msg.cwd,
+              gitBranch: msg.git_branch,
+              codexProfileId: parentProfileId,
+              refreshAt: Date.now() + FORK_FOCUS_REFRESH_MS,
+            });
             ws.setSessionEngines([{
               session_id: msg.session_id,
               engine: targetEngine,
@@ -2507,12 +2699,30 @@ export default function App() {
               stateRef.current.defaultCodexProfileId,
               msg,
             );
-            normalizedListedSessions = normalized.sessions;
+            const lease = forkFocusLeaseSession(
+              forkFocusLeaseRef.current,
+              normalized.sessions,
+              machineId,
+              msg.engine,
+              listedSpace,
+            );
+            if (!lease && forkFocusLeaseRef.current
+                && forkFocusLeaseRef.current.machineId === machineId
+                && forkFocusLeaseRef.current.engine === msg.engine
+                && forkFocusLeaseRef.current.space === listedSpace) {
+              const materialized = normalized.sessions.some(
+                (session) => session.session_id
+                  === forkFocusLeaseRef.current?.childSessionId,
+              );
+              clearForkFocusLease(false, !materialized);
+            }
+            normalizedListedSessions = lease
+              ? [lease, ...normalized.sessions] : normalized.sessions;
             historySessionListsRef.current[
               surfaceKey
-            ] = normalized.sessions;
-            ws.setSessionEngines(normalized.sessions);
-            sessionListsBySurfaceRef.current[surfaceKey] = normalized.sessions;
+            ] = normalizedListedSessions;
+            ws.setSessionEngines(normalizedListedSessions);
+            sessionListsBySurfaceRef.current[surfaceKey] = normalizedListedSessions;
             authoritativeSurfaceListsRef.current.add(surfaceKey);
             bumpNotificationListRevision();
             prefetchedSurfacesRef.current.add(surfaceKey);
@@ -2615,7 +2825,13 @@ export default function App() {
               || (msg.type === "error"
                 && msg.request_id === statusRuntimeBeforeEvent.statusRequestId)
             );
-          dispatch({ type: "event", event: msg, ownership });
+          if (msg.type === "session_list" && normalizedListedSessions) {
+            dispatch({ type: "event", event: {
+              ...msg, sessions: normalizedListedSessions,
+            }, ownership });
+          } else {
+            dispatch({ type: "event", event: msg, ownership });
+          }
           if (msg.sid && completesStatusRequest
               && deferredStatusRefreshRef.current.delete(msg.sid)) {
             const requestId = ws.sendGetStatusTo(msg.sid);
@@ -2693,12 +2909,26 @@ export default function App() {
           dispatch({ type: "conn", connState: s, detail });
           if (s !== "connected") {
             skillCatalogRequestsRef.current?.resetReads();
+            // The fork result is authoritative only for this live connection.
+            // A reconnect will obtain a fresh native SessionList, so do not
+            // preserve a synthetic child indefinitely across disconnects.
+            clearForkFocusLease(false);
           }
           if (s === "connected") {
             goalRecoveryRequestsRef.current.clear();
             goalRequestScopeByIdRef.current.clear();
+            // Recovery preamble replay happens before this callback. Forget
+            // both halves of the old-socket correlation together, then let
+            // the focused Goal's fresh GetGoal response deliberately enqueue
+            // a new idempotent migration. Keeping only the in-flight key would
+            // suppress that retry forever when the replay returns an Error.
+            resetGoalDismissMigrationTracking(
+              goalDismissMigrationsRef.current,
+              goalDismissMigrationByRequestRef.current,
+            );
             recoverableReads.clear();
-            historyRequestsRef.current.beginConnection();
+            settleCancelledHistoryBrowse(
+              historyRequestsRef.current.beginConnection());
             clearHistoryDetailRequests();
             notificationListRequestRef.current = null;
             bumpNotificationListRevision();
@@ -2724,6 +2954,7 @@ export default function App() {
           pendingSessionForkRef.current = null;
           pendingWorktreeForkRef.current = null;
           pendingSessionMigrationRef.current = null;
+          clearForkFocusLease(false);
           setMigrateSession(null);
           setMigrateCreating(false);
           setMigrateError(null);
@@ -2830,6 +3061,7 @@ export default function App() {
   }, [
     acceptSkillCatalog,
     authed,
+    clearForkFocusLease,
     clearHistoryDetailRequests,
     installBrowseHistoryPage,
     invalidateHistoryPageScopes,
@@ -2838,6 +3070,8 @@ export default function App() {
     requestHistory,
     requestSkillCatalog,
     setBtwOpeningFor,
+    settleCancelledHistoryBrowse,
+    startForkFocusLease,
   ]);
 
   // Land on the preferred/recent session only after an accepted list for the
@@ -4166,6 +4400,7 @@ export default function App() {
       pendingSessionForkRef.current = null;
       pendingWorktreeForkRef.current = null;
       pendingSessionMigrationRef.current = null;
+      clearForkFocusLease(false);
       setMigrateSession(null);
       setMigrateCreating(false);
       setMigrateError(null);
@@ -4224,6 +4459,15 @@ export default function App() {
   const effectiveState = mergeSessionActivityState(
     focusedSessionState, rt.state, rt.mirroredRunning,
   ) ?? rt.state;
+  // Fail closed when a migrated cache contains colliding display aliases. A
+  // session-level running bit alone must never animate the wrong historical
+  // row, another account, or a read-only browse projection.
+  const activeTurnId = exactActiveTurnId(
+    historyView.turns,
+    rt.liveOwner?.turnId,
+    !historyView.browsing && !historyView.recovering
+      && (rt.state !== "idle" || rt.mirroredRunning),
+  );
 
   return (
     <div className={"shell" + (sidebarOpen ? " sidebar-open" : "") + ((state.artifact || activeBtw || btwOpening) ? " panel-open" : "")} onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}>
@@ -4252,8 +4496,8 @@ export default function App() {
           const selected = state.sessions.find((s) => s.session_id === id);
           if (selected) focusListedSession(selected);
         }}
-        onNew={(codexProfileId) => { if (!confirmArtifactDiscard()) return; cancelPendingNotificationTarget(); pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd: "~", cwdSource: "default", codexProfileId: codexProfileId ?? newChatCodexProfileId }); if (isMobile()) setSidebarOpen(false); }}
-        onNewInDir={(cwd) => { if (!confirmArtifactDiscard()) return; cancelPendingNotificationTarget(); pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd, cwdSource: "explicit", codexProfileId: newChatCodexProfileId }); if (isMobile()) setSidebarOpen(false); }}
+        onNew={(codexProfileId) => { if (!confirmArtifactDiscard()) return; clearForkFocusLease(false); cancelPendingNotificationTarget(); pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd: "~", cwdSource: "default", codexProfileId: codexProfileId ?? newChatCodexProfileId }); if (isMobile()) setSidebarOpen(false); }}
+        onNewInDir={(cwd) => { if (!confirmArtifactDiscard()) return; clearForkFocusLease(false); cancelPendingNotificationTarget(); pendingCreateRef.current = null; setCreateError(null); setStatusOpenSid(null); setNewChatAutoFocus(true); wsRef.current?.setFocusedSid(null); dispatch({ type: "enter_new_chat", cwd, cwdSource: "explicit", codexProfileId: newChatCodexProfileId }); if (isMobile()) setSidebarOpen(false); }}
         onClose={() => setSidebarOpen(false)}
         onRename={(id, title) => wsRef.current?.sendRenameSession(id, title, engine, space)}
         onArchive={(id, archived) => { wsRef.current?.sendArchiveSession(id, archived, engine, space); }}
@@ -4279,6 +4523,9 @@ export default function App() {
           const target = deleted
             ? sessionCommandTarget(deleted, engine, space)
             : { engine, space };
+          if (forkFocusLeaseRef.current?.childSessionId === id) {
+            clearForkFocusLease(false);
+          }
           composerDraftsRef.current.delete(composerDraftKey(
             machineId, target.space, target.engine, id,
           ));
@@ -4288,7 +4535,8 @@ export default function App() {
             type: "enter_new_chat", cwd: "~", cwdSource: "default",
             codexProfileId: newChatCodexProfileId,
           });
-          wsRef.current?.sendDeleteSession(id, engine, space);
+          wsRef.current?.sendDeleteSession(
+            id, target.engine, target.space);
         }}
         onForkWorktree={openForkWorktree}
         onMigrate={openSessionMigration}
@@ -4422,8 +4670,9 @@ export default function App() {
             onSend={sendFirstMessage} />
         ) : (
           <>
-            <ChatView sid={focusedSid} turns={historyView.turns}
-              loading={!!rt.loading}
+            <ChatView key={`${activeScopeKey}\u0000${focusedSid ?? ""}`}
+              sid={focusedSid} turns={historyView.turns}
+              loading={!!rt.loading || historyView.recovering}
               surface={space}
               engine={focusedEngine} forkingPointId={forkingPointId}
               hasMore={historyView.hasMore}
@@ -4469,6 +4718,7 @@ export default function App() {
                 turnId: planProgress.turnId,
                 itemId: planProgress.block.item_id,
               } : null}
+              activeTurnId={activeTurnId}
               onFork={!historyView.recovering && space === "code"
                 ? forkFromTurn : undefined} />
 

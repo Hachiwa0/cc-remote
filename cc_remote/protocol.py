@@ -19,7 +19,7 @@ from typing_extensions import NotRequired, TypedDict
 
 from pydantic import (
     AfterValidator, BaseModel, ConfigDict, Field, StringConstraints, ValidationError,
-    model_validator,
+    PrivateAttr, model_validator,
 )
 
 from cc_remote.attachments import (
@@ -28,13 +28,14 @@ from cc_remote.attachments import (
     MAX_SINGLE_ATTACHMENT_BYTES,
 )
 
-PROTOCOL_VERSION = 34
+PROTOCOL_VERSION = 35
 
 # Codex Desktop renders a 53-week daily token-activity calendar. Keep the wire
 # payload to that same bounded window so an account response can never turn a
 # one-shot status frame into an unbounded relay/browser allocation.
 MAX_STATUS_USAGE_BUCKETS = 53 * 7
 MAX_SAFE_WIRE_INTEGER = 9_007_199_254_740_991
+MAX_SAFE_WIRE_TIMESTAMP_SECONDS = MAX_SAFE_WIRE_INTEGER // 1000
 
 State = Literal["idle", "running", "interrupting", "draining"]
 Engine = Literal["claude", "codex"]
@@ -843,6 +844,11 @@ class TurnEnd(_Base):
     # not the assistant UUID above or the browser's optimistic message id.
     checkpoint_id: Optional[WireId] = None
     notification_context: Optional[TurnNotificationContext] = None
+    # Wrapper-internal provenance.  This is deliberately a Pydantic private
+    # attribute so it never crosses the wire or changes protocol validation.
+    # Only a real Codex app-server ``turn/completed`` may set it; locally
+    # synthesized TurnEnd frames must not become durable lifecycle facts.
+    _codex_authoritative_terminal: bool = PrivateAttr(default=False)
 
 
 class Error(_Base):
@@ -1972,6 +1978,23 @@ class ConversationTurn(BaseModel):
     detailLoaded: bool = False
 
 
+class CodexTerminalFence(BaseModel):
+    """Source-bound Codex lifecycle fact independent of History content.
+
+    App-server's terminal notification is authoritative, but a large rollout's
+    materialized History page can briefly lag behind it.  A newest-page History
+    carries these small exact-turn fences so a reconnect can close the already
+    painted row without rescanning or guessing from the last open turn.
+    """
+    model_config = ConfigDict(extra="forbid")
+    turn_id: WireId
+    status: Literal["completed", "interrupted", "failed"]
+    duration_ms: Optional[int] = Field(
+        default=None, ge=0, le=MAX_SAFE_WIRE_INTEGER)
+    completed_at: Optional[float] = Field(
+        default=None, ge=0, le=MAX_SAFE_WIRE_TIMESTAMP_SECONDS)
+
+
 class History(_Base):
     """wrapper -> client: one summary or compatibility event page.
 
@@ -2032,6 +2055,11 @@ class History(_Base):
     # real user interrupt or crash must stay terminal on a cold browser.
     compaction_continuation_turn_ids: list[WireId] = Field(
         default_factory=list, max_length=4)
+    # Exact native terminal facts are a separate lifecycle projection.  They
+    # may close a stale/incomplete narrative page, but never identify a target
+    # by array position and never replace live TurnEnd notifications.
+    terminal_fences: list[CodexTerminalFence] = Field(
+        default_factory=list, max_length=16)
     # Authoritative replacement after a destructive history mutation such as
     # Codex rollback. Ordinary loads merge with a live tail; reset loads must
     # discard turns that the engine has just removed.

@@ -38,6 +38,14 @@ def _notification(method: str, turn_id: str, **params):
     }
 
 
+def _context_compaction(turn_id: str, item_id: str = "context-compaction"):
+    return _notification(
+        "item/completed",
+        turn_id,
+        item={"id": item_id, "type": "contextCompaction"},
+    )
+
+
 def _goal_notification(
     objective: str,
     *,
@@ -321,6 +329,49 @@ def test_managed_compaction_interrupted_boundary_keeps_response_open():
         assert frames[-1]["params"]["turn"]["status"] == "interrupted"
         assert handle.turn_active is False
         assert handle.turn_id is None
+
+    asyncio.run(run())
+
+
+def test_official_context_compaction_item_arms_managed_continuation():
+    async def run():
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-spontaneous"
+        turn_id = "managed-official-context-compaction"
+        handle.turn_id = turn_id
+        handle.turn_active = True
+        handle._open_managed_stream()
+
+        compacted = _context_compaction(turn_id)
+        await handle._dispatch(compacted)
+        await handle._dispatch(_notification(
+            "turn/completed", turn_id,
+            turn={"id": turn_id, "status": "interrupted"},
+        ))
+
+        fence = handle._managed_compaction_continuation
+        assert fence is not None
+        assert fence.awaiting_replacement is True
+        assert handle.turn_active is True
+
+        continuation = _notification(
+            "item/completed", turn_id,
+            item={
+                "id": "official-after-compaction",
+                "type": "agentMessage",
+                "text": "continued",
+            },
+        )
+        await handle._dispatch(continuation)
+        final = _notification(
+            "turn/completed", turn_id,
+            turn={"id": turn_id, "status": "completed"},
+        )
+        await handle._dispatch(final)
+
+        assert [item async for item in handle.receive_response()] == [
+            compacted, continuation, final,
+        ]
 
     asyncio.run(run())
 
@@ -740,6 +791,9 @@ def test_machine_persists_cross_turn_steer_identity_and_refreshes_history(
         })
         assert machine._history_revision(ctx.session_id) != revision
         assert len(refreshes) == 1
+        assert refreshes[0][1]["before"] is None
+        assert refreshes[0][1]["limit"] == machine.MIRROR_LIMIT
+        assert refreshes[0][1]["detail"] == "summary"
         assert ctx.codex_published_steers == {
             "remote-client-message": "remote-expected-turn",
         }
@@ -1141,6 +1195,316 @@ def test_compaction_interrupted_boundary_expires_to_a_real_terminal(monkeypatch)
         assert handle.turn_id is None
 
     asyncio.run(run())
+
+
+def test_compaction_deadline_probe_keeps_exact_active_turn_open(monkeypatch):
+    async def run():
+        monkeypatch.setattr(
+            codex_handle_module,
+            "_COMPACTION_CONTINUATION_GRACE_SECONDS",
+            0.01,
+        )
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-spontaneous"
+        turn_id = "managed-compact-active-probe"
+        handle.turn_id = turn_id
+        handle.turn_active = True
+        handle._open_managed_stream()
+        requests = []
+
+        async def request(method, params=None):
+            requests.append((method, params))
+            if method == "thread/read":
+                return {
+                    "thread": {
+                        "id": "thread-spontaneous",
+                        "status": {"type": "active", "activeFlags": []},
+                    },
+                }
+            assert method == "thread/turns/list"
+            return {
+                "data": [{"id": turn_id, "status": "inProgress"}],
+                "nextCursor": None,
+            }
+
+        handle._request = request
+        compacted = _context_compaction(turn_id)
+        await handle._dispatch(compacted)
+        await handle._dispatch(_notification(
+            "turn/completed", turn_id,
+            turn={"id": turn_id, "status": "interrupted"},
+        ))
+        fence = handle._managed_compaction_continuation
+        assert fence is not None
+        await asyncio.wait_for(fence.settled.wait(), timeout=0.2)
+        assert fence.awaiting_replacement is False
+        assert fence.suppressed_terminal is None
+        assert handle.turn_active is True
+        assert requests == [
+            ("thread/read", {
+                "threadId": "thread-spontaneous",
+                "includeTurns": False,
+            }),
+            ("thread/turns/list", {
+                "threadId": "thread-spontaneous",
+                "cursor": None,
+                "limit": 1,
+                "sortDirection": "desc",
+                "itemsView": "notLoaded",
+            }),
+        ]
+
+        continuation = _notification(
+            "item/completed", turn_id,
+            item={
+                "id": "after-active-probe",
+                "type": "agentMessage",
+                "text": "continued after the five second boundary",
+            },
+        )
+        final = _notification(
+            "turn/completed", turn_id,
+            turn={"id": turn_id, "status": "completed"},
+        )
+        await handle._dispatch(continuation)
+        await handle._dispatch(final)
+        assert [item async for item in handle.receive_response()] == [
+            compacted, continuation, final,
+        ]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("probe_mode", [
+    "idle", "different-turn", "timeout", "error",
+])
+def test_compaction_deadline_probe_fails_closed(monkeypatch, probe_mode):
+    async def run():
+        monkeypatch.setattr(
+            codex_handle_module,
+            "_COMPACTION_CONTINUATION_GRACE_SECONDS",
+            0.01,
+        )
+        monkeypatch.setattr(
+            codex_handle_module,
+            "_COMPACTION_CONTINUATION_PROBE_TIMEOUT_SECONDS",
+            0.02,
+        )
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-spontaneous"
+        turn_id = f"managed-compact-{probe_mode}"
+        handle.turn_id = turn_id
+        handle.turn_active = True
+        handle._open_managed_stream()
+
+        async def request(method, params=None):
+            if probe_mode == "timeout":
+                await asyncio.Event().wait()
+            if probe_mode == "error":
+                raise RuntimeError("probe failed")
+            if method == "thread/read":
+                return {
+                    "thread": {
+                        "id": "thread-spontaneous",
+                        "status": {"type": (
+                            "idle" if probe_mode == "idle" else "active"
+                        )},
+                    },
+                }
+            return {
+                "data": [{
+                    "id": "another-turn",
+                    "status": "inProgress",
+                }],
+            }
+
+        handle._request = request
+        compacted = _context_compaction(turn_id)
+        terminal = _notification(
+            "turn/completed", turn_id,
+            turn={"id": turn_id, "status": "interrupted"},
+        )
+        await handle._dispatch(compacted)
+        await handle._dispatch(terminal)
+        assert await asyncio.wait_for(
+            _collect_managed_response(handle), timeout=0.3,
+        ) == [compacted, terminal]
+        assert handle.turn_active is False
+        assert handle.turn_id is None
+
+    asyncio.run(run())
+
+
+def test_late_continuation_wins_while_compaction_probe_is_in_flight(monkeypatch):
+    async def run():
+        monkeypatch.setattr(
+            codex_handle_module,
+            "_COMPACTION_CONTINUATION_GRACE_SECONDS",
+            0.01,
+        )
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-spontaneous"
+        turn_id = "managed-compact-late-during-probe"
+        handle.turn_id = turn_id
+        handle.turn_active = True
+        handle._open_managed_stream()
+        probe_started = asyncio.Event()
+        release_probe = asyncio.Event()
+
+        async def request(method, params=None):
+            probe_started.set()
+            await release_probe.wait()
+            return {
+                "thread": {
+                    "id": "thread-spontaneous",
+                    "status": {"type": "idle"},
+                },
+            }
+
+        handle._request = request
+        compacted = _context_compaction(turn_id)
+        await handle._dispatch(compacted)
+        await handle._dispatch(_notification(
+            "turn/completed", turn_id,
+            turn={"id": turn_id, "status": "interrupted"},
+        ))
+        await asyncio.wait_for(probe_started.wait(), timeout=0.2)
+        fence = handle._managed_compaction_continuation
+        assert fence is not None and fence.probing is True
+
+        continuation = _notification(
+            "item/completed", turn_id,
+            item={
+                "id": "late-continuation-during-probe",
+                "type": "agentMessage",
+                "text": "late continuation",
+            },
+        )
+        await handle._dispatch(continuation)
+        assert fence.awaiting_replacement is False
+        release_probe.set()
+        await asyncio.sleep(0)
+        final = _notification(
+            "turn/completed", turn_id,
+            turn={"id": turn_id, "status": "completed"},
+        )
+        await handle._dispatch(final)
+        assert [item async for item in handle.receive_response()] == [
+            compacted, continuation, final,
+        ]
+
+    asyncio.run(run())
+
+
+def test_continuation_wins_after_final_compaction_probe_reply(monkeypatch):
+    async def run():
+        monkeypatch.setattr(
+            codex_handle_module,
+            "_COMPACTION_CONTINUATION_GRACE_SECONDS",
+            0.01,
+        )
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-spontaneous"
+        turn_id = "managed-compact-final-probe-race"
+        handle.turn_id = turn_id
+        handle.turn_active = True
+        handle._open_managed_stream()
+        continuation = _notification(
+            "item/completed", turn_id,
+            item={
+                "id": "continuation-at-final-probe-reply",
+                "type": "agentMessage",
+                "text": "continued",
+            },
+        )
+
+        async def request(method, params=None):
+            if method == "thread/read":
+                return {
+                    "thread": {
+                        "id": "thread-spontaneous",
+                        "status": {"type": "active"},
+                    },
+                }
+            # Model the reader delivering a continuation immediately before it
+            # resolves the final RPC response to the detached probe task.
+            await handle._dispatch(continuation)
+            return {"data": [{"id": turn_id, "status": "completed"}]}
+
+        handle._request = request
+        compacted = _context_compaction(turn_id)
+        await handle._dispatch(compacted)
+        await handle._dispatch(_notification(
+            "turn/completed", turn_id,
+            turn={"id": turn_id, "status": "interrupted"},
+        ))
+        fence = handle._managed_compaction_continuation
+        assert fence is not None
+        await asyncio.wait_for(fence.settled.wait(), timeout=0.2)
+        await asyncio.sleep(0)
+
+        final = _notification(
+            "turn/completed", turn_id,
+            turn={"id": turn_id, "status": "completed"},
+        )
+        await handle._dispatch(final)
+        assert [item async for item in handle.receive_response()] == [
+            compacted, continuation, final,
+        ]
+
+    asyncio.run(run())
+
+
+def test_compaction_probe_cannot_cross_generation_or_queue(monkeypatch):
+    async def run(stale_kind):
+        monkeypatch.setattr(
+            codex_handle_module,
+            "_COMPACTION_CONTINUATION_GRACE_SECONDS",
+            0.01,
+        )
+        handle = CodexHandle(_Cfg())
+        handle.thread_id = "thread-spontaneous"
+        turn_id = f"managed-compact-stale-{stale_kind}"
+        handle.turn_id = turn_id
+        handle.turn_active = True
+        handle._open_managed_stream()
+        old_queue = handle._turn_q
+        probe_started = asyncio.Event()
+        release_probe = asyncio.Event()
+
+        async def request(method, params=None):
+            probe_started.set()
+            await release_probe.wait()
+            if method == "thread/read":
+                return {
+                    "thread": {
+                        "id": "thread-spontaneous",
+                        "status": {"type": "active"},
+                    },
+                }
+            return {"data": [{"id": turn_id, "status": "inProgress"}]}
+
+        handle._request = request
+        await handle._dispatch(_context_compaction(turn_id))
+        await handle._dispatch(_notification(
+            "turn/completed", turn_id,
+            turn={"id": turn_id, "status": "interrupted"},
+        ))
+        await asyncio.wait_for(probe_started.wait(), timeout=0.2)
+        if stale_kind == "generation":
+            handle._generation += 1
+        else:
+            handle._open_managed_stream()
+        release_probe.set()
+        await asyncio.sleep(0.02)
+        assert handle._managed_compaction_continuation is None
+        # No stale terminal may be injected into a replacement queue.
+        assert handle._turn_q is not old_queue or stale_kind == "generation"
+        if handle._turn_q is not old_queue:
+            assert handle._turn_q.qsize() == 0
+
+    asyncio.run(run("generation"))
+    asyncio.run(run("queue"))
 
 
 def test_unconfirmed_replacement_start_is_replayed_after_compaction_timeout(
@@ -1668,6 +2032,152 @@ def test_machine_uses_live_cli_user_item_as_spontaneous_turn_identity():
         assert not any(event.prompt == "" for event in users)
         assert any(isinstance(event, Delta) and event.text == "seen remotely"
                    for event in transport.sent)
+
+    asyncio.run(run())
+
+
+def test_machine_recovers_missed_cli_user_before_first_output(monkeypatch):
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("thread-spontaneous", "thread-spontaneous")
+        ctx.engine = "codex"
+        handle = CodexHandle(machine.cfg)
+        handle.thread_id = ctx.session_id
+        handle.proc = SimpleNamespace(returncode=None)
+        ctx.sdk = handle
+        machine.sessions[ctx.key] = ctx
+        handle.turn_lifecycle_callback = (
+            lambda phase, turn_id: machine._on_codex_turn_lifecycle(
+                ctx, phase, turn_id))
+        recoveries = []
+        refreshes = []
+
+        async def recover(sid, native_turn_id, visible_turn_id, user_index,
+                          **kwargs):
+            recoveries.append((
+                sid,
+                native_turn_id,
+                visible_turn_id,
+                user_index,
+                kwargs,
+            ))
+            return UserMsg(
+                msg_id="persisted-cli-user",
+                prompt="persisted CLI prompt",
+            )
+
+        monkeypatch.setattr(
+            machine, "_recover_official_codex_user", recover)
+        monkeypatch.setattr(
+            machine,
+            "_schedule_history_refresh",
+            lambda sid, **kwargs: refreshes.append((sid, kwargs)),
+        )
+
+        turn_id = "cli-user-notification-missed"
+        for message in [
+            _notification("turn/started", turn_id, turn={"id": turn_id}),
+            # The wrapper attached after app-server had already emitted the
+            # userMessage item. Persisted rollout state still has the exact row.
+            _notification("item/completed", turn_id, item={
+                "id": "cli-answer", "type": "agentMessage",
+                "text": "answer", "phase": "final_answer",
+            }),
+            _notification("turn/completed", turn_id, turn={
+                "id": turn_id, "status": "completed",
+            }),
+        ]:
+            await handle._dispatch(message)
+
+        task = ctx.codex_spontaneous_task
+        assert task is not None
+        await asyncio.wait_for(task, timeout=1)
+
+        users = [event for event in transport.sent
+                 if isinstance(event, UserMsg)]
+        assert [(event.msg_id, event.prompt) for event in users] == [
+            ("persisted-cli-user", "persisted CLI prompt"),
+        ]
+        assert not any(event.prompt == "" for event in users)
+        assert [
+            (event.msg_id, event.turn_id)
+            for event in transport.sent
+            if isinstance(event, TurnBinding)
+        ] == [("persisted-cli-user", turn_id)]
+        assert recoveries == [(
+            ctx.session_id,
+            turn_id,
+            turn_id,
+            0,
+            {
+                "max_reverse_scan_bytes": (
+                    machine.CODEX_LIVE_USER_RECOVERY_SCAN_BYTES
+                ),
+            },
+        )]
+        assert refreshes == [(
+            ctx.session_id,
+            {
+                "before": None,
+                "limit": machine.MIRROR_LIMIT,
+                "cwd": None,
+                "detail": "summary",
+            },
+        )]
+
+    asyncio.run(run())
+
+
+def test_machine_refreshes_history_after_missed_cli_user_recovery(monkeypatch):
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("thread-spontaneous", "thread-spontaneous")
+        ctx.engine = "codex"
+        turn_id = "cli-user-persisted-late"
+        ctx.codex_spontaneous_turn_id = turn_id
+        refreshes = []
+
+        class Sdk:
+            async def receive_spontaneous_response(self, requested_turn_id):
+                assert requested_turn_id == turn_id
+                yield _notification("item/completed", turn_id, item={
+                    "id": "cli-answer", "type": "agentMessage",
+                    "text": "answer", "phase": "final_answer",
+                })
+                yield _notification("turn/completed", turn_id, turn={
+                    "id": turn_id, "status": "completed",
+                })
+
+        async def recover(*_args, **_kwargs):
+            return None
+
+        ctx.sdk = Sdk()
+        machine.sessions[ctx.key] = ctx
+        monkeypatch.setattr(
+            machine, "_recover_official_codex_user", recover)
+        monkeypatch.setattr(
+            machine,
+            "_schedule_history_refresh",
+            lambda sid, **kwargs: refreshes.append((sid, kwargs)),
+        )
+
+        await machine._run_codex_spontaneous_turn(
+            ctx, turn_id, announce_running=False)
+
+        users = [event for event in transport.sent
+                 if isinstance(event, UserMsg)]
+        assert [(event.msg_id, event.prompt) for event in users] == [
+            (turn_id, ""),
+        ]
+        assert refreshes == [(
+            ctx.session_id,
+            {
+                "before": None,
+                "limit": machine.MIRROR_LIMIT,
+                "cwd": None,
+                "detail": "summary",
+            },
+        )]
 
     asyncio.run(run())
 

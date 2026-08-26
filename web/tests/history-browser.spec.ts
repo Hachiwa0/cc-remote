@@ -1462,7 +1462,7 @@ test("user scrolling cancels a pending turn-detail anchor", async ({ page }) => 
     .toBeLessThan(2);
 });
 
-test("history page cache upgrades v1 and preserves pages in real IndexedDB", async ({
+test("history page cache rebuilds a v1 record in real IndexedDB", async ({
   page,
 }) => {
   await page.goto("/tests/history-browser.html");
@@ -1541,16 +1541,16 @@ test("history page cache upgrades v1 and preserves pages in real IndexedDB", asy
     const invalidated = await cache.invalidateScope(scope);
     const afterInvalidation = await cache.getPage(scope, pageKey);
     return {
-      upgradedIds: upgraded?.turns.map((turn: { id: string }) => turn.id),
+      legacyMiss: upgraded === null,
       stored,
       mergedIds: merged?.turns.map((turn: { id: string }) => turn.id),
       invalidated,
       afterInvalidation,
     };
   });
-  expect(result.upgradedIds).toEqual(["legacy-turn"]);
+  expect(result.legacyMiss).toBe(true);
   expect(result.stored.ok).toBe(true);
-  expect(result.mergedIds).toEqual(["legacy-turn", "new-turn"]);
+  expect(result.mergedIds).toEqual(["new-turn"]);
   expect(result.invalidated.ok).toBe(true);
   expect(result.afterInvalidation).toBeNull();
 });
@@ -2932,10 +2932,22 @@ test("a generation change clears the automatic keyboard paging boundary", async 
 
   await page.getByTestId("shift-generation").click();
   await expect(page.getByTestId("history-page-activity")).toHaveCount(0);
-  await viewport.press("End");
-  await expect.poll(() => viewport.evaluate((node) => node.scrollTop))
-    .toBeGreaterThan(0);
-  await viewport.press("Home");
+  const keyboardBaseline = await viewport.evaluate((node) => {
+    // Chromium may expose the End position before delivering its scroll event,
+    // then coalesce that event with the following Home movement. Reproduce the
+    // ordering deterministically: keydown sees the physical bottom position,
+    // while the only delivered scroll event observes the final top position.
+    node.scrollTop = node.scrollHeight;
+    const bottom = node.scrollTop;
+    node.dispatchEvent(new KeyboardEvent("keydown", {
+      bubbles: true,
+      key: "Home",
+    }));
+    node.scrollTop = 0;
+    node.dispatchEvent(new Event("scroll"));
+    return bottom;
+  });
+  expect(keyboardBaseline).toBeGreaterThan(0);
   await expect(page.getByTestId("load-count")).toHaveText("2");
 });
 
@@ -2951,6 +2963,72 @@ test("same-session revision replacement resets to the latest row", async ({
   await expect(page.locator('[data-turn-id="m1"]')).toHaveCount(0);
   await expect(page.locator('[data-turn-id="r24"]')).toBeVisible();
   await expect(page.locator('[data-turn-id="r1"]')).toHaveCount(0);
+});
+
+test("pending history handoffs retain rows only within one authority", async ({
+  page,
+}, testInfo) => {
+  await page.goto(
+    "/tests/history-browser.html?large=40&pending-revision-replace=1",
+  );
+  await expect(page.locator('[data-turn-id="m40"]')).toBeVisible();
+  await wheelUntilTurn(page, "m10", -400, testInfo.project.name);
+  await waitForReadingPositionIdle(page);
+  const before = await readingAnchor(page);
+
+  await page.getByTestId("replace-revision").click();
+  await expect(page.getByTestId("history-transition-state"))
+    .toHaveText("pending");
+  const samples = await page.evaluate(async () => {
+    const readings: Array<{
+      count: number;
+      id: string | null;
+      offset: number | null;
+      scrollTop: number;
+    }> = [];
+    const deadline = performance.now() + 100;
+    while (performance.now() < deadline) {
+      await new Promise<void>((resolveFrame) =>
+        requestAnimationFrame(() => resolveFrame()));
+      const viewport = document.querySelector<HTMLElement>(".thread");
+      if (!viewport) throw new Error("thread viewport is missing");
+      const viewportRect = viewport.getBoundingClientRect();
+      const rows = [...document.querySelectorAll<HTMLElement>("[data-turn-id]")]
+        .map((row) => ({ row, rect: row.getBoundingClientRect() }))
+        .filter(({ rect }) =>
+          rect.bottom > viewportRect.top && rect.top < viewportRect.bottom)
+        .sort((left, right) =>
+          Math.abs(left.rect.top - viewportRect.top)
+          - Math.abs(right.rect.top - viewportRect.top));
+      readings.push({
+        count: document.querySelectorAll("[data-turn-id]").length,
+        id: rows[0]?.row.dataset.turnId ?? null,
+        offset: rows[0] ? rows[0].rect.top - viewportRect.top : null,
+        scrollTop: viewport.scrollTop,
+      });
+    }
+    return readings;
+  });
+  expect(samples.length).toBeGreaterThan(2);
+  expect(samples.every((sample) => sample.count > 0)).toBe(true);
+  expect(samples.every((sample) => sample.id === before.id)).toBe(true);
+  expect(samples.every((sample) => sample.offset != null
+    && Math.abs(sample.offset - before.offset) < 2)).toBe(true);
+  expect(samples.every((sample) => sample.scrollTop > 1)).toBe(true);
+
+  await expect(page.getByTestId("history-transition-state"))
+    .toHaveText("ready");
+  await expect(page.locator('[data-turn-id="m10"]')).toHaveCount(0);
+  await expect(page.locator('[data-turn-id="r24"]')).toBeVisible();
+
+  await page.getByTestId("replace-authority").click();
+  await expect(page.getByTestId("session-authority-scope"))
+    .toHaveText("fixture-authority-b");
+  expect(await page.locator('[data-turn-id="r24"]').count()).toBe(0);
+
+  await expect(page.getByTestId("history-transition-state"))
+    .toHaveText("ready");
+  await expect(page.locator('[data-turn-id="r24"]')).toBeVisible();
 });
 
 test("replay recovery replacement preserves the current reading row", async ({
@@ -3021,11 +3099,21 @@ test("plan progress uses a compact popover that closes outside", async ({
 
   const box = await popover.boundingBox();
   const viewport = page.viewportSize();
-  if (!box || !viewport) throw new Error("plan popover has no geometry");
+  const anchorBox = await trigger.boundingBox();
+  if (!box || !viewport || !anchorBox) {
+    throw new Error("plan popover has no geometry");
+  }
   expect(box.x).toBeGreaterThanOrEqual(8);
   expect(box.x + box.width).toBeLessThanOrEqual(viewport.width - 8);
   expect(box.y).toBeGreaterThanOrEqual(8);
   expect(box.y + box.height).toBeLessThanOrEqual(viewport.height - 8);
+  const expectedCenter = Math.min(
+    Math.max(anchorBox.x + anchorBox.width / 2, 16 + box.width / 2),
+    viewport.width - 16 - box.width / 2,
+  );
+  expect(Math.abs(box.x + box.width / 2 - expectedCenter)).toBeLessThan(2);
+  expect(Math.abs(box.y + box.height - (anchorBox.y - 8)))
+    .toBeLessThan(2);
 
   await trigger.click();
   await expect(popover).toHaveCount(0);
@@ -3038,6 +3126,71 @@ test("plan progress uses a compact popover that closes outside", async ({
 
   await page.getByTestId("load-count").click();
   await expect(popover).toHaveCount(0);
+});
+
+test("historical Plan flips below a trigger near the top edge", async ({
+  page,
+}, testInfo) => {
+  await page.goto("/tests/history-browser.html?timeline=1");
+  await scrollThreadToEdge(page, "start", testInfo.project.name);
+  const trigger = page.locator('[data-turn-id="timeline"]')
+    .getByRole("button", { name: /查看计划进度/ });
+  await expect(trigger).toBeVisible();
+  if (isMobileWebKitProject(testInfo.project.name)) {
+    await dispatchTouchGesture(page, -60);
+  } else {
+    await page.locator(".thread").dispatchEvent("wheel", { deltaY: 80 });
+  }
+  await trigger.evaluate((node) => {
+    const viewport = node.closest<HTMLElement>(".thread");
+    if (!viewport) throw new Error("historical Plan has no thread viewport");
+    const viewportBox = viewport.getBoundingClientRect();
+    const triggerBox = node.getBoundingClientRect();
+    viewport.scrollTop += triggerBox.y - (viewportBox.y + 20);
+  });
+  await expect.poll(() => trigger.evaluate((node) => {
+    const viewport = node.closest<HTMLElement>(".thread");
+    if (!viewport) return false;
+    const viewportBox = viewport.getBoundingClientRect();
+    const triggerBox = node.getBoundingClientRect();
+    const relativeTop = triggerBox.y - viewportBox.y;
+    const settled = relativeTop >= 16 && relativeTop < 24;
+    if (!settled) {
+      viewport.scrollTop += relativeTop - 20;
+    }
+    return settled && triggerBox.bottom <= viewportBox.bottom;
+  })).toBe(true);
+
+  await trigger.click();
+  const popover = page.getByRole("dialog", { name: "计划进度" });
+  await expect(popover).toBeVisible();
+  await expect(popover).toHaveAttribute("data-placement", "below");
+  const { threadBox, anchorBox, popoverBox } = await trigger.evaluate((node) => {
+    const viewport = node.closest<HTMLElement>(".thread");
+    const dialog = document.querySelector<HTMLElement>(
+      '[role="dialog"][aria-label="计划进度"]',
+    );
+    if (!viewport || !dialog) throw new Error("near-top Plan has no geometry");
+    const bounds = (element: Element) => {
+      const box = element.getBoundingClientRect();
+      return {
+        x: box.x,
+        y: box.y,
+        width: box.width,
+        height: box.height,
+      };
+    };
+    return {
+      threadBox: bounds(viewport),
+      anchorBox: bounds(node),
+      popoverBox: bounds(dialog),
+    };
+  });
+  expect(Math.abs(popoverBox.y - (anchorBox.y + anchorBox.height + 8)))
+    .toBeLessThan(2);
+  expect(popoverBox.height).toBeGreaterThan(64);
+  expect(popoverBox.y + popoverBox.height)
+    .toBeLessThanOrEqual(threadBox.y + threadBox.height - 15);
 });
 
 test("a long active turn keeps its plan beside the composer", async ({ page }) => {
@@ -3056,20 +3209,20 @@ test("a long active turn keeps its plan beside the composer", async ({ page }) =
     .toContainText("验证计划弹层");
 });
 
-test("an old session lifts its earlier plan out of the first message", async ({
+test("an old terminal plan stays with its historical turn", async ({
   page,
 }, testInfo) => {
   await page.goto("/tests/history-browser.html?historical-plan=1");
 
-  const chip = page.getByRole("button", { name: /查看计划进度/ });
-  await expect(chip).toBeVisible();
   await scrollThreadToEdge(page, "start", testInfo.project.name);
   const planTurn = page.locator('[data-turn-id="historical-plan"]');
   await expect(planTurn).toBeVisible();
-  await expect(planTurn.getByRole("button", { name: /查看计划进度/ }))
-    .toHaveCount(0);
+  const trigger = planTurn.getByRole("button", { name: /查看计划进度/ });
+  await expect(trigger).toBeVisible();
+  await expect(page.getByRole("button", { name: /查看计划进度/ }))
+    .toHaveCount(1);
 
-  await chip.click();
+  await trigger.click();
   await expect(page.getByRole("dialog", { name: "计划进度" }))
     .toContainText("验证计划弹层");
 });
@@ -3097,7 +3250,7 @@ test("terminal turn does not mark unfinished structured plan complete", async ({
   await page.getByRole("button", { name: /查看计划进度/ }).click();
   const popover = page.getByRole("dialog", { name: "计划进度" });
   await expect(popover).toContainText("1 / 3");
-  await expect(popover).toContainText("执行已结束");
+  await expect(popover).toContainText("本轮已结束，计划未更新");
   await expect(popover).not.toContainText("全部完成");
 });
 
@@ -3154,17 +3307,139 @@ test("a turn plan without a Goal stays in a compact session-level strip", async 
   await expect(page.locator(".plan-sheet")).toHaveCount(0);
   const dialogBox = await dialog.boundingBox();
   if (!dialogBox) throw new Error("plan popover has no geometry");
-  // Fractional device scaling can report 320.000015px for a 320px CSS box.
-  expect(dialogBox.width).toBeLessThan(321);
-  expect(await dialog.evaluate((node) =>
-    getComputedStyle(node).animationName)).toBe("panel-in");
+  expect(dialogBox.width).toBeLessThan(361);
+  const anchorBox = await chip.boundingBox();
+  if (!anchorBox) throw new Error("plan popover has no anchor");
+  expect(Math.abs(
+    dialogBox.x + dialogBox.width / 2
+      - (anchorBox.x + anchorBox.width / 2),
+  )).toBeLessThan(2);
+  expect(Math.abs(
+    dialogBox.y + dialogBox.height - (anchorBox.y - 8),
+  )).toBeLessThan(2);
   const openChipBox = await chip.boundingBox();
   if (!openChipBox) throw new Error("open plan strip has no geometry");
   expect(Math.abs(openChipBox.x - box.x)).toBeLessThan(1);
   expect(Math.abs(openChipBox.y - box.y)).toBeLessThan(1);
 
-  await chip.click();
+  await page.locator("[data-testid=goal-fixture-content]").click({
+    position: { x: 5, y: 5 },
+  });
   await expect(dialog).toHaveCount(0);
+});
+
+test("standalone Plan closes from outside and fits the mobile viewport", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 720 });
+  await page.goto("/tests/history-browser.html?goal-ui=1&goal-status=none&plan=1");
+  await page.getByRole("button", { name: /查看计划进度/ }).click();
+  const dialog = page.getByRole("dialog", { name: "计划进度" });
+  await expect(dialog).toBeVisible();
+  const box = await dialog.boundingBox();
+  if (!box) throw new Error("mobile plan has no geometry");
+  const anchor = page.getByRole("button", { name: /查看计划进度/ });
+  const anchorBox = await anchor.boundingBox();
+  if (!anchorBox) throw new Error("mobile plan has no anchor");
+  expect(box.x).toBeGreaterThanOrEqual(11);
+  expect(box.x + box.width).toBeLessThanOrEqual(379);
+  const visualBottom = await page.evaluate(() => (
+    (window.visualViewport?.offsetTop ?? 0)
+      + (window.visualViewport?.height ?? window.innerHeight)
+  ));
+  expect(box.y + box.height).toBeLessThanOrEqual(visualBottom - 11);
+  expect(Math.abs(box.y + box.height - (anchorBox.y - 8)))
+    .toBeLessThan(2);
+  await page.locator("[data-testid=goal-fixture-content]").click({
+    position: { x: 5, y: 5 },
+  });
+  await expect(dialog).toHaveCount(0);
+});
+
+test("Plan follows chat and composer geometry changes", async ({ page }) => {
+  await page.goto("/tests/history-browser.html?goal-ui=1&goal-status=none&plan=1");
+  await page.getByRole("button", { name: /查看计划进度/ }).click();
+  const dialog = page.getByRole("dialog", { name: "计划进度" });
+  const chip = page.getByRole("button", { name: /查看计划进度/ });
+  const initialBox = await dialog.boundingBox();
+  const initialAnchorBox = await chip.boundingBox();
+  if (!initialBox || !initialAnchorBox) {
+    throw new Error("Plan has no initial geometry");
+  }
+  await page.getByTestId("goal-fixture-composer").evaluate((node) => {
+    node.style.height = "176px";
+  });
+  await expect.poll(async () => {
+    const anchorBox = await chip.boundingBox();
+    return anchorBox?.y ?? null;
+  }).toBeLessThan(initialAnchorBox.y - 40);
+  await expect.poll(async () => {
+    const [currentDialog, currentAnchor] = await Promise.all([
+      dialog.boundingBox(),
+      chip.boundingBox(),
+    ]);
+    if (!currentDialog || !currentAnchor) return null;
+    return Math.abs(
+      currentDialog.y + currentDialog.height - (currentAnchor.y - 8),
+    );
+  }).toBeLessThan(2);
+  const [resizedDialogBox, resizedAnchorBox, composerBox] = await Promise.all([
+    dialog.boundingBox(),
+    chip.boundingBox(),
+    page.getByTestId("goal-fixture-composer").boundingBox(),
+  ]);
+  if (!resizedDialogBox || !resizedAnchorBox || !composerBox) {
+    throw new Error("tall-composer Plan fixture has no geometry");
+  }
+  expect(Math.abs(
+    resizedDialogBox.y + resizedDialogBox.height - (resizedAnchorBox.y - 8),
+  )).toBeLessThan(2);
+  expect(resizedDialogBox.y + resizedDialogBox.height).toBeLessThanOrEqual(
+    composerBox.y - 15,
+  );
+
+  await page.getByTestId("goal-fixture-spacer").evaluate((node) => {
+    node.style.width = "180px";
+  });
+  await expect.poll(async () => {
+    const [currentDialog, currentAnchor] = await Promise.all([
+      dialog.boundingBox(),
+      chip.boundingBox(),
+    ]);
+    if (!currentDialog || !currentAnchor) return null;
+    return Math.abs(
+      currentDialog.x + currentDialog.width / 2
+        - (currentAnchor.x + currentAnchor.width / 2),
+    );
+  }).toBeLessThan(2);
+});
+
+test("a long Plan scrolls within the space above its anchor", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 520 });
+  await page.goto(
+    "/tests/history-browser.html?goal-ui=1&goal-status=none&plan=1&plan-long=1",
+  );
+  const chip = page.getByRole("button", { name: /查看计划进度/ });
+  await chip.click();
+  const dialog = page.getByRole("dialog", { name: "计划进度" });
+  await expect(dialog).toBeVisible();
+  const [box, anchorBox] = await Promise.all([
+    dialog.boundingBox(),
+    chip.boundingBox(),
+  ]);
+  if (!box || !anchorBox) throw new Error("long Plan has no geometry");
+  expect(Math.abs(box.y + box.height - (anchorBox.y - 8)))
+    .toBeLessThan(2);
+  expect(box.y).toBeGreaterThanOrEqual(15);
+  expect(await dialog.evaluate((node) => ({
+    clientHeight: node.clientHeight,
+    scrollHeight: node.scrollHeight,
+    overflowY: getComputedStyle(node).overflowY,
+  }))).toMatchObject({ overflowY: "auto" });
+  expect(await dialog.evaluate((node) => node.scrollHeight))
+    .toBeGreaterThan(await dialog.evaluate((node) => node.clientHeight));
 });
 
 test("a completed session Plan disappears when the next message begins", async ({
@@ -3284,6 +3559,14 @@ test("goal entry stays compact and opens its editor", async ({ page }) => {
   const dialogBox = await dialog.boundingBox();
   if (!dialogBox || !viewport) throw new Error("goal dialog has no geometry");
   expect(dialogBox.width).toBeLessThanOrEqual(Math.min(580, viewport.width));
+  const chatBox = await page.locator(".thread-shell").boundingBox();
+  if (!chatBox) throw new Error("goal dialog has no chat viewport");
+  expect(Math.abs(
+    dialogBox.x + dialogBox.width / 2 - (chatBox.x + chatBox.width / 2),
+  )).toBeLessThan(2);
+  expect(Math.abs(
+    dialogBox.y + dialogBox.height / 2 - (chatBox.y + chatBox.height / 2),
+  )).toBeLessThan(2);
   const statCards = dialog.locator(".goal-stats > div");
   await expect(statCards).toHaveCount(3);
   expect(await statCards.first().evaluate((node) =>
@@ -3293,6 +3576,12 @@ test("goal entry stays compact and opens its editor", async ({ page }) => {
     const style = getComputedStyle(node);
     return style.backgroundColor !== style.color;
   })).toBe(true);
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog", { name: "Codex Goal" }))
+    .toHaveCount(0);
+  await chip.click();
+  await expect(page.getByRole("dialog", { name: "Codex Goal" }))
+    .toBeVisible();
   await page.locator(".scrim.show").click({ position: { x: 5, y: 5 } });
   await expect(page.getByRole("dialog", { name: "Codex Goal" })).toHaveCount(0);
 });
@@ -3335,6 +3624,7 @@ test("goal editor stays inside the tablet visual viewport above the keyboard", a
     root.style.setProperty(
       "--keyboard-inset", `${window.innerHeight - top - height}px`,
     );
+    window.dispatchEvent(new Event("resize"));
   }, { top: visualTop, height: visualHeight });
   await dialog.locator("textarea").focus();
 
@@ -3345,6 +3635,9 @@ test("goal editor stays inside the tablet visual viewport above the keyboard", a
   expect(box.y + box.height).toBeLessThanOrEqual(
     visualTop + visualHeight + 1,
   );
+  expect(Math.abs(
+    box.y + box.height / 2 - (visualTop + visualHeight / 2),
+  )).toBeLessThan(2);
 });
 
 test("desktop text selection keeps its original virtual turn while edge-dragging", async ({
@@ -4021,6 +4314,94 @@ test("multi-line IME growth stays pinned during a Codex tool burst", async ({
   expect(result.heights.at(-1)).toBeGreaterThan(result.heights[0]);
   expect(result.heights.at(-1)).toBeLessThanOrEqual(133);
   expect(result.worstDistance).toBeLessThanOrEqual(2);
+});
+
+test("long paste stays out of the textarea and remains editable before send", async ({
+  page,
+}) => {
+  await page.goto(
+    "/tests/history-browser.html?codex-live-burst=1&composer-live=1&composer-paste=1",
+  );
+  const input = page.locator(
+    '[data-testid="live-composer-shell"] .composer textarea',
+  );
+  const pasted = `Editable paste opening ${"content ".repeat(170)}`;
+  await input.evaluate((node, text) => {
+    const data = new DataTransfer();
+    data.setData("text/plain", text);
+    node.dispatchEvent(new ClipboardEvent("paste", {
+      bubbles: true,
+      cancelable: true,
+      clipboardData: data,
+    }));
+  }, pasted);
+  await expect(input).toHaveValue("");
+  const card = page.locator(
+    '[data-testid="live-composer-shell"] .paste-card',
+  );
+  await expect(card).toContainText("Editable paste opening");
+  await expect(card).toContainText(`${pasted.length} 字符`);
+  const box = await card.boundingBox();
+  expect(box?.width ?? 999).toBeLessThanOrEqual(302);
+
+  await card.locator(".paste-open").click();
+  const editor = page.getByRole("dialog", { name: "编辑粘贴内容" })
+    .getByRole("textbox");
+  await editor.fill("edited paste body");
+  await page.getByRole("button", { name: "保存" }).click();
+  await expect(card).toContainText("edited paste body");
+  await expect(input).toHaveValue("");
+
+  await input.fill("visible follow-up");
+  await page.locator(
+    '[data-testid="live-composer-shell"] .sendbtn',
+  ).click();
+  await expect(page.getByTestId("composer-paste-output"))
+    .toHaveText("edited paste body\n\nvisible follow-up");
+  await expect(card).toHaveCount(0);
+  await expect(input).toHaveValue("");
+});
+
+test("oversized edited paste stays in the draft instead of being cleared", async ({
+  page,
+}) => {
+  await page.goto(
+    "/tests/history-browser.html?codex-live-burst=1&composer-live=1&composer-paste=1",
+  );
+  const input = page.locator(
+    '[data-testid="live-composer-shell"] .composer textarea',
+  );
+  const seed = `oversized ${"seed ".repeat(205)}`;
+  await input.evaluate((node, text) => {
+    const data = new DataTransfer();
+    data.setData("text/plain", text);
+    node.dispatchEvent(new ClipboardEvent("paste", {
+      bubbles: true,
+      cancelable: true,
+      clipboardData: data,
+    }));
+  }, seed);
+  const card = page.locator(
+    '[data-testid="live-composer-shell"] .paste-card',
+  );
+  await card.locator(".paste-open").click();
+  const pasteEditor = page.getByRole("dialog", { name: "编辑粘贴内容" });
+  await pasteEditor.getByRole("textbox")
+    .fill("x".repeat(2 * 1024 * 1024));
+  await expect(pasteEditor.locator("small"))
+    .toContainText("2097152 字符 · 1 行");
+  await page.getByRole("button", { name: "保存" }).click();
+  await expect(card.locator(".paste-card-preview")).toHaveText(/^x{180}$/);
+  await input.fill("tail");
+  await page.locator(
+    '[data-testid="live-composer-shell"] .sendbtn',
+  ).click();
+  await expect(page.locator(
+    '[data-testid="live-composer-shell"] .composer-notice',
+  )).toContainText("消息内容超过上限");
+  await expect(card).toHaveCount(1);
+  await expect(input).toHaveValue("tail");
+  await expect(page.getByTestId("composer-paste-output")).toHaveText("");
 });
 
 test("multi-line composer growth does not move a history reader", async ({

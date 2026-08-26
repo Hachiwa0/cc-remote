@@ -154,6 +154,18 @@ const heavyPage: HistoryBrowsePage = {
       command: "PROCESS_COMMAND_SECRET",
       done: true,
     }, {
+      kind: "process",
+      item_id: "compaction-1",
+      processKind: "compaction",
+      phase: "end",
+      status: "succeeded",
+      turn_id: "native-compaction-turn",
+      title: "压缩上下文",
+      detail: "COMPACTION_DETAIL_SECRET",
+      input: { secret: "COMPACTION_INPUT_SECRET" },
+      output: "COMPACTION_OUTPUT_SECRET",
+      done: true,
+    }, {
       kind: "text",
       message_id: "answer-1",
       channel: "final",
@@ -183,6 +195,9 @@ for (const forbidden of [
   "PROCESS_DIFF_SECRET",
   "PROCESS_PROGRESS_SECRET",
   "PROCESS_COMMAND_SECRET",
+  "COMPACTION_DETAIL_SECRET",
+  "COMPACTION_INPUT_SECRET",
+  "COMPACTION_OUTPUT_SECRET",
 ]) {
   assert.equal(encoded.includes(forbidden), false, forbidden);
 }
@@ -198,9 +213,15 @@ assert.equal(sanitized.turns[0].detailLoading, false);
 assert.equal(sanitized.turns[0].blocks.at(-1)?.kind, "text");
 assert.deepEqual(
   sanitized.turns[0].blocks.map((block) => block.kind),
-  ["text"],
-  "deferred tool/process shells are dropped instead of cached as empty cards",
+  ["process", "text"],
+  "only compaction proof and final text survive the page-cache projection",
 );
+const cachedCompaction = sanitized.turns[0].blocks[0];
+assert.equal(cachedCompaction.kind, "process");
+assert.equal(cachedCompaction.kind === "process"
+  ? cachedCompaction.processKind : null, "compaction");
+assert.equal(cachedCompaction.kind === "process"
+  ? cachedCompaction.turn_id : null, "native-compaction-turn");
 
 const storage = new MemoryStorage();
 let now = 100;
@@ -213,9 +234,14 @@ assert.equal((await cache.putPage(scope, heavyPage)).ok, true);
 const cachedHeavy = await cache.getPage(scope, "page-heavy");
 assert.deepEqual(
   cachedHeavy?.turns[0].blocks.map((block) => block.kind),
-  ["text"],
-  "an IndexedDB-style cache reload cannot resurrect empty command rows",
+  ["process", "text"],
+  "a cache reload keeps compaction proof without resurrecting command rows",
 );
+const incompatibleV3Key = cache.pageKey(scope, "page-heavy");
+(storage.records.get(incompatibleV3Key) as { version: number }).version = 3;
+assert.equal(await cache.getPage(scope, "page-heavy"), null,
+  "v3 pages without durable compaction proof are rebuilt after hard refresh");
+assert.equal(storage.deletedKeys.includes(incompatibleV3Key), true);
 const firstWrite = await cache.putPage(scope, {
   pageKey: "page-1",
   turns: [turn("1"), turn("optimistic-2", {
@@ -315,9 +341,9 @@ corruptStorage.records.set(corruptKey, { malformed: true });
 assert.equal(await corruptCache.getPage(scope, "corrupt"), null);
 assert.deepEqual(corruptStorage.deletedKeys, [corruptKey]);
 
-// v3 corrects Claude turn identity semantics. Reuse old Codex pages, but
-// discard v1/v2 Claude projections so a reconnect cannot resurrect either the
-// pre-alias shape or v2's incorrect native promptId alias.
+// v4 preserves compaction identity proof. Every older page must be rebuilt,
+// including Codex v1/v2 pages which v3 could otherwise reuse: sanitizing those
+// records cannot recover proof that was never stored in the first place.
 const legacyCodexStorage = new MemoryStorage();
 const legacyCodexCache = new HistoryPageCache({ storage: legacyCodexStorage });
 assert.equal((await legacyCodexCache.putPage(scope, {
@@ -330,16 +356,43 @@ const legacyCodexKey = legacyCodexCache.pageKey(scope, "legacy-codex-v1");
 (legacyCodexStorage.records.get(legacyCodexKey) as { version: number })
   .version = 1;
 assert.equal(
-  (await legacyCodexCache.getPage(scope, "legacy-codex-v1"))
-    ?.turns[0]?.id,
-  "legacy-codex",
+  await legacyCodexCache.getPage(scope, "legacy-codex-v1"),
+  null,
 );
-(legacyCodexStorage.records.get(legacyCodexKey) as { version: number })
+assert.deepEqual(legacyCodexStorage.deletedKeys, [legacyCodexKey]);
+assert.equal((await legacyCodexCache.putPage(scope, {
+  pageKey: "legacy-codex-v2",
+  turns: [turn("legacy-codex-v2")],
+  hasOlder: false,
+  olderCursor: "legacy-codex-v2",
+})).ok, true);
+const legacyCodexV2Key = legacyCodexCache.pageKey(scope, "legacy-codex-v2");
+(legacyCodexStorage.records.get(legacyCodexV2Key) as { version: number })
   .version = 2;
 assert.equal(
-  (await legacyCodexCache.getPage(scope, "legacy-codex-v1"))
-    ?.turns[0]?.id,
-  "legacy-codex",
+  await legacyCodexCache.getPage(scope, "legacy-codex-v2"),
+  null,
+);
+assert.deepEqual(
+  legacyCodexStorage.deletedKeys,
+  [legacyCodexKey, legacyCodexV2Key],
+);
+assert.equal((await legacyCodexCache.putPage(scope, {
+  pageKey: "legacy-codex-v3",
+  turns: [turn("legacy-codex-v3")],
+  hasOlder: false,
+  olderCursor: "legacy-codex-v3",
+})).ok, true);
+const legacyCodexV3Key = legacyCodexCache.pageKey(scope, "legacy-codex-v3");
+(legacyCodexStorage.records.get(legacyCodexV3Key) as { version: number })
+  .version = 3;
+assert.equal(
+  await legacyCodexCache.getPage(scope, "legacy-codex-v3"),
+  null,
+);
+assert.deepEqual(
+  legacyCodexStorage.deletedKeys,
+  [legacyCodexKey, legacyCodexV2Key, legacyCodexV3Key],
 );
 
 const claudeScope = { ...scope, engine: "claude" };

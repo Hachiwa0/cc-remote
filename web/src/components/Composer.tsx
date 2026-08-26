@@ -18,7 +18,7 @@ import { Icon } from "../icons";
 import {
   clientSlashesFor, CODEX_PROMPTS, isKnownCodeOnlySlash, slashToken,
   matchCommands, matchSkills, parseSlash, skillToken,
-  modelsFor, effortsFor, permsFor,
+  modelsFor, effortNameForDisplay, permsFor,
   permissionProfileLabel, type Catalog,
 } from "../data";
 import { CommandSheet } from "./CommandSheet";
@@ -35,9 +35,16 @@ import {
 } from "../composer-submit";
 import { workContextMetrics } from "../work-context";
 import type { ComposerDraft, ComposerDraftStore } from "../composer-drafts";
+import {
+  composePastePrompt,
+  LONG_PASTE_THRESHOLD,
+  makeComposerPaste,
+} from "../composer-pastes";
 import { PendingImageAttachments } from "./PendingImageAttachments";
 import { QueuedQueryChip } from "./QueuedQueryDialog";
 import { UsageMeter } from "./UsageMeter";
+import { PasteCards } from "./PasteCards";
+import { uuid } from "../util";
 
 interface Props {
   draftKey: string;
@@ -123,6 +130,7 @@ export function Composer(p: Props) {
   const input = draft.input;
   const images = draft.images;
   const files = draft.files;
+  const pastes = draft.pastes;
   const updateDraft = useCallback((
     update: (current: ComposerDraft) => ComposerDraft,
   ) => {
@@ -146,7 +154,7 @@ export function Composer(p: Props) {
     files: typeof next === "function" ? next(current.files) : next,
   })), [updateDraft]);
   const clearDraft = useCallback(() => updateDraft(() => ({
-    input: "", images: [], files: [],
+    input: "", images: [], files: [], pastes: [],
   })), [updateDraft]);
   // Only the modal pickers live in state now; the "/" command palette is a live
   // popover DERIVED from the composer text (no second input box).
@@ -254,7 +262,7 @@ export function Composer(p: Props) {
   // controls to the Agent SDK. Keep Remote's saved takeover preferences visible,
   // but never present them as the active native runtime state.
   const deferredClaudeControls = externalClaudeOwner !== null;
-  const hasText = input.trim().length > 0;
+  const hasText = input.trim().length > 0 || pastes.length > 0;
   const hasAttachments = images.length > 0 || files.length > 0;
 
   useEffect(() => {
@@ -268,11 +276,11 @@ export function Composer(p: Props) {
   // edit: refill the input box with a past prompt (user-bubble edit button)
   useEffect(() => {
     if (editPrompt != null) {
-      setInput(editPrompt);
+      updateDraft((current) => ({ ...current, input: editPrompt, pastes: [] }));
       onEditConsumed();
       setTimeout(() => taRef.current?.focus(), 0);
     }
-  }, [editPrompt, onEditConsumed, setInput]);
+  }, [editPrompt, onEditConsumed, updateDraft]);
 
   const nativeTextareaSizing = typeof CSS !== "undefined"
     && CSS.supports?.("field-sizing", "content");
@@ -301,9 +309,7 @@ export function Composer(p: Props) {
     noticeTimer.current = window.setTimeout(() => setNotice(null), 2200);
   };
 
-  const onInput = (v: string) => {
-    setInput(v);
-  };
+  const onInput = (v: string) => setInput(v);
 
   // Command/Skill palette = live suggestions derived from the input. A slash
   // matches cc-remote/native commands; "$" matches the Codex app-server's real
@@ -395,7 +401,8 @@ export function Composer(p: Props) {
     };
   }, []);
 
-  // paste images/files straight into the textarea (clipboard API)
+  // Keep the native textarea for reliable selection/undo/IME. Large text is
+  // retained privately by the draft and represented only by an editable card.
   const onPaste = (e: ClipboardEvent<HTMLTextAreaElement>) => {
     const items = e.clipboardData?.items;
     if (!items) return;
@@ -407,25 +414,41 @@ export function Composer(p: Props) {
         if (f) files.push(f);
       }
     }
-    if (files.length) { e.preventDefault(); void onPickFiles(files); }
+    if (files.length) { e.preventDefault(); void onPickFiles(files); return; }
+    const text = e.clipboardData.getData("text/plain");
+    if (text.length <= LONG_PASTE_THRESHOLD) return;
+    e.preventDefault();
+    const textarea = e.currentTarget;
+    const id = uuid();
+    updateDraft((current) => ({
+      ...current,
+      pastes: [...current.pastes, makeComposerPaste(text, id)],
+    }));
+    window.setTimeout(() => textarea.focus(), 0);
   };
 
   // Send prompt text to cc, honoring busy/queue/interrupt rules.
   const submitPrompt = (prompt: string) => {
     if (importing) { flash("请等待附件导入完成"); return; }
+    const composed = composePastePrompt(pastes, prompt);
+    if (!composed.ok) {
+      flash(`消息内容超过上限（最多 ${composed.maxChars.toLocaleString()} 个字符）`);
+      return;
+    }
+    const expandedPrompt = composed.prompt;
     const query: PendingQuery = {
-      prompt,
+      prompt: expandedPrompt,
       images: images.length ? images : undefined,
       files: files.length ? files : undefined,
     };
     if (busy) {
       const action = classifyBusySubmit(
         p.state, p.sendMode, p.engine ?? "claude",
-        !!prompt || hasAttachments);
+        !!expandedPrompt || hasAttachments);
       if (action === "noop") return;
       if (action === "steer") {
         if (p.onSteerQuery(
-            prompt,
+            expandedPrompt,
             images.length ? images : undefined,
             files.length ? files : undefined)) {
           clearDraft(); resetTaHeight();
@@ -452,9 +475,9 @@ export function Composer(p: Props) {
       }
       return;
     }
-    if (!prompt && !hasAttachments) return;
+    if (!expandedPrompt && !hasAttachments) return;
     if (p.onSendQuery(
-        prompt, images.length ? images : undefined, files.length ? files : undefined)) {
+        expandedPrompt, images.length ? images : undefined, files.length ? files : undefined)) {
       clearDraft(); resetTaHeight();
     }
   };
@@ -600,7 +623,7 @@ export function Composer(p: Props) {
     buttonSendTimerRef.current = window.setTimeout(() => {
       buttonSendTimerRef.current = null;
       const buttonPrompt = taRef.current?.value ?? input;
-      if (busy && !buttonPrompt.trim() && !hasAttachments) {
+      if (busy && !buttonPrompt.trim() && !hasAttachments && pastes.length === 0) {
         if (p.state === "running") p.onInterrupt();
         return;
       }
@@ -634,11 +657,7 @@ export function Composer(p: Props) {
     ? (MODELS_E.find((m) => m.id === p.model)
       || { id: p.model, name: p.model, ds: "", ic: "cpu" })
     : null;
-  const EFFORTS_E = effortsFor(p.engine, model?.id, p.catalog);
-  const effort = p.effort
-    ? (EFFORTS_E.find((e) => e.id === p.effort)
-      || { id: p.effort, name: p.effort, ds: "", ic: "gauge3" })
-    : null;
+  const effortName = effortNameForDisplay(p.effort);
   const perm = p.perm
     ? (PERMS_E.find((x) => x.id === p.perm)
       || { id: p.perm, name: p.perm, short: p.perm, ds: "", ic: "shield" })
@@ -757,7 +776,7 @@ export function Composer(p: Props) {
           </div>
         )}
 
-        {hasAttachments && (
+        {(hasAttachments || pastes.length > 0) && (
           <div className="attach show">
             <PendingImageAttachments key={p.draftKey} images={images}
               onRemove={(index) => setImages((previous) =>
@@ -769,6 +788,10 @@ export function Composer(p: Props) {
                 <button className="attach-x" onClick={() => setFiles(files.filter((_, j) => j !== i))} aria-label="移除"><Icon name="close" size={12} /></button>
               </span>
             ))}
+            <PasteCards pastes={pastes}
+              onChange={(nextPastes) => updateDraft((current) => ({
+                ...current, pastes: nextPastes,
+              }))} />
           </div>
         )}
 
@@ -828,7 +851,7 @@ export function Composer(p: Props) {
                   </button>
                   <button type="button" onClick={() => setSheetKind("efforts")}
                     disabled={locked}>
-                    <span>思考强度</span><b>{effort?.name ?? "读取中"}</b>
+                    <span>思考强度</span><b>{effortName ?? "读取中"}</b>
                   </button>
                   <button type="button" onClick={() => { p.onContext(); setCtxOpen((o) => !o); }}>
                     <span>会话上下文</span><b>{p.contextReport?.available === false
@@ -912,8 +935,8 @@ export function Composer(p: Props) {
             <button className="hint-ctl" onClick={() => setSheetKind("efforts")}
               disabled={locked}
               title={deferredClaudeControls
-                ? `Remote 接管后思考强度：${effort?.name ?? "读取中"}；不是${externalClaudeOwner}当前强度`
-                : "思考强度"}>{effort?.name ?? "强度读取中"}</button>
+                ? `Remote 接管后思考强度：${effortName ?? "读取中"}；不是${externalClaudeOwner}当前强度`
+                : "思考强度"}>{effortName ?? "强度读取中"}</button>
             {p.engine === "codex" && p.collaborationMode === "plan" && (
               <button
                 className="hint-ctl collaboration-chip plan"

@@ -410,6 +410,76 @@ def test_profile_bootstrap_never_replaces_existing_managed_path(tmp_path):
     assert not existing.is_symlink()
 
 
+def test_profile_bootstrap_atomically_advances_owned_official_current(
+    tmp_path,
+):
+    source_home = tmp_path / "source"
+    source_standalone = source_home / "packages" / "standalone"
+    source_release = source_standalone / "releases" / "0.148.0"
+    source_binary = source_release / "bin" / "codex"
+    source_binary.parent.mkdir(parents=True)
+    source_binary.write_bytes(b"#!/bin/sh\n")
+    source_binary.chmod(0o755)
+    (source_release / "codex").symlink_to("bin/codex")
+    (source_standalone / "current").symlink_to(
+        source_release,
+        target_is_directory=True,
+    )
+
+    profile_home = tmp_path / "profile"
+    profile_standalone = profile_home / "packages" / "standalone"
+    old_release = profile_standalone / "releases" / "0.147.0"
+    old_binary = old_release / "bin" / "codex"
+    old_binary.parent.mkdir(parents=True)
+    old_binary.write_bytes(b"#!/bin/sh\n")
+    old_binary.chmod(0o755)
+    (old_release / "codex").symlink_to("bin/codex")
+    current = profile_standalone / "current"
+    current.symlink_to(old_release, target_is_directory=True)
+
+    assert daemon_module._prepare_profile_standalone(
+        str(source_binary),
+        {"CODEX_HOME": str(profile_home)},
+    ) is True
+    assert current.is_symlink()
+    assert current.readlink() == source_standalone / "current"
+    assert (current / "codex").resolve() == source_binary
+    assert old_binary.exists()
+
+
+def test_profile_bootstrap_never_replaces_external_current_symlink(tmp_path):
+    source_home = tmp_path / "source"
+    source_standalone = source_home / "packages" / "standalone"
+    source_release = source_standalone / "releases" / "0.148.0"
+    source_binary = source_release / "bin" / "codex"
+    source_binary.parent.mkdir(parents=True)
+    source_binary.write_bytes(b"#!/bin/sh\n")
+    source_binary.chmod(0o755)
+    (source_release / "codex").symlink_to("bin/codex")
+    (source_standalone / "current").symlink_to(
+        source_release,
+        target_is_directory=True,
+    )
+
+    profile_home = tmp_path / "profile"
+    current = profile_home / "packages" / "standalone" / "current"
+    current.parent.mkdir(parents=True)
+    external_release = tmp_path / "external" / "releases" / "0.147.0"
+    external_binary = external_release / "bin" / "codex"
+    external_binary.parent.mkdir(parents=True)
+    external_binary.write_bytes(b"#!/bin/sh\n")
+    external_binary.chmod(0o755)
+    (external_release / "codex").symlink_to("bin/codex")
+    current.symlink_to(external_release, target_is_directory=True)
+
+    assert daemon_module._prepare_profile_standalone(
+        str(source_binary),
+        {"CODEX_HOME": str(profile_home)},
+    ) is False
+    assert current.readlink() == external_release
+    assert (current / "codex").resolve() == external_binary
+
+
 def test_required_profile_never_silently_falls_back_to_stdio(monkeypatch):
     async def run():
         monkeypatch.setattr(
@@ -634,6 +704,60 @@ def test_lagging_managed_daemon_restart_failure_never_uses_stdio(monkeypatch):
             await manager.proxy_args("/bin/codex", {})
         assert manager.info is None
         assert manager.strict_shared_affinity is False
+
+    asyncio.run(run())
+
+
+def test_lagging_managed_daemon_waits_for_async_replacement(monkeypatch):
+    async def run():
+        monkeypatch.setattr(
+            daemon_module, "_binary_identity", lambda _path: ("codex-v2",))
+        monkeypatch.setattr(
+            daemon_module,
+            "_prepare_profile_standalone",
+            lambda _bin, _env: True,
+        )
+        monkeypatch.setattr(
+            daemon_module,
+            "_DAEMON_UPGRADE_POLL_INTERVAL",
+            0.0,
+        )
+        manager = CodexDaemonManager("auto")
+        version_probes = 0
+        restarted = False
+
+        async def command(_bin, _env, *args):
+            nonlocal version_probes, restarted
+            if args[-1] == "--help":
+                return _result(0)
+            if args[-1] == "version":
+                version_probes += 1
+                upgraded = restarted and version_probes >= 5
+                version = "0.148.0" if upgraded else "0.147.0"
+                return _result(0, {
+                    "status": "running",
+                    "managedCodexPath": "/opt/codex/current/codex",
+                    "managedCodexVersion": version,
+                    "socketPath": "/tmp/codex.sock",
+                    "cliVersion": "0.148.0",
+                    "appServerVersion": version,
+                })
+            if args[-1] == "restart":
+                restarted = True
+                return _result(0, {"status": "restarted"})
+            assert args[-1] == "enable-remote-control"
+            return _result(0, {
+                "status": "enabled",
+                "remoteControlEnabled": True,
+                "socketPath": "/tmp/codex.sock",
+            })
+
+        manager._run = command  # type: ignore[method-assign]
+        assert await manager.proxy_args("/bin/codex", {}) == [
+            "/bin/codex", "app-server", "proxy",
+            "--sock", "/tmp/codex.sock",
+        ]
+        assert version_probes == 5
 
     asyncio.run(run())
 
@@ -923,7 +1047,8 @@ def test_code_daemon_unavailable_falls_back_and_work_never_probes(monkeypatch):
     asyncio.run(run(True))
 
 
-def test_oversized_resume_newer_core_bypasses_shared_daemon(monkeypatch):
+def test_oversized_resume_prefers_shared_daemon_before_newer_private_core(
+        monkeypatch):
     async def run():
         manager = _Manager(["/managed/codex", "app-server", "proxy"])
         spawned = []
@@ -947,15 +1072,18 @@ def test_oversized_resume_newer_core_bypasses_shared_daemon(monkeypatch):
             ).connect(resume_id="oversized-thread", cwd="/tmp")
 
         assert spawned[0][:3] == [
+            "/managed/codex", "app-server", "proxy",
+        ]
+        assert spawned[1][:3] == [
             "/Applications/Codex.app/Resources/codex",
             "app-server", "--stdio",
         ]
-        assert manager.proxy_calls == 0
+        assert manager.proxy_calls == 1
 
     asyncio.run(run())
 
 
-def test_oversized_desktop_openai_resume_uses_private_http_provider(
+def test_oversized_desktop_openai_resume_prefers_shared_daemon_then_http_stdio(
         monkeypatch):
     async def run():
         manager = _Manager(["/managed/codex", "app-server", "proxy"])
@@ -983,13 +1111,16 @@ def test_oversized_desktop_openai_resume_uses_private_http_provider(
                 _Cfg(), daemon_mode="auto", daemon_manager=manager,
             ).connect(resume_id="oversized-thread", cwd="/tmp")
 
-        argv = spawned[0]
+        assert spawned[0][:3] == [
+            "/managed/codex", "app-server", "proxy",
+        ]
+        argv = spawned[1]
         assert argv[:3] == [
             "/managed/codex", "app-server", "--stdio",
         ]
         assert any(
             item.endswith("supports_websockets=false") for item in argv)
-        assert manager.proxy_calls == 0
+        assert manager.proxy_calls == 1
 
     asyncio.run(run())
 
@@ -1132,6 +1263,39 @@ def test_daemon_upgrade_error_is_not_converted_to_stdio(monkeypatch):
     asyncio.run(run())
 
 
+def test_strict_daemon_preparation_failure_never_starts_private_stdio(
+        monkeypatch):
+    async def run():
+        class _StrictFailingManager(_Manager):
+            async def proxy_args(self, _bin, _env):
+                self.proxy_calls += 1
+                raise RuntimeError("strict daemon preparation failed")
+
+        manager = _StrictFailingManager(strict_shared=True)
+        spawned = []
+
+        async def spawn(*argv, **_kwargs):
+            spawned.append(list(argv))
+            raise AssertionError("private stdio must not be started")
+
+        monkeypatch.setattr(
+            handle_module, "_resolve_codex_bin", lambda: "/usr/bin/codex")
+        monkeypatch.setattr(
+            handle_module.asyncio, "create_subprocess_exec", spawn)
+
+        with pytest.raises(
+            RuntimeError,
+            match="strict daemon preparation failed",
+        ):
+            await CodexHandle(
+                _Cfg(), daemon_manager=manager).connect(cwd="/tmp")
+
+        assert manager.proxy_calls == 1
+        assert spawned == []
+
+    asyncio.run(run())
+
+
 def test_proxy_connect_exposes_shared_state_and_disconnect_keeps_manager(
         monkeypatch):
     async def run():
@@ -1179,6 +1343,84 @@ def test_proxy_connect_exposes_shared_state_and_disconnect_keeps_manager(
         # Normal session teardown owns only the proxy and keeps daemon liveness
         # cached for the other clients.
         assert manager.invalidations == 0
+
+    asyncio.run(run())
+
+
+def test_oversized_http_resume_keeps_shared_affinity_and_thread_local_provider(
+        monkeypatch):
+    async def run():
+        nonce = b"0123456789abcdef"
+        monkeypatch.setattr(handle_module.os, "urandom", lambda _size: nonce)
+        monkeypatch.setattr(
+            handle_module,
+            "_oversized_desktop_openai_resume_requires_http",
+            lambda _sid: True,
+        )
+        monkeypatch.setattr(
+            handle_module,
+            "_newer_private_core_for_oversized_resume",
+            lambda _bin, _sid: "/Applications/Codex.app/Resources/codex",
+        )
+        manager = _Manager(["/managed/codex", "app-server", "proxy"])
+        spawned = []
+
+        async def spawn(*argv, **_kwargs):
+            spawned.append(list(argv))
+            return _Process(
+                _Reader(_handshake_response(nonce)), 50004 + len(spawned))
+
+        monkeypatch.setattr(
+            handle_module, "_resolve_codex_bin", lambda: "/managed/codex")
+        monkeypatch.setattr(
+            handle_module.asyncio, "create_subprocess_exec", spawn)
+        monkeypatch.setattr(handle_module.os, "killpg", lambda *_args: None)
+        handle = CodexHandle(_Cfg(), daemon_manager=manager)
+        resume_params = []
+
+        async def idle(*_args):
+            await asyncio.Event().wait()
+
+        async def request(method, params=None):
+            if method == "initialize":
+                return {"userAgent": "codex_cli_rs/0.147.0 (test)"}
+            if method == "thread/resume":
+                resume_params.append(params)
+                return {"thread": {"id": "oversized-thread"}}
+            raise AssertionError(method)
+
+        handle._read_loop = idle  # type: ignore[method-assign]
+        handle._request = request  # type: ignore[method-assign]
+        handle._notify = lambda *_args: asyncio.sleep(0)  # type: ignore[method-assign]
+        handle._restore_http_provider_state = (  # type: ignore[method-assign]
+            lambda **_kwargs: asyncio.sleep(0)
+        )
+        await handle.connect(resume_id="oversized-thread", cwd="/tmp")
+
+        assert spawned == [["/managed/codex", "app-server", "proxy"]]
+        assert handle.using_daemon_proxy is True
+        assert handle.shared_daemon_affinity is True
+        expected_resume = {
+            "threadId": "oversized-thread",
+            "cwd": "/tmp",
+            "modelProvider": handle_module._OPENAI_HTTP_RESUME_PROVIDER_ID,
+            "config": handle_module._openai_http_resume_thread_config(),
+            "excludeTurns": True,
+        }
+        assert resume_params == [expected_resume]
+        await handle.disconnect()
+
+        # Reconnecting an already-shared thread must retain its HTTP transport
+        # override while remaining on the shared daemon.  Shared affinity only
+        # disables the private-core fallback, not HTTP-provider detection.
+        await handle.connect(resume_id="oversized-thread", cwd="/tmp")
+        assert spawned == [
+            ["/managed/codex", "app-server", "proxy"],
+            ["/managed/codex", "app-server", "proxy"],
+        ]
+        assert handle.using_daemon_proxy is True
+        assert resume_params == [expected_resume, expected_resume]
+        await handle.disconnect()
 
     asyncio.run(run())
 

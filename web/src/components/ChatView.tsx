@@ -113,6 +113,7 @@ interface RetainedMeasurementBoundary {
 }
 
 interface HistoryViewportPresentation {
+  sid: string | null;
   scope: string;
   authorityScope: string;
   generation: string | null;
@@ -147,7 +148,6 @@ function sameHistoryViewportPresentation(
 ): boolean {
   return left.scope === right.scope
     && left.authorityScope === right.authorityScope
-    && left.generation === right.generation
     && left.turns === right.turns
     && left.hasMore === right.hasMore
     && left.cursor === right.cursor
@@ -290,6 +290,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   historyImageAssets, onLoadHistoryImage,
   onTextSelectionGuardChange,
   externalPlanProgress,
+  activeTurnId = null,
   surface = "code" }: {
   sid: string | null;
   turns: Turn[];
@@ -341,6 +342,9 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     turnId: string;
     itemId: string;
   } | null;
+  /** Exact displayed row owned by the still-running native task. Runtime-only:
+   * never infer this from array position, final text, or historical activity. */
+  activeTurnId?: string | null;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentSizerRef = useRef<HTMLDivElement>(null);
@@ -409,11 +413,12 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   // non-destructive recovery path. Deep-history browsing supplies an explicit
   // stable view id: revision/view changes reset, window paging does not.
   const resolvedHistoryViewId = historyViewId ?? historyViewRevision ?? "";
-  const scrollScope = historyViewId == null
+  const incomingScrollScope = historyViewId == null
     ? `${historyScopeKey ?? ""}\u0000${sid ?? ""}\u0000${resolvedHistoryViewId}`
     : `${historyScopeKey ?? ""}\u0000${sid ?? ""}\u0000${historyRevision ?? ""}\u0000${resolvedHistoryViewId}`;
   const incomingHistoryPresentation: HistoryViewportPresentation = {
-    scope: scrollScope,
+    sid,
+    scope: incomingScrollScope,
     authorityScope: [
       historyScopeKey ?? "", sid ?? "", historyRevision ?? "",
       historyGeneration ?? "",
@@ -443,9 +448,23 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     presentedHistory,
     incomingHistoryPresentation,
   );
-  const scopedPresentedHistory = presentedHistory.scope === scrollScope
+  // A revision/generation handoff can briefly expose an empty replacement.
+  // Keep the same session's complete old scope mounted until its rows arrive;
+  // same-authority rollback invalidation deliberately does not qualify.
+  const retainPendingHistory = loading && sid
+    && presentedHistory.sid === sid && presentedHistory.turns.length
+    && !incomingTurns.length
+    && presentedHistory.authorityScope
+      !== incomingHistoryPresentation.authorityScope;
+  const scopedPresentedHistory = retainPendingHistory
     ? presentedHistory
-    : transitionPresentation ?? incomingHistoryPresentation;
+    : (presentedHistory.scope === incomingScrollScope
+      ? presentedHistory
+      : transitionPresentation ?? incomingHistoryPresentation);
+  // Every scroll/virtualization transaction must use the presentation's own
+  // scope. During a pending empty handoff that is intentionally the old scope,
+  // never the incoming revision's scope.
+  const scrollScope = scopedPresentedHistory.scope;
   const {
     turns,
     hasMore,
@@ -458,6 +477,10 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
 
   useLayoutEffect(() => {
     const incoming = latestHistoryPresentationRef.current;
+    if (retainPendingHistory) {
+      pendingHistoryPresentationRef.current = incoming;
+      return;
+    }
     if (presentedHistory.scope !== incoming.scope) {
       const retained = acceptedHistoryViewportTransition(
         historyViewportLeaseRef.current,
@@ -492,7 +515,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
     incomingBrowseMode, incomingHasMore, incomingHasNewer,
     incomingHistoryCursor, incomingHistoryWindowEpoch, incomingTurns,
     incomingHistoryPresentation.authorityScope,
-    presentedHistory, scrollScope,
+    incomingScrollScope, presentedHistory, retainPendingHistory,
   ]);
 
   const beginHistoryViewportLease = useCallback(() => {
@@ -1867,6 +1890,12 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
   };
 
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    // Native keyboard scrolling can update scrollTop before React receives the
+    // preceding scroll event (and browsers may coalesce that event with the
+    // next key's movement). Use the physical position at this input boundary
+    // as the baseline so End -> Home still registers as historyward movement.
+    const el = scrollRef.current;
+    if (el) lastScrollTopRef.current = el.scrollTop;
     if (["ArrowUp", "PageUp", "Home"].includes(event.key)) {
       markUserScrollIntent("history");
     } else if (["ArrowDown", "PageDown", "End", " "].includes(event.key)) {
@@ -2442,18 +2471,21 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
             const activeTimeline = activeProcess
               || processItems.some((block) => !block.done);
             const finalBlocks = finalTextBlocks(t.blocks);
+            const enclosingTaskActive = activeTurnId === t.id;
             // A failed/interrupted enclosing terminal is authoritative. A
             // successful answer may still own genuine background agent work,
             // but a stale child flag must never animate beside "已打断".
             const terminalProblem = t.done && (!!t.interrupted || !!t.error);
-            const working = !terminalProblem && (!t.done || activeTimeline);
+            const working = !terminalProblem && (
+              enclosingTaskActive || !t.done || activeTimeline);
             const hasProcessTimeline = processItems.length > 0
               || (!!t.detailEventCount && !t.detailLoaded)
               || !!t.detailError;
             const activePhase = !working
               ? "complete"
               : hasProcessTimeline
-                  && (activeTimeline || finalBlocks.length === 0)
+                  && (enclosingTaskActive
+                    || activeTimeline || finalBlocks.length === 0)
                 ? "process"
                 : finalBlocks.length > 0 ? "answering" : "waiting";
             const showProcessTimeline = hasProcessTimeline;
@@ -2462,6 +2494,10 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
             // tool stream grows, so it must not be the only place which tells
             // the reader that the turn is still active.
             const showWorking = working;
+            // Compact can close a display segment before the enclosing native
+            // task reaches its terminal boundary. Completion time, copy and
+            // fork belong to that real boundary, never to the segment bit.
+            const showCompletionFooter = t.done && !working;
             const workingLabel = t.progress
               ?? (activePhase === "answering"
                 ? "回答中"
@@ -2639,7 +2675,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
                     onAuthorizeImage={onAuthorizeImage}
                     onPreviewImage={(src, alt) => setZoom({ kind: "data", src, alt })} />
                 ))}
-                {t.done && (
+                {showCompletionFooter && (
                   <>
                     <div className="ubub-meta ai-meta">
                       {t.doneTs && <span className="ubub-time">{formatTime(t.doneTs)}</span>}
@@ -2659,7 +2695,7 @@ export function ChatView({ sid, turns: incomingTurns, engine = "claude", loading
                         </button>
                       )}
                     </div>
-                    {ti === turns.length - 1 && !working
+                    {ti === turns.length - 1
                       && <div className="turn-done-mark"><ClaudeSpark size={22} /></div>}
                   </>
                 )}

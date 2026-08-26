@@ -31,9 +31,12 @@ from cc_remote.wrapper.codex_forks import CodexForkJournal
 from cc_remote.wrapper.codex_turn_leases import CodexTurnLeaseStore
 from cc_remote.wrapper.process_scan import ProcessIdentity
 from cc_remote.wrapper.session_pins import SessionPinStore
+from cc_remote.wrapper.session_plans import SessionPlanStore
+from cc_remote.wrapper.session_presentation import SessionPresentationStore
 from cc_remote.wrapper.machine import WrapperMachine, _CodexHistoryProfiles
 from cc_remote.wrapper.ringbuffer import RingBuffer
 from cc_remote.wrapper.session_ctx import SessionContext
+from cc_remote.workspaces import WorkRegistry
 
 
 def _profiles(primary: Path, stack: Path) -> str:
@@ -108,6 +111,116 @@ def test_cli_thread_catalog_hint_dedupe_is_profile_scoped(tmp_path: Path) -> Non
             event for event in transport.sent
             if isinstance(event, SessionListInvalidated)
         ]) == 1
+        candidates = machine._codex_exact_catalog_candidates()
+        assert candidates["primary"]["same-native-new"]["hinted"] is True
+        assert candidates["stack"]["same-native-new"]["hinted"] is True
+
+    asyncio.run(run())
+
+
+def test_cli_thread_catalog_hint_survives_placeholder_ttl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        machine, _transport = _machine(tmp_path)
+        primary = _context(
+            "primary@current-primary", "current-primary", "primary")
+        machine.sessions[primary.key] = primary
+        machine._codex_thread_started_hints[
+            ("primary", "cli-long-running")
+        ] = 1.0
+        monkeypatch.setattr(machine_module.time, "monotonic", lambda: 60.0)
+
+        machine._on_codex_thread_started_hint(primary, "cli-newer")
+        await asyncio.gather(*tuple(machine._codex_catalog_hint_tasks))
+
+        assert set(machine._codex_thread_started_hints) == {
+            ("primary", "cli-long-running"),
+            ("primary", "cli-newer"),
+        }
+        candidates = machine._codex_exact_catalog_candidates()
+        assert candidates["primary"]["cli-long-running"]["hinted"] is True
+        assert candidates["primary"]["cli-long-running"]["hint_fresh"] is False
+        assert candidates["primary"]["cli-newer"]["hint_fresh"] is True
+        assert (
+            candidates["primary"]["cli-long-running"]["created_at"]
+            < candidates["primary"]["cli-newer"]["created_at"]
+        )
+
+    asyncio.run(run())
+
+
+def test_hidden_cli_thread_hint_materializes_in_its_own_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        machine, _transport = _machine(tmp_path)
+        primary = _context(
+            "primary@current-primary", "current-primary", "primary")
+        machine.sessions = {primary.key: primary}
+
+        async def empty_list(_limit, *, codex_home=None):
+            return []
+
+        def exact_rows(session_ids, *, codex_home=None):
+            assert Path(codex_home).name == "primary"
+            return [{
+                "session_id": "cli-hidden",
+                "summary": None,
+                "first_prompt": "CLI prompt",
+                "cwd": "/repo/cli",
+                "last_modified": "30",
+                "git_branch": None,
+                "forked_from_id": None,
+                "status": None,
+                "tag": None,
+            }] if "cli-hidden" in session_ids else []
+
+        monkeypatch.setattr(machine_module, "list_codex_sessions", empty_list)
+        monkeypatch.setattr(
+            machine_module, "codex_exact_catalog_rows", exact_rows)
+        machine._on_codex_thread_started_hint(primary, "cli-hidden")
+        await asyncio.gather(*tuple(machine._codex_catalog_hint_tasks))
+
+        rows = await machine._read_all_codex_profile_sessions()
+
+        hidden = next(
+            row for row in rows
+            if row["session_id"] == "primary@cli-hidden"
+        )
+        assert hidden["codex_profile_id"] == "primary"
+        assert hidden["cwd"] == "/repo/cli"
+        assert all(row["session_id"] != "stack@cli-hidden" for row in rows)
+
+    asyncio.run(run())
+
+
+def test_codex_id_capture_broadcasts_catalog_invalidation(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        machine, transport = _machine(tmp_path)
+        ctx = SessionContext(
+            session_id=None,
+            sdk=object(),
+            buffer=RingBuffer(100, 1024 * 1024),
+            cwd="/repo/new",
+            key="tmp-new",
+            engine="codex",
+            codex_profile_id="primary",
+        )
+        machine.sessions = {ctx.key: ctx}
+
+        await machine._capture_session_id(ctx, "captured-native")
+
+        assert ctx.key == "primary@captured-native"
+        assert [event.type for event in transport.sent][-2:] == [
+            "session_rekey",
+            "session_list_invalidated",
+        ]
+        invalidated = transport.sent[-1]
+        assert invalidated.engine == "codex"
+        assert invalidated.space == "code"
 
     asyncio.run(run())
 
@@ -1227,6 +1340,333 @@ def test_profile_fork_recovery_stays_in_parent_home(
     }
 
 
+def test_hidden_resident_and_fork_catalog_rows_stay_profile_scoped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    machine, _transport = _machine(tmp_path)
+    primary = _context(
+        "primary@same-native-id", "same-native-id", "primary")
+    machine.sessions = {primary.key: primary}
+    machine._codex_forks.begin(
+        "fork-request", "stack@parent-native", "turn-1", "/repo/stack")
+    machine._codex_forks.complete(
+        "fork-request", "stack@same-native-id")
+    # A corrupt/stale cross-profile journal record must not be repaired into
+    # either account even if its child happens to exist in one state DB.
+    machine._codex_forks.begin(
+        "cross-request", "stack@other-parent", "turn-2", "/repo/stack")
+    machine._codex_forks.complete(
+        "cross-request", "primary@cross-child")
+
+    calls: list[tuple[str, tuple[str, ...]]] = []
+
+    async def empty_list(_limit, *, codex_home=None):
+        assert codex_home is not None
+        return []
+
+    def exact_rows(session_ids, *, codex_home=None):
+        home = str(Path(codex_home).resolve())
+        native_ids = tuple(session_ids)
+        calls.append((home, native_ids))
+        if Path(home).name == "primary":
+            # thread/start returned the durable id, but the exact DB metadata
+            # transaction is still lagging. The live resident itself keeps the
+            # row visible without borrowing anything from Stack.
+            return []
+        return [{
+            "session_id": native_sid,
+            "summary": None,
+            "first_prompt": None,
+            "cwd": f"/repo/{Path(home).name}",
+            "last_modified": "20",
+            "git_branch": None,
+            "forked_from_id": None,
+            "status": None,
+            "tag": None,
+        } for native_sid in native_ids]
+
+    monkeypatch.setattr(machine_module, "list_codex_sessions", empty_list)
+    monkeypatch.setattr(
+        machine_module, "codex_exact_catalog_rows", exact_rows)
+
+    rows = asyncio.run(machine._read_all_codex_profile_sessions())
+
+    by_wire = {row["session_id"]: row for row in rows}
+    assert set(by_wire) == {
+        "primary@same-native-id",
+        "stack@same-native-id",
+    }
+    assert by_wire["primary@same-native-id"]["codex_profile_id"] == "primary"
+    assert by_wire["primary@same-native-id"]["forked_from_id"] is None
+    assert by_wire["primary@same-native-id"]["cwd"] == (
+        "/tmp/cc-remote-profile-test")
+    assert by_wire["stack@same-native-id"]["codex_profile_id"] == "stack"
+    assert by_wire["stack@same-native-id"]["forked_from_id"] == (
+        "stack@parent-native")
+    assert by_wire["stack@same-native-id"]["summary"] == "派生会话"
+    assert all("cross-child" not in native_ids for _home, native_ids in calls)
+    assert set(calls) == {
+        (str((tmp_path / "primary").resolve()), ("same-native-id",)),
+        (str((tmp_path / "stack").resolve()), ("same-native-id",)),
+    }
+
+
+def test_old_schema_catalog_fallback_is_batched_and_profile_scoped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    machine, _transport = _machine(tmp_path)
+    machine.sessions = {}
+    for profile_id in ("primary", "stack"):
+        profile_home = tmp_path / profile_id
+        profile_home.mkdir(parents=True, exist_ok=True)
+        (profile_home / "config.toml").write_text(
+            'model_provider = "openai"\n', encoding="utf-8")
+        request_id = f"fork-{profile_id}"
+        machine._codex_forks.begin(
+            request_id,
+            f"{profile_id}@parent-native",
+            f"turn-{profile_id}",
+            f"/repo/{profile_id}",
+        )
+        machine._codex_forks.complete(
+            request_id, f"{profile_id}@same-native-id")
+
+    async def empty_list(_limit, *, codex_home=None):
+        assert codex_home is not None
+        return []
+
+    def uncertain_exact_rows(session_ids, *, codex_home=None):
+        assert tuple(session_ids) == ("same-native-id",)
+        assert codex_home is not None
+        return None
+
+    calls: list[tuple[str, list[tuple[str, object]], float]] = []
+
+    async def batch(requests, cwd=None, *, timeout, codex_home=None):
+        assert cwd is None
+        assert codex_home is not None
+        profile_id = Path(codex_home).name
+        calls.append((profile_id, requests, timeout))
+        return [{"thread": {
+            "id": request[1]["threadId"],
+            "cwd": f"/repo/{profile_id}",
+            "preview": f"{profile_id} hidden fork",
+            "updatedAt": 42,
+            "modelProvider": "openai",
+        }} for request in requests]
+
+    monkeypatch.setattr(machine_module, "list_codex_sessions", empty_list)
+    monkeypatch.setattr(
+        machine_module, "codex_exact_catalog_rows", uncertain_exact_rows)
+    monkeypatch.setattr(machine_module, "codex_rpc_batch", batch)
+
+    rows = asyncio.run(machine._read_all_codex_profile_sessions())
+
+    by_wire = {row["session_id"]: row for row in rows}
+    assert set(by_wire) == {
+        "primary@same-native-id", "stack@same-native-id",
+    }
+    assert by_wire["primary@same-native-id"]["cwd"] == "/repo/primary"
+    assert by_wire["stack@same-native-id"]["cwd"] == "/repo/stack"
+    assert by_wire["primary@same-native-id"]["forked_from_id"] == (
+        "primary@parent-native")
+    assert by_wire["stack@same-native-id"]["forked_from_id"] == (
+        "stack@parent-native")
+    assert {profile_id for profile_id, _requests, _timeout in calls} == {
+        "primary", "stack",
+    }
+    assert all(requests == [(
+        "thread/read",
+        {"threadId": "same-native-id", "includeTurns": False},
+    )] for _profile_id, requests, _timeout in calls)
+    assert all(0 < timeout <= machine.CODEX_EXACT_CATALOG_RPC_TIMEOUT_SECONDS
+               for _profile_id, _requests, timeout in calls)
+
+
+def test_exact_catalog_rpc_fallback_is_bounded_and_provider_filtered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    machine, _transport = _machine(tmp_path)
+    primary_home = tmp_path / "primary"
+    primary_home.mkdir(parents=True, exist_ok=True)
+    (primary_home / "config.toml").write_text(
+        'model_provider = "openai"\n', encoding="utf-8")
+    captured: list[tuple[str, object]] = []
+    batch_sizes: list[int] = []
+    timeouts: list[float] = []
+
+    async def batch(requests, cwd=None, *, timeout, codex_home=None):
+        del cwd
+        assert Path(codex_home) == primary_home
+        batch_sizes.append(len(requests))
+        timeouts.append(timeout)
+        captured.extend(requests)
+        return [{"thread": {
+            "id": params["threadId"],
+            "modelProvider": "different-provider",
+        }} for _method, params in requests]
+
+    monkeypatch.setattr(machine_module, "codex_rpc_batch", batch)
+    rows = asyncio.run(machine._codex_exact_catalog_rpc_rows(
+        machine._codex_profile("primary"),
+        [f"thread-{index}" for index in range(600)],
+    ))
+
+    assert rows == []
+    assert len(captured) == machine_module.CODEX_EXACT_CATALOG_MAX_IDS
+    assert batch_sizes == [
+        machine.CODEX_EXACT_CATALOG_RPC_BATCH_IDS,
+    ] * (
+        machine_module.CODEX_EXACT_CATALOG_MAX_IDS
+        // machine.CODEX_EXACT_CATALOG_RPC_BATCH_IDS
+    )
+    assert all(0 < timeout <= machine.CODEX_EXACT_CATALOG_RPC_TIMEOUT_SECONDS
+               for timeout in timeouts)
+
+
+def test_resident_catalog_repair_survives_the_global_row_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    machine, _transport = _machine(tmp_path)
+    resident = _context(
+        "primary@resident-old", "resident-old", "primary")
+    machine.sessions = {resident.key: resident}
+
+    async def full_list(_limit, *, codex_home=None):
+        profile_id = Path(codex_home).name
+        return [{
+            "session_id": f"listed-{profile_id}-{index}",
+            "summary": f"row {index}",
+            "last_modified": str(10_000 - index),
+        } for index in range(200)]
+
+    def exact_rows(session_ids, *, codex_home=None):
+        if Path(codex_home).name != "primary":
+            return []
+        return [{
+            "session_id": "resident-old",
+            "summary": "old resident",
+            "first_prompt": None,
+            "cwd": "/repo/old",
+            "last_modified": "1",
+            "git_branch": None,
+            "forked_from_id": None,
+            "status": None,
+            "tag": None,
+        }] if "resident-old" in session_ids else []
+
+    monkeypatch.setattr(machine_module, "list_codex_sessions", full_list)
+    monkeypatch.setattr(
+        machine_module, "codex_exact_catalog_rows", exact_rows)
+
+    rows = asyncio.run(machine._read_all_codex_profile_sessions())
+
+    assert len(rows) == machine.CODEX_SESSION_LIST_MAX_ROWS
+    assert any(
+        row["session_id"] == "primary@resident-old" for row in rows
+    )
+    assert all(
+        machine_module._CODEX_CATALOG_PRIORITY not in row for row in rows
+    )
+
+
+def test_profile_list_failure_still_returns_resident_exact_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    machine, _transport = _machine(tmp_path)
+    resident = _context(
+        "primary@resident-during-error", "resident-during-error", "primary")
+    machine.sessions = {resident.key: resident}
+
+    async def list_sessions(_limit, *, codex_home=None):
+        if Path(codex_home).name == "primary":
+            raise RuntimeError("app-server list unavailable")
+        return []
+
+    monkeypatch.setattr(machine_module, "list_codex_sessions", list_sessions)
+    monkeypatch.setattr(
+        machine_module,
+        "codex_exact_catalog_rows",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        machine_module,
+        "codex_rpc_batch",
+        lambda *_args, **_kwargs: asyncio.sleep(0, result=[]),
+    )
+
+    rows, errors = asyncio.run(machine._read_codex_profile_catalog())
+
+    assert [row["session_id"] for row in rows] == [
+        "primary@resident-during-error"
+    ]
+    assert errors == (("primary", "会话列表暂不可用"),)
+
+
+def test_profile_list_failure_cache_merge_keeps_old_resident(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    machine, _transport = _machine(tmp_path)
+    resident = _context(
+        "primary@resident-during-error", "resident-during-error", "primary")
+    machine.sessions = {resident.key: resident}
+    cached_rows = [
+        {
+            "session_id": f"primary@cached-primary-{index}",
+            "native_session_id": f"cached-primary-{index}",
+            "codex_profile_id": "primary",
+            "codex_profile_label": "primary",
+            "summary": "cached",
+            "last_modified": str(10_000 - index),
+        }
+        for index in range(machine.CODEX_SESSION_LIST_MAX_ROWS)
+    ]
+    machine._codex_session_list_cache = (
+        time.monotonic(), cached_rows, (),
+    )
+
+    async def list_sessions(_limit, *, codex_home=None):
+        if Path(codex_home).name == "primary":
+            raise RuntimeError("app-server list unavailable")
+        return []
+
+    def exact_rows(session_ids, *, codex_home=None):
+        if (
+            Path(codex_home).name != "primary"
+            or "resident-during-error" not in session_ids
+        ):
+            return []
+        return [{
+            "session_id": "resident-during-error",
+            "summary": "old resident",
+            "first_prompt": None,
+            "cwd": "/repo/old",
+            "last_modified": "1",
+            "git_branch": None,
+            "forked_from_id": None,
+            "status": None,
+            "tag": None,
+        }]
+
+    monkeypatch.setattr(machine_module, "list_codex_sessions", list_sessions)
+    monkeypatch.setattr(
+        machine_module, "codex_exact_catalog_rows", exact_rows)
+
+    rows = asyncio.run(machine._refresh_codex_session_catalog())
+
+    assert len(rows) == machine.CODEX_SESSION_LIST_MAX_ROWS
+    assert any(
+        row["session_id"] == "primary@resident-during-error"
+        for row in rows
+    )
+    assert machine._codex_session_profile_errors == (
+        ("primary", "会话列表暂不可用"),
+    )
+    assert all(
+        machine_module._CODEX_CATALOG_PRIORITY not in row for row in rows
+    )
+
+
 def test_profile_history_rpc_uses_native_uuid_and_matching_home(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1725,6 +2165,157 @@ def test_profile_remap_retries_do_not_apply_completed_store_twice(
         "primary@same-native-id").permission_profile == ":stack"
     assert not (
         tmp_path / "state" / "codex-profile-transition.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("store_type", "method_name", "attribute"),
+    [
+        (SessionPlanStore, "migrate_profile_sessions", "_session_plans"),
+        (
+            SessionPresentationStore,
+            "migrate_codex_profile_sessions",
+            "_session_presentation",
+        ),
+    ],
+)
+def test_optional_presentation_migration_does_not_disable_codex_or_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    store_type,
+    method_name: str,
+    attribute: str,
+) -> None:
+    machine, _transport = _machine(tmp_path)
+    state = tmp_path / "state"
+    previous = json.loads(
+        (state / "codex-profile-topology.json").read_text(encoding="utf-8")
+    )
+    renamed_profiles = {}
+    for profile in previous["profiles"]:
+        target = "renamed" if profile["id"] == "primary" else profile["id"]
+        renamed_profiles[target] = {
+            "label": target,
+            "home": profile["home"],
+            "default": profile["id"] == previous["default_id"],
+        }
+
+    def fail_optional(self, transform, *, profile_revision):
+        raise RuntimeError("simulated optional cache failure")
+
+    monkeypatch.setattr(store_type, method_name, fail_optional)
+    cfg = WrapperConfig()
+    cfg.state_dir = state
+    cfg.claude_work_root = tmp_path / "work" / "claude"
+    cfg.codex_work_root = tmp_path / "work" / "codex"
+    cfg.codex_profiles_json = json.dumps(renamed_profiles)
+
+    migrated = WrapperMachine(cfg, _StubTransport())
+
+    assert migrated._codex_profile_migration_ok
+    assert migrated._codex_work_profile_migration_ok
+    assert not migrated._codex_presentation_profile_migration_ok
+    assert getattr(migrated, attribute) is None
+    assert migrated._codex_profile().id == "renamed"
+    assert (state / "codex-profile-transition.json").exists()
+    # The pending transition is retained so the optional projection can catch
+    # up after restart without revoking access to the already-migrated engines.
+    assert machine._codex_profiles.default.id == "primary"
+
+
+@pytest.mark.parametrize(
+    ("filename", "attribute"),
+    [
+        ("session-plans.json", "_session_plans"),
+        ("session-presentation.json", "_session_presentation"),
+    ],
+)
+def test_corrupt_rebuildable_projection_does_not_pin_profile_transition(
+    tmp_path: Path,
+    filename: str,
+    attribute: str,
+) -> None:
+    _machine(tmp_path)
+    state = tmp_path / "state"
+    previous = json.loads(
+        (state / "codex-profile-topology.json").read_text(encoding="utf-8")
+    )
+    renamed_profiles = {}
+    for profile in previous["profiles"]:
+        target = "renamed" if profile["id"] == "primary" else profile["id"]
+        renamed_profiles[target] = {
+            "label": target,
+            "home": profile["home"],
+            "default": profile["id"] == previous["default_id"],
+        }
+
+    projection = state / filename
+    projection.write_text("{not-json", encoding="utf-8")
+    cfg = WrapperConfig()
+    cfg.state_dir = state
+    cfg.claude_work_root = tmp_path / "work" / "claude"
+    cfg.codex_work_root = tmp_path / "work" / "codex"
+    cfg.codex_profiles_json = json.dumps(renamed_profiles)
+
+    migrated = WrapperMachine(cfg, _StubTransport())
+
+    assert migrated._codex_profile_migration_ok
+    assert migrated._codex_work_profile_migration_ok
+    assert migrated._codex_presentation_profile_migration_ok
+    assert getattr(migrated, attribute) is not None
+    assert not (state / "codex-profile-transition.json").exists()
+    quarantined = list(state.glob(f"{filename}.corrupt-*"))
+    assert len(quarantined) == 1
+    assert quarantined[0].read_text(encoding="utf-8") == "{not-json"
+
+    next_profiles = dict(renamed_profiles)
+    next_profiles["third"] = {
+        "label": "third",
+        "home": str(tmp_path / "third"),
+    }
+    cfg.codex_profiles_json = json.dumps(next_profiles)
+    advanced = WrapperMachine(cfg, _StubTransport())
+
+    assert advanced._codex_profile_migration_ok
+    assert advanced._codex_work_profile_migration_ok
+    assert advanced._codex_presentation_profile_migration_ok
+    assert not (state / "codex-profile-transition.json").exists()
+
+
+def test_work_profile_migration_failure_does_not_disable_codex_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _machine(tmp_path)
+    state = tmp_path / "state"
+    previous = json.loads(
+        (state / "codex-profile-topology.json").read_text(encoding="utf-8")
+    )
+    renamed_profiles = {}
+    for profile in previous["profiles"]:
+        target = "renamed" if profile["id"] == "primary" else profile["id"]
+        renamed_profiles[target] = {
+            "label": target,
+            "home": profile["home"],
+            "default": profile["id"] == previous["default_id"],
+        }
+
+    def fail_work(*_args, **_kwargs):
+        raise RuntimeError("simulated Work ownership failure")
+
+    monkeypatch.setattr(
+        WorkRegistry, "migrate_codex_profiles", fail_work)
+    cfg = WrapperConfig()
+    cfg.state_dir = state
+    cfg.claude_work_root = tmp_path / "work" / "claude"
+    cfg.codex_work_root = tmp_path / "work" / "codex"
+    cfg.codex_profiles_json = json.dumps(renamed_profiles)
+
+    migrated = WrapperMachine(cfg, _StubTransport())
+
+    assert migrated._codex_profile_migration_ok
+    assert not migrated._codex_work_profile_migration_ok
+    assert migrated._codex_profile().id == "renamed"
+    assert (state / "codex-profile-transition.json").exists()
 
 
 def test_v1_topology_is_upgraded_before_old_checkpoint_is_opened(
@@ -2432,7 +3023,7 @@ def test_unknown_profile_switch_fails_closed_before_spawn(
     assert transport.sent == [result]
 
 
-def test_profile_model_permission_and_capability_reads_use_matching_home(
+def test_profile_model_reads_use_catalog_default_from_matching_home(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     machine, _transport = _machine(tmp_path)
@@ -2452,7 +3043,14 @@ def test_profile_model_permission_and_capability_reads_use_matching_home(
 
     def configured_model(_default="", *, codex_home=None):
         calls.append(("default", codex_home))
-        return "stack-model"
+        # A newly added account commonly has no model in config.toml. Its own
+        # app-server catalog default must win; never borrow the primary account
+        # or CodexHandle's historical fallback.
+        return ""
+
+    def configured_effort(_default="", *, codex_home=None):
+        calls.append(("effort", codex_home))
+        return ""
 
     async def permission_profiles(_cwd, *, codex_home=None):
         calls.append(("permissions", codex_home))
@@ -2467,6 +3065,7 @@ def test_profile_model_permission_and_capability_reads_use_matching_home(
 
     monkeypatch.setattr(machine_module, "codex_catalog", catalog)
     monkeypatch.setattr(machine_module, "codex_model", configured_model)
+    monkeypatch.setattr(machine_module, "codex_effort", configured_effort)
     monkeypatch.setattr(
         machine_module, "codex_permission_profiles", permission_profiles)
     monkeypatch.setattr(machine_module, "engine_capabilities", capabilities)
@@ -2478,6 +3077,7 @@ def test_profile_model_permission_and_capability_reads_use_matching_home(
         ))
         assert models.codex_profile_id == "stack"
         assert models.default_model == "stack-model"
+        assert models.default_effort == "high"
         permissions = await machine._handle_get_permission_profiles(
             SimpleNamespace(
                 sid=None,
@@ -2500,12 +3100,198 @@ def test_profile_model_permission_and_capability_reads_use_matching_home(
         assert report.codex_profile_id == "stack"
 
     asyncio.run(run())
-    assert calls == [
-        ("models", stack_home),
+    assert calls[0] == ("models", stack_home)
+    assert set(calls[1:3]) == {
         ("default", stack_home),
+        ("effort", stack_home),
+    }
+    assert calls[3:] == [
         ("permissions", stack_home),
         ("capabilities", stack_home),
     ]
+
+
+def test_profile_model_resolution_isolated_and_fails_closed_for_explicit_choice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    machine, _transport = _machine(tmp_path)
+    calls: list[str] = []
+
+    async def catalog(*, codex_home=None):
+        profile_id = Path(codex_home).name
+        calls.append(profile_id)
+        return [{
+            "id": f"{profile_id}-default",
+            "efforts": ["low"],
+            "default_effort": "low",
+            "is_default": True,
+        }]
+
+    def provider(*, codex_home=None):
+        return "cubence" if Path(codex_home).name == "primary" else ""
+
+    monkeypatch.setattr(machine_module, "codex_catalog", catalog)
+    monkeypatch.setattr(machine_module, "codex_current_provider", provider)
+
+    async def run() -> None:
+        primary = machine._codex_profile("primary")
+        stack = machine._codex_profile("stack")
+        assert await machine._resolve_codex_profile_model(
+            primary, None,
+        ) == ("primary-default", True)
+        assert await machine._resolve_codex_profile_model(
+            primary, "custom-provider-model",
+        ) == ("custom-provider-model", False)
+        assert await machine._resolve_codex_profile_model(
+            stack, "retired-model",
+        ) == ("stack-default", True)
+        with pytest.raises(machine_module._UnsupportedCodexModel):
+            await machine._resolve_codex_profile_model(
+                stack, "primary-default", explicit=True)
+
+        # An empty result is availability uncertainty. Do not resurrect an old
+        # hardcoded model when no configured/session value exists.
+        assert await machine._resolve_codex_profile_model(
+            stack, None, catalog=[],
+        ) == (None, False)
+
+    asyncio.run(run())
+    assert calls == ["primary", "primary", "stack", "stack"]
+
+
+def test_new_stack_session_applies_its_catalog_default_before_connect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    machine, _transport = _machine(tmp_path)
+    created = []
+
+    class FakeCodexHandle:
+        def __init__(self, _cfg, **kwargs):
+            self.init = kwargs
+            self.model = "gpt-5-codex"
+            self.effort = None
+            self.applied_effort = None
+            self.display_effort = None
+            self.display_effort_model = None
+            self.display_effort_cwd = None
+            self.display_effort_generation = None
+            self._display_effort_retry_at = None
+            self._cwd = kwargs["cwd"]
+            self.cwd = kwargs["cwd"]
+            self._generation = 1
+            self._approval = "never"
+            self.approval_policy = "never"
+            self.permission_profile = None
+            self.web_search = "cached"
+            self.web_search_override = None
+            self.collaboration_mode = "default"
+            self.service_tier = None
+            self.shared_daemon_affinity = False
+            self.using_daemon_proxy = False
+            self.thread_id = None
+            self.connect_model = None
+            self.connect_effort = None
+            created.append(self)
+
+        @property
+        def approval(self):
+            return self._approval
+
+        @approval.setter
+        def approval(self, value):
+            self._approval = value
+            self.approval_policy = value
+
+        async def connect(self, **_kwargs):
+            self.connect_model = self.model
+            self.connect_effort = self.effort
+            self.thread_id = "stack-native"
+
+        async def disconnect(self):
+            return None
+
+    stack_home = str((tmp_path / "stack").resolve())
+
+    async def catalog(*, codex_home=None):
+        assert codex_home == stack_home
+        return [{
+            "id": "stack-default",
+            "efforts": ["low"],
+            "default_effort": "low",
+            "is_default": True,
+        }]
+
+    def configured_model(_default="", *, codex_home=None):
+        assert codex_home == stack_home
+        return ""
+
+    async def clamp(_model, effort, *, codex_home=None):
+        assert _model == "stack-default"
+        assert codex_home == stack_home
+        return effort
+
+    async def no_op(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(machine_module, "CodexHandle", FakeCodexHandle)
+    monkeypatch.setattr(machine_module, "codex_catalog", catalog)
+    monkeypatch.setattr(machine_module, "codex_model", configured_model)
+    monkeypatch.setattr(machine_module, "clamp_effort", clamp)
+    monkeypatch.setattr(machine, "_resolve_codex_session_effort", no_op)
+    monkeypatch.setattr(machine, "_stamp_codex_daemon_epoch", no_op)
+    monkeypatch.setattr(machine, "_persist_codex_session_controls", no_op)
+    monkeypatch.setattr(machine, "_load_history", no_op)
+
+    ctx = asyncio.run(machine._spawn(
+        resume_id=None,
+        cwd=str(tmp_path),
+        engine="codex",
+        codex_profile_id="stack",
+        raise_on_failure=True,
+    ))
+
+    assert ctx is not None
+    assert ctx.key == "stack@stack-native"
+    assert ctx.codex_profile_id == "stack"
+    assert created[0].init["codex_home"] == stack_home
+    assert created[0].connect_model == "stack-default"
+    assert created[0].connect_effort is None
+
+
+def test_explicit_stack_model_is_rejected_before_handle_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    machine, _transport = _machine(tmp_path)
+    stack_home = str((tmp_path / "stack").resolve())
+
+    async def catalog(*, codex_home=None):
+        assert codex_home == stack_home
+        return [{
+            "id": "stack-default",
+            "efforts": ["low"],
+            "default_effort": "low",
+            "is_default": True,
+        }]
+
+    monkeypatch.setattr(machine_module, "codex_catalog", catalog)
+    monkeypatch.setattr(
+        machine_module,
+        "CodexHandle",
+        lambda *_args, **_kwargs: pytest.fail(
+            "unsupported model must fail before handle creation"),
+    )
+
+    with pytest.raises(machine_module._SpawnFailure) as caught:
+        asyncio.run(machine._spawn(
+            resume_id=None,
+            cwd=str(tmp_path),
+            engine="codex",
+            codex_profile_id="stack",
+            model="primary-only-model",
+            raise_on_failure=True,
+        ))
+
+    assert caught.value.code == machine_module.ERR_BAD_PROMPT
 
 
 def test_new_codex_work_session_freezes_selected_profile_before_spawn(

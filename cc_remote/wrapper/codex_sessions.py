@@ -11,8 +11,10 @@ from importlib import import_module
 import json
 import math
 import os
+from pathlib import Path
 import re
-from typing import Any, Optional
+import sqlite3
+from typing import Any, Iterable, Optional
 
 from cc_remote.log import logger
 from cc_remote.wrapper.codex_rpc import codex_rpc
@@ -41,6 +43,34 @@ _LIST_PAGE_SIZE = 100
 _LIST_MAX_PER_ARCHIVE_STATE = 200
 _LIST_MAX_PAGES = 20
 _THREAD_STATUSES = frozenset({"notLoaded", "idle", "systemError", "active"})
+_STATE_DB = re.compile(r"^state_(\d+)\.sqlite$")
+CODEX_EXACT_CATALOG_MAX_IDS = 512
+_EXACT_CATALOG_COLUMNS = (
+    "id",
+    "cwd",
+    "name",
+    "preview",
+    "first_user_message",
+    "title",
+    "recency_at",
+    "recency_at_ms",
+    "updated_at",
+    "updated_at_ms",
+    "created_at",
+    "created_at_ms",
+    "git_branch",
+    "archived",
+    "model_provider",
+)
+_EXACT_CATALOG_TEXT_LIMITS = {
+    "cwd": 4096,
+    "name": 500,
+    "preview": 2000,
+    "first_user_message": 2000,
+    "title": 2000,
+    "git_branch": 500,
+    "model_provider": 256,
+}
 
 
 def _codex_home(codex_home: str | os.PathLike[str] | None = None) -> str:
@@ -169,6 +199,17 @@ def _normalize_thread(thread: Any, *, archived: bool) -> Optional[dict[str, Any]
     }
 
 
+def codex_thread_catalog_row(thread: Any) -> Optional[dict[str, Any]]:
+    """Normalize one profile-scoped ``thread/read`` result for the sidebar.
+
+    The caller is responsible for selecting the matching ``CODEX_HOME`` before
+    obtaining ``thread``. This helper deliberately performs no cross-account
+    lookup and accepts only the same bounded fields as ``thread/list``.
+    """
+    archived = isinstance(thread, dict) and thread.get("archived") is True
+    return _normalize_thread(thread, archived=archived)
+
+
 def _bounded_text(value: Any, limit: int) -> Optional[str]:
     if not isinstance(value, str):
         return None
@@ -213,8 +254,211 @@ def codex_rollout_path(
     )
 
 
+def _state_db_path(
+    codex_home: str | os.PathLike[str] | None = None,
+) -> Optional[str]:
+    """Resolve the newest app-server state DB without opening it writable."""
+    home = _codex_home(codex_home)
+    config_path = os.path.join(home, "config.toml")
+    try:
+        if os.path.getsize(config_path) > _CONFIG_MAX_BYTES:
+            return None
+        with open(config_path, "rb") as stream:
+            config = tomllib.load(stream)
+    except FileNotFoundError:
+        config = {}
+    except Exception:
+        return None
+    sqlite_home = config.get("sqlite_home")
+    if sqlite_home is None:
+        sqlite_root = home
+    elif isinstance(sqlite_home, str) and sqlite_home.strip():
+        sqlite_root = os.path.expanduser(sqlite_home)
+        if not os.path.isabs(sqlite_root):
+            sqlite_root = os.path.join(home, sqlite_root)
+        sqlite_root = os.path.realpath(sqlite_root)
+    else:
+        return None
+    try:
+        candidates = [
+            (int(match.group(1)), os.path.join(sqlite_root, entry.name))
+            for entry in os.scandir(sqlite_root)
+            if entry.is_file(follow_symlinks=False)
+            and (match := _STATE_DB.fullmatch(entry.name)) is not None
+        ]
+    except OSError:
+        return None
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+def codex_session_presence(
+    session_id: str,
+    *,
+    codex_home: str | os.PathLike[str] | None = None,
+) -> bool | None:
+    """Read one exact native thread id without collapsing I/O failure.
+
+    The app-server SQLite catalog is authoritative for active and archived
+    threads. ``None`` means ownership is unknown and callers must not infer a
+    different engine from absence.
+    """
+    if not isinstance(session_id, str) or not _SAFE_SESSION_ID.fullmatch(
+        session_id
+    ):
+        return None
+    db_path = _state_db_path(codex_home)
+    if db_path is None:
+        return None
+    try:
+        uri = f"{Path(db_path).resolve().as_uri()}?mode=ro"
+        with sqlite3.connect(uri, uri=True, timeout=1.0) as connection:
+            row = connection.execute(
+                "SELECT 1 FROM threads WHERE id=? LIMIT 1", (session_id,)
+            ).fetchone()
+    except (OSError, sqlite3.Error):
+        return None
+    return row is not None
+
+
+def codex_exact_catalog_rows(
+    session_ids: Iterable[str],
+    *,
+    codex_home: str | os.PathLike[str] | None = None,
+) -> Optional[list[dict[str, Any]]]:
+    """Read bounded, exact sidebar rows which ``thread/list`` omitted.
+
+    Recent app-server builds can keep a real thread addressable through
+    ``thread/read`` while hiding it from ``thread/list`` until its preview is
+    materialized.  New cc-remote sessions and persistent forks must not vanish
+    during that window.  This helper does not scan or merge accounts: callers
+    provide native ids for one already-selected ``CODEX_HOME``, and the query
+    is additionally filtered to that home's configured model provider.
+
+    ``None`` preserves read uncertainty; an empty list proves that none of the
+    exact ids belongs to the selected catalog.
+    """
+    unique_ids: list[str] = []
+    seen: set[str] = set()
+    for value in session_ids:
+        if (
+            not isinstance(value, str)
+            or not _SAFE_SESSION_ID.fullmatch(value)
+            or value in seen
+        ):
+            continue
+        seen.add(value)
+        unique_ids.append(value)
+        if len(unique_ids) >= CODEX_EXACT_CATALOG_MAX_IDS:
+            break
+    if not unique_ids:
+        return []
+
+    db_path = _state_db_path(codex_home)
+    if db_path is None:
+        return None
+    provider = codex_current_provider(codex_home=codex_home).strip()
+    try:
+        uri = f"{Path(db_path).resolve().as_uri()}?mode=ro"
+        with sqlite3.connect(uri, uri=True, timeout=1.0) as connection:
+            connection.row_factory = sqlite3.Row
+            schema = {
+                row["name"]
+                for row in connection.execute('PRAGMA table_info("threads")')
+                if isinstance(row["name"], str)
+            }
+            if "id" not in schema:
+                return None
+            if provider and "model_provider" not in schema:
+                # Older Codex schemas predate provider ownership metadata. The
+                # id may exist, but this SQLite snapshot cannot prove it belongs
+                # to the configured provider, so absence is not authoritative.
+                return None
+            projections = []
+            for name in _EXACT_CATALOG_COLUMNS:
+                if name not in schema:
+                    continue
+                limit = _EXACT_CATALOG_TEXT_LIMITS.get(name)
+                projections.append(
+                    f'substr("{name}", 1, {limit}) AS "{name}"'
+                    if limit is not None else f'"{name}"'
+                )
+            placeholders = ",".join("?" for _ in unique_ids)
+            predicates = [f'"id" IN ({placeholders})']
+            parameters = list(unique_ids)
+            if provider:
+                predicates.append('"model_provider" = ?')
+                parameters.append(provider)
+            records = connection.execute(
+                f"SELECT {','.join(projections)} FROM \"threads\" "
+                f"WHERE {' AND '.join(predicates)}",
+                parameters,
+            ).fetchall()
+    except (OSError, sqlite3.Error):
+        return None
+
+    rows: list[dict[str, Any]] = []
+    for raw in records:
+        record = dict(raw)
+        session_id = record.get("id")
+        if (
+            not isinstance(session_id, str)
+            or not _SAFE_SESSION_ID.fullmatch(session_id)
+        ):
+            continue
+        timestamps: list[float] = []
+        for name, scale in (
+            ("recency_at", 1),
+            ("updated_at", 1),
+            ("created_at", 1),
+            ("recency_at_ms", 1000),
+            ("updated_at_ms", 1000),
+            ("created_at_ms", 1000),
+        ):
+            value = record.get(name)
+            if (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(value)
+                and value >= 0
+            ):
+                timestamps.append(value / scale)
+        modified = max(timestamps, default=None)
+        modified_text = (
+            str(int(modified))
+            if modified is not None and modified.is_integer()
+            else str(modified) if modified is not None else None
+        )
+        preview = next((
+            value for value in (
+                record.get("preview"),
+                record.get("first_user_message"),
+                record.get("title"),
+            )
+            if isinstance(value, str) and value
+        ), None)
+        archived = bool(record.get("archived"))
+        rows.append({
+            "session_id": session_id,
+            "summary": _bounded_text(record.get("name"), 500),
+            "first_prompt": _bounded_text(preview, 2000),
+            "cwd": _bounded_text(record.get("cwd"), 4096),
+            "last_modified": modified_text,
+            "git_branch": _bounded_text(record.get("git_branch"), 500),
+            "forked_from_id": None,
+            "status": None,
+            "tag": "archived" if archived else None,
+        })
+    rows.sort(
+        key=lambda item: _updated_sort_key(item.get("last_modified")),
+        reverse=True,
+    )
+    return rows
+
+
 def codex_model(
-    default: str = "gpt-5-codex",
+    default: str = "",
     *,
     codex_home: str | os.PathLike[str] | None = None,
 ) -> str:
@@ -224,7 +468,7 @@ def codex_model(
 
 
 def codex_effort(
-    default: str = "high",
+    default: str = "",
     *,
     codex_home: str | os.PathLike[str] | None = None,
 ) -> str:

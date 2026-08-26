@@ -1,6 +1,7 @@
 import {
   installAuthoritativeTurnDetailPage,
   mergeAuthoritativeTurnDetail,
+  reconcileProvenCompactionOrphans,
 } from "./history-merge.ts";
 import {
   MAX_RUNTIME_COMPLETED_UNITS,
@@ -197,13 +198,36 @@ function flattenSegments(segments: readonly HistoryBrowseSegment[]): Turn[] {
   return turns;
 }
 
+/** Persist a canonical compaction repair in its owning page segment. Keeping
+ * empty segments is intentional: page keys and cursors remain the authority
+ * for walking back to an evicted neighbour even when the only polluted row in
+ * one byte-window page was absorbed by the adjacent canonical page. */
+function reconcileCompactionSegments(
+  segments: readonly HistoryBrowseSegment[],
+): HistoryBrowseSegment[] {
+  const source = flattenSegments(segments);
+  const repaired = reconcileProvenCompactionOrphans(source);
+  if (repaired.length === source.length) return [...segments];
+  // The repair is deletion-only and preserves the exact source objects.
+  // Display ids are not unique across every cache migration: two legitimate
+  // rows can share an optimistic id while carrying distinct historyTurnId
+  // authorities. Filtering by object identity avoids replacing both with the
+  // last Map entry for that display id.
+  const retained = new Set(repaired);
+  return segments.map((segment) => ({
+    ...segment,
+    turns: segment.turns.filter((turn) => retained.has(turn)),
+  }));
+}
+
 function materializeProjection(
   projection: Omit<
     HistoryBrowseProjection,
     "turns" | "loadedPageKeys" | "oldestPageKey" | "newestPageKey"
   >,
 ): HistoryBrowseProjection {
-  const segments = dedupeSegments(projection.segments);
+  const segments = reconcileCompactionSegments(
+    dedupeSegments(projection.segments));
   return {
     ...projection,
     segments,
@@ -423,7 +447,8 @@ export function prependOlderPage(
   const withoutSamePage = projection.segments.filter(
     (segment) => segment.pageKey !== incoming.pageKey,
   );
-  const normalized = dedupeSegments([incoming, ...withoutSamePage]);
+  const normalized = reconcileCompactionSegments(
+    dedupeSegments([incoming, ...withoutSamePage]));
   const bounded = boundSegments(
     normalized,
     "tail",
@@ -463,7 +488,8 @@ export function appendNewerPage(
   const withoutSamePage = projection.segments.filter(
     (segment) => segment.pageKey !== incoming.pageKey,
   );
-  const normalized = dedupeSegments([...withoutSamePage, incoming]);
+  const normalized = reconcileCompactionSegments(
+    dedupeSegments([...withoutSamePage, incoming]));
   const bounded = boundSegments(
     normalized,
     "head",

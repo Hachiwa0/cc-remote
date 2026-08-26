@@ -21,9 +21,13 @@ import {
   mergeAuthoritativeTurnDetail,
   mergeDetailWithLiveTail,
   mergeInitialHistory,
+  reconcileProvenCompactionOrphans,
   restoreCachedTurnDetails,
   restoreObservedLiveTurnDetails,
 } from "../src/history-merge.ts";
+import {
+  reconcileBoundCompactionOrphan as reconcileCompactionOnlyOrphan,
+} from "../src/compaction-orphans.ts";
 import {
   HISTORY_INITIAL_PAGE,
   HISTORY_MORE_PAGE,
@@ -105,6 +109,8 @@ import {
 import {
   clientSlashesFor,
   commandsFor,
+  effortIsSelectable,
+  effortNameForDisplay,
   isKnownCodeOnlySlash,
   matchCommands,
   matchSkills,
@@ -115,6 +121,29 @@ import {
   permsFor,
   skillToken,
 } from "../src/data.ts";
+
+function testEffortPresentation(): void {
+  assert.equal(
+    effortNameForDisplay("model-default"),
+    "模型默认",
+    "an unresolved official model default must not remain in loading state",
+  );
+  assert.equal(
+    effortNameForDisplay(""),
+    null,
+    "an unseeded effort must retain the loading label instead of painting blank",
+  );
+  assert.equal(
+    effortNameForDisplay("xhigh"),
+    "xhigh",
+    "ordinary effort labels retain the raw CLI/config id contract",
+  );
+  assert.equal(effortIsSelectable("model-default"), false,
+    "the model-default display sentinel is never a selectable effort override");
+  assert.equal(effortIsSelectable("high"), true,
+    "ordinary effort ids remain selectable");
+}
+testEffortPresentation();
 import {
   createMobileViewportSync,
   type MobileViewportBindings,
@@ -203,14 +232,80 @@ import {
   composerDraftKey,
 } from "../src/composer-drafts.ts";
 import {
+  composePastePrompt,
+  makeComposerPaste,
+  MAX_PROMPT_CHARS,
+} from "../src/composer-pastes.ts";
+import {
+  ENGINE_SPACES_KEY,
+  LEGACY_SPACE_KEY,
+  readEngineSpaces,
+  rememberEngineSpace,
+} from "../src/surface-preferences.ts";
+import {
   normalizeSessionList,
   updateScopedSessionLifecycle,
 } from "../src/session-list.ts";
-import { codexProfilePresentation } from
-  "../src/codex-profile-presentation.ts";
+import {
+  codexProfileIdForSession,
+  codexProfilePresentation,
+} from "../src/codex-profile-presentation.ts";
 
 const composerDrafts = new ComposerDraftStore();
+const pasteOne = makeComposerPaste("first pasted block", "paste-1");
+const pasteTwo = makeComposerPaste("second pasted block", "paste-2");
+assert.deepEqual(
+  composePastePrompt([pasteOne, pasteTwo], "follow-up"),
+  { ok: true, prompt: "first pasted block\n\nsecond pasted block\n\nfollow-up" },
+  "paste cards must remain ordered prefixes of the visible composer text",
+);
+assert.deepEqual(
+  composePastePrompt([], "x".repeat(MAX_PROMPT_CHARS)),
+  { ok: true, prompt: "x".repeat(MAX_PROMPT_CHARS) },
+  "the protocol's exact prompt limit remains sendable",
+);
+assert.deepEqual(
+  composePastePrompt([{ text: "x".repeat(MAX_PROMPT_CHARS) }], "tail"),
+  { ok: false, chars: MAX_PROMPT_CHARS + 6, maxChars: MAX_PROMPT_CHARS },
+  "paste separators and visible text must participate in the prompt bound",
+);
+const preferenceValues = new Map<string, string>([[LEGACY_SPACE_KEY, "work"]]);
+const preferenceStorage = {
+  getItem: (key: string) => preferenceValues.get(key) ?? null,
+};
+assert.deepEqual(readEngineSpaces(preferenceStorage, "codex"), {
+  claude: "code", codex: "work",
+}, "legacy space migrates only to the previously active engine");
+preferenceValues.set(ENGINE_SPACES_KEY, JSON.stringify({
+  claude: "work", codex: "code",
+}));
+assert.deepEqual(readEngineSpaces(preferenceStorage, "codex"), {
+  claude: "work", codex: "code",
+}, "persisted engine spaces survive reload independently");
+assert.deepEqual(
+  rememberEngineSpace({ claude: "work", codex: "code" }, "codex", "work"),
+  { claude: "work", codex: "work" },
+  "changing one engine's space must preserve the other engine's memory",
+);
+let switchingSpaces: { claude: "code" | "work"; codex: "code" | "work" } = {
+  claude: "code", codex: "code",
+};
+switchingSpaces = rememberEngineSpace(switchingSpaces, "claude", "work");
+assert.equal(switchingSpaces.codex, "code",
+  "Codex Code -> Claude Work must leave the remembered Codex surface alone");
+assert.equal(switchingSpaces.claude, "work",
+  "switching back to Claude must restore Claude Work");
 const oneCodexProfile = [{ id: "primary", label: "Main" }];
+assert.equal(
+  codexProfileIdForSession("stack@same-native-id", "primary"),
+  "stack",
+  "a catalog-delayed child keeps the account encoded in its wire id",
+);
+assert.equal(
+  codexProfileIdForSession("same-native-id", "primary"),
+  "primary",
+  "single-profile wire ids retain their configured default ownership",
+);
 assert.equal(
   codexProfilePresentation(oneCodexProfile, "primary", "primary"),
   null,
@@ -350,6 +445,7 @@ composerDrafts.set(draftA, {
   input: "session A unfinished",
   images: [{ media_type: "image/png", data: "draft-image" }],
   files: [{ filename: "notes.txt", data: "draft-file" }],
+  pastes: [],
 });
 assert.equal(composerDrafts.get(draftB).input, "",
   "switching sessions must not carry the previous composer text");
@@ -359,6 +455,7 @@ composerDrafts.set(draftB, {
   input: "session B unfinished",
   images: [],
   files: [],
+  pastes: [],
 });
 assert.equal(composerDrafts.get(draftA).input, "session A unfinished",
   "returning to a session restores only that session's draft");
@@ -370,6 +467,7 @@ composerDrafts.set(tempDraft, {
   input: "typed while the first turn was running",
   images: [],
   files: [],
+  pastes: [],
 });
 composerDrafts.rekey(tempDraft, realDraft);
 assert.equal(composerDrafts.get(realDraft).input,
@@ -384,6 +482,7 @@ composerDrafts.set(btwDraftA, {
   input: "unfinished side question",
   images: [],
   files: [],
+  pastes: [],
 });
 assert.equal(composerDrafts.get(btwDraftB).input, "",
   "BTW drafts must not follow another fork");
@@ -1185,6 +1284,9 @@ assert.match(historyAppSource,
   /displayHistoryProjection\(\s*state\.historyRecovery,\s*focusedSid,\s*rt,\s*state\.historyBrowse,\s*state\.retainedHistoryBrowse,\s*\)/,
   "ChatView must select retained recovery, browse, then live runtime without rebuilding rt.turns");
 assert.match(historyAppSource,
+  /<ChatView key=\{`\$\{activeScopeKey\}\\u0000\$\{focusedSid \?\? ""\}`\}/,
+  "session switches must remount ChatView so scroll and disclosure state cannot leak between sessions");
+assert.match(historyAppSource,
   /new HistoryPageCache\(\)/,
   "deep-history pages must use their independent best-effort IndexedDB");
 assert.match(historyAppSource,
@@ -1197,13 +1299,13 @@ assert.match(historyAppSource,
   /return \(\) => \{[\s\S]{0,260}historyRequests\.clear\(\);\s*clearHistoryDetailRequests\(\);/,
   "WebSocket cleanup must release frozen detail loading rows");
 assert.match(historyAppSource,
-  /const browseWaiters\s*=\s*historyRequestsRef\.current\.complete\(msg\)/,
+  /const completedHistory\s*=\s*historyRequestsRef\.current\.complete\(msg\);[\s\S]{0,120}const browseWaiters\s*=\s*completedHistory\.matched/,
   "History.before must consume request-time browse authority instead of current UI state");
 assert.match(historyAppSource,
   /await historyPageCacheRef\.current\.getPage[\s\S]{0,400}acceptsCachedNewerPage\(current, frozen\)/,
   "a deferred cached-newer read must revalidate the current browse authority");
 assert.match(historyAppSource,
-  /if \(msg\.before\)[\s\S]{0,1600}return;/,
+  /if \(msg\.before\) \{[\s\S]{0,2800}History\.before is display-only[\s\S]{0,220}return;/,
   "every History.before path must terminate before the generic live reducer");
 assert.match(historyAppSource,
   /browseMode=\{historyView\.browsing\}/);
@@ -1928,6 +2030,273 @@ assert.deepEqual(
   ["history-older-compact", "live-shared-compact"],
   "a live tail pairs with the latest history occurrence without hiding older compaction",
 );
+
+function testCompactionOrphanHelpers() {
+const orphanCompactionBlock = {
+  kind: "process" as const,
+  item_id: "orphan-compaction",
+  processKind: "compaction" as const,
+  phase: "end" as const,
+  status: "succeeded" as const,
+  turn_id: compactNativeTurnId,
+  title: "压缩上下文",
+  done: true,
+};
+const compactionOrphanOwner: Turn = {
+  id: "bound-compaction-user",
+  clientMsgId: "bound-compaction-client",
+  prompt: "继续修复问题",
+  blocks: [{
+    kind: "text", message_id: "bound-compaction-final",
+    channel: "final", text: "已经修好", done: true,
+  }],
+  done: true,
+  doneTs: 22_000,
+  durationMs: 1_200,
+};
+const compactionOnlyOrphan: Turn = {
+  id: "orphan-compaction-row",
+  prompt: "",
+  blocks: [orphanCompactionBlock],
+  done: false,
+};
+const directOrphanRepaired = reconcileCompactionOnlyOrphan(
+  [compactionOnlyOrphan, compactionOrphanOwner],
+  ["bound-compaction-client"],
+  compactNativeTurnId,
+);
+assert.equal(directOrphanRepaired.length, 1,
+  "one exact binding absorbs one compaction-only live row");
+assert.deepEqual({
+  id: directOrphanRepaired[0].id,
+  done: directOrphanRepaired[0].done,
+  doneTs: directOrphanRepaired[0].doneTs,
+  durationMs: directOrphanRepaired[0].durationMs,
+}, {
+  id: "bound-compaction-user", done: true, doneTs: 22_000, durationMs: 1_200,
+}, "moving a compact marker cannot inherit the orphan lifecycle");
+assert.deepEqual(
+  directOrphanRepaired[0].blocks.map((block) => block.kind === "process"
+    ? block.item_id : block.message_id),
+  ["orphan-compaction", "bound-compaction-final"],
+  "a newly bound compact marker renders before the answer rather than as a trailing 已处理 row",
+);
+assert.deepEqual(
+  directOrphanRepaired[0].blocks.map((block) => block.liveOrder),
+  [0, 1],
+  "moving a live compact marker rebases chronology without duplicate orders",
+);
+assert.deepEqual(
+  reconcileCompactionOnlyOrphan(
+    directOrphanRepaired,
+    ["bound-compaction-client"],
+    compactNativeTurnId,
+  ),
+  directOrphanRepaired,
+  "repeated binding reconciliation is idempotent",
+);
+
+const spilledCompactionOwner: Turn = {
+  ...compactionOrphanOwner,
+  id: "spilled-compaction-owner",
+  clientMsgId: "spilled-compaction-client",
+  blocks: [{ ...compactionOrphanOwner.blocks[0], liveOrder: 1 }],
+  liveBlocksSpilled: true,
+  liveSpillBlocks: [{
+    kind: "process", item_id: "spilled-before-compaction",
+    processKind: "command", phase: "end", status: "succeeded",
+    title: "运行命令", done: true, liveOrder: 0,
+  }],
+  nextLiveBlockOrder: 2,
+};
+const spilledCompactionRepaired = reconcileCompactionOnlyOrphan(
+  [compactionOnlyOrphan, spilledCompactionOwner],
+  ["spilled-compaction-client"],
+  compactNativeTurnId,
+)[0];
+assert.deepEqual([
+  spilledCompactionRepaired.blocks.map((block) => block.liveOrder),
+  spilledCompactionRepaired.liveSpillBlocks?.map((block) => block.liveOrder),
+  spilledCompactionRepaired.nextLiveBlockOrder,
+], [[0, 2], [1], 3],
+"live compaction insertion shifts the bounded spill archive without collisions");
+assert.deepEqual(
+  mergeDetailWithLiveTail(
+    spilledCompactionRepaired.liveSpillBlocks ?? [],
+    spilledCompactionRepaired.blocks,
+  ).map((block) => block.kind === "text"
+    ? block.message_id : block.kind === "tool"
+      ? block.tool_use_id : block.item_id),
+  ["orphan-compaction", "spilled-before-compaction", "bound-compaction-final"],
+  "the final spill/live render follows the repaired cross-slice chronology",
+);
+
+const ambiguousCompactionOrphans = reconcileCompactionOnlyOrphan([
+  compactionOrphanOwner,
+  compactionOnlyOrphan,
+  {
+    ...compactionOnlyOrphan,
+    id: "second-orphan-compaction-row",
+    blocks: [{ ...orphanCompactionBlock, item_id: "second-orphan-compaction" }],
+  },
+], ["bound-compaction-client"], compactNativeTurnId);
+assert.equal(ambiguousCompactionOrphans.length, 3,
+  "two compaction-only candidates fail closed instead of guessing an owner");
+assert.equal(reconcileCompactionOnlyOrphan([
+  compactionOrphanOwner,
+  { ...compactionOnlyOrphan, done: true },
+], ["bound-compaction-client"], compactNativeTurnId).length, 2,
+"a completed live row needs canonical History proof before it can be absorbed");
+assert.equal(reconcileCompactionOnlyOrphan([
+  compactionOrphanOwner,
+  { ...compactionOnlyOrphan,
+    id: "multiple-live-compaction-row",
+    blocks: [
+      orphanCompactionBlock,
+      { ...orphanCompactionBlock, item_id: "second-live-compaction" },
+    ] },
+], ["bound-compaction-client"], compactNativeTurnId).length, 2,
+"more than one live compaction marker is ambiguous and must fail closed");
+
+const ownerWithExistingCompaction: Turn = {
+  ...compactionOrphanOwner,
+  blocks: [{ ...orphanCompactionBlock, item_id: "already-owned-compaction" }],
+};
+assert.equal(reconcileCompactionOnlyOrphan([
+  ownerWithExistingCompaction,
+  compactionOnlyOrphan,
+], ["bound-compaction-client"], compactNativeTurnId).length, 2,
+"a distinct second compaction in one native task must wait for History ordering proof");
+const exactDuplicateCompaction = reconcileCompactionOnlyOrphan([
+  ownerWithExistingCompaction,
+  {
+    ...compactionOnlyOrphan,
+    blocks: [{ ...orphanCompactionBlock,
+      item_id: "already-owned-compaction" }],
+  },
+], ["bound-compaction-client"], compactNativeTurnId);
+assert.equal(exactDuplicateCompaction.length, 1,
+  "an exact process item duplicate can be removed without guessing occurrence order");
+assert.equal(exactDuplicateCompaction[0].blocks.length, 1,
+  "exact duplicate reconciliation never paints a second compaction marker");
+
+for (const [label, candidate] of ([
+  ["ordinary promptless assistant", {
+    ...compactionOnlyOrphan,
+    id: "promptless-assistant",
+    blocks: [{ kind: "text" as const, message_id: "assistant-final",
+      channel: "final" as const, text: "automatic answer", done: true }],
+  }],
+  ["goal continuation", {
+    ...compactionOnlyOrphan,
+    id: "goal-continuation",
+    forkPointId: compactNativeTurnId,
+  }],
+  ["optimistic steer", {
+    ...compactionOnlyOrphan,
+    id: "optimistic-steer-row",
+    clientMsgId: "optimistic-steer-row",
+    prompt: "change direction",
+  }],
+  ["ordinary process", {
+    ...compactionOnlyOrphan,
+    id: "ordinary-process-row",
+    blocks: [{ ...orphanCompactionBlock,
+      item_id: "ordinary-process", processKind: "command" as const }],
+  }],
+  ["detail-bearing compaction", {
+    ...compactionOnlyOrphan,
+    id: "detail-compaction-row",
+    detailProjection: {
+      segments: [], blocks: [], capped: false, hasMore: false,
+      oldestCursor: null, hasNewer: false, newerCursor: null,
+    },
+  }],
+] satisfies Array<[string, Turn]>)) {
+  assert.equal(reconcileCompactionOnlyOrphan(
+    [compactionOrphanOwner, candidate],
+    ["bound-compaction-client"],
+    compactNativeTurnId,
+  ).length, 2, `${label} is not a disposable compact orphan`);
+}
+
+const canonicalCompactionOwner: Turn = {
+  id: "canonical-compaction-user",
+  forkPointId: compactNativeTurnId,
+  prompt: "继续修复问题",
+  blocks: [{
+    ...orphanCompactionBlock,
+    item_id: "canonical-compaction",
+    summary: "canonical summary",
+  }, {
+    kind: "text", message_id: "canonical-compaction-final",
+    channel: "final", text: "done", done: true,
+  }],
+  done: true,
+  doneTs: 30_000,
+  durationMs: 2_000,
+};
+const completedCachedOrphan: Turn = {
+  ...compactionOnlyOrphan,
+  id: "completed-cached-compaction-orphan",
+  done: true,
+  doneTs: 99_000,
+  durationMs: 50_000,
+  blocks: [{
+    ...orphanCompactionBlock,
+    item_id: "cached-compaction",
+    summary: "stale cached summary",
+  }],
+};
+const canonicalOrphanRepaired = reconcileProvenCompactionOrphans([
+  canonicalCompactionOwner,
+  {
+    ...completedCachedOrphan,
+    blocks: [{ ...orphanCompactionBlock,
+      item_id: "canonical-compaction" }],
+  },
+]);
+assert.equal(canonicalOrphanRepaired.length, 1,
+  "canonical History removes an exact completed cache occurrence duplicate");
+assert.deepEqual({
+  doneTs: canonicalOrphanRepaired[0].doneTs,
+  durationMs: canonicalOrphanRepaired[0].durationMs,
+  compactions: canonicalOrphanRepaired[0].blocks.filter((block) =>
+    block.kind === "process" && block.processKind === "compaction").length,
+  summary: canonicalOrphanRepaired[0].blocks[0].kind === "process"
+    ? canonicalOrphanRepaired[0].blocks[0].summary : null,
+}, {
+  doneTs: 30_000,
+  durationMs: 2_000,
+  compactions: 1,
+  summary: "canonical summary",
+}, "History keeps lifecycle and completed process payload authority");
+assert.deepEqual(
+  canonicalOrphanRepaired[0].blocks,
+  canonicalCompactionOwner.blocks,
+  "canonical History never reimports extra compactions from a stale cache row",
+);
+assert.deepEqual(
+  reconcileProvenCompactionOrphans(canonicalOrphanRepaired),
+  canonicalOrphanRepaired,
+  "repeated canonical History repair is idempotent",
+);
+assert.equal(reconcileProvenCompactionOrphans([
+  canonicalCompactionOwner,
+  { ...canonicalCompactionOwner, id: "same-native-steer-owner",
+    prompt: "another steer" },
+  completedCachedOrphan,
+]).length, 3,
+"two visible owners of one native task make cache repair ambiguous");
+
+return { orphanCompactionBlock, canonicalCompactionOwner, completedCachedOrphan };
+}
+const {
+  orphanCompactionBlock,
+  canonicalCompactionOwner,
+  completedCachedOrphan,
+} = testCompactionOrphanHelpers();
+
 const sharedTaskSegments = mergeInitialHistory([], [{
   id: "steer-segment-one",
   prompt: "first",
@@ -4254,6 +4623,123 @@ try {
   );
   assert.equal(exactEndState.runtimes[exactEndSid].acceptancePending, null);
 
+  const lateClaudeDetailSid = "claude-late-terminal-detail";
+  const lateDetailInputTurn: Turn = {
+    id: "claude-late-detail-turn",
+    forkPointId: "claude-late-detail-native",
+    prompt: "finish before detail arrives",
+    blocks: [{
+      kind: "process",
+      item_id: "live-process-before-terminal",
+      processKind: "command",
+      phase: "start",
+      status: "running",
+      turn_id: "claude-late-detail-native",
+      title: "live process",
+      done: false,
+    }],
+    detailProjection: {
+      segments: [],
+      blocks: [{
+        kind: "tool",
+        message_id: "detail-message-before-terminal",
+        tool_use_id: "detail-tool-before-terminal",
+        tool: "Read",
+        input: { file_path: "README.md" },
+        done: false,
+      }],
+      capped: false,
+      hasMore: false,
+      oldestCursor: null,
+      hasNewer: false,
+      newerCursor: null,
+    },
+    done: false,
+  };
+  let lateClaudeDetailState = {
+    ...initialState,
+    focusedSid: lateClaudeDetailSid,
+    runtimes: {
+      [lateClaudeDetailSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        syncReady: true,
+        historyRevision: "claude-late-detail-r1",
+        turns: [lateDetailInputTurn],
+      },
+    },
+  };
+  lateClaudeDetailState = reduce(lateClaudeDetailState, {
+    type: "event", event: event({
+      type: "turn_end", sid: lateClaudeDetailSid, seq: 20,
+      turn_id: "claude-late-detail-native",
+      result: { subtype: "success", duration_ms: 20, is_error: false },
+    }),
+  });
+  const afterClaudeTurnEnd =
+    lateClaudeDetailState.runtimes[lateClaudeDetailSid].turns[0];
+  assert.equal(afterClaudeTurnEnd.blocks[0].done, true,
+    "TurnEnd closes the live process present at its terminal boundary");
+  assert.equal(afterClaudeTurnEnd.detailProjection?.blocks[0].done, true,
+    "TurnEnd also closes the detail projection already on screen");
+  assert.equal(lateDetailInputTurn.blocks[0].done, false,
+    "TurnEnd does not mutate reducer input live blocks");
+  assert.equal(lateDetailInputTurn.detailProjection?.blocks[0].done, false,
+    "TurnEnd does not mutate reducer input detail blocks");
+
+  lateClaudeDetailState = reduce(lateClaudeDetailState, {
+    type: "event", event: event({
+      type: "process", sid: lateClaudeDetailSid, seq: 21,
+      item_id: "real-background-after-terminal", kind: "agent",
+      phase: "start", status: "running",
+      turn_id: "claude-late-detail-native",
+      title: "real background work",
+    }),
+  });
+  const withBackgroundProcess =
+    lateClaudeDetailState.runtimes[lateClaudeDetailSid].turns[0];
+  assert.equal(
+    withBackgroundProcess.blocks.find((block: Block) =>
+      block.kind === "process"
+      && block.item_id === "real-background-after-terminal")?.done,
+    false,
+    "genuine process activity after TurnEnd may reactivate the completed row",
+  );
+
+  lateClaudeDetailState = reduce(lateClaudeDetailState, {
+    type: "event", event: event({
+      type: "turn_detail", sid: lateClaudeDetailSid,
+      session_id: lateClaudeDetailSid,
+      turn_id: "claude-late-detail-turn",
+      revision: "claude-late-detail-r1",
+      authoritative: true,
+      before: null,
+      has_more: false,
+      oldest_cursor: null,
+      has_newer: false,
+      newer_cursor: null,
+      events: [{
+        ...event({
+          type: "tool_use", sid: lateClaudeDetailSid, seq: 10,
+          message_id: "old-detail-message",
+          tool_use_id: "old-detail-tool",
+          tool: "Read", input: { file_path: "old.md" },
+        }),
+      }],
+    }),
+  });
+  const afterLateClaudeDetail =
+    lateClaudeDetailState.runtimes[lateClaudeDetailSid].turns[0];
+  assert.equal(afterLateClaudeDetail.detailProjection?.blocks[0].done, true,
+    "TurnDetail arriving after TurnEnd closes its newly-installed old tool");
+  assert.equal(
+    afterLateClaudeDetail.blocks.find((block: Block) =>
+      block.kind === "process"
+      && block.item_id === "real-background-after-terminal")?.done,
+    false,
+    "old TurnDetail cannot close real background work that began after TurnEnd",
+  );
+
   const steeredTurnSid = "codex-turn-steered";
   const steeredNativeTurnId = "native-task-steered";
   let steeredTurnState = {
@@ -6431,6 +6917,7 @@ try {
       },
       cachedSixStepTurn,
     ],
+    "idle",
   );
   assert.deepEqual(
     twoCachedRestores.map((turn) => !!turn.detailRestorePending),
@@ -6464,7 +6951,7 @@ try {
     }, ...turn.blocks],
   }));
   const repeatedPromptRestores = restoreCachedTurnDetails(
-    repeatedPromptSummaries, repeatedPromptCaches);
+    repeatedPromptSummaries, repeatedPromptCaches, "idle");
   assert.deepEqual(
     repeatedPromptRestores.map(processFingerprint),
     [["process-0"], ["process-1"]],
@@ -6490,7 +6977,8 @@ try {
       done: true,
     }, ...repeatedPromptSummaries[index].blocks],
   }));
-  const aliasRestores = restoreCachedTurnDetails(aliasSummaries, aliasCaches);
+  const aliasRestores = restoreCachedTurnDetails(
+    aliasSummaries, aliasCaches, "idle");
   assert.deepEqual(
     aliasRestores.map(processFingerprint),
     [["native-process-a"], ["native-process-b"]],
@@ -7367,6 +7855,7 @@ try {
     (block: { kind: string; processKind?: string }) =>
       block.kind === "process" && block.processKind === "compaction"), true);
 
+  const testCompactionReducerRaces = () => {
   // A compact marker can reach the live optimistic row before the next
   // authoritative History head binds that row's native user-message id. The
   // reducer must reconcile those two identities instead of painting the same
@@ -7434,6 +7923,396 @@ try {
   assert.equal(compactDuplicateTurns[0].blocks.some(
     (block: { kind: string; processKind?: string }) =>
       block.kind === "process" && block.processKind === "compaction"), true);
+
+  const cachedCompactionSid = "canonical-history-repairs-cached-compaction";
+  const cachedCompactionOwner = {
+    ...canonicalCompactionOwner,
+    id: "cached-history-owner",
+    forkPointId: "cached-history-native",
+    blocks: [{ ...orphanCompactionBlock,
+      item_id: "cached-history-canonical-compact",
+      turn_id: "cached-history-native" }, {
+      kind: "text" as const,
+      message_id: "cached-history-final",
+      channel: "final" as const,
+      text: "canonical answer",
+      done: true,
+    }],
+  };
+  const cachedCompactionOrphan = {
+    ...completedCachedOrphan,
+    id: "cached-history-orphan",
+    blocks: [{ ...orphanCompactionBlock,
+      item_id: "cached-history-stale-compact",
+      turn_id: "cached-history-native" }],
+  };
+  let cachedCompactionState = reduce({
+    ...initialState,
+    focusedSid: cachedCompactionSid,
+    sessions: [{ session_id: cachedCompactionSid,
+      engine: "codex" as const, space: "code" as const }],
+  }, {
+    type: "hydrate_cache",
+    sid: cachedCompactionSid,
+    turns: [cachedCompactionOwner, cachedCompactionOrphan],
+    revision: "cached-history-revision",
+    generation: "cached-history-generation",
+  });
+  cachedCompactionState = reduce(cachedCompactionState, {
+    type: "event", event: event({
+      type: "history", sid: cachedCompactionSid,
+      session_id: cachedCompactionSid,
+      revision: "cached-history-revision",
+      generation: "cached-history-generation",
+      build_seq: 1,
+      live_seq: 1,
+      detail: "summary",
+      in_progress: false,
+      has_more: true,
+      oldest_id: "cached-history-cursor",
+      newest_id: "cached-history-owner",
+      events: [],
+      turns: [cachedCompactionOwner],
+    }),
+  });
+  assert.deepEqual(cachedCompactionState.runtimes[cachedCompactionSid].turns.map(
+    (turn: Turn) => turn.id), ["cached-history-owner", "cached-history-orphan"],
+  "the first-page reducer preserves a different bounded-out compaction occurrence");
+  assert.equal(cachedCompactionState.runtimes[cachedCompactionSid].hasMore, true,
+    "cache self-heal preserves authoritative moving-head pagination");
+  assert.equal(cachedCompactionState.runtimes[cachedCompactionSid].oldestId,
+    "cached-history-cursor",
+    "cache self-heal preserves the authoritative older-page cursor");
+  cachedCompactionState = reduce(cachedCompactionState, {
+    type: "event", event: event({
+      type: "history", sid: cachedCompactionSid,
+      session_id: cachedCompactionSid,
+      revision: "cached-history-revision",
+      generation: "cached-history-generation",
+      build_seq: 2,
+      live_seq: 1,
+      detail: "summary",
+      in_progress: false,
+      has_more: true,
+      oldest_id: "cached-history-cursor",
+      newest_id: "cached-history-owner",
+      events: [],
+      turns: [cachedCompactionOwner],
+    }),
+  });
+  assert.equal(cachedCompactionState.runtimes[cachedCompactionSid].turns.length, 2,
+    "repeated first-page History keeps the unmatched occurrence stable");
+
+  const orphanRaceProcess = (sid: string, nativeTurnId: string) => event({
+    type: "process", sid, item_id: `${sid}-compaction`,
+    kind: "compaction", phase: "end", status: "succeeded",
+    turn_id: nativeTurnId, title: "压缩上下文", seq: 10,
+  });
+  const assertCompactionRaceRepaired = (
+    label: string,
+    orderedEvents: ServerEvent[],
+    sid: string,
+    messageId: string,
+  ) => {
+    let raceState = {
+      ...initialState,
+      focusedSid: sid,
+      runtimes: { [sid]: { ...createRuntime(), state: "running" as const } },
+    };
+    for (const raceEvent of orderedEvents) {
+      raceState = reduce(raceState, { type: "event", event: raceEvent });
+    }
+    const turns = raceState.runtimes[sid].turns;
+    assert.equal(turns.length, 1, `${label} leaves one visible user row`);
+    assert.equal(turns[0].id, messageId);
+    assert.equal(turns[0].prompt, "继续修复问题");
+    assert.deepEqual(turns[0].blocks.flatMap((block: Block) =>
+      block.kind === "process" ? [block.processKind] : []),
+    ["compaction"], `${label} retains exactly one compact disclosure`);
+    assert.equal(turns[0].done, false,
+      `${label} keeps the user turn lifecycle rather than the orphan lifecycle`);
+    assert.deepEqual(
+      raceState.runtimes[sid].liveDetailTurnIds,
+      [messageId],
+      `${label} transfers observed detail ownership to the surviving row`,
+    );
+  };
+
+  for (const order of [
+    ["process", "user", "binding"],
+    ["process", "binding", "user"],
+    ["binding", "user", "process"],
+  ] as const) {
+    const sid = `compact-orphan-${order.join("-")}`;
+    const messageId = `${sid}-message`;
+    const nativeTurnId = `${sid}-native`;
+    const frames: Record<(typeof order)[number], ServerEvent> = {
+      process: orphanRaceProcess(sid, nativeTurnId),
+      user: event({ type: "user_msg", sid, msg_id: messageId,
+        prompt: "继续修复问题", seq: 11 }),
+      binding: event({ type: "turn_binding", sid, msg_id: messageId,
+        turn_id: nativeTurnId, seq: 9 }),
+    };
+    assertCompactionRaceRepaired(
+      order.join(" → "),
+      order.map((name) => frames[name]),
+      sid,
+      messageId,
+    );
+  }
+
+  const ownerBeforeOrphanSid = "compact-owner-before-orphan";
+  const ownerBeforeOrphanMessage = "compact-owner-before-orphan-message";
+  const ownerBeforeOrphanNative = "compact-owner-before-orphan-native";
+  let ownerBeforeOrphan = {
+    ...initialState,
+    focusedSid: ownerBeforeOrphanSid,
+    runtimes: {
+      [ownerBeforeOrphanSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        legacyLiveFallbackBlocked: true,
+        turns: [{
+          id: ownerBeforeOrphanMessage,
+          clientMsgId: ownerBeforeOrphanMessage,
+          prompt: "继续修复问题",
+          blocks: [],
+          done: false,
+        }],
+        liveDetailTurnIds: [],
+      },
+    },
+  };
+  const ownerBeforeOrphanRuntime = ownerBeforeOrphan.runtimes[
+    ownerBeforeOrphanSid];
+  const generatedOrphan = {
+    id: ownerBeforeOrphanNative,
+    prompt: "",
+    done: false,
+    blocks: [{ ...orphanCompactionBlock,
+      item_id: "owner-before-orphan-compact",
+      turn_id: ownerBeforeOrphanNative }],
+  };
+  ownerBeforeOrphan = {
+    ...ownerBeforeOrphan,
+    runtimes: {
+      ...ownerBeforeOrphan.runtimes,
+      [ownerBeforeOrphanSid]: {
+        ...ownerBeforeOrphanRuntime,
+        turns: [...ownerBeforeOrphanRuntime.turns, generatedOrphan],
+        liveDetailTurnIds: [generatedOrphan.id],
+      },
+    },
+  };
+  ownerBeforeOrphan = reduce(ownerBeforeOrphan, {
+    type: "event", event: event({
+      type: "turn_binding", sid: ownerBeforeOrphanSid,
+      msg_id: ownerBeforeOrphanMessage,
+      turn_id: ownerBeforeOrphanNative, seq: 11,
+    }),
+  });
+  assert.deepEqual(
+    ownerBeforeOrphan.runtimes[ownerBeforeOrphanSid].liveDetailTurnIds,
+    [ownerBeforeOrphanMessage],
+    "detail ownership follows the surviving user row when it precedes the orphan",
+  );
+
+  // Cache migrations can leave two legitimate rows with the same presentation
+  // id but distinct canonical aliases. Runtime bookkeeping must follow the
+  // exact removed object, not infer deletion from that colliding display id.
+  const collidingOrphanSid = "compact-orphan-colliding-display-id";
+  const collidingDisplayId = "shared-optimistic-display";
+  const collidingOwnerMessage = "colliding-owner-message";
+  const collidingNative = "colliding-compaction-native";
+  let collidingOrphanState = {
+    ...initialState,
+    focusedSid: collidingOrphanSid,
+    runtimes: {
+      [collidingOrphanSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        legacyLiveFallbackBlocked: true,
+        turns: [{
+          id: collidingDisplayId,
+          historyTurnId: "legitimate-canonical-row",
+          prompt: "unrelated legitimate row",
+          blocks: [],
+          done: true,
+        }, {
+          id: collidingOwnerMessage,
+          clientMsgId: collidingOwnerMessage,
+          prompt: "continue",
+          blocks: [],
+          done: false,
+        }, {
+          id: collidingDisplayId,
+          prompt: "",
+          blocks: [{ ...orphanCompactionBlock,
+            item_id: "colliding-compaction-item",
+            turn_id: collidingNative }],
+          done: false,
+        }],
+        hydratedCacheTurnIds: [collidingDisplayId],
+        liveDetailTurnIds: [collidingDisplayId],
+        liveOwner: { turnId: collidingDisplayId, seq: 29 },
+      },
+    },
+  };
+  collidingOrphanState = reduce(collidingOrphanState, {
+    type: "event", event: event({
+      type: "turn_binding", sid: collidingOrphanSid,
+      msg_id: collidingOwnerMessage, turn_id: collidingNative, seq: 30,
+    }),
+  });
+  assert.deepEqual(
+    collidingOrphanState.runtimes[collidingOrphanSid].turns.map(
+      (turn: Turn) => [turn.id, turn.historyTurnId, turn.prompt]),
+    [
+      [collidingDisplayId, "legitimate-canonical-row", "unrelated legitimate row"],
+      [collidingOwnerMessage, undefined, "continue"],
+    ],
+    "orphan reconciliation preserves a legitimate row with a colliding display id",
+  );
+  assert.deepEqual(
+    collidingOrphanState.runtimes[collidingOrphanSid].hydratedCacheTurnIds,
+    [collidingDisplayId, collidingOwnerMessage],
+    "a colliding retained cache id stays valid while orphan provenance transfers",
+  );
+  assert.deepEqual(
+    collidingOrphanState.runtimes[collidingOrphanSid].liveDetailTurnIds,
+    [collidingDisplayId, collidingOwnerMessage],
+    "a colliding retained id stays observed while exact orphan detail transfers",
+  );
+  assert.deepEqual(
+    collidingOrphanState.runtimes[collidingOrphanSid].liveOwner,
+    { turnId: collidingOwnerMessage, seq: 30 },
+    "live ownership follows the exact removed orphan despite a display-id collision",
+  );
+
+  const completedBeforeBindingSid = "compact-orphan-completed-before-binding";
+  const completedBeforeBindingMessage =
+    "compact-orphan-completed-before-binding-message";
+  const completedBeforeBindingNative =
+    "compact-orphan-completed-before-binding-native";
+  let completedBeforeBinding = {
+    ...initialState,
+    focusedSid: completedBeforeBindingSid,
+    runtimes: {
+      [completedBeforeBindingSid]: {
+        ...createRuntime(), state: "running" as const,
+      },
+    },
+  };
+  for (const completedEvent of [
+    orphanRaceProcess(completedBeforeBindingSid, completedBeforeBindingNative),
+    event({ type: "turn_end", sid: completedBeforeBindingSid,
+      turn_id: completedBeforeBindingNative, seq: 11,
+      result: { subtype: "success", duration_ms: 700, is_error: false } }),
+    event({ type: "user_msg", sid: completedBeforeBindingSid,
+      msg_id: completedBeforeBindingMessage,
+      prompt: "继续修复问题", seq: 12 }),
+    event({ type: "turn_binding", sid: completedBeforeBindingSid,
+      msg_id: completedBeforeBindingMessage,
+      turn_id: completedBeforeBindingNative, seq: 13 }),
+  ]) {
+    completedBeforeBinding = reduce(completedBeforeBinding, {
+      type: "event", event: completedEvent,
+    });
+  }
+  const completedBeforeBindingTurns =
+    completedBeforeBinding.runtimes[completedBeforeBindingSid].turns;
+  assert.equal(completedBeforeBindingTurns.length, 1,
+    "a TurnEnd which wins the race still cannot strand a compact-only row");
+  assert.equal(completedBeforeBindingTurns[0].id,
+    completedBeforeBindingMessage);
+  assert.equal(completedBeforeBindingTurns[0].done, true,
+    "the existing exact terminal binding remains authoritative after reconciliation");
+  assert.equal(completedBeforeBindingTurns[0].historyTurnId,
+    completedBeforeBindingNative,
+    "the completed native shell remains the History/detail lookup authority");
+
+  const terminalOrphanSid = "compact-orphan-after-final";
+  const terminalOrphanMessage = "compact-orphan-after-final-message";
+  const terminalOrphanNative = "compact-orphan-after-final-native";
+  let terminalOrphanState = {
+    ...initialState,
+    focusedSid: terminalOrphanSid,
+    runtimes: {
+      [terminalOrphanSid]: {
+        ...createRuntime(),
+        state: "running" as const,
+        liveDetailTurnIds: [terminalOrphanNative],
+      },
+    },
+  };
+  for (const terminalEvent of [
+    orphanRaceProcess(terminalOrphanSid, terminalOrphanNative),
+    event({ type: "assistant_msg_start", sid: terminalOrphanSid,
+      message_id: "terminal-orphan-final", channel: "final", seq: 11 }),
+    event({ type: "delta", sid: terminalOrphanSid,
+      message_id: "terminal-orphan-final", channel: "final",
+      text: "已经完成", seq: 12 }),
+    event({ type: "assistant_msg_end", sid: terminalOrphanSid,
+      message_id: "terminal-orphan-final", channel: "final", seq: 13 }),
+    event({ type: "turn_end", sid: terminalOrphanSid,
+      turn_id: terminalOrphanNative, seq: 14,
+      result: { subtype: "success", duration_ms: 800, is_error: false } }),
+    event({ type: "user_msg", sid: terminalOrphanSid,
+      msg_id: terminalOrphanMessage, prompt: "继续修复问题", seq: 15 }),
+    event({ type: "turn_binding", sid: terminalOrphanSid,
+      msg_id: terminalOrphanMessage, turn_id: terminalOrphanNative, seq: 16 }),
+    event({ type: "turn_binding", sid: terminalOrphanSid,
+      msg_id: terminalOrphanMessage, turn_id: terminalOrphanNative, seq: 16 }),
+  ]) {
+    terminalOrphanState = reduce(terminalOrphanState, {
+      type: "event", event: terminalEvent,
+    });
+  }
+  const terminalOrphanTurns =
+    terminalOrphanState.runtimes[terminalOrphanSid].turns;
+  assert.equal(terminalOrphanTurns.length, 1,
+    "the existing exact binding path may join the user and assistant rows once");
+  assert.equal(terminalOrphanTurns[0].prompt, "继续修复问题");
+  assert.equal(terminalOrphanTurns.filter((turn: Turn) =>
+    !turn.prompt && turn.blocks.every((block) => block.kind === "process"
+      && block.processKind === "compaction")).length, 0,
+  "final plus repeated binding leaves no standalone compaction-only row");
+  assert.equal(terminalOrphanTurns.some((turn: Turn) => turn.blocks.some(
+    (block) => block.kind === "text" && block.text === "已经完成")), true,
+  "ordinary promptless assistant content remains visible");
+
+  const ambiguousRaceSid = "compact-orphan-ambiguous-live";
+  const ambiguousRaceNative = "compact-orphan-ambiguous-native";
+  let ambiguousRaceState = {
+    ...initialState,
+    focusedSid: ambiguousRaceSid,
+    runtimes: {
+      [ambiguousRaceSid]: {
+        ...createRuntime(), state: "running" as const,
+        turns: [{
+          id: "ambiguous-orphan-one", prompt: "", done: false,
+          blocks: [{ ...orphanCompactionBlock,
+            item_id: "ambiguous-live-one", turn_id: ambiguousRaceNative }],
+        }, {
+          id: "ambiguous-orphan-two", prompt: "", done: false,
+          blocks: [{ ...orphanCompactionBlock,
+            item_id: "ambiguous-live-two", turn_id: ambiguousRaceNative }],
+        }],
+      },
+    },
+  };
+  ambiguousRaceState = reduce(ambiguousRaceState, {
+    type: "event", event: event({ type: "user_msg", sid: ambiguousRaceSid,
+      msg_id: "ambiguous-live-user", prompt: "continue", seq: 20 }),
+  });
+  ambiguousRaceState = reduce(ambiguousRaceState, {
+    type: "event", event: event({ type: "turn_binding", sid: ambiguousRaceSid,
+      msg_id: "ambiguous-live-user", turn_id: ambiguousRaceNative, seq: 21 }),
+  });
+  assert.equal(ambiguousRaceState.runtimes[ambiguousRaceSid].turns.length, 3,
+    "the reducer keeps every row when more than one compact orphan qualifies");
+  };
+  testCompactionReducerRaces();
 
   const fallbackHistory = reduce({
     ...liveHistory,
@@ -7623,6 +8502,82 @@ try {
   "correlated pagination is display-only and never prepends into runtime");
   assert.deepEqual(orderedHistory.historyBrowse?.turns.map(
     (turn: { id: string }) => turn.id), ["older-page", "new"]);
+
+  const testCrossPageCompactionRepair = () => {
+  // A polluted completed projection can span the byte boundary between the
+  // newest page and one older page. A shared native task does not prove that
+  // the compact-only row is the same occurrence, so preserve both rows while
+  // keeping page keys and cursors usable.
+  const compactBrowseSid = "compact-orphan-across-browse-pages";
+  const compactBrowseNative = "compact-browse-native";
+  const compactBrowseOwner: Turn = {
+    id: "compact-browse-owner",
+    forkPointId: compactBrowseNative,
+    prompt: "continue long work",
+    done: true,
+    blocks: [{ ...orphanCompactionBlock,
+      item_id: "compact-browse-canonical", turn_id: compactBrowseNative }],
+  };
+  let compactBrowse = reduce({
+    ...initialState,
+    focusedSid: compactBrowseSid,
+    runtimes: {
+      [compactBrowseSid]: {
+        ...createRuntime(),
+        turns: [compactBrowseOwner],
+        historyRevision: "compact-browse-rev",
+        historyGeneration: "compact-browse-generation",
+        hasMore: true,
+        oldestId: "compact-browse-cursor",
+      },
+    },
+  }, {
+    type: "begin_history_browse",
+    sid: compactBrowseSid,
+    scopeKey: "machine-a:code:codex",
+    revision: "compact-browse-rev",
+    generation: "compact-browse-generation",
+    viewId: "compact-browse-view",
+    basePageKey: "compact-browse-head",
+  });
+  compactBrowse = reduce(compactBrowse, {
+    type: "install_history_browse_page",
+    sid: compactBrowseSid,
+    scopeKey: "machine-a:code:codex",
+    revision: "compact-browse-rev",
+    generation: "compact-browse-generation",
+    viewId: "compact-browse-view",
+    windowEpoch: compactBrowse.historyBrowse!.windowEpoch,
+    before: "compact-browse-cursor",
+    page: {
+      pageKey: "compact-browse-older",
+      turns: [{
+        ...completedCachedOrphan,
+        id: "compact-browse-orphan",
+        blocks: [{ ...orphanCompactionBlock,
+          item_id: "compact-browse-stale", turn_id: compactBrowseNative }],
+      }],
+      hasOlder: false,
+      olderCursor: "compact-browse-floor",
+      newerPageKey: "compact-browse-head",
+    },
+  });
+  assert.deepEqual(compactBrowse.historyBrowse?.turns.map(
+    (turn: Turn) => turn.id), [
+      "compact-browse-orphan", "compact-browse-owner",
+    ],
+  "older-page materialization preserves a distinct compaction occurrence");
+  assert.deepEqual(compactBrowse.historyBrowse?.loadedPageKeys,
+    ["compact-browse-older", "compact-browse-head"],
+  "preserving the row does not erase page-link authority");
+  assert.equal(compactBrowse.historyBrowse?.hasOlder, false);
+  assert.equal(compactBrowse.historyBrowse?.olderCursor,
+    "compact-browse-floor");
+  assert.equal(compactBrowse.runtimes[compactBrowseSid].turns.length, 1,
+    "browse repair remains display-only and does not mutate the live runtime");
+  };
+  testCrossPageCompactionRepair();
+
   orderedHistory = reduce(orderedHistory, { type: "event", event: event({
     type: "history", sid: orderedHistorySid, session_id: orderedHistorySid,
     revision: "ordered-rev-new", generation: "wrapper-one",
@@ -12148,6 +13103,13 @@ try {
           liveTaskId: "shared-steer-task",
           blocks: [],
           done: false,
+        }, {
+          id: "stale-binding-compaction-orphan",
+          prompt: "",
+          blocks: [{ ...orphanCompactionBlock,
+            item_id: "stale-binding-compaction",
+            turn_id: "shared-steer-task" }],
+          done: false,
         }],
       },
     },
@@ -12162,6 +13124,12 @@ try {
       turn_id: "shared-steer-task",
     }),
   });
+  assert.equal(
+    staleBindingState.runtimes[staleBindingSid].turns.some((turn: Turn) =>
+      turn.id === "stale-binding-compaction-orphan"),
+    true,
+    "a stale predecessor binding cannot claim or delete an ambiguous compaction",
+  );
   staleBindingState = reduce(staleBindingState, {
     type: "event",
     event: event({
@@ -12172,12 +13140,15 @@ try {
       channel: "final",
     }),
   });
-  assert.equal(staleBindingState.runtimes[staleBindingSid].turns.length, 2);
-  assert.equal(staleBindingState.runtimes[staleBindingSid].turns[0].done, true);
+  assert.equal(staleBindingState.runtimes[staleBindingSid].turns.length, 3);
+  assert.equal(staleBindingState.runtimes[staleBindingSid].turns.find(
+    (turn: Turn) => turn.id === "initial-message")?.done, true);
+  const currentSteer = staleBindingState.runtimes[staleBindingSid].turns.find(
+    (turn: Turn) => turn.id === "current-steer");
   assert.equal(
-    staleBindingState.runtimes[staleBindingSid].turns[1].blocks[0].kind
+    currentSteer?.blocks[0].kind
       === "text"
-      ? staleBindingState.runtimes[staleBindingSid].turns[1].blocks[0].message_id
+      ? currentSteer.blocks[0].message_id
       : null,
     "current-steer-answer",
     "an older binding cannot reopen the completed predecessor",
@@ -12284,6 +13255,390 @@ try {
       ["different-native-message", "separate"],
     ],
     "unfinished exact ids still append while different ids remain distinct",
+  );
+
+  // Exact production reconnect race: IndexedDB paints an unfinished row whose
+  // stable assistant item is already present, then current-generation replay
+  // recreates the user/binding row after that old user boundary fell outside
+  // the ring. The assistant replay refreshes the cached row, while History
+  // paints the same canonical item onto the newly bound row. Both rows are
+  // live, but only the bound row is the current owner. Authoritative History
+  // must absorb the older projection even though it is not the physical tail.
+  const cachedReplaySid = "cached-replay-before-bound-owner";
+  const cachedReplayMessage =
+    "msg_0a40ae38f7d2caa1016a7d977a67408191b30c594107a3495c";
+  const cachedReplayUser = "msg_019ffa87-85cf-7f62-81f0-8a04cb4e782a";
+  const cachedReplayNative = "019ffa87-85a7-7093-8a2a-ce906d7b1a59";
+  let cachedReplayState = reduce({
+    ...initialState,
+    focusedSid: cachedReplaySid,
+    sessions: [{
+      session_id: cachedReplaySid,
+      engine: "codex" as const,
+      space: "code" as const,
+    }],
+  }, {
+    type: "hydrate_cache",
+    sid: cachedReplaySid,
+    revision: "cached-replay-r1",
+    generation: "cached-replay-g1",
+    turns: [{
+      id: "stale-indexeddb-projection",
+      prompt: "修复问题。",
+      done: false,
+      blocks: [{
+        kind: "text",
+        message_id: cachedReplayMessage,
+        channel: "commentary",
+        text: "",
+        done: false,
+      }],
+    }],
+  });
+  for (const reconnectEvent of [
+    event({
+      type: "snapshot",
+      sid: cachedReplaySid,
+      cc_session_id: cachedReplaySid,
+      generation: "cached-replay-g1",
+      state: "running",
+    }),
+    event({
+      type: "replay_start",
+      sid: cachedReplaySid,
+      generation: "cached-replay-g1",
+      from_seq: 19,
+      to_seq: 23,
+      truncated: false,
+    }),
+    event({
+      type: "user_msg",
+      sid: cachedReplaySid,
+      seq: 20,
+      msg_id: cachedReplayUser,
+      client_msg_id: "cached-replay-browser-message",
+      prompt: "修复问题。",
+    }),
+    event({
+      type: "turn_binding",
+      sid: cachedReplaySid,
+      seq: 21,
+      msg_id: cachedReplayUser,
+      turn_id: cachedReplayNative,
+    }),
+    event({
+      type: "assistant_msg_start",
+      sid: cachedReplaySid,
+      seq: 22,
+      message_id: cachedReplayMessage,
+      channel: "commentary",
+    }),
+    event({
+      type: "delta",
+      sid: cachedReplaySid,
+      seq: 23,
+      message_id: cachedReplayMessage,
+      channel: "commentary",
+      text: "浏览器全量测试仍在后台正常运行",
+    }),
+    event({
+      type: "assistant_msg_end",
+      sid: cachedReplaySid,
+      seq: 24,
+      message_id: cachedReplayMessage,
+      channel: "commentary",
+    }),
+    event({
+      type: "replay_end",
+      sid: cachedReplaySid,
+      to_seq: 24,
+      truncated: false,
+    }),
+  ]) {
+    cachedReplayState = reduce(cachedReplayState, {
+      type: "event",
+      event: reconnectEvent,
+    });
+  }
+  assert.deepEqual(
+    cachedReplayState.runtimes[cachedReplaySid].turns.map(
+      (turn: Turn) => turn.id),
+    ["stale-indexeddb-projection", cachedReplayUser],
+    "replay first exposes the cached item row and the separately bound user row",
+  );
+  cachedReplayState = reduce(cachedReplayState, {
+    type: "event",
+    event: event({
+      type: "history",
+      sid: cachedReplaySid,
+      session_id: cachedReplaySid,
+      revision: "cached-replay-r1",
+      generation: "cached-replay-g1",
+      build_seq: 2,
+      live_seq: 24,
+      detail: "summary",
+      authoritative: true,
+      has_more: true,
+      oldest_id: cachedReplayUser,
+      newest_id: cachedReplayUser,
+      in_progress: true,
+      events: [],
+      turns: [{
+        id: cachedReplayUser,
+        prompt: "修复问题。",
+        forkPointId: cachedReplayNative,
+        done: true,
+        blocks: [{
+          kind: "text",
+          message_id: cachedReplayMessage,
+          channel: "commentary",
+          text: "浏览器全量测试仍在后台正常运行",
+          done: true,
+        }],
+      }],
+    }),
+  });
+  const cachedReplayTurns =
+    cachedReplayState.runtimes[cachedReplaySid].turns;
+  assert.deepEqual(
+    cachedReplayTurns.map((turn: Turn) => ({
+      id: turn.id,
+      done: turn.done,
+      messages: turn.blocks.flatMap((block: Block) =>
+        block.kind === "text" ? [block.message_id] : []),
+    })),
+    [{
+      id: cachedReplayUser,
+      done: false,
+      messages: [cachedReplayMessage],
+    }],
+    "running History collapses the non-tail cached projection into its bound owner",
+  );
+  assert.deepEqual(
+    cachedReplayState.runtimes[cachedReplaySid].liveOwner,
+    { turnId: cachedReplayUser, seq: 21 },
+    "the surviving row remains the exact ordered live owner",
+  );
+  assert.deepEqual(
+    cachedReplayState.runtimes[cachedReplaySid].liveDetailTurnIds,
+    [cachedReplayUser],
+    "live detail provenance follows the row which survives cache self-healing",
+  );
+  cachedReplayState = reduce(cachedReplayState, {
+    type: "event",
+    event: event({
+      type: "history",
+      sid: cachedReplaySid,
+      session_id: cachedReplaySid,
+      revision: "cached-replay-r1",
+      generation: "cached-replay-g1",
+      build_seq: 3,
+      live_seq: 24,
+      detail: "summary",
+      authoritative: true,
+      has_more: true,
+      oldest_id: cachedReplayUser,
+      newest_id: cachedReplayUser,
+      in_progress: true,
+      events: [],
+      turns: [{
+        id: cachedReplayUser,
+        prompt: "修复问题。",
+        forkPointId: cachedReplayNative,
+        done: true,
+        blocks: [{
+          kind: "text",
+          message_id: cachedReplayMessage,
+          channel: "commentary",
+          text: "浏览器全量测试仍在后台正常运行",
+          done: true,
+        }],
+      }],
+    }),
+  });
+  assert.equal(
+    cachedReplayState.runtimes[cachedReplaySid].turns.length,
+    1,
+    "a second authoritative refresh cannot recreate the repaired projection",
+  );
+  cachedReplayState = reduce(cachedReplayState, {
+    type: "event",
+    event: event({
+      type: "assistant_msg_start",
+      sid: cachedReplaySid,
+      seq: 25,
+      message_id: "cached-replay-later-message",
+      channel: "commentary",
+    }),
+  });
+  assert.deepEqual(
+    cachedReplayState.runtimes[cachedReplaySid].turns[0].blocks.flatMap(
+      (block: Block) => block.kind === "text" ? [block.message_id] : []),
+    [cachedReplayMessage, "cached-replay-later-message"],
+    "later native items keep targeting the surviving row exactly once",
+  );
+
+  // A polluted cache can also leave an unrelated unfinished row after the
+  // current owner. The explicit liveOwner binding, not physical array order,
+  // decides which row may inherit History's running lifecycle.
+  const currentOwnerBeforeTail = mergeInitialHistory(
+    [{
+      id: "bound-history-owner",
+      prompt: "current request",
+      forkPointId: "bound-native-task",
+      done: true,
+      blocks: [{
+        kind: "text",
+        message_id: "bound-current-item",
+        channel: "commentary",
+        text: "current output",
+        done: true,
+      }],
+    }],
+    [{
+      id: "bound-current-owner",
+      historyTurnId: "bound-history-owner",
+      liveTaskId: "bound-native-task",
+      prompt: "current request",
+      done: false,
+      blocks: [{
+        kind: "text",
+        message_id: "bound-current-item",
+        channel: "commentary",
+        text: "current output",
+        done: true,
+      }],
+    }, {
+      id: "unrelated-open-tail",
+      prompt: "different request",
+      done: false,
+      blocks: [{
+        kind: "text",
+        message_id: "unrelated-open-item",
+        channel: "commentary",
+        text: "different output",
+        done: false,
+      }],
+    }],
+    {
+      preserveLiveTailOpen: true,
+      newestHistoryId: "bound-history-owner",
+      activeOwnerId: "bound-current-owner",
+      reconcileReplayOrphans: true,
+    },
+  );
+  assert.deepEqual(
+    currentOwnerBeforeTail.map((turn) => [turn.id, turn.done]),
+    [["bound-current-owner", false], ["unrelated-open-tail", false]],
+    "an explicit non-tail owner stays active without absorbing another row",
+  );
+
+  const duplicatePrimaryActiveProjection = mergeInitialHistory(
+    [{
+      id: "duplicate-primary-history",
+      prompt: "keep both duplicate blocks visible",
+      done: true,
+      blocks: [{
+        kind: "text",
+        message_id: "duplicate-primary-message",
+        channel: "commentary",
+        text: "one canonical occurrence",
+        done: true,
+      }],
+    }],
+    [{
+      id: "duplicate-primary-cache",
+      prompt: "keep both duplicate blocks visible",
+      done: false,
+      blocks: [0, 1].map(() => ({
+        kind: "text" as const,
+        message_id: "duplicate-primary-message",
+        channel: "commentary" as const,
+        text: "one canonical occurrence",
+        done: true,
+      })),
+    }, {
+      id: "duplicate-primary-owner",
+      historyTurnId: "duplicate-primary-history",
+      prompt: "keep both duplicate blocks visible",
+      done: false,
+      blocks: [{
+        kind: "text",
+        message_id: "duplicate-primary-message",
+        channel: "commentary",
+        text: "one canonical occurrence",
+        done: true,
+      }],
+    }],
+    {
+      preserveLiveTailOpen: true,
+      newestHistoryId: "duplicate-primary-history",
+      activeOwnerId: "duplicate-primary-owner",
+      reconcileReplayOrphans: true,
+    },
+  );
+  assert.equal(
+    duplicatePrimaryActiveProjection.some((turn) =>
+      turn.id === "duplicate-primary-cache"),
+    true,
+    "duplicate stable ids inside one projection remain unsafe to self-heal",
+  );
+
+  const distinctStableItemsStayDistinct = mergeInitialHistory(
+    [{
+      id: "distinct-items-history",
+      prompt: "two legitimate updates",
+      done: true,
+      blocks: [{
+        kind: "text",
+        message_id: "distinct-item-a",
+        channel: "commentary",
+        text: "same visible words",
+        done: true,
+      }, {
+        kind: "text",
+        message_id: "distinct-item-b",
+        channel: "commentary",
+        text: "same visible words",
+        done: true,
+      }],
+    }],
+    [{
+      id: "distinct-items-cache-a",
+      prompt: "two legitimate updates",
+      done: false,
+      blocks: [{
+        kind: "text",
+        message_id: "distinct-item-a",
+        channel: "commentary",
+        text: "same visible words",
+        done: true,
+      }],
+    }, {
+      id: "distinct-items-owner",
+      historyTurnId: "distinct-items-history",
+      prompt: "two legitimate updates",
+      done: false,
+      blocks: [{
+        kind: "text",
+        message_id: "distinct-item-b",
+        channel: "commentary",
+        text: "same visible words",
+        done: true,
+      }],
+    }],
+    {
+      preserveLiveTailOpen: true,
+      newestHistoryId: "distinct-items-history",
+      activeOwnerId: "distinct-items-owner",
+      reconcileReplayOrphans: true,
+    },
+  );
+  assert.deepEqual(
+    distinctStableItemsStayDistinct[0].blocks.flatMap((block) =>
+      block.kind === "text" ? [block.message_id] : []),
+    ["distinct-item-a", "distinct-item-b"],
+    "self-healing uses stable ids and preserves equal-text native occurrences",
   );
 
   // The first running summary can race ahead of every visible item. With no
@@ -13105,6 +14460,7 @@ try {
       },
     ],
     restoredSteerSegments.slice(0, 2),
+    "idle",
   );
   assert.deepEqual(
     restoredCachedSteerSegments[0].detailProjection?.blocks.flatMap((block) =>
@@ -13441,6 +14797,41 @@ try {
     onLoadDetail: () => {},
   }));
   assert.doesNotMatch(loadedDetailMarkup, /展开完整过程/);
+  const repairedDeferredDetail = mergeInitialHistory([{
+    id: "native-summary-turn",
+    clientMsgId: "browser-turn",
+    prompt: "修复问题。",
+    done: true,
+    detailEventCount: 93,
+    detailLoaded: false,
+    blocks: [{
+      kind: "text", message_id: "native-final", channel: "final",
+      text: "已经修复。", done: true,
+    }],
+  }], [{
+    id: "browser-turn",
+    historyTurnId: "native-summary-turn",
+    prompt: "修复问题。",
+    done: true,
+    // A stale cache flag without its former projection is the production
+    // failure shape: it must not suppress the server-advertised process shell.
+    detailLoaded: true,
+    blocks: [{
+      kind: "text", message_id: "native-final", channel: "final",
+      text: "已经修复。", done: true,
+    }],
+  }])[0];
+  assert.equal(repairedDeferredDetail.detailEventCount, 93);
+  assert.equal(repairedDeferredDetail.detailLoaded, false,
+    "a stale loaded bit without payload cannot erase deferred process history");
+  const repairedDeferredMarkup = renderToStaticMarkup(createElement(ChatView, {
+    sid: "repaired-summary-session",
+    turns: [repairedDeferredDetail],
+    engine: "codex", onEdit: () => {}, onGetDiff: () => {},
+    onLoadDetail: () => {},
+  }));
+  assert.match(repairedDeferredMarkup, /已处理/);
+  assert.match(repairedDeferredMarkup, /93 项/);
   const failedInterruptedMarkup = renderToStaticMarkup(createElement(ChatView, {
     sid: "failed-interrupted-session",
     turns: [{
@@ -13925,6 +15316,45 @@ try {
   });
   assert.equal(refocusedPlan?.block.item_id, "structured-plan",
     "A -> B -> A navigation retains the Plan omitted by full turn detail");
+  assert.equal(planCache.resolve({
+    machineId: "machine-b",
+    engine: "codex",
+    space: "code",
+    sid: "plan-session-a",
+    runtime: null,
+    history: null,
+    runtimeTurns: [planOwnerAfterDetail],
+    historyTurns: [planOwnerAfterDetail],
+    recovering: true,
+    runtimeLoading: true,
+  }), null,
+  "the same native sid on another machine cannot inherit a retained Plan");
+  assert.equal(planCache.resolve({
+    machineId: "legacy",
+    engine: "claude",
+    space: "code",
+    sid: "plan-session-a",
+    runtime: null,
+    history: null,
+    runtimeTurns: [planOwnerAfterDetail],
+    historyTurns: [planOwnerAfterDetail],
+    recovering: true,
+    runtimeLoading: true,
+  }), null,
+  "the same sid on another engine cannot inherit a retained Plan");
+  assert.equal(planCache.resolve({
+    machineId: "legacy",
+    engine: "codex",
+    space: "work",
+    sid: "plan-session-a",
+    runtime: null,
+    history: null,
+    runtimeTurns: [planOwnerAfterDetail],
+    historyTurns: [planOwnerAfterDetail],
+    recovering: true,
+    runtimeLoading: true,
+  }), null,
+  "the same sid in Work cannot inherit Code's retained Plan");
   assert.equal(planProgressPresentation(refocusedPlan!.block).progressLabel,
     "1 / 2");
   assert.equal(refocusedPlan?.needsDetail, false,
@@ -13963,8 +15393,12 @@ try {
     assert.equal(planProgressPresentation(
       livePlanAfterStaleDetail!.block).progressLabel, "2 / 3",
     `a late detail cannot roll back the Plan in ${location}`);
+    assert.equal(livePlanAfterStaleDetail!.block.plan?.find(
+      (entry) => entry.status === "inProgress")?.step, "完成验证",
+    "the newer raw step survives even though its owning turn is terminal");
     assert.equal(planProgressPresentation(
-      livePlanAfterStaleDetail!.block).currentStep, "完成验证");
+      livePlanAfterStaleDetail!.block).stateLabel,
+    "本轮已结束，计划未更新");
   }
   const completedDetailPlan: Block = {
     ...staleDetailPlan,
@@ -16056,8 +17490,10 @@ assert.match(appSource, /\{space === "work" \? "Work" : "Code"\}/);
 assert.match(appSource, /<button className="engine-toggle" onClick=\{toggleEngine\}/);
 assert.match(appSource, /setNewChatAutoFocus\(false\)/,
   "switching engines must not summon the new-chat keyboard");
-assert.match(appSource, /prepareSurfaceSwitch\(nextEngine, space\)/,
-  "engine switches must restore their own remembered surface session");
+assert.match(appSource, /prepareSurfaceSwitch\(nextEngine, nextSpace\)/,
+  "engine switches must restore the target engine's remembered surface session");
+assert.match(appSource, /spacesByEngineRef\.current\[nextEngine\]/,
+  "engine switches must remember Code/Work independently");
 assert.match(appSource, /prepareSurfaceSwitch\(engine, next\)/,
   "Work/Code switches must share the remembered-session restoration path");
 assert.match(appSource,
@@ -16181,6 +17617,16 @@ assert.match(appSource, /space === "work" \? "never" : permissionMode/,
   "the atomic new-session wire must retain the authoritative Work policy");
 const composerSource = readFileSync(
   resolve(process.cwd(), "src/components/Composer.tsx"), "utf8");
+for (const [surface, source] of [
+  ["session composer", composerSource],
+  ["new chat", newChatSource],
+  ["BTW", btwPanelSource],
+] as const) {
+  assert.match(source, /\buuid\(\)/,
+    `${surface} long pastes must use the insecure-origin UUID fallback`);
+  assert.doesNotMatch(source, /crypto\.randomUUID\(/,
+    `${surface} must remain usable over supported private-IP HTTP origins`);
+}
 assert.match(composerSource, /<PendingImageAttachments/,
   "session drafts must expose the shared interactive image preview");
 assert.match(composerSource, /workSurface \? \(/);

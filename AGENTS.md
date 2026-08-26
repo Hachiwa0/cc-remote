@@ -54,7 +54,7 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   transport, never the caller's Origin. Uvicorn trusts forwarded transport
   metadata only from loopback Caddy. Never put tokens in URLs or protocol
   message bodies; logging redacts token/password fields.
-- **Protocol version gate**: current wire protocol v34 is declared by
+- **Protocol version gate**: current wire protocol v35 is declared by
   `PROTOCOL_VERSION` in both `protocol.py` and `web/src/protocol.ts`.
   `deserialize` hard-rejects a version mismatch, and
   `_Base` is `extra="forbid"`, so ANY protocol change must be deployed to all
@@ -113,7 +113,12 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
   hello sends lightweight resident `Snapshot`s; reconnect cursors replay only
   the bounded missing live tail. Source fingerprints invalidate appended pages,
   and rollback explicitly invalidates both server and browser projections. These
-  reads never spawn/resume an engine or create a model turn.
+  reads never spawn/resume an engine or create a model turn. Codex
+  `History.terminal_fences` is a separate bounded lifecycle projection: only a
+  real app-server terminal or a source-validated rollout marker may enter it;
+  local synthetic failures may not. The browser applies a fence only to its
+  exact native turn identity and never changes completion receipts or guesses
+  from the last open row.
 - **Token-aware residency**: resuming an evicted Claude SDK session may rebuild
   a cold prompt cache, so it only happens on first spawn / re-focus after
   eviction; raising the cap trades RAM for fewer cold re-sends. Codex context is
@@ -132,8 +137,9 @@ local `claude` or `codex` session through a WebSocket relay. Two independent lin
 - `cc_remote/log.py` — JSON logging with token redaction; use `logger("...")`.
 - `cc_remote/wrapper/` — `sdk.py` / `stream.py` and `claude_*` implement Claude;
   `codex_handle.py` / `codex_stream.py` / `codex_daemon.py` / `codex_external.py`
-  implement the official Codex app-server paths; `history_store.py` owns the
-  rebuildable SQLite projection; `machine.py`, `command_router.py`,
+  implement the official Codex app-server paths; `codex_lifecycle.py` owns the
+  source-bound exact-terminal ledger; `history_store.py` owns the rebuildable
+  SQLite projection; `machine.py`, `command_router.py`,
   `session_ctx.py`, `ringbuffer.py`, `transport.py`, and `session.py` provide
   the shared session pool, command dispatch, live replay, relay transport, and
   persistence.

@@ -48,7 +48,8 @@ export function normalizeSessionList(
   const retained = unavailableProfileIds.size === 0
     ? []
     : previousSessions.filter((session) =>
-      session.engine === "codex"
+      !session.provisional_fork
+      && session.engine === "codex"
       && (session.space ?? "code") === listedSpace
       && !!session.codex_profile_id
       && configuredProfileIds.has(session.codex_profile_id)

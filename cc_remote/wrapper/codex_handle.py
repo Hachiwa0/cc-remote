@@ -72,6 +72,7 @@ from cc_remote.wrapper.work_prompt import (
     WORK_BASE_INSTRUCTIONS,
     WORK_DEVELOPER_INSTRUCTIONS,
 )
+from cc_remote.wrapper.work_context import recover_codex_context_usage
 
 log = logger("cc_remote.wrapper.codex_handle")
 
@@ -79,6 +80,7 @@ _REQ_TIMEOUT = 60.0
 _APPROVAL_TIMEOUT = 5 * 60.0
 _MAX_SERVER_REQUEST_TASKS = 32
 _THREAD_SETTINGS_NOTIFY_TIMEOUT = 1.0
+_CONFIGURED_DEFAULT_EFFORT_CACHE_SECONDS = 30.0
 _OWNED_TURN_IDS_MAX = 512
 _STATUS_RATE_LIMIT_MAX = 16
 _STATUS_USAGE_BUCKET_SCAN_MAX = 4096
@@ -106,6 +108,7 @@ _WORK_MCP_SERVER_LIMIT = 128
 _WORK_PATH_MAX = 4096
 _WORK_NAME_MAX = 256
 _COMPACTION_CONTINUATION_GRACE_SECONDS = 5.0
+_COMPACTION_CONTINUATION_PROBE_TIMEOUT_SECONDS = 1.0
 _GOAL_PROMPT_CANDIDATE_TTL_SECONDS = 30.0
 _PROXY_HANDSHAKE_MAX = 16 * 1024
 _PROXY_HANDSHAKE_TIMEOUT = 5.0
@@ -479,6 +482,7 @@ class _CodexCompactionContinuation:
         "candidate_turn_id",
         "candidate_started",
         "candidate_size",
+        "probing",
         "settled",
         "expiry_task",
     )
@@ -506,6 +510,7 @@ class _CodexCompactionContinuation:
         self.candidate_turn_id: Optional[str] = None
         self.candidate_started: Optional[dict] = None
         self.candidate_size: Optional[int] = None
+        self.probing = False
         self.settled = asyncio.Event()
         self.settled.set()
         self.expiry_task: Optional[asyncio.Task] = None
@@ -1114,6 +1119,39 @@ def _append_openai_http_resume_provider(argv: list[str]) -> None:
     ])
 
 
+def _openai_http_resume_thread_config() -> dict[str, Any]:
+    """Register the HTTP compatibility alias in one thread configuration.
+
+    ``thread/resume.config`` is evaluated by the app-server which owns the
+    thread.  Supplying the alias there lets a shared daemon select official
+    Responses HTTP without writing the user's config.toml or starting a second
+    independently writable app-server.
+    """
+    return {
+        "model_providers": {
+            _OPENAI_HTTP_RESUME_PROVIDER_ID: {
+                "name": "cc-remote OpenAI HTTP",
+                "base_url": _OPENAI_HTTP_RESUME_BASE_URL,
+                "wire_api": "responses",
+                "requires_openai_auth": True,
+                "supports_websockets": False,
+            },
+        },
+    }
+
+
+def _code_thread_config(
+    *, http_only_resume: bool, web_search: Optional[str],
+) -> Optional[dict[str, Any]]:
+    """Compose independent Code-time overrides without losing either one."""
+    config: dict[str, Any] = {}
+    if http_only_resume:
+        config.update(_openai_http_resume_thread_config())
+    if web_search:
+        config["web_search"] = web_search
+    return config or None
+
+
 def _semantic_version(value: Optional[str]) -> tuple[int, ...]:
     """Return the numeric release prefix used for app-server feature gates."""
     if not isinstance(value, str):
@@ -1352,6 +1390,7 @@ class CodexHandle:
         self._thread_deleted_ids: Optional[list[str]] = None
         self.thread_delete_notifications_overflowed = False
         self._thread_delete_done = asyncio.Event()
+        self._thread_settings_revision = 0
         # Human approval can take minutes.  It must not block the sole stdout
         # reader, which still has to consume turn/interrupt and other RPC replies.
         # Keep detached request handlers generation-owned and cancel them on
@@ -1389,6 +1428,7 @@ class CodexHandle:
         self._http_provider_repair_stop = asyncio.Event()
         self.last_token_usage: Optional[dict] = None
         self.context_window: Optional[int] = None
+        self._rollout_context_recovery_attempted = False
         self.app_server_version: Optional[str] = None
         self.last_thread_status: Optional[dict] = None
         self.last_rate_limits: Optional[dict] = None
@@ -1423,15 +1463,43 @@ class CodexHandle:
         # turn. Config.toml is read-only here and supplies fresh-thread defaults.
         # Codex equivalents of cc's model / effort / permission-mode. Defaults come
         # from ~/.codex/config.toml; the client overrides them via set_* .
-        self.model: Optional[str] = (
+        configured_model = (
             codex_model() if self.codex_home is None
             else codex_model(codex_home=self.codex_home)
         )
-        self.effort: Optional[str] = (
+        self.model: Optional[str] = configured_model or None
+        configured_effort = (
             codex_effort() if self.codex_home is None
             else codex_effort(codex_home=self.codex_home)
-        )         # low | medium | high | xhigh
+        )
+        self.effort: Optional[str] = configured_effort or None
         self.applied_effort = self.effort                   # keep machine's spawn-time check a no-op
+        # UI projection may be ``model-default`` when app-server reports a null
+        # thread override and its effective config has no explicit fallback.
+        # Query must continue to use only ``effort``; never send that display
+        # sentinel to turn/start.
+        self.display_effort: Optional[str] = self.effort
+        self.display_effort_model: Optional[str] = (
+            self.model if self.display_effort else None
+        )
+        self.display_effort_cwd: Optional[str] = (
+            os.path.realpath(self._cwd)
+            if self.display_effort and isinstance(self._cwd, str) and self._cwd
+            else None
+        )
+        self.display_effort_generation: Optional[int] = (
+            self._generation if self.display_effort else None
+        )
+        self._display_effort_retry_at: Optional[float] = None
+        # A null thread override falls through to app-server's effective config
+        # before the selected model's catalog default. Cache that read per cwd
+        # and app-server generation; it is presentation state only and must not
+        # become a turn/start override.
+        self._configured_default_effort: Optional[str] = None
+        self._configured_default_effort_cwd: Optional[str] = None
+        self._configured_default_effort_generation: Optional[int] = None
+        self._configured_default_effort_read_at: Optional[float] = None
+        self._configured_default_effort_known = False
         # Work is governed by its per-process named permission profile. It must
         # never fall back to interactive escalation outside that profile, even
         # when a resumed native thread persisted a Code-time approval policy.
@@ -1682,6 +1750,26 @@ class CodexHandle:
         self._discard_managed_compaction_continuation()
         self.last_token_usage = None
         self.context_window = None
+        self._rollout_context_recovery_attempted = False
+        self._configured_default_effort = None
+        self._configured_default_effort_cwd = None
+        self._configured_default_effort_generation = None
+        self._configured_default_effort_read_at = None
+        self._configured_default_effort_known = False
+        if self.effort:
+            self.display_effort = self.effort
+            self.display_effort_model = self.model
+            self.display_effort_cwd = (
+                os.path.realpath(self._cwd)
+                if isinstance(self._cwd, str) and self._cwd else None
+            )
+            self.display_effort_generation = self._generation
+        else:
+            self.display_effort = None
+            self.display_effort_model = None
+            self.display_effort_cwd = None
+            self.display_effort_generation = None
+        self._display_effort_retry_at = None
         self._stderr_task = asyncio.create_task(
             self._drain_stderr(proc, generation))
         try:
@@ -1720,11 +1808,7 @@ class CodexHandle:
         codex_bin = await asyncio.to_thread(_resolve_codex_bin)
         private_core = None
         http_only_resume = False
-        if (
-            not self.work_mode
-            and not self._daemon_proxy_established
-            and not control_only
-        ):
+        if not self.work_mode:
             http_only_resume = await asyncio.to_thread(
                 _oversized_desktop_openai_resume_requires_http,
                 resume_id,
@@ -1732,6 +1816,7 @@ class CodexHandle:
                 _oversized_desktop_openai_resume_requires_http,
                 resume_id, self.codex_home,
             )
+        if not self.work_mode and not self._daemon_proxy_established:
             private_core = await asyncio.to_thread(
                 _newer_private_core_for_oversized_resume,
                 codex_bin,
@@ -1741,13 +1826,16 @@ class CodexHandle:
                 codex_bin,
                 resume_id, self.codex_home,
             )
-            if private_core is not None:
-                codex_bin = private_core
+        # The managed binary owns the shared daemon.  A newer desktop core is
+        # only a private-stdio fallback if no shared control plane is available;
+        # choosing it before probing the daemon would split terminal and Web
+        # into two independently writable app-servers for every large thread.
+        stdio_codex_bin = private_core or codex_bin
         self._http_provider_root_id = resume_id if http_only_resume else None
         if http_only_resume:
             self._http_provider_repair_stop.clear()
         child_env = _profile_codex_env(codex_bin, self.codex_home)
-        stdio_argv = [codex_bin, "app-server", "--stdio"]
+        stdio_argv = [stdio_codex_bin, "app-server", "--stdio"]
         if http_only_resume:
             _append_openai_http_resume_provider(stdio_argv)
             log.info(
@@ -1774,13 +1862,18 @@ class CodexHandle:
                 "-c", "permissions.cc_remote_work.network.enabled=false",
             ])
         proxy_argv: Optional[list[str]] = None
-        strict_shared = False
-        if (private_core is None and not http_only_resume and not self.work_mode
-                and self.daemon_mode == "auto"):
+        strict_shared = bool(
+            getattr(
+                self.daemon_manager,
+                "strict_shared_affinity",
+                False,
+            )
+        )
+        if not self.work_mode and self.daemon_mode == "auto":
             try:
                 proxy_argv = await self.daemon_manager.proxy_args(
                     codex_bin, child_env)
-                strict_shared = bool(
+                strict_shared = strict_shared or bool(
                     getattr(
                         self.daemon_manager,
                         "strict_shared_affinity",
@@ -1792,16 +1885,27 @@ class CodexHandle:
                 # silently severing the terminal CLI <-> Remote live channel.
                 raise
             except Exception as exc:
+                strict_shared = strict_shared or bool(
+                    getattr(
+                        self.daemon_manager,
+                        "strict_shared_affinity",
+                        False,
+                    )
+                )
+                if strict_shared:
+                    raise
                 log.warning(
                     "Codex daemon preparation failed; using stdio",
                     error_type=type(exc).__name__,
                 )
         attempts = (
-            [(proxy_argv, True), (stdio_argv, False)]
-            if proxy_argv is not None else [(stdio_argv, False)]
+            [(proxy_argv, True, codex_bin),
+             (stdio_argv, False, stdio_codex_bin)]
+            if proxy_argv is not None
+            else [(stdio_argv, False, stdio_codex_bin)]
         )
         if strict_shared and proxy_argv is not None:
-            attempts = [(proxy_argv, True)]
+            attempts = [(proxy_argv, True, codex_bin)]
         if self._daemon_proxy_established:
             if proxy_argv is None:
                 raise RuntimeError(
@@ -1809,15 +1913,15 @@ class CodexHandle:
             # A previously shared thread must never reconnect through private
             # stdio.  Leave the handle disconnected and let Machine retry the
             # shared proxy instead of manufacturing a false external-CLI lock.
-            attempts = [(proxy_argv, True)]
+            attempts = [(proxy_argv, True, codex_bin)]
         if control_only:
             if proxy_argv is None:
                 raise RuntimeError(
                     "shared Codex app-server proxy is unavailable"
                 )
-            attempts = [(proxy_argv, True)]
+            attempts = [(proxy_argv, True, codex_bin)]
         initialized: Any = None
-        for argv, daemon_proxy in attempts:
+        for argv, daemon_proxy, attempt_codex_bin in attempts:
             self._shared_resume_binding_thread_id = (
                 resume_id
                 if daemon_proxy and resume_id and not fork
@@ -1825,7 +1929,7 @@ class CodexHandle:
             )
             try:
                 await self._open_process(
-                    argv, codex_bin, daemon_proxy=daemon_proxy)
+                    argv, attempt_codex_bin, daemon_proxy=daemon_proxy)
                 initialized = await self._request(
                     "initialize", _initialize_params())
                 self.app_server_version = _app_server_version(initialized)
@@ -1880,6 +1984,7 @@ class CodexHandle:
                 )
                 self._work_config = _work_thread_config(
                     skills_response, config_response)
+                self._remember_configured_default_effort(config_response)
 
             if fork and resume_id:
                 # ephemeral /btw fork: inherits resume_id's context into a throwaway
@@ -1892,10 +1997,14 @@ class CodexHandle:
                 }
                 if self.permission_profile:
                     fork_params["permissions"] = self.permission_profile
-                if not self.work_mode and self.web_search_override:
-                    fork_params["config"] = {
-                        "web_search": self.web_search_override,
-                    }
+                code_config = _code_thread_config(
+                    http_only_resume=http_only_resume,
+                    web_search=(
+                        None if self.work_mode else self.web_search_override
+                    ),
+                )
+                if code_config is not None:
+                    fork_params["config"] = code_config
                 if http_only_resume:
                     fork_params["modelProvider"] = (
                         _OPENAI_HTTP_RESUME_PROVIDER_ID)
@@ -1944,10 +2053,13 @@ class CodexHandle:
                         "config": self._work_config,
                         "permissions": "cc_remote_work",
                     })
-                elif self.web_search_override:
-                    resume_params["config"] = {
-                        "web_search": self.web_search_override,
-                    }
+                else:
+                    code_config = _code_thread_config(
+                        http_only_resume=http_only_resume,
+                        web_search=self.web_search_override,
+                    )
+                    if code_config is not None:
+                        resume_params["config"] = code_config
                 if _supports_lightweight_resume(self.app_server_version):
                     # Since Codex 0.144.6, excludeTurns is the official way for
                     # clients with a paged history UI to resume a live thread.
@@ -2652,6 +2764,18 @@ class CodexHandle:
         item = params.get("item") if isinstance(params, dict) else None
         return isinstance(item, dict) and item.get("type") == "userMessage"
 
+    @staticmethod
+    def _notification_is_context_compaction(message: dict) -> bool:
+        """Recognize the current authoritative app-server compact item."""
+        if message.get("method") != "item/completed":
+            return False
+        params = message.get("params")
+        item = params.get("item") if isinstance(params, dict) else None
+        return (
+            isinstance(item, dict)
+            and item.get("type") == "contextCompaction"
+        )
+
     def _managed_compaction_fence_current(
         self,
         fence: Optional[_CodexCompactionContinuation] = None,
@@ -2674,6 +2798,7 @@ class CodexHandle:
         if (
             check_deadline
             and fence.awaiting_replacement
+            and not fence.probing
             and fence.deadline > 0
             and asyncio.get_running_loop().time() > fence.deadline
         ):
@@ -2746,7 +2871,11 @@ class CodexHandle:
         try:
             await asyncio.wait_for(
                 fence.settled.wait(),
-                timeout=remaining + 0.25,
+                timeout=(
+                    remaining
+                    + _COMPACTION_CONTINUATION_PROBE_TIMEOUT_SECONDS
+                    + 0.25
+                ),
             )
         except asyncio.TimeoutError:
             if self._managed_compaction_continuation is fence:
@@ -2761,7 +2890,58 @@ class CodexHandle:
                 fence.deadline - asyncio.get_running_loop().time(),
             )
             await asyncio.sleep(delay)
-            if self._managed_compaction_continuation is fence:
+            if (
+                self._managed_compaction_continuation is not fence
+                or not fence.awaiting_replacement
+                or not self._managed_compaction_fence_current(
+                    fence, check_deadline=False)
+            ):
+                return
+            fence.probing = True
+            still_running = False
+            try:
+                still_running = await asyncio.wait_for(
+                    self._probe_managed_compaction_continuation(fence),
+                    timeout=(
+                        _COMPACTION_CONTINUATION_PROBE_TIMEOUT_SECONDS
+                    ),
+                )
+            except asyncio.TimeoutError:
+                pass
+            except Exception as exc:
+                log.warning(
+                    "Codex compaction continuation probe failed",
+                    error_type=type(exc).__name__,
+                )
+            finally:
+                fence.probing = False
+
+            if self._managed_compaction_continuation is not fence:
+                return
+            if (
+                still_running
+                and fence.awaiting_replacement
+                and self._managed_compaction_fence_current(
+                    fence, check_deadline=False)
+            ):
+                # The official status endpoints prove that the exact native
+                # turn is still in progress. Drop only the compact-interrupt
+                # shell; the eventual real terminal remains authoritative.
+                fence.awaiting_replacement = False
+                fence.suppressed_terminal = None
+                fence.suppressed_size = None
+                fence.settled.set()
+                fence.expiry_task = None
+                self._compaction_continuation_turn_id = None
+                return
+            # ``_request`` replies are dispatched by the sole stdout reader.
+            # A continuation item may therefore have confirmed this fence
+            # while the final probe reply was being delivered. Never replay
+            # the previously suppressed terminal after that confirmation.
+            if (
+                fence.awaiting_replacement
+                and not fence.settled.is_set()
+            ):
                 await self._release_managed_compaction_continuation()
         except asyncio.CancelledError:
             return
@@ -2770,6 +2950,50 @@ class CodexHandle:
                 "Codex compaction continuation expiry failed",
                 error_type=type(exc).__name__,
             )
+
+    async def _probe_managed_compaction_continuation(
+        self, fence: _CodexCompactionContinuation,
+    ) -> bool:
+        """Prove once that a compact-interrupted native turn is still active.
+
+        This runs only in the detached expiry task. Never await these requests
+        from ``_dispatch``: their replies are consumed by the same stdout reader.
+        """
+        if not self._managed_compaction_fence_current(
+            fence, check_deadline=False,
+        ):
+            return False
+        response = await self._request("thread/read", {
+            "threadId": fence.thread_id,
+            "includeTurns": False,
+        })
+        thread = response.get("thread") if isinstance(response, dict) else None
+        status = thread.get("status") if isinstance(thread, dict) else None
+        if (
+            not isinstance(thread, dict)
+            or thread.get("id") != fence.thread_id
+            or not isinstance(status, dict)
+            or status.get("type") != "active"
+            or not self._managed_compaction_fence_current(
+                fence, check_deadline=False)
+        ):
+            return False
+        page = await self._request("thread/turns/list", {
+            "threadId": fence.thread_id,
+            "cursor": None,
+            "limit": 1,
+            "sortDirection": "desc",
+            "itemsView": "notLoaded",
+        })
+        turns = page.get("data") if isinstance(page, dict) else None
+        latest = turns[0] if isinstance(turns, list) and len(turns) == 1 else None
+        return bool(
+            isinstance(latest, dict)
+            and latest.get("id") == fence.native_turn_id
+            and latest.get("status") == "inProgress"
+            and self._managed_compaction_fence_current(
+                fence, check_deadline=False)
+        )
 
     def _arm_managed_compaction_continuation(
         self, native_turn_id: str,
@@ -2820,6 +3044,7 @@ class CodexHandle:
             or not fence.awaiting_replacement
             or not self._managed_compaction_fence_current(fence)
             or _notification_turn_id(message) != fence.native_turn_id
+            or self._notification_is_context_compaction(message)
             or message.get("method") in {
                 "turn/completed", "thread/compacted", "error",
             }
@@ -3725,6 +3950,7 @@ class CodexHandle:
         Granular approval objects are preserved in ``approval_policy`` while the
         current UI receives their lossless-compatible ``on-request`` projection.
         """
+        self._thread_settings_revision += 1
         cwd = settings.get("cwd")
         if (isinstance(cwd, str) and os.path.isabs(cwd)
                 and 0 < len(cwd) <= 4096):
@@ -3740,9 +3966,22 @@ class CodexHandle:
             if effort is None:
                 self.effort = None
                 self.applied_effort = None
+                self.display_effort = None
+                self.display_effort_model = None
+                self.display_effort_cwd = None
+                self.display_effort_generation = None
+                self._display_effort_retry_at = None
             elif isinstance(effort, str) and effort:
                 self.effort = effort[:64]
                 self.applied_effort = self.effort
+                self.display_effort = self.effort
+                self.display_effort_model = self.model
+                self.display_effort_cwd = (
+                    os.path.realpath(self._cwd)
+                    if isinstance(self._cwd, str) and self._cwd else None
+                )
+                self.display_effort_generation = self._generation
+                self._display_effort_retry_at = None
 
         approval = settings.get("approvalPolicy")
         if self.work_mode:
@@ -3791,6 +4030,60 @@ class CodexHandle:
         elif active_key in settings:
             self.permission_profile = None
 
+    def _remember_configured_default_effort(
+        self,
+        response: object,
+        *,
+        cwd: Optional[str] = None,
+        generation: Optional[int] = None,
+    ) -> Optional[str]:
+        if not isinstance(response, dict):
+            raise RuntimeError("codex config/read returned an invalid response")
+        config = response.get("config")
+        if not isinstance(config, dict):
+            raise RuntimeError("codex config/read returned an invalid response")
+        raw = config.get("model_reasoning_effort")
+        if raw is not None and (
+            not isinstance(raw, str) or not raw or len(raw) > 64
+        ):
+            raise RuntimeError(
+                "codex config/read returned an invalid reasoning effort")
+        resolved_cwd = os.path.realpath(cwd or self._cwd)
+        resolved_generation = (
+            self._generation if generation is None else generation)
+        # config/read is asynchronous. A cwd migration or reconnect may finish
+        # while the old request is in flight; never label that old response as
+        # belonging to the new scope. The caller separately revalidates before
+        # using the returned value as a display projection.
+        if (os.path.realpath(self._cwd) == resolved_cwd
+                and self._generation == resolved_generation):
+            self._configured_default_effort = raw
+            self._configured_default_effort_cwd = resolved_cwd
+            self._configured_default_effort_generation = resolved_generation
+            self._configured_default_effort_read_at = time.monotonic()
+            self._configured_default_effort_known = True
+        return raw
+
+    async def configured_default_effort(self) -> Optional[str]:
+        """Read the effective config fallback for a null thread override."""
+        cwd = os.path.realpath(self._cwd)
+        generation = self._generation
+        if (
+            self._configured_default_effort_known
+            and self._configured_default_effort_cwd == cwd
+            and self._configured_default_effort_generation == generation
+            and self._configured_default_effort_read_at is not None
+            and time.monotonic() - self._configured_default_effort_read_at
+                < _CONFIGURED_DEFAULT_EFFORT_CACHE_SECONDS
+        ):
+            return self._configured_default_effort
+        response = await self._request("config/read", {
+            "cwd": cwd,
+            "includeLayers": False,
+        })
+        return self._remember_configured_default_effort(
+            response, cwd=cwd, generation=generation)
+
     async def set_model(self, model: str) -> None:
         if not isinstance(model, str) or not model:
             raise ValueError("Codex model must be non-empty")
@@ -3832,7 +4125,7 @@ class CodexHandle:
         )
         return effective
 
-    async def set_effort(self, effort: str) -> None:
+    async def set_effort(self, effort: str) -> bool:
         if not isinstance(effort, str) or not effort:
             raise ValueError("Codex effort must be non-empty")
         authoritative = await self._update_thread_settings(
@@ -3840,8 +4133,17 @@ class CodexHandle:
         if not authoritative:
             self.effort = effort
             self.applied_effort = effort
+            self.display_effort = effort
+            self.display_effort_model = self.model
+            self.display_effort_cwd = (
+                os.path.realpath(self._cwd)
+                if isinstance(self._cwd, str) and self._cwd else None
+            )
+            self.display_effort_generation = self._generation
+            self._display_effort_retry_at = None
         log.info("codex thread effort set", requested=effort,
                  applied=self.effort)
+        return authoritative
 
     async def set_service_tier(self, tier: Optional[str]) -> None:
         normalized = tier if tier and tier != "default" else None
@@ -4470,14 +4772,48 @@ class CodexHandle:
         # recent turn's full token count ≈ current context depth (what the codex TUI
         # gauges); `total` is the cumulative session sum (over-counts context). Use
         # `last` for the "context full?" reading, falling back to `total`.
+        if (self.thread_id and self.last_token_usage is None
+                and not self._rollout_context_recovery_attempted):
+            recovery_thread_id = self.thread_id
+            recovery_generation = self._generation
+            self._rollout_context_recovery_attempted = True
+            recovered = await asyncio.to_thread(
+                recover_codex_context_usage,
+                recovery_thread_id,
+                codex_home=self.codex_home,
+            )
+            # The stdout reader may have installed a live notification while
+            # the bounded file read was in flight. A reconnect/resume can also
+            # replace the handle's thread; never install that old file sample
+            # into a new app-server generation or native session.
+            if (self.last_token_usage is None
+                    and self.thread_id == recovery_thread_id
+                    and self._generation == recovery_generation
+                    and isinstance(recovered, dict)):
+                self.last_token_usage = recovered
+                window = recovered.get("modelContextWindow")
+                if isinstance(window, int) and not isinstance(window, bool):
+                    self.context_window = window
+            elif (self.last_token_usage is None
+                    and self.thread_id == recovery_thread_id
+                    and self._generation == recovery_generation):
+                # Missing/replaced/truncated rollouts are transient while Codex
+                # is flushing or rotating the file. Let a later explicit
+                # context read retry; a successful recovery or live
+                # tokenUsage notification still permanently ends cold reads
+                # for this process generation.
+                self._rollout_context_recovery_attempted = False
         u = self.last_token_usage if isinstance(self.last_token_usage, dict) else {}
         last = u.get("last") if isinstance(u.get("last"), dict) else {}
         total = u.get("total") if isinstance(u.get("total"), dict) else {}
-        used = last.get("totalTokens")
+        used = _nonnegative_int(last.get("totalTokens"))
         if used is None:
-            used = total.get("totalTokens")
+            used = _nonnegative_int(total.get("totalTokens"))
         # server value (captured in _dispatch) wins; else the config-declared window.
-        win = self.context_window or u.get("modelContextWindow") or (
+        win = _nonnegative_int(self.context_window)
+        if not win:
+            win = _nonnegative_int(u.get("modelContextWindow"))
+        win = win or (
             codex_context_window() if self.codex_home is None
             else codex_context_window(codex_home=self.codex_home)
         )
@@ -5775,7 +6111,10 @@ class CodexHandle:
         if method == "turn/completed" and review_execution_frame:
             self._review_execution_turn_id = None
             return
-        if method == "thread/compacted":
+        if (
+            method == "thread/compacted"
+            or self._notification_is_context_compaction(m)
+        ):
             # This notification has already passed exact thread/turn routing.
             # Freeze its native owner now; a later different turn cannot inherit
             # the continuation right.
@@ -6372,7 +6711,8 @@ def _runtime_event_key(event: RuntimeEvent) -> str:
 
 
 def _nonnegative_int(value: Any) -> Optional[int]:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+    if (isinstance(value, bool) or not isinstance(value, int) or value < 0
+            or value > MAX_SAFE_WIRE_INTEGER):
         return None
     return value
 

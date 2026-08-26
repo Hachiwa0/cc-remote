@@ -28,6 +28,18 @@ export interface HistoryBrowseRequestContext {
   anchorTurnId?: string | null;
 }
 
+function sameBrowseWaiter(
+  left: HistoryBrowseRequestContext,
+  right: HistoryBrowseRequestContext,
+): boolean {
+  return left.scopeKey === right.scopeKey
+    && left.viewId === right.viewId
+    && left.windowEpoch === right.windowEpoch
+    && left.pendingBefore === right.pendingBefore
+    && left.sourcePageKey === right.sourcePageKey
+    && (left.anchorTurnId ?? null) === (right.anchorTurnId ?? null);
+}
+
 /** Resolve an optional acceleration hint from ownership-accepted session lists.
  *
  * The wrapper remains authoritative. If two accepted engine/space scopes ever
@@ -52,6 +64,32 @@ interface PendingHistoryRequest extends HistoryRequestKey {
   browseWaiters: HistoryBrowseRequestContext[];
 }
 
+interface RetiredHistoryRequest {
+  sid: string;
+  before?: string | null;
+  generation?: string | null;
+  revision?: string | null;
+}
+
+// RelayWs can retain this many reliable commands. Keep the same bounded number
+// of response authorities: a transcript scan may legitimately outlive several
+// ordinary request timeouts, especially on a phone reconnecting over a slow
+// uplink. Time-based expiry would then let a delayed old page consume the exact
+// same-cursor request issued by the replacement connection.
+const MAX_RETIRED_HISTORY_REQUESTS = 256;
+
+export interface HistoryRequestCompletion {
+  matched: HistoryBrowseRequestContext[];
+  stale: HistoryBrowseRequestContext[];
+}
+
+export interface CancelledHistoryBrowseRequest {
+  sid: string;
+  generation?: string | null;
+  revision: string;
+  browse: HistoryBrowseRequestContext;
+}
+
 /** One authority for every focus/reconnect/rebuild history trigger.
  *
  * App historically had four independent call sites.  Each generated a new
@@ -63,6 +101,7 @@ interface PendingHistoryRequest extends HistoryRequestKey {
 export class HistoryRequestCoordinator {
   private connectionEpoch = 0;
   private readonly pending = new Map<string, PendingHistoryRequest>();
+  private readonly retired: RetiredHistoryRequest[] = [];
   private readonly now: () => number;
   private readonly timeoutMs: number;
 
@@ -74,20 +113,74 @@ export class HistoryRequestCoordinator {
     this.timeoutMs = timeoutMs;
   }
 
-  beginConnection(): void {
+  beginConnection(): CancelledHistoryBrowseRequest[] {
+    const cancelled = this.retirePending();
     this.connectionEpoch += 1;
-    this.pending.clear();
+    return cancelled;
   }
 
-  clear(): void {
+  clear(): CancelledHistoryBrowseRequest[] {
+    const cancelled = this.cancelledBrowseWaiters();
     this.pending.clear();
+    this.retired.length = 0;
+    return cancelled;
+  }
+
+  private cancelledBrowseWaiters(
+    requests: Iterable<PendingHistoryRequest> = this.pending.values(),
+  ): CancelledHistoryBrowseRequest[] {
+    const cancelled: CancelledHistoryBrowseRequest[] = [];
+    for (const pending of requests) {
+      if (!pending.revision) continue;
+      for (const browse of pending.browseWaiters) {
+        cancelled.push({
+          sid: pending.sid,
+          generation: pending.generation,
+          revision: pending.revision,
+          browse: { ...browse },
+        });
+      }
+    }
+    return cancelled;
+  }
+
+  private boundRetired(): void {
+    if (this.retired.length > MAX_RETIRED_HISTORY_REQUESTS) {
+      this.retired.splice(
+        0,
+        this.retired.length - MAX_RETIRED_HISTORY_REQUESTS,
+      );
+    }
+  }
+
+  private retirePending(
+    requests: Iterable<PendingHistoryRequest> = this.pending.values(),
+  ): CancelledHistoryBrowseRequest[] {
+    const retained = [...requests];
+    const cancelled = this.cancelledBrowseWaiters(retained);
+    for (const pending of retained) {
+      this.retired.push({
+        sid: pending.sid,
+        before: pending.before,
+        generation: pending.generation,
+        revision: pending.revision,
+      });
+    }
+    this.pending.clear();
+    this.boundRetired();
+    return cancelled;
   }
 
   private static key(request: HistoryRequestKey): string {
     return `${request.sid}\u0000${request.before ?? ""}\u0000${request.limit}`;
   }
 
-  request(request: HistoryRequestKey, send: () => boolean): boolean {
+  request(
+    request: HistoryRequestKey,
+    send: () => boolean,
+    onCancelled: (cancelled: CancelledHistoryBrowseRequest[]) => void =
+      () => undefined,
+  ): boolean {
     const key = HistoryRequestCoordinator.key(request);
     const existing = this.pending.get(key);
     const now = this.now();
@@ -111,13 +204,7 @@ export class HistoryRequestCoordinator {
       if (sameRevision && sameGeneration) {
         if (request.browse) {
           const duplicate = existing.browseWaiters.some((waiter) =>
-            waiter.scopeKey === request.browse!.scopeKey
-            && waiter.viewId === request.browse!.viewId
-            && waiter.windowEpoch === request.browse!.windowEpoch
-            && waiter.pendingBefore === request.browse!.pendingBefore
-            && waiter.sourcePageKey === request.browse!.sourcePageKey
-            && (waiter.anchorTurnId ?? null)
-              === (request.browse!.anchorTurnId ?? null));
+            sameBrowseWaiter(waiter, request.browse!));
           if (!duplicate) existing.browseWaiters.push({ ...request.browse });
           // The local anchor has a real waiter even though the immutable wire
           // page was already in flight.
@@ -136,6 +223,20 @@ export class HistoryRequestCoordinator {
     // phantom pending entry which suppresses the user's next pagination
     // attempt while no command exists on the wire.
     if (!send()) return false;
+    if (existing) {
+      const cancelled = this.cancelledBrowseWaiters([existing]).filter(
+        (candidate) => !pending.browseWaiters.some(
+          (waiter) => sameBrowseWaiter(candidate.browse, waiter)),
+      );
+      this.retired.push({
+        sid: existing.sid,
+        before: existing.before,
+        generation: existing.generation,
+        revision: existing.revision,
+      });
+      this.boundRetired();
+      if (cancelled.length > 0) onCancelled(cancelled);
+    }
     this.pending.set(key, pending);
     return true;
   }
@@ -145,19 +246,71 @@ export class HistoryRequestCoordinator {
     before?: string | null;
     generation?: string | null;
     revision?: string | null;
-  }): HistoryBrowseRequestContext[] {
-    const browseWaiters: HistoryBrowseRequestContext[] = [];
+  }): HistoryRequestCompletion {
+    const matched: HistoryBrowseRequestContext[] = [];
+    const stale: HistoryBrowseRequestContext[] = [];
+    let retiredMatch = -1;
+    for (let index = this.retired.length - 1; index >= 0; index -= 1) {
+      const retired = this.retired[index];
+      if (retired.sid !== response.session_id
+          || (retired.before ?? "") !== (response.before ?? "")
+          || (retired.generation
+            && retired.generation !== response.generation)
+          || (retired.revision
+            && retired.revision !== response.revision)) continue;
+      retiredMatch = index;
+      break;
+    }
+    let matchedActive: PendingHistoryRequest | null = null;
+    const mismatched: [string, PendingHistoryRequest][] = [];
     for (const [key, pending] of this.pending) {
       if (pending.sid !== response.session_id
           || (pending.before ?? "") !== (response.before ?? "")) continue;
-      if (pending.generation
-          && pending.generation !== response.generation) continue;
-      if (pending.revision
-          && pending.revision !== response.revision) continue;
-      browseWaiters.push(...pending.browseWaiters.map((waiter) => ({ ...waiter })));
+      if ((pending.generation
+            && pending.generation !== response.generation)
+          || (pending.revision
+            && pending.revision !== response.revision)) {
+        mismatched.push([key, pending]);
+        continue;
+      }
+      matchedActive = pending;
+      matched.push(...pending.browseWaiters.map((waiter) => ({ ...waiter })));
       this.pending.delete(key);
     }
-    return browseWaiters;
+    if (retiredMatch >= 0) {
+      if (matchedActive) {
+        // The response can render the active waiter, but without a wire request
+        // id we cannot know whether it answered that request or its delayed
+        // predecessor. Keep one conservative tombstone for the still-possible
+        // response: a field remains constrained only when both requests agree.
+        const retired = this.retired[retiredMatch];
+        this.retired[retiredMatch] = {
+          sid: retired.sid,
+          before: retired.before,
+          generation: retired.generation === matchedActive.generation
+            ? retired.generation : undefined,
+          revision: retired.revision === matchedActive.revision
+            ? retired.revision : undefined,
+        };
+      } else {
+        // One response accounts for exactly one retired wire request. Preserve
+        // duplicate tombstones so a second delayed response cannot consume a
+        // newer same-cursor request later.
+        this.retired.splice(retiredMatch, 1);
+      }
+    }
+    // Only an otherwise-unattributable response proves that the active browse
+    // request itself crossed a revision/generation boundary. A response which
+    // matches a retired request is delayed old work and must leave its exact
+    // same-cursor replacement untouched.
+    if (!matchedActive && retiredMatch < 0) {
+      for (const [key, pending] of mismatched) {
+        if (pending.browseWaiters.length === 0) continue;
+        stale.push(...pending.browseWaiters.map((waiter) => ({ ...waiter })));
+        this.pending.delete(key);
+      }
+    }
+    return { matched, stale };
   }
 
   size(): number {

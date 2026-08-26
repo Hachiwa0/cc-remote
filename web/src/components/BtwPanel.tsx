@@ -27,9 +27,19 @@ import {
   type SendMode,
 } from "../composer-submit";
 import { canEnqueueQuery, type QueueCapacity } from "../runtime-drain";
-import { effortsFor, modelsFor, type Catalog } from "../data";
+import {
+  effortNameForDisplay, modelsFor, type Catalog,
+} from "../data";
 import { QueuedQueryChip } from "./QueuedQueryDialog";
 import type { InlineImageAsset } from "../inline-image-assets";
+import {
+  composePastePrompt,
+  LONG_PASTE_THRESHOLD,
+  makeComposerPaste,
+} from "../composer-pastes";
+import { PasteCards } from "./PasteCards";
+import { uuid } from "../util";
+import { exactActiveTurnId } from "../process-blocks";
 
 interface Props {
   sid?: string;
@@ -89,6 +99,11 @@ export function BtwPanel(p: Props) {
   const input = draft.input;
   const turns = p.rt?.turns ?? [];
   const runtimeState = p.rt?.state ?? "idle";
+  const activeTurnId = exactActiveTurnId(
+    turns,
+    p.rt?.liveOwner?.turnId,
+    runtimeState !== "idle" || p.rt?.mirroredRunning === true,
+  );
   // The query outbox can be awaiting its first authoritative echo while the
   // last lifecycle frame still says idle. Treat that short acceptance window
   // as settling-busy so a second submit becomes pending/queued instead of
@@ -98,7 +113,7 @@ export function BtwPanel(p: Props) {
     ? "draining" : runtimeState;
   const runtimeBusy = isComposerBusy(submitState);
   const busy = !!p.opening || runtimeBusy;
-  const hasText = input.trim().length > 0;
+  const hasText = input.trim().length > 0 || draft.pastes.length > 0;
 
   const updateDraft = useCallback((
     update: (current: ComposerDraft) => ComposerDraft,
@@ -117,7 +132,7 @@ export function BtwPanel(p: Props) {
     }));
   }, [updateDraft]);
   const clearDraft = useCallback(() => {
-    updateDraft(() => ({ input: "", images: [], files: [] }));
+    updateDraft(() => ({ input: "", images: [], files: [], pastes: [] }));
   }, [updateDraft]);
 
   useLayoutEffect(() => {
@@ -168,7 +183,12 @@ export function BtwPanel(p: Props) {
 
   const submit = (value = taRef.current?.value ?? input) => {
     if (p.opening || !p.sid) return;
-    const prompt = value.trim();
+    const composed = composePastePrompt(draft.pastes, value.trim());
+    if (!composed.ok) {
+      flash(`消息内容超过上限（最多 ${composed.maxChars.toLocaleString()} 个字符）`);
+      return;
+    }
+    const prompt = composed.prompt;
     const query: PendingQuery = { prompt };
     if (runtimeBusy) {
       const action = classifyBusySubmit(
@@ -214,7 +234,7 @@ export function BtwPanel(p: Props) {
       const value = taRef.current?.value ?? input;
       // Stopping is an explicit button action. Empty Enter goes through submit
       // and remains a no-op.
-      if (runtimeBusy && !value.trim()) {
+      if (runtimeBusy && !value.trim() && draft.pastes.length === 0) {
         if (runtimeState === "running") p.onInterrupt();
         return;
       }
@@ -227,11 +247,7 @@ export function BtwPanel(p: Props) {
     ? (modelList.find((candidate) => candidate.id === p.rt?.model)
       ?? { id: p.rt.model, name: p.rt.model, ds: "", ic: "cpu" })
     : null;
-  const effortList = effortsFor(p.engine, model?.id, p.catalog);
-  const effort = p.rt?.effort
-    ? (effortList.find((candidate) => candidate.id === p.rt?.effort)
-      ?? { id: p.rt.effort, name: p.rt.effort, ds: "", ic: "gauge3" })
-    : null;
+  const effortName = effortNameForDisplay(p.rt?.effort);
   const stopping = runtimeBusy && !hasText;
   const interruptSettling = isInterruptSettling(submitState);
   const primaryIsInterrupt = p.engine !== "codex";
@@ -276,6 +292,7 @@ export function BtwPanel(p: Props) {
                 问一个基于当前会话的侧边问题 —— 回答不会写进主线,关闭即丢弃。
               </div>
             : <ChatView sid={p.sid ?? null} turns={turns}
+                activeTurnId={activeTurnId}
                 onEdit={() => {}} onGetDiff={() => {}}
                 onOpenFile={p.onOpenFile}
                 imageAssets={p.imageAssets}
@@ -299,6 +316,15 @@ export function BtwPanel(p: Props) {
                 onOpen={p.onInspectQueued}
                 onRemove={() => p.onRemoveQueued(query)} />
             ))}
+          </div>
+        )}
+        {draft.pastes.length > 0 && (
+          <div className="attach show btw-pastes">
+            <PasteCards pastes={draft.pastes}
+              disabled={!!p.opening || !p.sid}
+              onChange={(pastes) => updateDraft((current) => ({
+                ...current, pastes,
+              }))} />
           </div>
         )}
         {runtimeBusy && (
@@ -337,6 +363,18 @@ export function BtwPanel(p: Props) {
               imeSubmitRef.current.endComposition();
               setInput(event.currentTarget.value);
             }}
+            onPaste={(event) => {
+              const text = event.clipboardData.getData("text/plain");
+              if (text.length <= LONG_PASTE_THRESHOLD) return;
+              event.preventDefault();
+              updateDraft((current) => ({
+                ...current,
+                pastes: [
+                  ...current.pastes,
+                  makeComposerPaste(text, uuid()),
+                ],
+              }));
+            }}
             onKeyDown={(event) => {
               if (!imeSubmitRef.current.shouldSubmitKey({
                 key: event.key,
@@ -366,7 +404,7 @@ export function BtwPanel(p: Props) {
           <button className="hint-ctl" onClick={() => setSheetKind("models")}
             disabled={busy}>{model?.name ?? "模型读取中"}</button>
           <button className="hint-ctl" onClick={() => setSheetKind("efforts")}
-            disabled={busy}>{effort?.name ?? "强度读取中"}</button>
+            disabled={busy}>{effortName ?? "强度读取中"}</button>
         </div>
       </div>
       <CommandSheet

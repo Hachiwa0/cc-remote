@@ -15,6 +15,13 @@ export interface TurnPlanProgress {
 
 export type TurnPlanProgressSource = "runtime" | "history";
 
+export interface SessionPlanProgressScope {
+  machineId: string;
+  engine: "claude" | "codex";
+  space: "code" | "work";
+  sid: string;
+}
+
 export interface ScopedTurnPlanProgress extends TurnPlanProgress {
   source: TurnPlanProgressSource;
 }
@@ -62,6 +69,9 @@ export class SessionPlanProgressCache {
   }
 
   resolve({
+    machineId = "legacy",
+    engine = "codex",
+    space = "code",
     sid,
     runtime,
     history,
@@ -70,6 +80,9 @@ export class SessionPlanProgressCache {
     recovering,
     runtimeLoading,
   }: {
+    machineId?: string;
+    engine?: "claude" | "codex";
+    space?: "code" | "work";
     sid: string;
     runtime: TurnPlanProgress | null;
     history: TurnPlanProgress | null;
@@ -78,19 +91,20 @@ export class SessionPlanProgressCache {
     recovering: boolean;
     runtimeLoading: boolean;
   }): ScopedTurnPlanProgress | null {
+    const cacheKey = this.key({ machineId, engine, space, sid });
     const selected = runtime ?? history;
     if (selected) {
       const selectedTurns = runtime ? runtimeTurns : historyTurns;
       const newerTurns = runtime ? [] : runtimeTurns;
       if (terminalPlanHasNewerTurn(
         selected, selectedTurns, newerTurns)) {
-        this.entries.delete(sid);
+        this.entries.delete(cacheKey);
         return null;
       }
       const entry = copyProgress(
         selected, runtime ? "runtime" : "history");
-      this.entries.delete(sid);
-      this.entries.set(sid, entry);
+      this.entries.delete(cacheKey);
+      this.entries.set(cacheKey, entry);
       while (this.entries.size > this.maxEntries) {
         const oldest = this.entries.keys().next().value;
         if (typeof oldest !== "string") break;
@@ -99,7 +113,7 @@ export class SessionPlanProgressCache {
       return entry;
     }
 
-    const retained = this.entries.get(sid);
+    const retained = this.entries.get(cacheKey);
     if (!retained) return null;
     const turns = retained.source === "history" ? historyTurns : runtimeTurns;
     const owner = turns.find((turn) => turnOwnsProgress(
@@ -107,15 +121,15 @@ export class SessionPlanProgressCache {
     const newerTurns = retained.source === "history" ? runtimeTurns : [];
     if (owner && terminalPlanHasNewerTurn(
       retained, turns, newerTurns)) {
-      this.entries.delete(sid);
+      this.entries.delete(cacheKey);
       return null;
     }
     if (!owner && !recovering && !runtimeLoading) {
-      this.entries.delete(sid);
+      this.entries.delete(cacheKey);
       return null;
     }
     // Touch on focus so the bounded cache evicts genuinely old sessions first.
-    this.entries.delete(sid);
+    this.entries.delete(cacheKey);
     const resolved = {
       ...retained,
       detailLoading: owner?.detailLoading === true,
@@ -123,21 +137,45 @@ export class SessionPlanProgressCache {
         ? !owner.detailLoaded && (owner.detailEventCount ?? 0) > 0
         : retained.needsDetail,
     };
-    this.entries.set(sid, resolved);
+    this.entries.set(cacheKey, resolved);
     return resolved;
   }
 
-  clear(sid: string): void {
-    this.entries.delete(sid);
+  clear(scope: SessionPlanProgressScope | string): void {
+    this.entries.delete(typeof scope === "string"
+      ? this.key({
+        machineId: "legacy", engine: "codex", space: "code", sid: scope,
+      })
+      : this.key(scope));
   }
 
-  rekey(oldSid: string, sid: string): void {
-    if (oldSid === sid) return;
-    const retained = this.entries.get(oldSid);
+  rekey(
+    scope: Omit<SessionPlanProgressScope, "sid"> | string,
+    oldSid: string,
+    sid?: string,
+  ): void {
+    const owner = typeof scope === "string"
+      ? { machineId: "legacy", engine: "codex" as const, space: "code" as const }
+      : scope;
+    const oldSessionId = typeof scope === "string" ? scope : oldSid;
+    const sessionId = typeof scope === "string" ? oldSid : sid;
+    if (!sessionId) return;
+    if (oldSessionId === sessionId) return;
+    const oldKey = this.key({ ...owner, sid: oldSessionId });
+    const key = this.key({ ...owner, sid: sessionId });
+    const retained = this.entries.get(oldKey);
     if (!retained) return;
-    this.entries.delete(oldSid);
-    this.entries.delete(sid);
-    this.entries.set(sid, retained);
+    this.entries.delete(oldKey);
+    this.entries.delete(key);
+    this.entries.set(key, retained);
+  }
+
+  reset(): void {
+    this.entries.clear();
+  }
+
+  private key(scope: SessionPlanProgressScope): string {
+    return [scope.machineId, scope.engine, scope.space, scope.sid].join("\0");
   }
 }
 
@@ -209,10 +247,12 @@ function terminalPlanHasNewerTurn(
   newerTurns: readonly Turn[] = [],
 ): boolean {
   const presentation = planProgressPresentation(progress.block);
-  // An active unfinished Plan may span clarification turns. A negative
-  // terminal belongs to the interrupted attempt, though: keep it visible until
-  // acknowledged by the next user message, then wait for that turn's own Plan.
-  if (!presentation.complete && !presentation.failed) return false;
+  // An active unfinished Plan may span clarification turns. Once its owning
+  // turn has actually ended, though, the stale inProgress marker is an audit
+  // snapshot rather than active work. Keep it visible until acknowledged by
+  // the next user message, then wait for that turn's own Plan.
+  if (!progress.block.done
+      && !presentation.complete && !presentation.failed) return false;
   const ownerIndex = turns.findIndex((turn) =>
     turnOwnsProgress(turn, progress.turnId));
   if (ownerIndex >= 0
@@ -311,6 +351,7 @@ export interface PlanProgressPresentation {
   currentStep: string | null;
   failed: boolean;
   complete: boolean;
+  stale: boolean;
   progress: number;
   progressLabel: string;
   stateLabel: string;
@@ -331,21 +372,24 @@ export function planProgressPresentation(
   // A successful terminal turn does not imply that unfinished structured plan
   // steps ran; step state remains authoritative whenever it exists.
   const complete = !failed && steps.length > 0 && completed === steps.length;
+  const stale = block.done && !failed && !complete && steps.length > 0;
   const progress = steps.length > 0
     ? Math.min(100, completed / steps.length * 100)
     : 0;
   return {
     completed,
     total: steps.length,
-    currentStep: current?.step ?? null,
+    currentStep: stale ? null : current?.step ?? null,
     failed,
     complete,
+    stale,
     progress,
     progressLabel: steps.length > 0
       ? `${completed} / ${steps.length}`
       : block.done ? "已记录" : "执行中",
     stateLabel: detailLoading ? "正在同步" : failed ? "执行异常"
-      : complete ? "全部完成" : block.done ? "执行已结束"
+      : complete ? "全部完成" : stale ? "本轮已结束，计划未更新"
+        : block.done ? "执行已结束"
         : current ? "正在执行" : "等待执行",
     description: block.explanation || block.summary || null,
     fallbackDetail: steps.length === 0

@@ -36,12 +36,315 @@ from cc_remote.wrapper.work_prompt import (
     WORK_BASE_INSTRUCTIONS,
     WORK_DEVELOPER_INSTRUCTIONS,
 )
+from cc_remote.workspaces import WorkStores
 from tests.test_multisession import _mk_ctx, _mk_machine
 
 
 class _Cfg:
     cc_cwd = "/tmp"
     tool_result_max = 8000
+
+
+def test_codex_work_btw_uses_private_profile_bound_runtime(
+    monkeypatch, tmp_path,
+):
+    created = []
+
+    class FakeCodexHandle:
+        def __init__(self, _cfg, **kwargs):
+            self.init = kwargs
+            self.thread_id = None
+            self.model = "gpt-work"
+            self.effort = None
+            self.applied_effort = None
+            self.display_effort = None
+            self.display_effort_model = None
+            self.display_effort_cwd = None
+            self.display_effort_generation = None
+            self._display_effort_retry_at = None
+            self._cwd = kwargs["cwd"]
+            self._generation = 1
+            self._thread_settings_revision = 0
+            self._approval = "on-request"
+            self.approval_policy = "on-request"
+            self.permission_profile = ":workspace"
+            self.web_search_override = "live"
+            self.web_search = "live"
+            self.service_tier = None
+            self.shared_daemon_affinity = False
+            self.using_daemon_proxy = False
+            self.connect_call = None
+            self.disconnected = False
+            created.append(self)
+
+        @property
+        def approval(self):
+            return self._approval
+
+        @approval.setter
+        def approval(self, value):
+            self._approval = value
+            self.approval_policy = value
+
+        async def connect(self, **kwargs):
+            self.connect_call = kwargs
+            self.thread_id = "forked-work"
+            # Model the app-server echoing controls from the parent rollout.
+            self.approval = "on-request"
+            self.approval_policy = "on-request"
+            self.permission_profile = ":workspace"
+
+        async def disconnect(self):
+            self.disconnected = True
+
+    async def run():
+        profiles = {
+            "primary": {
+                "label": "Primary",
+                "home": str(tmp_path / "primary-home"),
+                "default": True,
+            },
+            "secondary": {
+                "label": "Secondary",
+                "home": str(tmp_path / "secondary-home"),
+            },
+        }
+        machine, _ = _mk_machine()
+        machine.cfg.codex_profiles_json = json.dumps(profiles)
+        machine.cfg.state_dir = tmp_path / "state"
+        machine.cfg.codex_work_root = tmp_path / "work" / "codex"
+        machine.cfg.claude_work_root = tmp_path / "work" / "claude"
+        # Rebuild so profile daemons and Work roots match the explicit config.
+        machine = machine_module.WrapperMachine(machine.cfg, machine.transport)
+        machine._work = WorkStores(
+            machine.cfg.claude_work_root, machine.cfg.codex_work_root)
+        monkeypatch.setattr(machine_module, "CodexHandle", FakeCodexHandle)
+
+        async def keep_effort(_model, effort, **_kwargs):
+            return effort
+
+        monkeypatch.setattr(machine_module, "clamp_effort", keep_effort)
+
+        store = machine._work.for_engine("codex")
+        record = store.create_session(codex_profile_id="secondary")
+        store.bind_session(
+            record.work_id, "parent-work", codex_profile_id="secondary")
+        parent = _mk_ctx("secondary@parent-work", "parent-work")
+        parent.engine = "codex"
+        parent.cwd = record.cwd
+        parent.space = "work"
+        parent.work_id = record.work_id
+        parent.codex_profile_id = "secondary"
+        machine.sessions[parent.key] = parent
+
+        fork = await machine._spawn_btw(
+            parent, owner_client_id="client-1")
+
+        handle = created[-1]
+        assert handle.init["cwd"] == record.cwd
+        assert handle.init["daemon_mode"] == "off"
+        assert handle.init["work_mode"] is True
+        assert handle.init["codex_home"] == str(tmp_path / "secondary-home")
+        assert handle.connect_call == {
+            "resume_id": "parent-work", "cwd": record.cwd, "fork": True,
+        }
+        assert fork.space == "work"
+        assert fork.work_id == record.work_id
+        assert fork.codex_profile_id == "secondary"
+        assert handle.approval == handle.approval_policy == "never"
+        assert handle.permission_profile == "cc_remote_work"
+        assert handle.web_search_override is None
+        assert handle.web_search == "cached"
+
+    asyncio.run(run())
+
+
+def test_codex_code_btw_keeps_parent_controls_and_shared_mode(monkeypatch):
+    created = []
+
+    class FakeCodexHandle:
+        def __init__(self, _cfg, **kwargs):
+            self.init = kwargs
+            self.thread_id = None
+            self.model = "gpt-code"
+            self.effort = None
+            self.applied_effort = None
+            self.display_effort = None
+            self.display_effort_model = None
+            self.display_effort_cwd = None
+            self.display_effort_generation = None
+            self._display_effort_retry_at = None
+            self._cwd = kwargs["cwd"]
+            self._generation = 1
+            self._thread_settings_revision = 0
+            self.approval = "never"
+            self.approval_policy = "never"
+            self.permission_profile = None
+            self.web_search_override = None
+            self.web_search = "cached"
+            self.service_tier = None
+            self.shared_daemon_affinity = False
+            self.using_daemon_proxy = False
+            created.append(self)
+
+        async def connect(self, **_kwargs):
+            self.thread_id = "forked-code"
+
+        async def disconnect(self):
+            return None
+
+    async def run():
+        monkeypatch.setattr(machine_module, "CodexHandle", FakeCodexHandle)
+        machine, _ = _mk_machine()
+        parent = _mk_ctx("parent-code", "parent-code")
+        parent.engine = "codex"
+        parent.space = "code"
+        parent.sdk = SimpleNamespace(
+            approval="on-request",
+            approval_policy="on-request",
+            permission_profile=":read-only",
+            web_search_override="live",
+            web_search="live",
+        )
+        machine.sessions[parent.key] = parent
+
+        fork = await machine._spawn_btw(
+            parent, owner_client_id="client-1")
+
+        handle = created[-1]
+        assert handle.init["daemon_mode"] == machine.cfg.codex_daemon_mode
+        assert "work_mode" not in handle.init
+        assert "codex_home" not in handle.init
+        assert fork.space == "code" and fork.work_id is None
+        assert handle.approval == handle.approval_policy == "on-request"
+        assert handle.permission_profile == ":read-only"
+        assert handle.web_search_override == handle.web_search == "live"
+
+    asyncio.run(run())
+
+
+def test_btw_post_connect_failure_disconnects_partial_handle(monkeypatch):
+    created = []
+
+    class FakeCodexHandle:
+        def __init__(self, _cfg, **kwargs):
+            self.init = kwargs
+            self.thread_id = None
+            self.model = "gpt-code"
+            self.effort = None
+            self.applied_effort = None
+            self.display_effort = None
+            self.display_effort_model = None
+            self.display_effort_cwd = None
+            self.display_effort_generation = None
+            self._display_effort_retry_at = None
+            self._cwd = kwargs["cwd"]
+            self._generation = 1
+            self._thread_settings_revision = 0
+            self.approval = "never"
+            self.approval_policy = "never"
+            self.permission_profile = None
+            self.web_search_override = None
+            self.web_search = "cached"
+            self.service_tier = None
+            self.shared_daemon_affinity = False
+            self.using_daemon_proxy = False
+            self.disconnected = False
+            created.append(self)
+
+        async def connect(self, **_kwargs):
+            self.thread_id = "partial-fork"
+
+        async def disconnect(self):
+            self.disconnected = True
+
+    async def run():
+        monkeypatch.setattr(machine_module, "CodexHandle", FakeCodexHandle)
+        machine, _ = _mk_machine()
+        parent = _mk_ctx("parent-code", "parent-code")
+        parent.engine = "codex"
+        parent.sdk = SimpleNamespace(
+            approval="never", approval_policy="never",
+            permission_profile=None, web_search_override=None,
+            web_search="cached",
+        )
+        machine.sessions[parent.key] = parent
+
+        async def fail_effort(*_args, **_kwargs):
+            raise RuntimeError("effort probe failed")
+
+        machine._resolve_codex_session_effort = fail_effort
+        with pytest.raises(
+            machine_module._BtwSpawnFailure,
+            match="临时侧边会话暂时无法打开",
+        ):
+            await machine._spawn_btw(parent, owner_client_id="client-1")
+
+        assert created[-1].disconnected is True
+        assert list(machine.sessions) == ["parent-code"]
+
+    asyncio.run(run())
+
+
+def test_spawn_post_connect_failure_disconnects_partial_handle(
+        monkeypatch, tmp_path,
+):
+    created = []
+
+    class FakeCodexHandle:
+        def __init__(self, _cfg, **kwargs):
+            self.thread_id = None
+            self.model = "gpt-code"
+            self.effort = None
+            self.applied_effort = None
+            self.display_effort = None
+            self.display_effort_model = None
+            self.display_effort_cwd = None
+            self.display_effort_generation = None
+            self._display_effort_retry_at = None
+            self._cwd = kwargs["cwd"]
+            self._generation = 1
+            self._thread_settings_revision = 0
+            self.approval = "never"
+            self.approval_policy = "never"
+            self.permission_profile = None
+            self.web_search_override = None
+            self.web_search = "cached"
+            self.collaboration_mode = "default"
+            self.service_tier = None
+            self.shared_daemon_affinity = False
+            self.using_daemon_proxy = False
+            self.disconnected = False
+            created.append(self)
+
+        async def connect(self, **_kwargs):
+            self.thread_id = "partial-session"
+
+        async def disconnect(self):
+            self.disconnected = True
+
+    async def run():
+        monkeypatch.setattr(machine_module, "CodexHandle", FakeCodexHandle)
+        machine, transport = _mk_machine()
+        machine.cfg.cc_cwd = str(tmp_path)
+
+        async def fail_effort(*_args, **_kwargs):
+            raise RuntimeError("effort probe failed")
+
+        machine._resolve_codex_session_effort = fail_effort
+        ctx = await machine._spawn(
+            resume_id=None,
+            cwd=str(tmp_path),
+            engine="codex",
+            space="code",
+        )
+
+        assert ctx is None
+        assert created[-1].disconnected is True
+        assert machine.sessions == {}
+        assert any(message.type == "error" for message in transport.sent)
+
+    asyncio.run(run())
 
 
 def test_provider_error_diagnostic_keeps_only_safe_classification():
@@ -2558,6 +2861,635 @@ def test_codex_catalog_normalization_is_structurally_bounded(monkeypatch):
     assert normalized[0]["efforts"] == ["low", "high"]
 
 
+def test_machine_resolves_nullable_codex_effort_without_loading_forever(
+        monkeypatch):
+    async def run():
+        machine, _transport = _mk_machine()
+        ctx = _mk_ctx("effort-session", "effort-session")
+        ctx.engine = "codex"
+        ctx.sdk = SimpleNamespace(
+            model="gpt-default",
+            effort=None,
+            applied_effort=None,
+            display_effort=None,
+            display_effort_model=None,
+            _cwd="/tmp/effort-one",
+            _generation=1,
+        )
+
+        async def configured_default():
+            return "medium"
+
+        async def unexpected_model_default(*_args, **_kwargs):
+            raise AssertionError("configured default must win")
+
+        monkeypatch.setattr(
+            machine_module, "default_effort_for", unexpected_model_default)
+        ctx.sdk.configured_default_effort = configured_default
+        assert await machine._resolve_codex_session_effort(ctx) == "medium"
+        assert ctx.sdk.effort is None
+        assert ctx.sdk.applied_effort is None
+        assert ctx.sdk.display_effort == "medium"
+        assert ctx.sdk.display_effort_model == "gpt-default"
+
+        ctx.sdk.effort = None
+        ctx.sdk.applied_effort = None
+        ctx.sdk.display_effort = None
+        ctx.sdk.display_effort_model = None
+
+        async def unavailable_default():
+            return None
+
+        ctx.sdk.configured_default_effort = unavailable_default
+
+        async def model_default(model, *, codex_home=None):
+            assert model == "gpt-default"
+            assert codex_home is None
+            return "low"
+
+        monkeypatch.setattr(
+            machine_module, "default_effort_for", model_default)
+        assert await machine._resolve_codex_session_effort(ctx) == "low"
+        assert ctx.sdk.effort is None
+        assert ctx.sdk.display_effort == "low"
+
+        ctx.sdk.display_effort = None
+        ctx.sdk.display_effort_model = None
+
+        unknown_default_calls = 0
+
+        async def unknown_model_default(_model, *, codex_home=None):
+            nonlocal unknown_default_calls
+            unknown_default_calls += 1
+            return None
+
+        monkeypatch.setattr(
+            machine_module, "default_effort_for", unknown_model_default)
+        assert await machine._resolve_codex_session_effort(ctx) == (
+            machine_module.MODEL_DEFAULT_EFFORT)
+        assert ctx.sdk.effort is None
+        assert ctx.sdk.display_effort == machine_module.MODEL_DEFAULT_EFFORT
+        assert ctx.sdk.display_effort_model == "gpt-default"
+        assert unknown_default_calls == 1
+        assert await machine._resolve_codex_session_effort(ctx) == (
+            machine_module.MODEL_DEFAULT_EFFORT)
+        assert unknown_default_calls == 1
+
+        # A temporary catalog miss is throttled, not cached forever. The next
+        # eligible control refresh can replace the truthful sentinel with the
+        # concrete suggested default without pinning turn/start.
+        ctx.sdk._display_effort_retry_at = 0
+
+        async def recovered_model_default(_model, *, codex_home=None):
+            return "high"
+
+        monkeypatch.setattr(
+            machine_module, "default_effort_for", recovered_model_default)
+        assert await machine._resolve_codex_session_effort(ctx) == "high"
+        assert ctx.sdk.effort is None
+        assert ctx.sdk.display_effort == "high"
+
+        # A failed effective-config read must still leave time for the catalog
+        # fallback instead of immediately degrading to the sentinel.
+        ctx.sdk.display_effort = None
+        ctx.sdk.display_effort_model = None
+
+        async def failed_configured_default():
+            raise RuntimeError("config temporarily unavailable")
+
+        ctx.sdk.configured_default_effort = failed_configured_default
+        assert await machine._resolve_codex_session_effort(ctx) == "high"
+        assert ctx.sdk.effort is None
+        assert ctx.sdk.display_effort == "high"
+        assert ctx.sdk._display_effort_retry_at is not None
+
+        # A concrete catalog fallback is provisional when config/read failed.
+        # Once the retry window opens, the recovered effective config replaces
+        # it instead of leaving the UI pinned to the wrong model default.
+        configured_recovery_calls = 0
+
+        async def recovered_configured_default():
+            nonlocal configured_recovery_calls
+            configured_recovery_calls += 1
+            return "medium"
+
+        ctx.sdk.configured_default_effort = recovered_configured_default
+        assert await machine._resolve_codex_session_effort(ctx) == "high"
+        assert configured_recovery_calls == 0
+        ctx.sdk._display_effort_retry_at = 0
+        assert await machine._resolve_codex_session_effort(ctx) == "medium"
+        assert configured_recovery_calls == 1
+        assert ctx.sdk._display_effort_retry_at is not None
+
+        # A concrete display cache is authoritative only for the cwd and
+        # app-server generation that produced it.
+        scoped_config_calls = 0
+
+        async def scoped_configured_default():
+            nonlocal scoped_config_calls
+            scoped_config_calls += 1
+            return "xhigh" if ctx.sdk._generation == 1 else "low"
+
+        ctx.sdk.configured_default_effort = scoped_configured_default
+        ctx.sdk._cwd = "/tmp/effort-two"
+        assert await machine._resolve_codex_session_effort(ctx) == "xhigh"
+        ctx.sdk._generation = 2
+        assert await machine._resolve_codex_session_effort(ctx) == "low"
+        assert scoped_config_calls == 2
+
+        ctx.sdk.display_effort = None
+        ctx.sdk.display_effort_model = None
+
+        async def clamp(_model, effort, *, codex_home=None):
+            assert effort == "low"
+            return effort
+
+        monkeypatch.setattr(machine_module, "clamp_effort", clamp)
+        assert await machine._resolve_codex_session_effort(
+            ctx, preferred="low") == "low"
+        assert ctx.sdk.effort == ctx.sdk.applied_effort == "low"
+        assert ctx.sdk.display_effort == "low"
+        assert ctx.sdk.display_effort_model == "gpt-default"
+
+        # thread/fork may echo the parent's explicit setting. BTW's wrapper-
+        # owned low choice must still win before its first query.
+        ctx.sdk.effort = "high"
+        ctx.sdk.applied_effort = "high"
+        assert await machine._resolve_codex_session_effort(
+            ctx, preferred="low") == "low"
+        assert ctx.sdk.effort == ctx.sdk.applied_effort == "low"
+
+    asyncio.run(run())
+
+
+def test_machine_effort_resolution_discards_stale_async_authority(monkeypatch):
+    async def run():
+        machine, _transport = _mk_machine()
+        ctx = _mk_ctx("effort-race", "effort-race")
+        ctx.engine = "codex"
+        ctx.sdk = SimpleNamespace(
+            model="gpt-before",
+            effort=None,
+            applied_effort=None,
+            display_effort=None,
+            display_effort_model=None,
+            display_effort_cwd=None,
+            display_effort_generation=None,
+            _display_effort_retry_at=None,
+            _cwd="/tmp/effort-before",
+            _generation=1,
+            _thread_settings_revision=0,
+        )
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def delayed_configured_default():
+            started.set()
+            await release.wait()
+            return "xhigh"
+
+        async def unexpected_catalog_default(*_args, **_kwargs):
+            raise AssertionError("stale config result must not fall through")
+
+        ctx.sdk.configured_default_effort = delayed_configured_default
+        monkeypatch.setattr(
+            machine_module, "default_effort_for", unexpected_catalog_default)
+        resolving = asyncio.create_task(
+            machine._resolve_codex_session_effort(ctx))
+        await started.wait()
+
+        # Simulate the authoritative thread/settings/updated snapshot which can
+        # arrive while config/read is in flight. Its concrete clamp must win.
+        ctx.sdk.model = "gpt-after"
+        ctx.sdk.effort = "medium"
+        ctx.sdk.applied_effort = "medium"
+        ctx.sdk.display_effort = "medium"
+        ctx.sdk.display_effort_model = "gpt-after"
+        ctx.sdk.display_effort_cwd = os.path.realpath("/tmp/effort-after")
+        ctx.sdk.display_effort_generation = 2
+        ctx.sdk._cwd = "/tmp/effort-after"
+        ctx.sdk._generation = 2
+        ctx.sdk._thread_settings_revision = 1
+        release.set()
+
+        assert await resolving == "medium"
+        assert ctx.sdk.effort == "medium"
+        assert ctx.sdk.display_effort == "medium"
+        assert ctx.sdk.display_effort_model == "gpt-after"
+        assert ctx.sdk.display_effort_generation == 2
+
+    asyncio.run(run())
+
+
+def test_machine_model_effort_publish_never_mixes_async_authorities(monkeypatch):
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("effort-publish-race", "effort-publish-race")
+        ctx.engine = "codex"
+        ctx.announced_model = "gpt-ui-before"
+        ctx.announced_effort = "high"
+        ctx.sdk = SimpleNamespace(
+            model="gpt-before",
+            effort=None,
+            applied_effort=None,
+            display_effort=None,
+            display_effort_model=None,
+            display_effort_cwd=None,
+            display_effort_generation=None,
+            _display_effort_retry_at=None,
+            _cwd="/tmp/effort-publish-before",
+            _generation=1,
+            _thread_settings_revision=0,
+        )
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def delayed_configured_default():
+            started.set()
+            await release.wait()
+            return "xhigh"
+
+        async def unexpected_catalog_default(*_args, **_kwargs):
+            raise AssertionError("stale config result must not fall through")
+
+        ctx.sdk.configured_default_effort = delayed_configured_default
+        monkeypatch.setattr(
+            machine_module, "default_effort_for", unexpected_catalog_default)
+        publishing = asyncio.create_task(
+            machine._publish_codex_model_effort(ctx))
+        await started.wait()
+
+        # No half-snapshot may escape while the nullable effort probe is still
+        # tied to the old model. The authoritative notification replaces the
+        # complete pair before the probe completes.
+        assert not [
+            event for event in transport.sent
+            if isinstance(event, (Model, Effort))
+        ]
+        ctx.sdk.model = "gpt-after"
+        ctx.sdk.effort = "medium"
+        ctx.sdk.applied_effort = "medium"
+        ctx.sdk.display_effort = "medium"
+        ctx.sdk.display_effort_model = "gpt-after"
+        ctx.sdk.display_effort_cwd = os.path.realpath(
+            "/tmp/effort-publish-after")
+        ctx.sdk.display_effort_generation = 2
+        ctx.sdk._cwd = "/tmp/effort-publish-after"
+        ctx.sdk._generation = 2
+        ctx.sdk._thread_settings_revision = 1
+        release.set()
+
+        assert await publishing is True
+        assert [
+            (event.type, getattr(event, "model", None),
+             getattr(event, "effort", None))
+            for event in transport.sent
+            if isinstance(event, (Model, Effort))
+        ] == [
+            ("model", "gpt-after", None),
+            ("effort", None, "medium"),
+        ]
+        assert ctx.announced_model == "gpt-after"
+        assert ctx.announced_effort == "medium"
+
+    asyncio.run(run())
+
+
+def test_machine_model_effort_publish_completes_old_pair_before_replacement():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("effort-send-race", "effort-send-race")
+        ctx.engine = "codex"
+        ctx.sdk = SimpleNamespace(
+            model="gpt-before",
+            effort="high",
+            applied_effort="high",
+            display_effort="high",
+            display_effort_model="gpt-before",
+            display_effort_cwd=os.path.realpath("/tmp/effort-send-before"),
+            display_effort_generation=1,
+            _display_effort_retry_at=None,
+            _cwd="/tmp/effort-send-before",
+            _generation=1,
+            _thread_settings_revision=0,
+        )
+        original_send = transport.send
+        replaced = False
+
+        async def send(event):
+            nonlocal replaced
+            await original_send(event)
+            if isinstance(event, Model) and not replaced:
+                replaced = True
+                # A native settings notification lands while sending the first
+                # frame. The old effort must still follow the old model before
+                # a complete new pair replaces it.
+                ctx.sdk.model = "gpt-after"
+                ctx.sdk.effort = "medium"
+                ctx.sdk.applied_effort = "medium"
+                ctx.sdk.display_effort = "medium"
+                ctx.sdk.display_effort_model = "gpt-after"
+                ctx.sdk.display_effort_cwd = os.path.realpath(
+                    "/tmp/effort-send-after")
+                ctx.sdk.display_effort_generation = 2
+                ctx.sdk._cwd = "/tmp/effort-send-after"
+                ctx.sdk._generation = 2
+                ctx.sdk._thread_settings_revision = 1
+
+        transport.send = send
+        published: list[object] = []
+        assert await machine._publish_codex_model_effort(
+            ctx, force=True, published=published,
+        ) is True
+
+        expected = [
+            ("model", "gpt-before", None),
+            ("effort", None, "high"),
+            ("model", "gpt-after", None),
+            ("effort", None, "medium"),
+        ]
+        assert [
+            (event.type, getattr(event, "model", None),
+             getattr(event, "effort", None))
+            for event in transport.sent
+        ] == expected
+        assert [
+            (event.type, getattr(event, "model", None),
+             getattr(event, "effort", None))
+            for event in published
+        ] == expected
+        assert ctx.announced_model == "gpt-after"
+        assert ctx.announced_effort == "medium"
+
+    asyncio.run(run())
+
+
+def test_machine_forced_model_effort_publish_falls_back_after_probe_churn():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("effort-probe-churn", "effort-probe-churn")
+        ctx.engine = "codex"
+        ctx.sdk = SimpleNamespace(
+            model="gpt-0",
+            effort="high",
+            applied_effort="high",
+            display_effort="high",
+            display_effort_model="gpt-0",
+            display_effort_cwd=os.path.realpath("/tmp/effort-probe-churn"),
+            display_effort_generation=1,
+            _display_effort_retry_at=None,
+            _cwd="/tmp/effort-probe-churn",
+            _generation=1,
+            _thread_settings_revision=0,
+        )
+        probes = 0
+
+        async def churning_effort(_ctx):
+            nonlocal probes
+            probes += 1
+            ctx.sdk.model = f"gpt-{probes}"
+            ctx.sdk.display_effort_model = ctx.sdk.model
+            ctx.sdk._thread_settings_revision = probes
+            return "high"
+
+        machine._resolve_codex_session_effort = churning_effort
+        published: list[object] = []
+        assert await machine._publish_codex_model_effort(
+            ctx, force=True, published=published,
+        ) is True
+
+        assert probes == 3
+        assert [
+            (event.type, getattr(event, "model", None),
+             getattr(event, "effort", None))
+            for event in transport.sent
+        ] == [
+            ("model", "gpt-3", None),
+            ("effort", None, "high"),
+        ]
+        assert published == transport.sent
+        assert ctx.announced_model == "gpt-3"
+        assert ctx.announced_effort == "high"
+
+    asyncio.run(run())
+
+
+def test_codex_resume_restores_rollout_effort_after_nullable_resume(
+        monkeypatch, tmp_path):
+    class FakeCodexHandle:
+        def __init__(self, _cfg, cwd=None, daemon_mode=None,
+                     daemon_manager=None):
+            self.cwd = cwd
+            self._cwd = cwd
+            self._generation = 1
+            self.daemon_mode = daemon_mode
+            self.daemon_manager = daemon_manager
+            self.thread_id = None
+            self.proc = SimpleNamespace(returncode=None)
+            self.model = "gpt-test"
+            self.effort = None
+            self.applied_effort = None
+            self.display_effort = None
+            self.display_effort_model = None
+            self.display_effort_cwd = None
+            self.display_effort_generation = None
+            self._display_effort_retry_at = None
+            self._approval = "never"
+            self.approval_policy = "never"
+            self.permission_profile = None
+            self.web_search = "cached"
+            self.web_search_override = None
+            self.collaboration_mode = "default"
+            self.service_tier = None
+            self.shared_daemon_affinity = False
+            self.using_daemon_proxy = False
+            self.preconnect_effort = None
+            self.preconnect_model = None
+            self.set_model_calls = []
+
+        @property
+        def approval(self):
+            return self._approval
+
+        @approval.setter
+        def approval(self, value):
+            self._approval = value
+            self.approval_policy = value
+
+        async def connect(self, **kwargs):
+            self.thread_id = kwargs["resume_id"]
+            self.preconnect_effort = self.effort
+            self.preconnect_model = self.model
+            # Model the resume response echoing the retired native value over
+            # the wrapper's pre-connect catalog replacement.
+            self.model = "retired-model"
+            # Some app-server versions omit the effective override on resume.
+            self.effort = None
+            self.applied_effort = None
+            self.display_effort = None
+            self.display_effort_model = None
+            self.display_effort_cwd = None
+            self.display_effort_generation = None
+
+        async def set_model(self, model):
+            self.set_model_calls.append(model)
+            self.model = model
+
+        async def configured_default_effort(self):
+            return "medium"
+
+        async def disconnect(self):
+            self.proc = None
+
+    async def run():
+        thread_id = "nullable-effort-resume"
+        machine, _transport = _mk_machine()
+        machine.cfg.cc_cwd = str(tmp_path)
+        monkeypatch.setattr(machine_module, "CodexHandle", FakeCodexHandle)
+        monkeypatch.setattr(
+            machine_module,
+            "codex_session_cwd",
+            lambda _thread_id: str(tmp_path),
+        )
+        monkeypatch.setattr(
+            machine_module,
+            "codex_session_settings",
+            lambda *_args, **_kwargs: {
+                "model": "retired-model",
+                "effort": "high",
+            },
+        )
+
+        async def catalog(*, codex_home=None):
+            return [{
+                "id": "current-model",
+                "efforts": ["high"],
+                "default_effort": "high",
+                "is_default": True,
+            }]
+
+        monkeypatch.setattr(machine_module, "codex_catalog", catalog)
+        monkeypatch.setattr(
+            machine_module, "codex_current_provider", lambda **_kwargs: "")
+
+        async def unchanged_effort(_model, effort, **_kwargs):
+            return effort
+
+        monkeypatch.setattr(machine_module, "clamp_effort", unchanged_effort)
+        machine._watch_session = lambda _sid: None
+        machine._prime_codex_ownership = (
+            lambda _sid: asyncio.sleep(0, result=False))
+        machine._load_history = lambda *_args: asyncio.sleep(0)
+
+        ctx = await machine._spawn(
+            resume_id=thread_id,
+            engine="codex",
+            space="code",
+        )
+
+        assert ctx is not None
+        assert ctx.sdk.preconnect_model == "current-model"
+        assert ctx.sdk.set_model_calls == ["current-model"]
+        assert ctx.sdk.model == "current-model"
+        assert ctx.sdk.preconnect_effort == "high"
+        assert ctx.sdk.effort == "high"
+        assert ctx.sdk.applied_effort == "high"
+        assert ctx.sdk.display_effort == "high"
+        assert ctx.announced_effort == "high"
+
+    asyncio.run(run())
+
+
+def test_machine_effort_apply_preserves_authoritative_app_server_clamp(
+        monkeypatch):
+    async def run():
+        machine, _transport = _mk_machine()
+        ctx = _mk_ctx("effort-clamp", "effort-clamp")
+        ctx.engine = "codex"
+        ctx.sdk = SimpleNamespace(
+            model="gpt-clamped",
+            effort="high",
+            applied_effort="high",
+            display_effort="high",
+            display_effort_model="gpt-clamped",
+            display_effort_cwd=os.path.realpath("/tmp"),
+            display_effort_generation=1,
+            _display_effort_retry_at=None,
+            _cwd="/tmp",
+            _generation=1,
+        )
+
+        async def set_effort(_requested):
+            # The authoritative notification adjusted the requested high level.
+            ctx.sdk.effort = "medium"
+            ctx.sdk.applied_effort = "medium"
+            ctx.sdk.display_effort = "medium"
+            return True
+
+        ctx.sdk.set_effort = set_effort
+
+        async def clamp(_model, effort, *, codex_home=None):
+            assert effort == "high"
+            return "high"
+
+        monkeypatch.setattr(machine_module, "clamp_effort", clamp)
+        assert await machine._apply_codex_effort(ctx, "high") == "medium"
+        assert ctx.sdk.effort == ctx.sdk.applied_effort == "medium"
+        assert ctx.sdk.display_effort == "medium"
+
+    asyncio.run(run())
+
+
+def test_machine_effort_apply_keeps_authoritative_null(monkeypatch):
+    async def run():
+        machine, _transport = _mk_machine()
+        ctx = _mk_ctx("effort-null", "effort-null")
+        ctx.engine = "codex"
+        ctx.sdk = SimpleNamespace(
+            model="gpt-null",
+            effort="high",
+            applied_effort="high",
+            display_effort="high",
+            display_effort_model="gpt-null",
+            display_effort_cwd=os.path.realpath("/tmp"),
+            display_effort_generation=1,
+            _display_effort_retry_at=None,
+            _cwd="/tmp",
+            _generation=1,
+        )
+
+        async def set_effort(_requested):
+            # An authoritative notification can reject/clear the override.
+            ctx.sdk.effort = None
+            ctx.sdk.applied_effort = None
+            ctx.sdk.display_effort = None
+            ctx.sdk.display_effort_model = None
+            ctx.sdk.display_effort_cwd = None
+            ctx.sdk.display_effort_generation = None
+            return True
+
+        async def configured_default():
+            return None
+
+        async def model_default(_model, *, codex_home=None):
+            return "low"
+
+        async def clamp(_model, effort, *, codex_home=None):
+            return effort
+
+        ctx.sdk.set_effort = set_effort
+        ctx.sdk.configured_default_effort = configured_default
+        monkeypatch.setattr(machine_module, "default_effort_for", model_default)
+        monkeypatch.setattr(machine_module, "clamp_effort", clamp)
+
+        assert await machine._apply_codex_effort(ctx, "high") == "low"
+        assert ctx.sdk.effort is None
+        assert ctx.sdk.applied_effort is None
+        assert ctx.sdk.display_effort == "low"
+
+    asyncio.run(run())
+
+
 def test_codex_binary_resolution_probes_bounded_candidates_and_picks_newest(
         monkeypatch):
     monkeypatch.setattr(codex_runtime_module, "_BIN_CACHE", None)
@@ -2718,6 +3650,18 @@ def test_codex_config_defaults_use_only_top_level_toml_keys(
     assert codex_sessions_module.codex_web_search() == "live"
 
 
+def test_codex_handle_has_no_retired_model_or_effort_fallback(tmp_path):
+    handle = CodexHandle(_Cfg(), codex_home=str(tmp_path))
+
+    assert codex_sessions_module.codex_model(
+        codex_home=str(tmp_path)) == ""
+    assert codex_sessions_module.codex_effort(
+        codex_home=str(tmp_path)) == ""
+    assert handle.model is None
+    assert handle.effort is None
+    assert handle.applied_effort is None
+
+
 def test_codex_thread_settings_update_uses_official_01441_shapes():
     async def run():
         handle = CodexHandle(_Cfg())
@@ -2834,6 +3778,42 @@ def test_codex_authoritative_thread_settings_restore_after_resume_or_notificatio
                 handle.collaboration_mode) == (
             "notification-model", "ultra", "untrusted",
             ":danger-full-access", None, "plan")
+
+    asyncio.run(run())
+
+
+def test_codex_configured_default_effort_is_bounded_and_scoped_per_cwd(
+        monkeypatch):
+    async def run():
+        handle = CodexHandle(_Cfg(), cwd="/tmp/one")
+        calls = []
+        now = 0.0
+        one = os.path.realpath("/tmp/one")
+        two = os.path.realpath("/tmp/two")
+
+        monkeypatch.setattr(
+            codex_handle_module.time, "monotonic", lambda: now)
+
+        async def request(method, params=None):
+            calls.append((method, params))
+            effort = "xhigh" if params["cwd"] == one else None
+            return {"config": {"model_reasoning_effort": effort}}
+
+        handle._request = request
+        assert await handle.configured_default_effort() == "xhigh"
+        assert await handle.configured_default_effort() == "xhigh"
+        now = codex_handle_module._CONFIGURED_DEFAULT_EFFORT_CACHE_SECONDS + 1
+        assert await handle.configured_default_effort() == "xhigh"
+        handle._cwd = "/tmp/two"
+        assert await handle.configured_default_effort() is None
+        handle._generation += 1
+        assert await handle.configured_default_effort() is None
+        assert calls == [
+            ("config/read", {"cwd": one, "includeLayers": False}),
+            ("config/read", {"cwd": one, "includeLayers": False}),
+            ("config/read", {"cwd": two, "includeLayers": False}),
+            ("config/read", {"cwd": two, "includeLayers": False}),
+        ]
 
     asyncio.run(run())
 
@@ -3112,6 +4092,7 @@ def test_codex_work_turn_uses_named_profile_without_legacy_sandbox_policy():
         handle.thread_id = "work-thread"
         handle.model = "gpt-work"
         handle.effort = None
+        handle.display_effort = codex_models_module.MODEL_DEFAULT_EFFORT
         requests = []
 
         async def request(method, params=None):
@@ -3126,6 +4107,7 @@ def test_codex_work_turn_uses_named_profile_without_legacy_sandbox_policy():
         assert params["cwd"] == cwd
         assert params["approvalPolicy"] == "never"
         assert params["permissions"] == "cc_remote_work"
+        assert "effort" not in params
         assert "sandboxPolicy" not in params
 
     asyncio.run(run())
@@ -3135,6 +4117,7 @@ def test_codex_work_turn_uses_named_profile_without_legacy_sandbox_policy():
     "work_mode,http_only,web_override,preserve_controls,preserve_profile", [
     (False, False, None, False, True),
     (False, True, None, False, True),
+    (False, True, "live", False, True),
     (False, False, "live", False, True),
     (False, False, "live", True, True),
     (False, False, None, True, False),
@@ -3256,14 +4239,19 @@ def test_codex_resume_adopts_native_settings_unless_controls_are_preserved(
                 "config": _expected_work_config(),
                 "permissions": "cc_remote_work",
             })
-        elif web_override:
-            expected_resume["config"] = {"web_search": web_override}
+        else:
+            code_config = codex_handle_module._code_thread_config(
+                http_only_resume=http_only,
+                web_search=web_override,
+            )
+            if code_config is not None:
+                expected_resume["config"] = code_config
         resume_call = next(call for call in calls if call[0] == "thread/resume")
         assert resume_call == ("thread/resume", expected_resume)
         assert not ({
             "sandbox", "sandboxPolicy", "approvalsReviewer",
         } & resume_call[1].keys())
-        if not work_mode and not web_override:
+        if not work_mode and not web_override and not http_only:
             assert not ({"config", "personality"} & resume_call[1].keys())
         assert (handle.model, handle.effort, handle.approval,
                 handle.permission_profile, handle.service_tier) == (
@@ -5732,7 +6720,7 @@ def test_managed_codex_turn_emits_authoritative_browser_turn_binding():
     asyncio.run(run())
 
 
-def test_managed_codex_turn_clears_stale_effort_when_sdk_has_none():
+def test_managed_codex_turn_replaces_stale_effort_with_model_default():
     async def run():
         machine, transport = _mk_machine()
         ctx = _mk_ctx("no-effort-session", "no-effort-session")
@@ -5778,17 +6766,114 @@ def test_managed_codex_turn_clears_stale_effort_when_sdk_has_none():
         machine._accept_codex_checkpoint = lambda _ctx: asyncio.sleep(0)
         await machine._run_turn(ctx, "hello")
 
-        assert ctx.announced_effort is None
+        assert ctx.announced_effort == machine_module.MODEL_DEFAULT_EFFORT
         assert [
             event.effort for event in transport.sent
             if isinstance(event, Effort)
-        ] == [""]
+        ] == [machine_module.MODEL_DEFAULT_EFFORT]
         assert not [event for event in transport.sent
                     if isinstance(event, Error)]
         terminal = [event for event in transport.sent
                     if isinstance(event, TurnEnd)]
         assert len(terminal) == 1
         assert terminal[0].result.is_error is False
+
+    asyncio.run(run())
+
+
+def test_managed_query_reconnect_refreshes_effort_without_blocking_stream():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _mk_ctx("query-reconnect-effort", "query-reconnect-effort")
+        ctx.engine = "codex"
+        ctx.state = "running"
+        ctx.active_msg_id = "browser-message"
+        ctx.announced_effort = "high"
+        ctx.turn_task = asyncio.current_task()
+        resolution_started = asyncio.Event()
+        release_resolution = asyncio.Event()
+
+        class ReconnectingSdk:
+            tier_dirty = False
+            model = "gpt-after-reconnect"
+            effort = None
+            applied_effort = None
+            display_effort = "high"
+            display_effort_model = model
+            display_effort_cwd = os.path.realpath("/tmp")
+            display_effort_generation = 1
+            _display_effort_retry_at = None
+            _cwd = "/tmp"
+            _generation = 1
+            _thread_settings_revision = 0
+            collaboration_mode = "default"
+            service_tier = None
+
+            async def query(
+                self, _prompt, images=None, *, client_user_message_id=None,
+            ):
+                # Model CodexHandle.query() repairing a dead app-server after
+                # Machine's normal effort preflight has already completed.
+                self._generation += 1
+                self.display_effort = None
+                self.display_effort_model = None
+                self.display_effort_cwd = None
+                self.display_effort_generation = None
+                return "native-turn"
+
+            async def configured_default_effort(self):
+                resolution_started.set()
+                await release_resolution.wait()
+                return "medium"
+
+            async def receive_response(self):
+                yield {
+                    "method": "item/completed",
+                    "params": {
+                        "turnId": "native-turn",
+                        "item": {
+                            "id": "answer",
+                            "type": "agentMessage",
+                            "text": "done",
+                        },
+                    },
+                }
+                yield {
+                    "method": "turn/completed",
+                    "params": {"turn": {
+                        "id": "native-turn", "status": "completed",
+                    }},
+                }
+
+        ctx.sdk = ReconnectingSdk()
+        machine.sessions[ctx.key] = ctx
+        machine._begin_codex_checkpoint = lambda _ctx: asyncio.sleep(0)
+        machine._accept_codex_checkpoint = lambda _ctx: asyncio.sleep(0)
+
+        await asyncio.wait_for(machine._run_turn(ctx, "hello"), timeout=0.5)
+        await asyncio.wait_for(resolution_started.wait(), timeout=0.5)
+
+        # The immediate sentinel removes the stale chip, while the config read
+        # remains entirely outside the already-accepted turn's stream drain.
+        assert ctx.state == "idle"
+        assert [
+            event.effort for event in transport.sent
+            if isinstance(event, Effort)
+        ] == [machine_module.MODEL_DEFAULT_EFFORT]
+
+        release_resolution.set()
+        for _ in range(20):
+            if any(
+                isinstance(event, Effort) and event.effort == "medium"
+                for event in transport.sent
+            ):
+                break
+            await asyncio.sleep(0)
+        assert [
+            event.effort for event in transport.sent
+            if isinstance(event, Effort)
+        ] == [machine_module.MODEL_DEFAULT_EFFORT, "medium"]
+        assert ctx.announced_effort == "medium"
 
     asyncio.run(run())
 
@@ -6161,6 +7246,51 @@ def test_web_search_is_codex_code_only_idle_and_broadcast_after_reconnect():
     asyncio.run(run())
 
 
+def test_web_search_reconnect_republishes_changed_nullable_effort():
+    async def run():
+        machine, transport = _mk_machine()
+        sdk = _ControlSdk()
+        sdk.model = "gpt-after-search-reconnect"
+        sdk.effort = None
+        sdk.applied_effort = None
+        sdk.display_effort = None
+        sdk._cwd = ctx_cwd = "/tmp/cc-remote-test-cwd"
+        sdk._generation = 2
+
+        async def set_web_search(mode):
+            sdk.web_search_calls.append(mode)
+            sdk.web_search = mode
+            sdk.web_search_override = mode
+            # Model a successful thread/resume whose authoritative thread
+            # setting is null and whose effective config resolves concretely.
+            sdk.display_effort = "medium"
+            sdk.display_effort_model = sdk.model
+            sdk.display_effort_cwd = os.path.realpath(ctx_cwd)
+            sdk.display_effort_generation = sdk._generation
+
+        sdk.set_web_search = set_web_search
+        ctx = _control_ctx("codex", "codex", sdk)
+        ctx.announced_model = "gpt-before-search-reconnect"
+        ctx.announced_effort = "high"
+        machine.sessions = {"codex": ctx}
+        machine._stamp_codex_daemon_epoch = lambda _ctx: asyncio.sleep(0)
+        machine._persist_codex_session_controls = (
+            lambda _ctx: asyncio.sleep(0))
+
+        result = await machine._handle_set_web_search(
+            SetWebSearch(sid="codex", mode="live"))
+
+        assert isinstance(result, WebSearch)
+        assert [event.type for event in transport.sent] == [
+            "model", "effort", "web_search",
+        ]
+        assert transport.sent[0].model == "gpt-after-search-reconnect"
+        assert transport.sent[1].effort == "medium"
+        assert ctx.announced_effort == "medium"
+
+    asyncio.run(run())
+
+
 def test_failed_web_search_republishes_restored_execution_controls():
     async def run():
         machine, transport = _mk_machine()
@@ -6235,25 +7365,99 @@ def test_collaboration_modes_are_codex_only_and_broadcast_after_apply():
     asyncio.run(run())
 
 
-def test_client_hello_always_seeds_resident_codex_collaboration_mode():
+def test_client_hello_seeds_codex_defaults_without_control_plane_probes():
     async def run():
         machine, transport = _mk_machine()
         ctx = _control_ctx("codex", "codex")
         ctx.sdk.collaboration_mode = "plan"
-        machine.sessions = {"codex": ctx}
+        ctx.sdk.effort = None
+        ctx.sdk.display_effort = machine_module.MODEL_DEFAULT_EFFORT
+        second = _control_ctx("codex-2", "codex")
+        second.sdk.effort = None
+        second.sdk.display_effort = None
+        machine.sessions = {"codex": ctx, "codex-2": second}
 
-        await machine._handle_client_hello(SimpleNamespace(
-            cursors={"codex": 0}, generations={"codex": machine.instance_id},
-            last_seq=None, client_id="client-1", route_id="route-1",
-        ))
+        async def unexpected_effort_probe(*_args, **_kwargs):
+            raise AssertionError("client hello must remain a no-probe fast path")
+
+        machine._resolve_codex_session_effort = unexpected_effort_probe
+
+        await asyncio.wait_for(
+            machine._handle_client_hello(SimpleNamespace(
+                cursors={"codex": 0},
+                generations={"codex": machine.instance_id},
+                last_seq=None, client_id="client-1", route_id="route-1",
+            )),
+            timeout=0.1,
+        )
 
         modes = [message for message in transport.sent
-                 if message.type == "collaboration_mode"]
+                 if message.type == "collaboration_mode"
+                 and message.sid == "codex"]
         assert len(modes) == 1
         assert modes[0].mode == "plan"
         assert modes[0].sid == "codex"
         assert modes[0].to == "client-1"
         assert modes[0].route_id == "route-1"
+        efforts = [message for message in transport.sent
+                   if message.type == "effort"]
+        assert {(event.sid, event.effort) for event in efforts} == {
+            ("codex", machine_module.MODEL_DEFAULT_EFFORT),
+            ("codex-2", machine_module.MODEL_DEFAULT_EFFORT),
+        }
+        assert all(event.to == "client-1" for event in efforts)
+        assert all(event.route_id == "route-1" for event in efforts)
+
+    asyncio.run(run())
+
+
+def test_client_hello_never_mixes_model_effort_during_settings_update():
+    async def run():
+        machine, transport = _mk_machine()
+        ctx = _control_ctx("codex", "codex")
+        ctx.sdk.model = "gpt-before"
+        ctx.sdk.effort = "high"
+        ctx.sdk.display_effort = "high"
+        ctx.sdk.display_effort_model = "gpt-before"
+        ctx.sdk.display_effort_cwd = os.path.realpath(ctx.cwd)
+        ctx.sdk.display_effort_generation = 1
+        ctx.sdk._cwd = ctx.cwd
+        ctx.sdk._generation = 1
+        ctx.sdk._thread_settings_revision = 0
+        machine.sessions = {"codex": ctx}
+        original_send = transport.send
+        replaced = False
+
+        async def send(event):
+            nonlocal replaced
+            await original_send(event)
+            if isinstance(event, Model) and not replaced:
+                replaced = True
+                ctx.sdk.model = "gpt-after"
+                ctx.sdk.effort = "medium"
+                ctx.sdk.display_effort = "medium"
+                ctx.sdk.display_effort_model = "gpt-after"
+                ctx.sdk.display_effort_generation = 2
+                ctx.sdk._generation = 2
+                ctx.sdk._thread_settings_revision = 1
+
+        transport.send = send
+        await machine._handle_client_hello(SimpleNamespace(
+            cursors={}, generations={}, last_seq=None,
+            client_id="client-1", route_id="route-1",
+        ))
+
+        assert [
+            (event.type, getattr(event, "model", None),
+             getattr(event, "effort", None))
+            for event in transport.sent
+            if isinstance(event, (Model, Effort))
+        ] == [
+            ("model", "gpt-before", None),
+            ("effort", None, "high"),
+            ("model", "gpt-after", None),
+            ("effort", None, "medium"),
+        ]
 
     asyncio.run(run())
 
