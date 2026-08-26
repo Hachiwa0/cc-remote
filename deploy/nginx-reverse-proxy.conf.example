@@ -1,0 +1,59 @@
+# cc-remote Relay behind nginx.
+#
+# The official deploy uses a managed Caddy that terminates TLS and reverse
+# proxies the WebSocket (deploy/Caddyfile). If you already run nginx as the
+# only front on this host, use this file as the alternative. The relay
+# deliberately trusts forwarded transport metadata only from loopback peers, so
+# nginx MUST run on the same host and proxy to the loopback address where the
+# container published port 8765 (see docker-compose.yml).
+#
+# Setup:
+#   1. Point an A/AAAA record for cc-remote.example.com at this VPS and open
+#      80/443.
+#   2. Install a certificate. The .well-known/acme-challenge location below is
+#      already present, so `certbot --nginx -d cc-remote.example.com` will work
+#      out of the box and fill in the ssl_ lines for you.
+#   3. Save this file as /etc/nginx/sites-available/cc-remote, symlink it into
+#      /etc/nginx/sites-enabled/, then `nginx -t && systemctl reload nginx`.
+#      (Skip the symlink on distros that read /etc/nginx/conf.d/ directly.)
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name cc-remote.example.com;
+
+    # Let certbot complete the ACME challenge on the HTTP listener before it
+    # adds the 443 block. Can be removed after your certificate is in place.
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name cc-remote.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/cc-remote.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/cc-remote.example.com/privkey.pem;
+
+    # The /ws WebSocket carries wrapper and browser connections, so the upgrade
+    # headers and long timeouts are required — keep-alive settings alone are
+    # not enough.
+    location / {
+        proxy_pass http://127.0.0.1:8765;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+}

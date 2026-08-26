@@ -1,0 +1,12 @@
+# Keep the relay Docker build context lean and free of machine-local state.
+# web/dist is built inside the image (stage 1); web/node_modules would bloat
+# the context and is never committed upstream.
+.git/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+web/node_modules/
+web/dist/
+web/test-results/
+*.log
