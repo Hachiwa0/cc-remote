@@ -21,10 +21,14 @@ services:
     image: cc-remote-relay:latest
     container_name: cc-remote-relay
     restart: unless-stopped
-    ports:
-      # Loopback-only publish: the host nginx/Caddy terminates the public TLS
-      # and WebSocket connection and proxies it to 127.0.0.1:8765.
-      - "127.0.0.1:8765:8765"
+    # Host networking so the relay sees loopback peers. The relay only trusts
+    # forwarded transport metadata (X-Forwarded-Proto / X-Forwarded-For) from
+    # 127.0.0.1 and ::1; the Docker bridge gateway is not one of those, so a
+    # normal `ports:` mapping would make it ignore the proxy headers and reject
+    # the HTTPS PUBLIC_ORIGIN. With host networking the relay binds loopback
+    # only (RELAY_HOST=127.0.0.1), which the host nginx/Caddy reaches directly.
+    # Linux hosts only; the `ports:` mapping is ignored under host networking.
+    network_mode: host
     env_file:
       - env.relay
     volumes:

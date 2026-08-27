@@ -30,7 +30,7 @@ FROM python:3.13-slim-bookworm AS relay
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    RELAY_HOST=0.0.0.0 \
+    RELAY_HOST=127.0.0.1 \
     RELAY_PORT=8765 \
     WEB_STATIC_DIR=/app/web/dist \
     PUSH_DB_PATH=/app/state/relay-push.sqlite3 \

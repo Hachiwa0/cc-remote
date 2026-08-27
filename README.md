@@ -440,9 +440,11 @@ export UV_PYTHON_INSTALL_MIRROR=https://registry.npmmirror.com/-/binary/python-b
 ./install.sh wrapper --relay https://remote.example.com --pair XXXXX-XXXXX-XXXXX-XXXXX --name "MacBook Pro"
 ```
 
-若 `install.sh` 本身下载角色包超时，可先在别处下好 release 包再重试。Relay 用
-Docker 容器部署时，构建阶段同样可用 `--build-arg PIP_INDEX_URL=...` 加速
-（见 deploy/README.md 的容器章节）。
+若 `install.sh` 下载角色包超时：脚本每次都会从
+`CC_REMOTE_RELEASE_BASE_URL`（默认 GitHub Release）重新下载、没有本地缓存，
+可把该变量指向镜像源或本地 `file://` 路径后重试。Relay 用 Docker 容器部署时，
+构建阶段同样可用 `--build-arg PIP_INDEX_URL=...` 加速（见 deploy/README.md 的
+容器章节）。
 
 ## 生产部署（公网 VPS 中继 + 你机器上的 wrapper）
 

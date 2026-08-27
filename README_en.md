@@ -519,11 +519,12 @@ export UV_PYTHON_INSTALL_MIRROR=https://registry.npmmirror.com/-/binary/python-b
 ./install.sh wrapper --relay https://remote.example.com --pair XXXXX-XXXXX-XXXXX-XXXXX --name "MacBook Pro"
 ```
 
-If `install.sh` itself times out fetching the role bundle, pre-download the
-release archive elsewhere and retry. When deploying the Relay in a Docker
-container, the build stage can use the same mirror idea via
-`--build-arg PIP_INDEX_URL=...` (see the container section of
-[deploy/README.md](deploy/README.md)).
+If `install.sh` times out fetching the role bundle, note that it always
+re-downloads from `CC_REMOTE_RELEASE_BASE_URL` (GitHub Release by default) with
+no local cache - point that variable at a mirror or a local `file://` path and
+retry. When deploying the Relay in a Docker container, the build stage can use
+the same mirror idea via `--build-arg PIP_INDEX_URL=...` (see the container
+section of [deploy/README.md](deploy/README.md)).
 
 ## Production deploy (public VPS relay + wrapper on your machine)
 
